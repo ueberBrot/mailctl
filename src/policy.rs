@@ -1,6 +1,7 @@
 //! Access-grant authority and request narrowing are independent of provider adapters.
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -46,7 +47,7 @@ pub struct Narrowing {
 /// Created by the application from a configured access grant.
 #[derive(Clone, Debug)]
 pub struct RequestContext {
-    service_id: String,
+    service_id: Uuid,
     grant: String,
     accounts: Vec<String>,
     permissions: Vec<Permission>,
@@ -55,7 +56,7 @@ pub struct RequestContext {
 
 impl RequestContext {
     pub(crate) fn new(
-        service_id: String,
+        service_id: Uuid,
         grant: String,
         accounts: Vec<String>,
         permissions: Vec<Permission>,
@@ -73,7 +74,7 @@ impl RequestContext {
         self.response_limit = self.response_limit.min(maximum);
         self
     }
-    pub(crate) fn belongs_to(&self, service_id: &str) -> bool {
+    pub(crate) fn belongs_to(&self, service_id: Uuid) -> bool {
         self.service_id == service_id
     }
     pub(crate) fn grant_name(&self) -> &str {

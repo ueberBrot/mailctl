@@ -29,7 +29,7 @@ fn definitions() -> Vec<Tool> {
         Tool::new(
             "email_list_accounts",
             "List authorized email accounts with explicit completion.",
-            empty.as_object().unwrap().clone(),
+            serde_json::Map::new(),
         )
         .with_input_schema::<ListAccountsInput>()
         .with_output_schema::<Envelope<AccountDiscovery>>(),
@@ -52,7 +52,7 @@ impl ServerHandler for EmailTools {
             ))
     }
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
-        Cow::Owned(vec![ProtocolVersion::V_2025_11_25])
+        Cow::Borrowed(&[ProtocolVersion::V_2025_11_25])
     }
     async fn list_tools(
         &self,
@@ -88,14 +88,14 @@ impl ServerHandler for EmailTools {
                     .and_then(|permit| permit.map_err(|_| Error::new(ErrorCode::Cancelled)))
             },
         };
-        let input = Value::Object(request.arguments.unwrap_or_default());
+        let input = request.arguments.unwrap_or_default();
         let operation = match (admitted.as_ref(), request.name.as_ref()) {
             (Err(error), _) => Err(error.clone()),
-            (_, "email_list_accounts") => serde_json::from_value(input)
+            (_, "email_list_accounts") => serde_json::from_value(Value::Object(input))
                 .map(Operation::ListAccounts)
                 .map_err(|_| Error::new(ErrorCode::InvalidRequest)),
             (_, "email_capabilities") => {
-                if input.as_object().is_some_and(|value| value.is_empty()) {
+                if input.is_empty() {
                     Ok(Operation::Capabilities)
                 } else {
                     Err(Error::new(ErrorCode::InvalidRequest))

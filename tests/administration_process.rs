@@ -127,6 +127,42 @@ fn setup_guidance_is_actionable_without_a_sibling_executable() {
     }
 }
 
+#[test]
+fn setup_rejects_an_oversized_replacement_without_changing_configuration() {
+    for executable in executables() {
+        let installation = Installation::two_accounts();
+        let mut text = format!(
+            "version = 1\nstate_dir = {}\n",
+            support::toml_string(&installation.config().parent().unwrap().join("state")),
+        );
+        let labels = (0..816)
+            .map(|index| format!("'{index:04}{}'", "x".repeat(1020)))
+            .collect::<Vec<_>>()
+            .join(",");
+        for index in 0..5 {
+            text.push_str(&format!(
+                "\n[[accounts]]\nkey = 'account{index}'\nalias = 'account{index}'\nserver = 'imap.example.test'\nusername = 'account{index}'\nmailboxes = [{labels}]\nfrom_identities = ['account{index}']\n[accounts.credential]\nsource = 'native'\n",
+            ));
+        }
+        text.push_str(
+            "\n[[grants]]\nname = 'default'\naccounts = ['account0']\nmailboxes = ['INBOX']\n",
+        );
+        let config = mailctl::config::Config::parse(&text).unwrap();
+        assert!(toml::to_string_pretty(&config).unwrap().len() > 4 * 1024 * 1024);
+        std::fs::write(installation.config(), &text).unwrap();
+        let output = run_bounded({
+            let mut command = installation.command(executable);
+            command.args(["--json", "setup", "--alias", "account0"]);
+            command
+        });
+        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(
+            std::fs::read_to_string(installation.config()).unwrap(),
+            text
+        );
+    }
+}
+
 fn accounts(installation: &Installation) -> serde_json::Value {
     use mailctl::{
         config::Config,

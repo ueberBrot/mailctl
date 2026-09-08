@@ -42,7 +42,7 @@ pub(super) fn open(path: &Path, config: Config) -> Result<Service, Error> {
 }
 
 fn existing(path: &Path) -> Result<Option<String>, Error> {
-    crate::file_storage::read(path, 4 * 1024 * 1024)
+    crate::file_storage::read(path, crate::config::MAX_BYTES)
         .map_err(|_| Error::setup_required())?
         .map(|bytes| String::from_utf8(bytes).map_err(|_| Error::setup_required()))
         .transpose()
@@ -150,7 +150,11 @@ pub(super) fn setup(
         return Err(Error::new(ErrorCode::InvalidRequest));
     }
     let replacement = if edited || previous.is_none() {
-        Some(toml::to_string_pretty(&config).map_err(|_| Error::setup_required())?)
+        let text = toml::to_string_pretty(&config).map_err(|_| Error::setup_required())?;
+        if text.len() > crate::config::MAX_BYTES {
+            return Err(Error::setup_required());
+        }
+        Some(text)
     } else {
         None
     };

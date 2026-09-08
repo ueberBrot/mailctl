@@ -1,7 +1,6 @@
 //! Private installation files and crash-released OS leases.
 use crate::domain::{Error, ErrorCode};
 use crate::file_storage::{self, redirected};
-use serde::Serialize;
 use std::{
     fs::{self, File, OpenOptions, TryLockError},
     io::{Read, Seek, Write},
@@ -93,9 +92,8 @@ pub(super) fn read(directory: &Path) -> Result<Option<Vec<u8>>, Error> {
     file_storage::read(&directory.join("accounts.json"), MAX_BYTES).map_err(|_| invalid())
 }
 
-pub(super) fn persist(directory: &Path, registry: &impl Serialize) -> Result<(), Error> {
-    let bytes = crate::encoding::serialize_bounded(registry, MAX_BYTES).map_err(|_| invalid())?;
-    file_storage::replace(&directory.join("accounts.json"), &bytes).map_err(|_| invalid())
+pub(super) fn persist(directory: &Path, bytes: &[u8]) -> Result<(), Error> {
+    file_storage::replace(&directory.join("accounts.json"), bytes).map_err(|_| invalid())
 }
 
 pub(super) fn initialization_marker(file: &mut File) -> Result<Vec<u8>, Error> {

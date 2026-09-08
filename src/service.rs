@@ -15,7 +15,7 @@ use uuid::Uuid;
 pub struct Service {
     config: Config,
     registry: AccountRegistry,
-    context_id: String,
+    context_id: Uuid,
 }
 impl Service {
     pub fn open(config: Config) -> Result<Self, Error> {
@@ -30,14 +30,7 @@ impl Service {
         Ok(Self::build(config, registry))
     }
     pub fn setup(config: Config) -> Result<Setup, Error> {
-        config.validate()?;
-        let registry = AccountRegistry::setup(&config)?;
-        Ok(Setup {
-            installation_id: registry.installation().to_owned(),
-            configuration_revision: registry.revision().to_owned(),
-            accounts: config.accounts.len(),
-            grants: config.grants.len(),
-        })
+        Self::maintain(config, || Ok(())).map(|(setup, ())| setup)
     }
     pub fn maintain<T>(
         config: Config,
@@ -64,7 +57,7 @@ impl Service {
         Self {
             config,
             registry,
-            context_id: Uuid::new_v4().to_string(),
+            context_id: Uuid::new_v4(),
         }
     }
     pub fn context(
@@ -98,17 +91,14 @@ impl Service {
             .cloned()
             .collect();
         Ok(RequestContext::new(
-            self.context_id.clone(),
+            self.context_id,
             grant_name.into(),
             accounts,
             grant.profile.permissions(narrowing.read_only),
             grant.limits.envelope_bytes,
         ))
     }
-    pub fn limits<'a>(
-        &'a self,
-        context: &RequestContext,
-    ) -> Result<&'a crate::config::Limits, Error> {
+    pub fn limits(&self, context: &RequestContext) -> Result<&crate::config::Limits, Error> {
         Ok(&self.grant(context)?.limits)
     }
     /// Bound the currently implemented discovery envelopes without cloning labels.
@@ -144,20 +134,21 @@ impl Service {
         context: &RequestContext,
         operation: Operation,
     ) -> Result<OperationResult, Error> {
-        self.registry.check_revision()?;
         let grant = self.grant(context)?;
-        let permissions = context.permissions().to_vec();
+        self.registry.check_revision()?;
         let accounts = || {
             self.config
                 .accounts
                 .iter()
                 .filter(|account| context.accounts().contains(&account.key))
         };
-        let operations = vec![
-            "list_accounts".to_string(),
-            "capabilities".to_string(),
-            "health".to_string(),
-        ];
+        let operations = || {
+            vec![
+                "list_accounts".to_string(),
+                "capabilities".to_string(),
+                "health".to_string(),
+            ]
+        };
         let result = match operation {
             Operation::ListAccounts(input) => {
                 let limit = input.limit.unwrap_or(grant.limits.accounts);
@@ -185,7 +176,7 @@ impl Service {
                             account_id: account_id.to_owned(),
                             generation,
                             from_identities: account.from_identities.clone(),
-                            capabilities: operations.clone(),
+                            capabilities: operations(),
                             availability: Availability::Unknown,
                         }
                     })
@@ -196,8 +187,8 @@ impl Service {
                 })
             }
             Operation::Capabilities => OperationResult::Capabilities(Capabilities {
-                operations,
-                permissions,
+                operations: operations(),
+                permissions: context.permissions().to_vec(),
                 health: self.health(context, context.response_limit())?,
                 capacity: self.capacity(&grant.limits),
             }),
@@ -242,11 +233,8 @@ impl Service {
             accounts,
         })
     }
-    fn grant<'a>(
-        &'a self,
-        context: &RequestContext,
-    ) -> Result<&'a crate::config::AccessGrant, Error> {
-        if !context.belongs_to(&self.context_id) {
+    fn grant(&self, context: &RequestContext) -> Result<&crate::config::AccessGrant, Error> {
+        if !context.belongs_to(self.context_id) {
             return Err(denied());
         }
         self.config

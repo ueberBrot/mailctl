@@ -237,21 +237,19 @@ async fn report(
 }
 
 fn escape_bidi(text: &str) -> String {
-    text.chars().fold(
-        String::with_capacity(text.len()),
-        |mut output, character| {
-            use std::fmt::Write;
-            match character {
-                '\u{061c}'
-                | '\u{200e}'
-                | '\u{200f}'
-                | '\u{202a}'..='\u{202e}'
-                | '\u{2066}'..='\u{2069}' => {
-                    let _ = write!(output, "\\u{{{:04x}}}", character as u32);
-                }
-                _ => output.push(character),
+    use std::fmt::Write;
+    let mut output = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            '\u{061c}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}' => {
+                let _ = write!(output, "\\u{{{:04x}}}", character as u32);
             }
-            output
-        },
-    )
+            _ => output.push(character),
+        }
+    }
+    output
 }

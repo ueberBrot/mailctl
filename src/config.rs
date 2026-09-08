@@ -6,6 +6,8 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
+pub(crate) const MAX_BYTES: usize = 4 * 1024 * 1024;
+
 fn invalid() -> Error {
     Error::setup_required()
 }
@@ -196,13 +198,16 @@ fn default_grant() -> String {
 }
 impl Config {
     pub fn parse(input: &str) -> Result<Self, Error> {
-        if input.len() > 4 * 1024 * 1024 {
+        if input.len() > MAX_BYTES {
             return Err(invalid());
         }
-        if obsolete_runtime_capacity(input) {
-            return Err(Error::obsolete_runtime_capacity());
-        }
-        let raw: RawConfig = toml::from_str(input).map_err(|_| invalid())?;
+        let raw: RawConfig = toml::from_str(input).map_err(|_| {
+            if obsolete_runtime_capacity(input) {
+                Error::obsolete_runtime_capacity()
+            } else {
+                invalid()
+            }
+        })?;
         raw.limits.validate()?;
         let grants = raw
             .grants
@@ -332,11 +337,12 @@ fn label(value: &str) -> bool {
     !value.is_empty() && value.len() <= 1024 && !value.chars().any(char::is_control)
 }
 fn unique_labels(values: &[String], max: usize) -> bool {
-    let unique: HashSet<_> = values.iter().collect();
+    let mut unique = HashSet::new();
     !values.is_empty()
         && values.len() <= max
-        && unique.len() == values.len()
-        && values.iter().all(|value| label(value))
+        && values
+            .iter()
+            .all(|value| label(value) && unique.insert(value))
 }
 fn server_name(value: &str) -> bool {
     !value.is_empty()

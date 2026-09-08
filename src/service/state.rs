@@ -71,7 +71,8 @@ impl Registry {
         })
     }
     fn validate(&self) -> Result<(), Error> {
-        if Uuid::parse_str(&self.installation).is_err()
+        if self.version != 1
+            || Uuid::parse_str(&self.installation).is_err()
             || self.installation_key == [0; 32]
             || self.configuration_revision.len() != 64
             || !self
@@ -179,7 +180,22 @@ impl Initialization {
             },
             deadline,
         )?;
-        let registry = persisted.unwrap_or(Registry::new(revision.clone())?);
+        let registry = match persisted {
+            Some(registry) => registry,
+            None => Registry::new(revision.clone())?,
+        };
+        if !registry.installation.as_bytes().starts_with(&marker) {
+            return Err(invalid());
+        }
+        // An unchanged configuration must retain every account's existing identity.
+        if !changed
+            && config
+                .accounts
+                .iter()
+                .any(|account| !registry.accounts.contains_key(&account.key))
+        {
+            return Err(invalid());
+        }
         Ok(Self {
             directory,
             config: canonical,
@@ -193,24 +209,29 @@ impl Initialization {
         })
     }
 
-    fn reconcile(&mut self) -> Result<(), Error> {
-        if !self
-            .registry
-            .installation
-            .as_bytes()
-            .starts_with(&self.marker)
-        {
-            return Err(invalid());
-        }
-        if self.changed {
+    fn reconcile<T>(
+        &mut self,
+        update_configuration: impl FnOnce() -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        // Prepare bounded state before allowing the configuration to be replaced.
+        let bytes = if self.changed {
             self.registry.configuration_revision = self.revision.clone();
             self.registry.reconcile(&self.config)?;
-            storage::persist(&self.directory, &self.registry)?;
+            Some(
+                crate::encoding::serialize_bounded(&self.registry, storage::MAX_BYTES)
+                    .map_err(|_| invalid())?,
+            )
+        } else {
+            None
+        };
+        let updated = update_configuration()?;
+        if let Some(bytes) = bytes {
+            storage::persist(&self.directory, &bytes)?;
         }
         if self.marker.len() != self.registry.installation.len() {
             storage::mark_initialized(&mut self._initialization, &self.registry.installation)?;
         }
-        Ok(())
+        Ok(updated)
     }
 
     fn downgrade_to_shared(&mut self) -> Result<(), Error> {
@@ -242,36 +263,8 @@ impl AccountRegistry {
         config: &Config,
         confirm_configuration: impl FnOnce() -> Result<(), Error>,
     ) -> Result<Self, Error> {
-        Self::initialize(config, confirm_configuration)
-    }
-    pub(super) fn setup(config: &Config) -> Result<Self, Error> {
-        let mut initialization = Initialization::acquire(config, true)?;
-        initialization.reconcile()?;
-        Ok(Self {
-            registry: initialization.registry,
-            lease: None,
-        })
-    }
-    pub(super) fn maintain<T>(
-        config: &Config,
-        update_configuration: impl FnOnce() -> Result<T, Error>,
-    ) -> Result<(Self, T), Error> {
-        let mut initialization = Initialization::acquire(config, true)?;
-        let updated = update_configuration()?;
-        initialization.reconcile()?;
-        let registry = Self {
-            registry: initialization.registry,
-            lease: None,
-        };
-        Ok((registry, updated))
-    }
-    fn initialize(
-        config: &Config,
-        confirm_configuration: impl FnOnce() -> Result<(), Error>,
-    ) -> Result<Self, Error> {
         let mut initialization = Initialization::acquire(config, false)?;
-        confirm_configuration()?;
-        initialization.reconcile()?;
+        initialization.reconcile(confirm_configuration)?;
         initialization.downgrade_to_shared()?;
         let Initialization {
             directory,
@@ -286,6 +279,18 @@ impl AccountRegistry {
                 _maintenance: maintenance,
             }),
         })
+    }
+    pub(super) fn maintain<T>(
+        config: &Config,
+        update_configuration: impl FnOnce() -> Result<T, Error>,
+    ) -> Result<(Self, T), Error> {
+        let mut initialization = Initialization::acquire(config, true)?;
+        let updated = initialization.reconcile(update_configuration)?;
+        let registry = Self {
+            registry: initialization.registry,
+            lease: None,
+        };
+        Ok((registry, updated))
     }
     pub(super) fn check_revision(&self) -> Result<(), Error> {
         let Some(lease) = &self.lease else {
@@ -325,14 +330,6 @@ fn load(directory: &Path) -> Result<Option<Registry>, Error> {
     let Some(bytes) = storage::read(directory)? else {
         return Ok(None);
     };
-    #[derive(Deserialize)]
-    struct Version {
-        version: u32,
-    }
-    let version: Version = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
-    if version.version != 1 {
-        return Err(invalid());
-    }
     let registry: Registry = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
     registry.validate()?;
     Ok(Some(registry))

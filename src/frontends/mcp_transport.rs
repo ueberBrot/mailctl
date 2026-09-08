@@ -8,7 +8,7 @@ use rmcp::{
     transport::{Transport, async_rw::AsyncRwTransport},
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, hash_map::Entry},
     io,
     sync::{Arc, Mutex},
     time::Duration,
@@ -223,10 +223,12 @@ impl Transport<RoleServer> for BoundedStdio {
             // Keep cancellation notifications readable when all request slots are occupied.
             let permit = self.slots.clone().try_acquire_owned().ok()?;
             let mut pending = self.pending.lock().ok()?;
-            if pending.contains_key(&request.id) {
-                return None;
+            match pending.entry(request.id.clone()) {
+                Entry::Vacant(entry) => {
+                    entry.insert(permit);
+                }
+                Entry::Occupied(_) => return None,
             }
-            pending.insert(request.id.clone(), permit);
         }
         if let JsonRpcMessage::Notification(notification) = &mut item {
             notification

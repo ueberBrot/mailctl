@@ -414,9 +414,51 @@ fn private_account_history_fails_closed_on_corruption() {
     }
     let mut config = Config::parse(&configuration()).unwrap();
     config.state_dir = directory.clone();
-    Service::open(config.clone()).unwrap();
+    let service = Service::open(config.clone()).unwrap();
+    let foreign = Service::in_memory(config.clone()).unwrap();
+    let context = foreign.context("reader", &Narrowing::default()).unwrap();
     std::fs::write(directory.join("accounts.json"), b"{corrupt").unwrap();
+    assert_eq!(
+        service
+            .execute(&context, Operation::Health)
+            .unwrap_err()
+            .code,
+        mailctl::domain::ErrorCode::PermissionDenied
+    );
+    drop(service);
     assert!(Service::open(config).is_err());
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn unchanged_configuration_rejects_missing_account_history() {
+    let directory = std::fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .join(format!("mailctl-history-{}", uuid::Uuid::new_v4()));
+    let mut config = Config::parse(&configuration()).unwrap();
+    config.state_dir = directory.clone();
+    Service::setup(config.clone()).unwrap();
+    let registry_path = config.state_dir.join("accounts.json");
+    let mut registry: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&registry_path).unwrap()).unwrap();
+    registry["accounts"]
+        .as_object_mut()
+        .unwrap()
+        .remove(&config.accounts[0].key);
+    let corrupted = serde_json::to_vec(&registry).unwrap();
+    std::fs::write(&registry_path, &corrupted).unwrap();
+
+    assert!(Service::open(config.clone()).is_err());
+    let mut updated = false;
+    assert!(
+        Service::maintain(config, || {
+            updated = true;
+            Ok(())
+        })
+        .is_err()
+    );
+    assert!(!updated);
+    assert_eq!(std::fs::read(&registry_path).unwrap(), corrupted);
     std::fs::remove_dir_all(directory).unwrap();
 }
 
@@ -652,11 +694,73 @@ fn initialization_marker_is_checked_before_reconciling_a_changed_configuration()
     .unwrap();
     let mut changed = original;
     changed.accounts[0].alias = "renamed".into();
-    assert!(Service::open(changed).is_err());
+    assert!(Service::open(changed.clone()).is_err());
+    let mut updated = false;
+    assert!(
+        Service::maintain(changed, || {
+            updated = true;
+            Ok(())
+        })
+        .is_err()
+    );
+    assert!(
+        !updated,
+        "invalid installation must not update configuration"
+    );
     assert_eq!(
         std::fs::read(directory.join("accounts.json")).unwrap(),
         before
     );
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn maintenance_checks_registry_capacity_before_updating_configuration() {
+    let directory = std::env::temp_dir().join(format!("mailctl-capacity-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&directory).unwrap();
+    let directory = std::fs::canonicalize(directory).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let mut config = Config::parse(&configuration()).unwrap();
+    config.state_dir = directory.clone();
+    config.accounts[0].retain_history = true;
+    Service::setup(config.clone()).unwrap();
+
+    let registry_path = directory.join("accounts.json");
+    let mut registry: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&registry_path).unwrap()).unwrap();
+    let mut size = serde_json::to_vec(&registry).unwrap().len();
+    let generations = registry["accounts"][&config.accounts[0].key]["generations"]
+        .as_array_mut()
+        .unwrap();
+    let template = generations[0].clone();
+    loop {
+        let mut generation = template.clone();
+        generation["generation"] = (generations.len() + 1).into();
+        let additional = serde_json::to_vec(&generation).unwrap().len() + 1;
+        if size + additional > 4 * 1024 * 1024 {
+            break;
+        }
+        generations.push(generation);
+        size += additional;
+    }
+    let before = serde_json::to_vec(&registry).unwrap();
+    assert_eq!(before.len(), size);
+    std::fs::write(&registry_path, &before).unwrap();
+
+    config.accounts[0].server = "replacement.example.test".into();
+    let mut updated = false;
+    let error = Service::maintain(config, || {
+        updated = true;
+        Ok(())
+    })
+    .unwrap_err();
+    assert_eq!(error.code, mailctl::domain::ErrorCode::InvalidRequest);
+    assert!(!updated);
+    assert_eq!(std::fs::read(&registry_path).unwrap(), before);
     std::fs::remove_dir_all(directory).unwrap();
 }
 
