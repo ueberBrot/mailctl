@@ -1,6 +1,10 @@
 # Domain Docs
 
-How the engineering skills should consume this repo's domain documentation when exploring the codebase.
+How to read and write this repo's domain documentation.
+
+## Before writing domain docs
+
+Before creating or editing `CONTEXT.md` or an ADR, read and apply [writing-for-agents](../../.agents/skills/writing-for-agents/SKILL.md). Use [domain-modeling](../../.agents/skills/domain-modeling/SKILL.md) for glossary and ADR formats and decision criteria.
 
 ## Before exploring, read these
 

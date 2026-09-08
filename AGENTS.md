@@ -10,4 +10,4 @@ Use the five default triage labels. Before triaging or applying triage labels, r
 
 ### Domain docs
 
-This repo uses a single-context layout: root `CONTEXT.md` and `docs/adr/`. Before exploring the codebase, read `docs/agents/domain.md`.
+Before exploring the codebase or creating or editing `CONTEXT.md` or an ADR, read `docs/agents/domain.md`.
