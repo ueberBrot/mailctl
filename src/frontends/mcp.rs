@@ -1,18 +1,25 @@
 //! MCP tools share normalized envelopes with the CLI.
-use super::mcp_transport::{BoundedStdio, OUTPUT_LIMIT};
+use super::mcp_transport::{BoundedStdio, Bounds};
 use crate::{
-    domain::{Envelope, Error, ErrorCode, ListAccountsInput, Operation},
-    ipc::Client,
+    domain::{
+        AccountDiscovery, Capabilities, Envelope, Error, ErrorCode, ListAccountsInput, Operation,
+    },
+    policy::RequestContext as ApplicationContext,
+    service::Service,
 };
 use rmcp::model::ErrorData as McpError;
 use rmcp::{RoleServer, ServerHandler, ServiceExt, model::*, service::RequestContext};
 use serde_json::{Value, json};
 use std::{borrow::Cow, time::Duration};
-use tokio::sync::Mutex;
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 struct EmailTools {
-    client: Mutex<Client>,
+    service: Service,
+    context: ApplicationContext,
+    active: Semaphore,
+    output_limit: usize,
+    deadline: Duration,
     shutdown: CancellationToken,
 }
 
@@ -25,13 +32,13 @@ fn definitions() -> Vec<Tool> {
             empty.as_object().unwrap().clone(),
         )
         .with_input_schema::<ListAccountsInput>()
-        .with_output_schema::<Envelope>(),
+        .with_output_schema::<Envelope<AccountDiscovery>>(),
         Tool::new(
             "email_capabilities",
             "Show effective permissions and implemented operations.",
             empty.as_object().unwrap().clone(),
         )
-        .with_output_schema::<Envelope>(),
+        .with_output_schema::<Envelope<Capabilities>>(),
     ]
 }
 
@@ -39,7 +46,10 @@ impl ServerHandler for EmailTools {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_protocol_version(ProtocolVersion::V_2025_11_25)
-            .with_server_info(Implementation::new("mail-mcp", env!("CARGO_PKG_VERSION")))
+            .with_server_info(Implementation::new(
+                "mailctl-mcp",
+                env!("CARGO_PKG_VERSION"),
+            ))
     }
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
         Cow::Owned(vec![ProtocolVersion::V_2025_11_25])
@@ -47,11 +57,18 @@ impl ServerHandler for EmailTools {
     async fn list_tools(
         &self,
         request: Option<PaginatedRequestParams>,
-        _: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
         if request.is_some_and(|request| request.cursor.is_some()) {
             return Err(McpError::invalid_params("Invalid cursor", None));
         }
+        let _active = tokio::select! {
+            biased;
+            _ = context.ct.cancelled() => return Err(McpError::internal_error("Request cancelled", None)),
+            permit = tokio::time::timeout(self.deadline, self.active.acquire()) =>
+                permit.map_err(|_| McpError::internal_error("Request timed out", None))?
+                    .map_err(|_| McpError::internal_error("Service unavailable", None))?,
+        };
         Ok(ListToolsResult {
             tools: definitions(),
             ..Default::default()
@@ -62,12 +79,22 @@ impl ServerHandler for EmailTools {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
+        let admitted = tokio::select! {
+            biased;
+            _ = context.ct.cancelled() => Err(Error::new(ErrorCode::Cancelled)),
+            _ = self.shutdown.cancelled() => Err(Error::new(ErrorCode::Cancelled)),
+            permit = tokio::time::timeout(self.deadline, self.active.acquire()) => {
+                permit.map_err(|_| Error::new(ErrorCode::Timeout))
+                    .and_then(|permit| permit.map_err(|_| Error::new(ErrorCode::Cancelled)))
+            },
+        };
         let input = Value::Object(request.arguments.unwrap_or_default());
-        let operation = match request.name.as_ref() {
-            "email_list_accounts" => serde_json::from_value(input)
+        let operation = match (admitted.as_ref(), request.name.as_ref()) {
+            (Err(error), _) => Err(error.clone()),
+            (_, "email_list_accounts") => serde_json::from_value(input)
                 .map(Operation::ListAccounts)
                 .map_err(|_| Error::new(ErrorCode::InvalidRequest)),
-            "email_capabilities" => {
+            (_, "email_capabilities") => {
                 if input.as_object().is_some_and(|value| value.is_empty()) {
                     Ok(Operation::Capabilities)
                 } else {
@@ -86,28 +113,25 @@ impl ServerHandler for EmailTools {
         let mut envelope = match operation {
             Err(error) => Envelope::from_result(request_id, Err(error)),
             Ok(operation) => {
-                let mut client = self.client.lock().await;
-                let result = tokio::select! {
-                    _ = context.ct.cancelled() => Err(Error::new(ErrorCode::Cancelled)),
-                    result = client.request(&request_id, operation) => result,
-                };
-                match result {
-                    Ok(envelope) => envelope,
-                    Err(error) => {
-                        // A lost or cancelled exchange cannot be reused after broker restart.
-                        self.shutdown.cancel();
-                        Envelope::from_result(request_id, Err(error))
-                    }
+                // Discovery is bounded, synchronous in-memory work. Future provider
+                // operations must propagate this request's deadline/cancellation.
+                let result = self.service.execute(&self.context, operation);
+                if result
+                    .as_ref()
+                    .is_err_and(|error| error.code == ErrorCode::OperationConflict)
+                {
+                    self.shutdown.cancel();
                 }
+                Envelope::from_result(request_id, result)
             }
         };
-        if crate::ipc::serialized_size(&envelope, OUTPUT_LIMIT / 4).is_err() {
+        if crate::encoding::serialized_size(&envelope, self.output_limit / 4).is_err() {
             envelope = Envelope::from_result(
-                envelope.request_id,
+                envelope.request_id().to_owned(),
                 Err(Error::new(ErrorCode::ResponseTooLarge)),
             );
         }
-        let success = envelope.success;
+        let success = envelope.is_success();
         let value = serde_json::to_value(envelope)
             .map_err(|_| McpError::internal_error("Result unavailable", None))?;
         let response = if success {
@@ -115,40 +139,57 @@ impl ServerHandler for EmailTools {
         } else {
             CallToolResult::structured_error(value)
         };
-        let response = if crate::ipc::serialized_size(&response, OUTPUT_LIMIT / 2).is_ok() {
-            response
-        } else {
-            CallToolResult::structured_error(json!(Envelope::from_result(
-                uuid::Uuid::new_v4().to_string(),
-                Err(Error::new(ErrorCode::ResponseTooLarge))
-            )))
-        };
+        let response =
+            if crate::encoding::serialized_size(&response, self.output_limit.saturating_sub(256))
+                .is_ok()
+            {
+                response
+            } else {
+                CallToolResult::structured_error(json!(
+                    Envelope::<crate::domain::OperationResult>::from_result(
+                        uuid::Uuid::new_v4().to_string(),
+                        Err(Error::new(ErrorCode::ResponseTooLarge))
+                    )
+                ))
+            };
         Ok(response.into())
     }
 }
 
-pub(super) async fn run(client: Client) -> Result<(), Error> {
+pub(super) async fn run(service: Service, context: ApplicationContext) -> Result<(), Error> {
+    let limits = service
+        .config()
+        .grants
+        .iter()
+        .find(|grant| grant.name == context.grant)
+        .ok_or_else(|| Error::new(ErrorCode::PermissionDenied))?
+        .limits
+        .clone();
+    let bounds = Bounds::new(&limits)?;
+    let expires = tokio::time::Instant::now()
+        + Duration::from_secs(limits.connection_lifetime_seconds as u64);
     let shutdown = CancellationToken::new();
+    let _cancel_on_exit = shutdown.clone().drop_guard();
     let handler = EmailTools {
-        client: Mutex::new(client),
+        service,
+        context: context.with_response_limit(bounds.output / 4),
+        active: Semaphore::new(limits.active_requests),
+        output_limit: bounds.output,
+        deadline: Duration::from_secs(limits.operation_seconds as u64),
         shutdown: shutdown.clone(),
     };
-    let service = tokio::time::timeout(
-        Duration::from_secs(5),
-        handler.serve_with_ct(BoundedStdio::new(), shutdown),
+    let service = tokio::time::timeout_at(
+        expires.min(
+            tokio::time::Instant::now() + Duration::from_secs(limits.initialization_seconds as u64),
+        ),
+        handler.serve_with_ct(BoundedStdio::new(bounds), shutdown),
     )
     .await
     .map_err(|_| Error::new(ErrorCode::Timeout))?
     .map_err(|_| Error::new(ErrorCode::ProtocolMismatch))?;
-    let cancellation = service.cancellation_token();
-    let lifetime = tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(300)).await;
-        cancellation.cancel();
-    });
-    let result = service
-        .waiting()
+    tokio::time::timeout_at(expires, service.waiting())
         .await
-        .map_err(|_| Error::new(ErrorCode::InternalError));
-    lifetime.abort();
-    result.map(|_| ())
+        .map_err(|_| Error::new(ErrorCode::Timeout))?
+        .map_err(|_| Error::new(ErrorCode::InternalError))
+        .map(|_| ())
 }

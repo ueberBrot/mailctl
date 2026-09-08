@@ -33,9 +33,21 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
+    check_dependencies(root, CargoOpt::AllFeatures, false)?;
+    check_dependencies(root, CargoOpt::SomeFeatures(vec!["cli".into()]), true)?;
+    println!("Toolchain, fixture checksums and production dependency features passed.");
+    Ok(())
+}
+
+fn check_dependencies(
+    root: &Path,
+    features: CargoOpt,
+    cli_only: bool,
+) -> Result<(), Box<dyn Error>> {
     let metadata = MetadataCommand::new()
         .current_dir(root)
-        .features(CargoOpt::AllFeatures)
+        .features(CargoOpt::NoDefaultFeatures)
+        .features(features)
         .other_options(vec!["--locked".into()])
         .exec()?;
     let nodes: HashMap<_, _> = metadata
@@ -59,6 +71,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         let package = &metadata[id];
         let node = nodes[id];
         let name = package.name.as_str();
+        if cli_only && name == "rmcp" {
+            return Err("CLI-only production graph contains MCP dependencies".into());
+        }
         if [
             "greenmail-support",
             "testcontainers",
@@ -112,6 +127,5 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .map(|dep| &dep.pkg),
         );
     }
-    println!("Toolchain, fixture checksums and production dependency features passed.");
     Ok(())
 }

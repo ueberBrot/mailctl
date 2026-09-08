@@ -1,119 +1,78 @@
-//! CLI and MCP mapping onto the broker's application contract.
+//! Executable lifecycle and presentation around the embedded application contract.
+mod cli;
+mod configuration;
+mod diagnostics;
+#[cfg(feature = "mcp")]
 mod mcp;
+#[cfg(feature = "mcp")]
 mod mcp_transport;
 
 use crate::{
-    config::Config,
-    domain::{Envelope, Error, ErrorCode, ListAccountsInput, Operation},
-    ipc::{Broker, Client},
-    policy::Narrowing,
+    domain::{Envelope, Error, ErrorCode, OperationResult},
+    service::Service,
 };
-use clap::{Arg, ArgAction, Command};
-use std::{
-    io::{Read, Write},
-    path::{Path, PathBuf},
-};
+use clap::FromArgMatches;
+use cli::{Action, Invocation};
+use diagnostics::{Color, LogFormat, Options};
+use std::{io::Write, process::ExitCode, time::Duration};
 
-fn command(name: &'static str, description: &'static str) -> Command {
-    let base = Command::new(name)
-        .version(env!("CARGO_PKG_VERSION"))
-        .about(description);
-    if name == "maild" {
-        return base.arg(Arg::new("config").long("config").required(true));
+#[derive(Clone, Copy)]
+pub enum Executable {
+    #[cfg(feature = "cli")]
+    Cli,
+    #[cfg(feature = "mcp")]
+    Mcp,
+}
+impl Executable {
+    fn is_mcp(self) -> bool {
+        match self {
+            #[cfg(feature = "cli")]
+            Self::Cli => false,
+            #[cfg(feature = "mcp")]
+            Self::Mcp => true,
+        }
     }
-    if name == "mail-admin" {
-        return base;
-    }
-    let base = base
-        .arg(
-            Arg::new("endpoint")
-                .long("endpoint")
-                .global(true)
-                .value_parser(clap::value_parser!(PathBuf)),
-        )
-        .arg(
-            Arg::new("broker-uid")
-                .long("broker-uid")
-                .global(true)
-                .value_parser(clap::value_parser!(u32)),
-        )
-        .arg(
-            Arg::new("read-only")
-                .long("read-only")
-                .global(true)
-                .action(ArgAction::SetTrue),
-        )
-        .arg(
-            Arg::new("account")
-                .long("account")
-                .global(true)
-                .action(ArgAction::Append),
-        );
-    if name == "mail-mcp" {
-        return base.arg(
-            Arg::new("use-endpoint-grant")
-                .long("use-endpoint-grant")
-                .conflicts_with("read-only")
-                .action(ArgAction::SetTrue),
-        );
-    }
-    base.arg(
-        Arg::new("json")
-            .long("json")
-            .global(true)
-            .action(ArgAction::SetTrue),
-    )
-    .arg(
-        Arg::new("log-format")
-            .long("log-format")
-            .global(true)
-            .default_value("off")
-            .value_parser(["off", "json", "compact"]),
-    )
-    .subcommand_required(true)
-    .subcommand(
-        Command::new("account")
-            .subcommand_required(true)
-            .subcommand(
-                Command::new("list").arg(
-                    Arg::new("limit")
-                        .long("limit")
-                        .value_parser(clap::value_parser!(usize)),
-                ),
-            ),
-    )
-    .subcommand(
-        Command::new("capability")
-            .subcommand_required(true)
-            .subcommand(Command::new("show")),
-    )
-    .subcommand(Command::new("doctor"))
 }
 
-/// Run a machine-safe executable; all failures use reviewed error categories.
-pub fn run(name: &'static str, description: &'static str) {
-    std::panic::set_hook(Box::new(|_| {
-        eprintln!("{{\"event\":\"panic\",\"code\":\"internal_error\"}}")
-    }));
-    let args: Vec<_> = std::env::args_os().collect();
-    let json = name == "mailctl" && args.iter().any(|arg| arg == "--json");
-    let matches = match command(name, description).try_get_matches_from(args) {
-        Ok(matches) => matches,
-        Err(error)
-            if matches!(
-                error.kind(),
-                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
-            ) =>
-        {
-            let _ = error.print();
-            return;
+pub fn run(executable: Executable) -> ExitCode {
+    let arguments: Vec<_> = std::env::args_os().collect();
+    let command = Invocation::command(executable);
+    let preliminary = command
+        .clone()
+        .ignore_errors(true)
+        .try_get_matches_from(&arguments)
+        .ok();
+    let options = preliminary
+        .as_ref()
+        .and_then(|matches| Options::from_arg_matches(matches).ok())
+        .unwrap_or_default();
+    let administration = preliminary
+        .as_ref()
+        .is_some_and(|matches| matches!(matches.subcommand_name(), Some("setup" | "credential")));
+    let serving = executable.is_mcp() && !administration;
+    let json = !serving
+        && preliminary
+            .as_ref()
+            .is_some_and(|matches| matches.get_flag("json"));
+    let initialized = options.initialize(json || serving);
+    if initialized.is_err() {
+        let _ = Options {
+            log_format: LogFormat::Json,
+            ..options
         }
-        Err(_) => {
-            std::process::exit(
-                report(name, json, Err(Error::new(ErrorCode::InvalidRequest))) as i32,
-            );
-        }
-    };
+        .initialize(true);
+    }
+    let invocation = command
+        .try_get_matches_from(arguments)
+        .and_then(|matches| Invocation::from_matches(executable, &matches));
+    if let Err(error) = &invocation
+        && matches!(
+            error.kind(),
+            clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+        )
+    {
+        return ExitCode::from(if error.print().is_ok() { 0 } else { 8 });
+    }
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -121,151 +80,178 @@ pub fn run(name: &'static str, description: &'static str) {
     {
         Ok(runtime) => runtime,
         Err(_) => {
-            std::process::exit(
-                report(name, json, Err(Error::new(ErrorCode::InternalError))) as i32,
-            );
+            diagnostics::result("", Some(&Error::new(ErrorCode::InternalError)));
+            return ExitCode::from(8);
         }
     };
-    let result = runtime.block_on(async {
-        if name == "maild" {
-            let path = Path::new(
-                matches
-                    .get_one::<String>("config")
-                    .expect("required config"),
-            );
-            let broker = Broker::bind(read_config(path)?)?;
-            broker
-                .run(async {
-                    let _ = tokio::signal::ctrl_c().await;
-                })
-                .await?;
-            return Ok(None);
-        }
-        if name == "mail-admin" {
-            return Err(Error::new(ErrorCode::UnsupportedCapability));
-        }
-        if name == "mailctl"
-            && json
-            && matches
-                .get_one::<String>("log-format")
-                .is_some_and(|v| v == "compact")
-        {
-            return Err(Error::new(ErrorCode::InvalidRequest));
-        }
-        let endpoint = matches
-            .get_one::<PathBuf>("endpoint")
-            .ok_or_else(|| Error::new(ErrorCode::BrokerUnavailable))?;
-        let uid = matches
-            .get_one::<u32>("broker-uid")
-            .copied()
-            .unwrap_or_else(default_uid);
-        let narrowing = Narrowing {
-            read_only: matches.get_flag("read-only")
-                || (name == "mail-mcp" && !matches.get_flag("use-endpoint-grant")),
-            accounts: matches
-                .get_many::<String>("account")
-                .map(|values| values.cloned().collect()),
+    let code = runtime.block_on(async {
+        let result = match initialized {
+            Err(error) => Err(error),
+            Ok(()) => match invocation {
+                Ok(invocation) => {
+                    diagnostics::started();
+                    let result = execute(invocation).await;
+                    diagnostics::stopped();
+                    result
+                }
+                Err(_) => Err(Error::new(ErrorCode::InvalidRequest)),
+            },
         };
-        let mut client = Client::connect(endpoint, uid, narrowing).await?;
-        if name == "mail-mcp" {
-            mcp::run(client).await?;
-            return Ok(None);
+        match result {
+            Ok(code) => code,
+            Err(error) => report(json, options.color, Err(error), None, 30).await,
         }
-        let operation = match matches.subcommand() {
-            Some(("account", command)) => {
-                let (_, list) = command.subcommand().expect("required subcommand");
-                Operation::ListAccounts(ListAccountsInput {
-                    limit: list.get_one::<usize>("limit").copied(),
-                })
-            }
-            Some(("capability", _)) => Operation::Capabilities,
-            Some(("doctor", _)) => Operation::Health,
-            _ => return Err(Error::new(ErrorCode::InvalidRequest)),
-        };
-        let request_id = uuid::Uuid::new_v4().to_string();
-        Ok(Some(client.request(&request_id, operation).await?))
     });
-    std::process::exit(report(name, json, result) as i32);
+    // STDIO workers may remain blocked after cancellation; process exit releases their leases.
+    runtime.shutdown_timeout(Duration::from_millis(250));
+    code.into()
 }
 
-fn default_uid() -> u32 {
+async fn execute(invocation: Invocation) -> Result<u8, Error> {
+    let Invocation { options, action } = invocation;
+    if matches!(action, Action::Credential) {
+        return Err(Error::new(ErrorCode::UnsupportedCapability));
+    }
+    if let Action::Setup(args) = action {
+        let json = options.json;
+        let color = options.diagnostics.color;
+        let setup = tokio::task::spawn_blocking(move || {
+            configuration::setup(&options.config, args, &options.accounts, json)
+        })
+        .await
+        .map_err(|_| Error::new(ErrorCode::InternalError))??;
+        let envelope = Envelope::from_result(
+            uuid::Uuid::new_v4().to_string(),
+            Ok(OperationResult::Setup(setup)),
+        );
+        return Ok(report(json, color, Ok(envelope), None, 30).await);
+    }
+    let config = configuration::load(&options.config)?;
+    #[cfg(feature = "cli")]
+    let deadline = config.limits.operation_seconds;
+    let selected = options
+        .grant
+        .as_deref()
+        .unwrap_or(&config.default_grant)
+        .to_owned();
+    #[allow(unused_mut)]
+    let mut narrowing = options.narrowing();
+    #[cfg(feature = "mcp")]
+    if let Action::Mcp {
+        use_configured_grant,
+    } = action
+    {
+        if options.json {
+            return Err(Error::new(ErrorCode::InvalidRequest));
+        }
+        narrowing.read_only |= !use_configured_grant;
+    }
+    let shutdown = termination_signal()?;
+    tokio::pin!(shutdown);
+    let initialization =
+        tokio::task::spawn_blocking(move || configuration::open(&options.config, config));
+    let service = tokio::select! {
+        _ = &mut shutdown => return Err(Error::new(ErrorCode::Cancelled)),
+        result = initialization => result.map_err(|_| Error::new(ErrorCode::InternalError))??,
+    };
+    let context = service.context(&selected, &narrowing)?;
+    match action {
+        #[cfg(feature = "mcp")]
+        Action::Mcp { .. } => {
+            tokio::select! {
+                _ = &mut shutdown => Err(Error::new(ErrorCode::Cancelled)),
+                result = mcp::run(service, context) => result.map(|()| 0),
+            }
+        }
+        #[cfg(feature = "cli")]
+        Action::Email(operation) => {
+            let envelope = Envelope::from_result(
+                uuid::Uuid::new_v4().to_string(),
+                service.execute(&context, operation),
+            );
+            Ok(report(
+                options.json,
+                options.diagnostics.color,
+                Ok(envelope),
+                Some(service),
+                deadline,
+            )
+            .await)
+        }
+        Action::Setup(_) | Action::Credential => unreachable!(),
+    }
+}
+
+fn termination_signal() -> Result<impl Future<Output = ()>, Error> {
     #[cfg(unix)]
     {
-        rustix::process::geteuid().as_raw()
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut interrupt =
+            signal(SignalKind::interrupt()).map_err(|_| Error::new(ErrorCode::InternalError))?;
+        let mut terminate =
+            signal(SignalKind::terminate()).map_err(|_| Error::new(ErrorCode::InternalError))?;
+        Ok(async move {
+            tokio::select! { _ = interrupt.recv() => {}, _ = terminate.recv() => {} }
+        })
     }
     #[cfg(not(unix))]
     {
-        0
+        Ok(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
     }
 }
 
-fn read_config(path: &Path) -> Result<Config, Error> {
-    let invalid = || Error::new(ErrorCode::InvalidRequest);
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32);
-    }
-    let file = options.open(path).map_err(|_| invalid())?;
-    let metadata = file.metadata().map_err(|_| invalid())?;
-    if !metadata.is_file() || metadata.len() > 4 * 1024 * 1024 {
-        return Err(invalid());
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if metadata.uid() != default_uid() || metadata.mode() & 0o077 != 0 {
-            return Err(invalid());
+async fn report(
+    json: bool,
+    color: Color,
+    result: Result<Envelope, Error>,
+    owner: Option<Service>,
+    seconds: usize,
+) -> u8 {
+    let envelope = result.unwrap_or_else(|error| {
+        Envelope::from_result(uuid::Uuid::new_v4().to_string(), Err(error))
+    });
+    diagnostics::result(envelope.request_id(), envelope.error());
+    let code = envelope.error().map_or(0, Error::exit_code);
+    let output = if json {
+        serde_json::to_string(&envelope)
+    } else {
+        match envelope.result() {
+            Some(result) => serde_json::to_string_pretty(result).map(|text| escape_bidi(&text)),
+            None => return code,
         }
-    }
-    let mut text = String::new();
-    file.take(4 * 1024 * 1024 + 1)
-        .read_to_string(&mut text)
-        .map_err(|_| invalid())?;
-    if text.len() > 4 * 1024 * 1024 {
-        return Err(invalid());
-    }
-    Config::parse(&text)
-}
-
-fn report(name: &str, json: bool, result: Result<Option<Envelope>, Error>) -> u8 {
-    let envelope = match result {
-        Ok(None) => return 0,
-        Ok(Some(envelope)) => envelope,
-        Err(error) => Envelope::from_result(uuid::Uuid::new_v4().to_string(), Err(error)),
     };
-    let code = envelope.error.as_ref().map_or(0, Error::exit_code);
-    if name == "mailctl" && json {
-        if serde_json::to_writer(std::io::stdout().lock(), &envelope).is_err() {
-            return 8;
-        }
-        if writeln!(std::io::stdout().lock()).is_err() {
-            return 8;
-        }
-    } else if let Some(error) = envelope.error {
-        eprintln!(
-            "{{\"event\":\"operation_failed\",\"code\":{}}}",
-            serde_json::to_string(&error.code).expect("error code")
-        );
-    } else if let Some(result) = envelope.result {
-        let text = serde_json::to_string_pretty(&result).expect("domain result");
-        let safe: String = text
-            .chars()
-            .flat_map(|c| {
-                if matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}') {
-                    format!("\\u{{{:04x}}}", c as u32)
-                        .chars()
-                        .collect::<Vec<_>>()
-                } else {
-                    vec![c]
-                }
-            })
-            .collect();
-        if writeln!(std::io::stdout().lock(), "{safe}").is_err() {
-            return 8;
-        }
+    let Ok(text) = output else {
+        return 8;
+    };
+    let write = tokio::task::spawn_blocking(move || {
+        let _owner = owner;
+        writeln!(color.stdout(json), "{text}")
+    });
+    match tokio::time::timeout(Duration::from_secs(seconds as u64), write).await {
+        Ok(Ok(Ok(()))) => code,
+        Err(_) => 5,
+        _ => 8,
     }
-    code
+}
+
+fn escape_bidi(text: &str) -> String {
+    text.chars().fold(
+        String::with_capacity(text.len()),
+        |mut output, character| {
+            use std::fmt::Write;
+            match character {
+                '\u{061c}'
+                | '\u{200e}'
+                | '\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2066}'..='\u{2069}' => {
+                    let _ = write!(output, "\\u{{{:04x}}}", character as u32);
+                }
+                _ => output.push(character),
+            }
+            output
+        },
+    )
 }

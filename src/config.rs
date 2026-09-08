@@ -1,8 +1,5 @@
 //! Versioned operator configuration. Parsing validates authority and resource ceilings.
-use crate::{
-    domain::{Error, ErrorCode},
-    policy::Profile,
-};
+use crate::{domain::Error, policy::Profile};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
@@ -10,7 +7,27 @@ use std::{
 };
 
 fn invalid() -> Error {
-    Error::new(ErrorCode::InvalidRequest)
+    Error::setup_required()
+}
+
+fn obsolete_runtime_capacity(input: &str) -> bool {
+    fn contains(value: &toml::Value) -> bool {
+        match value {
+            toml::Value::Table(values) => values.iter().any(|(key, value)| {
+                matches!(
+                    key.as_str(),
+                    "runtimes"
+                        | "runtime_slots"
+                        | "runtime_slot"
+                        | "shared_permit"
+                        | "shared_permits"
+                ) || contains(value)
+            }),
+            toml::Value::Array(values) => values.iter().any(contains),
+            _ => false,
+        }
+    }
+    toml::from_str::<toml::Value>(input).is_ok_and(|value| contains(&value))
 }
 macro_rules! limits {
     ($($name:ident: $default:expr => $max:expr),+ $(,)?) => {
@@ -24,18 +41,18 @@ macro_rules! limits {
         impl LimitOverrides {
             fn resolve(self, ceiling: &Limits) -> Result<Limits, Error> {
                 let resolved = Limits { $($name: self.$name.unwrap_or(ceiling.$name),)+ };
-                if $(resolved.$name > ceiling.$name)||+ { return Err(invalid()); }
+                if !resolved.fits_within(ceiling) { return Err(invalid()); }
                 resolved.validate()?;
                 Ok(resolved)
             }
         }
         impl Limits {
+            fn fits_within(&self, ceiling: &Self) -> bool { $(self.$name <= ceiling.$name)&&+ }
             pub fn validate(&self) -> Result<(), Error> {
                 if $(self.$name == 0 || self.$name > $max)||+ { return Err(invalid()); }
-                if self.buffered_bytes < self.ipc_frame_bytes * 3 + 192 || self.ipc_frame_bytes < 1024
-                    || self.handshakes > self.clients || self.active_requests > self.clients
+                if self.buffered_bytes < crate::encoding::request_buffer_bytes(self.envelope_bytes) + self.envelope_bytes + 192 || self.envelope_bytes < 1024
                     || self.connection_seconds > self.operation_seconds
-                    || self.handshake_seconds > self.operation_seconds
+                    || self.initialization_seconds > self.operation_seconds
                     || self.mailbox_page > self.mailbox_inventory { return Err(invalid()); }
                 Ok(())
             }
@@ -43,7 +60,7 @@ macro_rules! limits {
     }
 }
 limits! {
-    ipc_frame_bytes: 16 * 1024 * 1024 => 64 * 1024 * 1024,
+    envelope_bytes: 16 * 1024 * 1024 => 64 * 1024 * 1024,
     json_nesting: 32 => 64,
     search_page: 50 => 200,
     search_uid_window: 1000 => 10000,
@@ -71,10 +88,8 @@ limits! {
     secret_command_seconds: 15 => 60,
     journal_records: 100000 => 1000000,
     accounts: 32 => 256,
-    listeners: 8 => 32,
-    clients: 32 => 128,
-    handshakes: 8 => 32,
-    handshake_seconds: 5 => 10,
+    grants: 8 => 32,
+    initialization_seconds: 5 => 10,
     active_requests: 16 => 64,
     queued_requests: 64 => 256,
     buffered_bytes: 64 * 1024 * 1024 => 256 * 1024 * 1024,
@@ -82,16 +97,10 @@ limits! {
     queued_credentials: 8 => 32,
     connection_lifetime_seconds: 300 => 900,
 }
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Deployment {
-    #[default]
-    Cooperative,
-    Isolated,
-}
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Topology {
+    #[default]
     Native,
     LinuxNativeWsl,
     WindowsHostedWsl,
@@ -139,11 +148,9 @@ pub struct AccountConfig {
 fn default_port() -> u16 {
     993
 }
-#[derive(Clone, Debug)]
-pub struct ListenerConfig {
+#[derive(Clone, Debug, Serialize)]
+pub struct AccessGrant {
     pub name: String,
-    pub endpoint: PathBuf,
-    pub peer_uids: Vec<u32>,
     pub profile: Profile,
     pub accounts: Vec<String>,
     pub mailboxes: Vec<String>,
@@ -151,10 +158,8 @@ pub struct ListenerConfig {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawListener {
+struct RawGrant {
     name: String,
-    endpoint: PathBuf,
-    peer_uids: Vec<u32>,
     #[serde(default)]
     profile: Profile,
     accounts: Vec<String>,
@@ -162,59 +167,64 @@ struct RawListener {
     #[serde(default)]
     limits: LimitOverrides,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct Config {
     pub version: u32,
-    pub deployment: Deployment,
+    pub default_grant: String,
     pub topology: Topology,
     pub state_dir: PathBuf,
     pub limits: Limits,
     pub accounts: Vec<AccountConfig>,
-    pub listeners: Vec<ListenerConfig>,
+    pub grants: Vec<AccessGrant>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
     version: u32,
+    #[serde(default = "default_grant")]
+    default_grant: String,
     #[serde(default)]
-    deployment: Deployment,
     topology: Topology,
     state_dir: PathBuf,
     #[serde(default)]
     limits: Limits,
     accounts: Vec<AccountConfig>,
-    listeners: Vec<RawListener>,
+    grants: Vec<RawGrant>,
+}
+fn default_grant() -> String {
+    "default".into()
 }
 impl Config {
     pub fn parse(input: &str) -> Result<Self, Error> {
         if input.len() > 4 * 1024 * 1024 {
             return Err(invalid());
         }
+        if obsolete_runtime_capacity(input) {
+            return Err(Error::obsolete_runtime_capacity());
+        }
         let raw: RawConfig = toml::from_str(input).map_err(|_| invalid())?;
         raw.limits.validate()?;
-        let listeners = raw
-            .listeners
+        let grants = raw
+            .grants
             .into_iter()
-            .map(|listener| {
-                Ok(ListenerConfig {
-                    name: listener.name,
-                    endpoint: listener.endpoint,
-                    peer_uids: listener.peer_uids,
-                    profile: listener.profile,
-                    accounts: listener.accounts,
-                    mailboxes: listener.mailboxes,
-                    limits: listener.limits.resolve(&raw.limits)?,
+            .map(|grant| {
+                Ok(AccessGrant {
+                    name: grant.name,
+                    profile: grant.profile,
+                    accounts: grant.accounts,
+                    mailboxes: grant.mailboxes,
+                    limits: grant.limits.resolve(&raw.limits)?,
                 })
             })
             .collect::<Result<_, Error>>()?;
         let config = Self {
             version: raw.version,
-            deployment: raw.deployment,
+            default_grant: raw.default_grant,
             topology: raw.topology,
             state_dir: raw.state_dir,
             limits: raw.limits,
             accounts: raw.accounts,
-            listeners,
+            grants,
         };
         config.validate()?;
         Ok(config)
@@ -224,8 +234,13 @@ impl Config {
         if self.version != 1
             || !safe_path(&self.state_dir)
             || self.accounts.len() > self.limits.accounts
-            || self.listeners.is_empty()
-            || self.listeners.len() > self.limits.listeners
+            || self.grants.is_empty()
+            || self.grants.len() > self.limits.grants
+            || !identifier(&self.default_grant)
+            || !self
+                .grants
+                .iter()
+                .any(|grant| grant.name == self.default_grant && grant.profile == Profile::ReadOnly)
         {
             return Err(invalid());
         }
@@ -267,34 +282,21 @@ impl Config {
             }
         }
         let mut names = HashSet::new();
-        let mut endpoints = HashSet::new();
-        for listener in &self.listeners {
-            listener.limits.validate()?;
-            // Programmatically assembled configurations receive the same ceiling check.
-            let limits = serde_json::to_value(&listener.limits).map_err(|_| invalid())?;
-            let ceilings = serde_json::to_value(&self.limits).map_err(|_| invalid())?;
-            if limits
-                .as_object()
-                .ok_or_else(invalid)?
-                .iter()
-                .any(|(key, value)| value.as_u64() > ceilings[key].as_u64())
+        for grant in &self.grants {
+            grant.limits.validate()?;
+            if !grant.limits.fits_within(&self.limits) {
+                return Err(invalid());
+            }
+            if !identifier(&grant.name)
+                || !names.insert(&grant.name)
+                || grant.accounts.len() > self.limits.accounts
+                || !unique_labels(&grant.mailboxes, self.limits.mailbox_inventory)
+                || grant.accounts.iter().any(|key| !keys.contains(key))
             {
                 return Err(invalid());
             }
-            if !identifier(&listener.name)
-                || !names.insert(&listener.name)
-                || !safe_path(&listener.endpoint)
-                || !endpoints.insert(&listener.endpoint)
-                || listener.peer_uids.is_empty()
-                || listener.peer_uids.len() > 128
-                || listener.accounts.len() > self.limits.accounts
-                || !unique_labels(&listener.mailboxes, self.limits.mailbox_inventory)
-                || listener.accounts.iter().any(|key| !keys.contains(key))
-            {
-                return Err(invalid());
-            }
-            if listener.profile != Profile::ReadOnly
-                && listener.accounts.iter().any(|key| {
+            if grant.profile != Profile::ReadOnly
+                && grant.accounts.iter().any(|key| {
                     self.accounts
                         .iter()
                         .find(|account| &account.key == key)
@@ -302,7 +304,7 @@ impl Config {
                             account
                                 .drafts_mailbox
                                 .as_ref()
-                                .is_none_or(|mailbox| !listener.mailboxes.contains(mailbox))
+                                .is_none_or(|mailbox| !grant.mailboxes.contains(mailbox))
                         })
                 })
             {

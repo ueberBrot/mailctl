@@ -31,3 +31,19 @@ _Avoid_: Operator
 **Operator**:
 The person who configures email accounts and grants access to their email operations.
 _Avoid_: Agent harness
+
+**Access grant**:
+An operator-approved ceiling on the email accounts, mailboxes, and operations available to a consuming application. A caller may narrow that ceiling; a resource reference does not convey it.
+_Avoid_: Harness name, resource reference
+
+**Installation**:
+The shared identity and history of a configured set of email accounts and draft operations, used by one or more consuming applications. Restarting a consuming application does not create a new installation.
+_Avoid_: Process, session, executable
+
+**Account alias**:
+A human-facing name for a configured email account. Renaming the alias preserves the account's identity.
+_Avoid_: Account identity
+
+**Credential reference**:
+The association between an email account and the source of its authentication secret. The reference identifies how to obtain a credential; it is not the secret value.
+_Avoid_: Password, account configuration

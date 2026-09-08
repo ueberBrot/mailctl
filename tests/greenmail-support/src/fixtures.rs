@@ -66,7 +66,7 @@ async fn openssl(dir: &Path, args: &str) -> Result<()> {
     )
     .await
     .map_err(|_| "OpenSSL fixture preparation timed out")?
-    .map_err(|_| "Docker tests require OpenSSL on PATH (see docs/development.md)")?;
+    .map_err(|_| "Docker tests require OpenSSL on PATH")?;
     if !result.status.success() {
         return Err("OpenSSL fixture certificate preparation failed".into());
     }

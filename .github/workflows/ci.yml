@@ -24,11 +24,12 @@ jobs:
       - run: cargo run --locked --example check-policy
       - run: cargo deny --locked --all-features check
 
-  shared:
+  components:
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+        features: [cli, mcp, 'cli,mcp']
     runs-on: ${{ matrix.os }}
     timeout-minutes: 25
     steps:
@@ -36,10 +37,18 @@ jobs:
         with:
           persist-credentials: false
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
-      - run: cargo build --locked --workspace --all-targets
-      - run: cargo clippy --locked --workspace --all-targets --no-default-features -- -D warnings
-      - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
-      - run: cargo test --locked --workspace --no-default-features
+      - run: cargo build --locked --workspace --all-targets --no-default-features --features "$MAILCTL_FEATURES"
+        shell: bash
+        env:
+          MAILCTL_FEATURES: ${{ matrix.features }}
+      - run: cargo clippy --locked --workspace --all-targets --no-default-features --features "$MAILCTL_FEATURES" -- -D warnings
+        shell: bash
+        env:
+          MAILCTL_FEATURES: ${{ matrix.features }}
+      - run: cargo test --locked --workspace --no-default-features --features "$MAILCTL_FEATURES"
+        shell: bash
+        env:
+          MAILCTL_FEATURES: ${{ matrix.features }}
 
   greenmail:
     runs-on: ubuntu-latest

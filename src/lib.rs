@@ -1,10 +1,10 @@
-//! Controlled email discovery through the application contract and protected IPC.
+//! Controlled email discovery through a shared embedded application contract.
 pub mod adapters;
-pub mod backend;
 pub mod config;
 pub mod domain;
+mod encoding;
+#[cfg(any(feature = "cli", feature = "mcp"))]
 pub mod frontends;
-pub mod ipc;
 pub mod policy;
 pub mod secret;
 pub mod service;
