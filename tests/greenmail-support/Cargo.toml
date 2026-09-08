@@ -1,0 +1,25 @@
+[package]
+name = "greenmail-support"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+docker = ["dep:testcontainers", "dep:reqwest", "dep:serde", "dep:serde_json", "dep:tokio", "dep:tokio-rustls", "dep:tempfile", "dep:serde-saphyr", "dep:jsonschema"]
+
+[dependencies]
+testcontainers = { version = "=0.28.0", default-features = false, optional = true }
+reqwest = { version = "=0.13.4", default-features = false, features = ["json"], optional = true }
+serde = { version = "1.0", features = ["derive"], optional = true }
+serde_json = { version = "1.0", optional = true }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "process"], optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"], optional = true }
+tempfile = { version = "3.27.0", optional = true }
+serde-saphyr = { version = "=1.2.0", optional = true }
+jsonschema = { version = "0.55", default-features = false, optional = true }
+
+[lints]
+workspace = true

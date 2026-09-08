@@ -1,0 +1,21 @@
+# Applies to production and development dependencies on every target.
+[advisories]
+unmaintained = "all"
+yanked = "deny"
+
+[licenses]
+confidence-threshold = 0.93
+allow = [
+  "MIT", "MIT-0", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC",
+  "Unicode-3.0",
+  "Zlib", # foldhash, through jsonschema's hashbrown dependency
+]
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
