@@ -67,9 +67,6 @@ impl Service {
             context_id: Uuid::new_v4().to_string(),
         }
     }
-    pub fn config(&self) -> &Config {
-        &self.config
-    }
     pub fn context(
         &self,
         grant_name: &str,
@@ -100,13 +97,47 @@ impl Service {
             })
             .cloned()
             .collect();
-        Ok(RequestContext {
-            installation: self.context_id.clone(),
-            grant: grant_name.into(),
+        Ok(RequestContext::new(
+            self.context_id.clone(),
+            grant_name.into(),
             accounts,
-            permissions: grant.profile.permissions(narrowing.read_only),
-            response_limit: grant.limits.envelope_bytes,
-        })
+            grant.profile.permissions(narrowing.read_only),
+            grant.limits.envelope_bytes,
+        ))
+    }
+    pub fn limits<'a>(
+        &'a self,
+        context: &RequestContext,
+    ) -> Result<&'a crate::config::Limits, Error> {
+        Ok(&self.grant(context)?.limits)
+    }
+    /// Bound the currently implemented discovery envelopes without cloning labels.
+    #[cfg(feature = "mcp")]
+    pub(crate) fn response_bound(&self, context: &RequestContext) -> Result<usize, Error> {
+        let maximum = self
+            .limits(context)?
+            .envelope_bytes
+            .min(context.response_limit());
+        let mut size = 2048usize.min(maximum);
+        for account in self
+            .config
+            .accounts
+            .iter()
+            .filter(|account| context.accounts().contains(&account.key))
+        {
+            // Covers account identity, generation, operation names and envelope
+            // fields; capability/health entries are smaller than this discovery entry.
+            size = size.saturating_add(512).min(maximum);
+            let Ok(alias) = serialized_size(&account.alias, maximum - size) else {
+                return Ok(maximum);
+            };
+            size += alias;
+            let Ok(identities) = serialized_size(&account.from_identities, maximum - size) else {
+                return Ok(maximum);
+            };
+            size += identities;
+        }
+        Ok(size)
     }
     pub fn execute(
         &self,
@@ -114,21 +145,13 @@ impl Service {
         operation: Operation,
     ) -> Result<OperationResult, Error> {
         self.registry.check_revision()?;
-        if context.installation != self.context_id {
-            return Err(denied());
-        }
-        let grant = self
-            .config
-            .grants
-            .iter()
-            .find(|grant| grant.name == context.grant)
-            .ok_or_else(denied)?;
-        let permissions = context.permissions.clone();
+        let grant = self.grant(context)?;
+        let permissions = context.permissions().to_vec();
         let accounts = || {
             self.config
                 .accounts
                 .iter()
-                .filter(|account| context.accounts.contains(&account.key))
+                .filter(|account| context.accounts().contains(&account.key))
         };
         let operations = vec![
             "list_accounts".to_string(),
@@ -146,7 +169,7 @@ impl Service {
                 ordered.sort_by_key(|account| self.registry.identity(&account.key).0);
                 let complete = ordered.len() <= limit;
                 ordered.truncate(limit);
-                let mut budget = OutputBudget::new(context.response_limit.saturating_sub(512));
+                let mut budget = OutputBudget::new(context.response_limit().saturating_sub(512));
                 budget.reserve(32)?;
                 for account in &ordered {
                     budget.reserve(256)?;
@@ -175,14 +198,14 @@ impl Service {
             Operation::Capabilities => OperationResult::Capabilities(Capabilities {
                 operations,
                 permissions,
-                health: self.health(context, context.response_limit)?,
+                health: self.health(context, context.response_limit())?,
                 capacity: self.capacity(&grant.limits),
             }),
             Operation::Health => {
-                OperationResult::Health(self.health(context, context.response_limit)?)
+                OperationResult::Health(self.health(context, context.response_limit())?)
             }
         };
-        serialized_size(&result, context.response_limit.saturating_sub(512))?;
+        serialized_size(&result, context.response_limit().saturating_sub(512))?;
         Ok(result)
     }
     fn capacity(&self, limits: &crate::config::Limits) -> Capacity {
@@ -197,12 +220,12 @@ impl Service {
 
     fn health(&self, context: &RequestContext, frame_bytes: usize) -> Result<Health, Error> {
         let mut budget = OutputBudget::new(frame_bytes.saturating_sub(512));
-        budget.reserve(256 + context.accounts.len() * 160)?;
+        budget.reserve(256 + context.accounts().len() * 160)?;
         let mut accounts = self
             .config
             .accounts
             .iter()
-            .filter(|account| context.accounts.contains(&account.key))
+            .filter(|account| context.accounts().contains(&account.key))
             .map(|account| {
                 let (account_id, generation) = self.registry.identity(&account.key);
                 AccountHealth {
@@ -215,9 +238,22 @@ impl Service {
         accounts.sort_by(|a, b| a.account_id.cmp(&b.account_id));
         Ok(Health {
             status: "ready".into(),
-            grant: context.grant.clone(),
+            grant: context.grant_name().into(),
             accounts,
         })
+    }
+    fn grant<'a>(
+        &'a self,
+        context: &RequestContext,
+    ) -> Result<&'a crate::config::AccessGrant, Error> {
+        if !context.belongs_to(&self.context_id) {
+            return Err(denied());
+        }
+        self.config
+            .grants
+            .iter()
+            .find(|grant| grant.name == context.grant_name())
+            .ok_or_else(denied)
     }
 }
 fn denied() -> Error {

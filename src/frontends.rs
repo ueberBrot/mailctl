@@ -1,5 +1,5 @@
 //! Executable lifecycle and presentation around the embedded application contract.
-mod cli;
+mod arguments;
 mod configuration;
 mod diagnostics;
 #[cfg(feature = "mcp")]
@@ -11,8 +11,8 @@ use crate::{
     domain::{Envelope, Error, ErrorCode, OperationResult},
     service::Service,
 };
+use arguments::{Action, Invocation};
 use clap::FromArgMatches;
-use cli::{Action, Invocation};
 use diagnostics::{Color, LogFormat, Options};
 use std::{io::Write, process::ExitCode, time::Duration};
 

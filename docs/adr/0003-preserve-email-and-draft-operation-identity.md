@@ -4,4 +4,4 @@ Mailbox, message and attachment references are reusable through CLI commands and
 
 Draft operations retain their original account identity, account generation and target mailbox when configuration changes. Keep historical status available to currently authorized callers; reconcile against the original target only when current permissions allow it. Status and retry requests must identify the original operation independently of a mutable account alias.
 
-This permits handoffs between harnesses without treating references as grants, and prevents account or Drafts-mailbox reconfiguration from redirecting an old operation. Verify reuse across separate CLI processes and MCP sessions with both allowed and denied callers, concurrent first startup without identity replacement, and configuration changes with pending and uncertain operations. Uncertain operations are reconciled without another APPEND.
+This permits handoffs between harnesses without treating references as grants, and prevents account or Drafts-mailbox reconfiguration from redirecting an old operation. Uncertain operations are reconciled without another APPEND.

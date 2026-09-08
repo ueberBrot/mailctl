@@ -5,81 +5,29 @@ use crate::{
     policy::Profile,
     service::Service,
 };
-use directories::ProjectDirs;
+use etcetera::{AppStrategy, AppStrategyArgs, app_strategy::choose_native_strategy};
 use std::{
-    fs::OpenOptions,
     io::{BufRead, IsTerminal, Read, Write},
     path::{Path, PathBuf},
 };
 
 pub(super) fn default_path() -> PathBuf {
-    ProjectDirs::from("org", "ueberBrot", "mailctl")
-        .map(|directories| directories.config_local_dir().join("config.toml"))
-        .unwrap_or_else(|| PathBuf::from("mailctl.toml"))
+    directories()
+        .map(|directories| directories.in_config_dir("config.toml"))
+        .unwrap_or_else(|_| PathBuf::from("mailctl.toml"))
 }
 
-fn read(path: &Path) -> Result<String, Error> {
-    const MAX_BYTES: u64 = 4 * 1024 * 1024;
-    let invalid = Error::setup_required;
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(
-            (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32,
-        );
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        options.custom_flags(0x00200000);
-        for ancestor in path.ancestors().filter(|part| !part.as_os_str().is_empty()) {
-            use std::os::windows::fs::MetadataExt;
-            if std::fs::symlink_metadata(ancestor)
-                .map_err(|_| invalid())?
-                .file_attributes()
-                & 0x400
-                != 0
-            {
-                return Err(invalid());
-            }
-        }
-    }
-    let file = options.open(path).map_err(|_| invalid())?;
-    let metadata = file.metadata().map_err(|_| invalid())?;
-    if !metadata.is_file() || metadata.len() > MAX_BYTES {
-        return Err(invalid());
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        if metadata.file_attributes() & 0x400 != 0 {
-            return Err(invalid());
-        }
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if metadata.uid() != rustix::process::geteuid().as_raw()
-            || metadata.mode() & 0o077 != 0
-            || metadata.nlink() != 1
-        {
-            return Err(invalid());
-        }
-    }
-    let mut text = String::new();
-    file.take(MAX_BYTES + 1)
-        .read_to_string(&mut text)
-        .map_err(|_| invalid())?;
-    if text.len() as u64 > MAX_BYTES {
-        return Err(invalid());
-    }
-    Ok(text)
+fn directories() -> Result<impl AppStrategy, Error> {
+    choose_native_strategy(AppStrategyArgs {
+        top_level_domain: "org".into(),
+        author: "ueberBrot".into(),
+        app_name: "mailctl".into(),
+    })
+    .map_err(|_| Error::setup_required())
 }
 
 pub(super) fn load(path: &Path) -> Result<Config, Error> {
-    Config::parse(&read(path)?)
+    Config::parse(&existing(path)?.ok_or_else(Error::setup_required)?)
 }
 
 pub(super) fn open(path: &Path, config: Config) -> Result<Service, Error> {
@@ -94,16 +42,15 @@ pub(super) fn open(path: &Path, config: Config) -> Result<Service, Error> {
 }
 
 fn existing(path: &Path) -> Result<Option<String>, Error> {
-    match std::fs::symlink_metadata(path) {
-        Ok(_) => read(path).map(Some),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(_) => Err(Error::setup_required()),
-    }
+    crate::file_storage::read(path, 4 * 1024 * 1024)
+        .map_err(|_| Error::setup_required())?
+        .map(|bytes| String::from_utf8(bytes).map_err(|_| Error::setup_required()))
+        .transpose()
 }
 
 pub(super) fn setup(
     path: &Path,
-    mut args: super::cli::Setup,
+    mut args: super::arguments::Setup,
     selected: &[String],
     json: bool,
 ) -> Result<Setup, Error> {
@@ -138,10 +85,7 @@ pub(super) fn setup(
             version: 1,
             topology: Topology::Native,
             state_dir: if path == default_path() {
-                ProjectDirs::from("org", "ueberBrot", "mailctl")
-                    .ok_or_else(Error::setup_required)?
-                    .data_local_dir()
-                    .join("state")
+                directories()?.in_data_dir("state")
             } else {
                 parent.join("state")
             },
@@ -215,7 +159,8 @@ pub(super) fn setup(
             return Err(Error::new(ErrorCode::OperationConflict));
         }
         if let Some(text) = replacement {
-            persist(&destination, &text)?;
+            crate::file_storage::replace(&destination, text.as_bytes())
+                .map_err(|_| Error::setup_required())?;
         }
         Ok(())
     })?;
@@ -236,28 +181,4 @@ fn prompt(label: &str) -> Result<String, Error> {
         return Err(Error::new(ErrorCode::InvalidRequest));
     }
     Ok(line.trim().to_owned())
-}
-
-fn persist(path: &Path, text: &str) -> Result<(), Error> {
-    let temporary = path.with_file_name(format!(".config-{}.tmp", uuid::Uuid::new_v4()));
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let result = (|| {
-        let mut file = options.open(&temporary)?;
-        file.write_all(text.as_bytes())?;
-        file.sync_all()?;
-        std::fs::rename(&temporary, path)?;
-        #[cfg(unix)]
-        std::fs::File::open(path.parent().unwrap())?.sync_all()?;
-        Ok::<_, std::io::Error>(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(temporary);
-    }
-    result.map_err(|_| Error::setup_required())
 }

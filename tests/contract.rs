@@ -521,7 +521,7 @@ fn default_selection_is_read_only_and_legacy_transport_configuration_is_rejected
     ] {
         let error = Config::parse(&format!("{legacy}\n{input}")).unwrap_err();
         assert_eq!(error.code, mailctl::domain::ErrorCode::InvalidRequest);
-        assert!(error.message.contains("mailctl setup"));
+        assert!(error.message.contains("setup subcommand"));
     }
     assert!(Config::parse(&input.replace("name = \"default\"", "name = \"other\"")).is_err());
     assert!(
@@ -560,7 +560,7 @@ fn obsolete_shared_runtime_capacity_settings_explain_the_migration() {
         let error = Config::parse(&setting).unwrap_err();
         assert_eq!(error.code, mailctl::domain::ErrorCode::InvalidRequest);
         assert!(error.message.contains("per process"));
-        assert!(error.message.contains("mailctl setup"));
+        assert!(error.message.contains("setup subcommand"));
     }
 }
 

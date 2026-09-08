@@ -48,6 +48,131 @@ async fn listed_accounts(installation: &Installation, arguments: &[&str]) -> (Mc
     )
 }
 
+#[cfg(feature = "cli")]
+#[tokio::test]
+async fn large_discovery_matches_cli_in_both_mcp_result_forms() {
+    for account_count in [4, 40] {
+        let installation = Installation::two_accounts();
+        let mut config: toml::Value =
+            toml::from_str(&std::fs::read_to_string(installation.config()).unwrap()).unwrap();
+        let template = config["accounts"][0].clone();
+        let mut keys = Vec::new();
+        let accounts = (0..account_count)
+            .map(|index| {
+                let mut account = template.clone();
+                let key = format!("account{index}");
+                keys.push(toml::Value::String(key.clone()));
+                account["key"] = key.clone().into();
+                account["alias"] = key.into();
+                account["from_identities"] = toml::Value::Array(
+                    (0..100)
+                        .map(|identity| {
+                            let prefix = format!("identity{identity:02}");
+                            toml::Value::String(format!(
+                                "{prefix}{}",
+                                "x".repeat(999 - prefix.len())
+                            ))
+                        })
+                        .collect(),
+                );
+                account
+            })
+            .collect();
+        config["accounts"] = toml::Value::Array(accounts);
+        let mut grant = config["grants"][0].clone();
+        grant["accounts"] = toml::Value::Array(keys);
+        config["grants"] = toml::Value::Array(vec![grant]);
+        config.as_table_mut().unwrap().insert(
+            "limits".into(),
+            toml::Value::Table(toml::map::Map::from_iter([(
+                "accounts".into(),
+                toml::Value::Integer(account_count),
+            )])),
+        );
+        let configuration = toml::to_string(&config).unwrap();
+        assert!(configuration.len() < 4 * 1024 * 1024);
+        std::fs::write(installation.config(), configuration).unwrap();
+        setup(&installation);
+
+        // Drain stdout while the process runs: this result is larger than a pipe.
+        let cli = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::process::Command::new(support::MAILCTL)
+                .arg("--config")
+                .arg(installation.config())
+                .args(["--json", "account", "list"])
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_success(&cli);
+        let cli_envelope = envelope(&cli);
+        assert!(cli.stdout.len() > 400_000);
+
+        let client = client(&installation, &[]).await;
+        let response = client
+            .call_tool(CallToolRequestParams::new("email_list_accounts"))
+            .await
+            .expect("large discovery completes");
+        assert_eq!(response.is_error, Some(false), "{account_count} accounts");
+        let structured = response.structured_content.unwrap();
+        let text: Value =
+            serde_json::from_str(&response.content[0].as_text().unwrap().text).unwrap();
+        assert_eq!(structured, text);
+        assert_eq!(structured["result"], cli_envelope["result"]);
+        assert_eq!(
+            structured["result"]["accounts"].as_array().unwrap().len(),
+            account_count as usize
+        );
+        client
+            .cancel()
+            .await
+            .expect("close large discovery session");
+    }
+}
+
+#[tokio::test]
+async fn mcp_serves_with_a_small_valid_byte_budget() {
+    let installation = Installation::two_accounts();
+    let mut config: toml::Value =
+        toml::from_str(&std::fs::read_to_string(installation.config()).unwrap()).unwrap();
+    config.as_table_mut().unwrap().insert(
+        "limits".into(),
+        toml::Value::Table(toml::map::Map::from_iter([
+            ("envelope_bytes".into(), 4096.into()),
+            ("buffered_bytes".into(), (1024 * 1024).into()),
+        ])),
+    );
+    std::fs::write(installation.config(), toml::to_string(&config).unwrap()).unwrap();
+    setup(&installation);
+    let (client, envelope) = listed_accounts(&installation, &[]).await;
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["result"]["accounts"][0]["alias"], "work");
+    assert_eq!(client.list_all_tools().await.unwrap().len(), 2);
+    client.cancel().await.unwrap();
+}
+
+#[test]
+fn an_mcp_budget_that_cannot_admit_a_frame_has_setup_guidance() {
+    let installation = Installation::two_accounts();
+    let mut config: toml::Value =
+        toml::from_str(&std::fs::read_to_string(installation.config()).unwrap()).unwrap();
+    config.as_table_mut().unwrap().insert(
+        "limits".into(),
+        toml::Value::Table(toml::map::Map::from_iter([
+            ("envelope_bytes".into(), 1024.into()),
+            ("buffered_bytes".into(), (64 * 1024).into()),
+        ])),
+    );
+    std::fs::write(installation.config(), toml::to_string(&config).unwrap()).unwrap();
+    setup(&installation);
+    let output = run_bounded(installation.mcp());
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8(output.stderr).unwrap().contains("setup"));
+}
+
 #[tokio::test]
 async fn standalone_mcp_negotiates_schemas_and_applies_configured_grant_scope() {
     let installation = Installation::two_accounts();

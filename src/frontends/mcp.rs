@@ -18,7 +18,7 @@ struct EmailTools {
     service: Service,
     context: ApplicationContext,
     active: Semaphore,
-    output_limit: usize,
+    envelope_limit: usize,
     deadline: Duration,
     shutdown: CancellationToken,
 }
@@ -125,7 +125,7 @@ impl ServerHandler for EmailTools {
                 Envelope::from_result(request_id, result)
             }
         };
-        if crate::encoding::serialized_size(&envelope, self.output_limit / 4).is_err() {
+        if crate::encoding::serialized_size(&envelope, self.envelope_limit).is_err() {
             envelope = Envelope::from_result(
                 envelope.request_id().to_owned(),
                 Err(Error::new(ErrorCode::ResponseTooLarge)),
@@ -139,42 +139,22 @@ impl ServerHandler for EmailTools {
         } else {
             CallToolResult::structured_error(value)
         };
-        let response =
-            if crate::encoding::serialized_size(&response, self.output_limit.saturating_sub(256))
-                .is_ok()
-            {
-                response
-            } else {
-                CallToolResult::structured_error(json!(
-                    Envelope::<crate::domain::OperationResult>::from_result(
-                        uuid::Uuid::new_v4().to_string(),
-                        Err(Error::new(ErrorCode::ResponseTooLarge))
-                    )
-                ))
-            };
         Ok(response.into())
     }
 }
 
 pub(super) async fn run(service: Service, context: ApplicationContext) -> Result<(), Error> {
-    let limits = service
-        .config()
-        .grants
-        .iter()
-        .find(|grant| grant.name == context.grant)
-        .ok_or_else(|| Error::new(ErrorCode::PermissionDenied))?
-        .limits
-        .clone();
-    let bounds = Bounds::new(&limits)?;
+    let limits = service.limits(&context)?.clone();
+    let bounds = Bounds::new(&limits, service.response_bound(&context)?)?;
     let expires = tokio::time::Instant::now()
         + Duration::from_secs(limits.connection_lifetime_seconds as u64);
     let shutdown = CancellationToken::new();
     let _cancel_on_exit = shutdown.clone().drop_guard();
     let handler = EmailTools {
         service,
-        context: context.with_response_limit(bounds.output / 4),
+        context: context.with_response_limit(bounds.envelope),
         active: Semaphore::new(limits.active_requests),
-        output_limit: bounds.output,
+        envelope_limit: bounds.envelope,
         deadline: Duration::from_secs(limits.operation_seconds as u64),
         shutdown: shutdown.clone(),
     };

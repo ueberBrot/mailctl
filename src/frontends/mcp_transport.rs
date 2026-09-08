@@ -28,38 +28,55 @@ type Pending = Arc<Mutex<HashMap<rmcp::model::RequestId, OwnedSemaphorePermit>>>
 /// request reservations are occupied. These are ceilings, not eagerly allocated buffers.
 pub(super) struct Bounds {
     input: usize,
-    pub(super) output: usize,
+    pub(super) envelope: usize,
+    output: usize,
     requests: usize,
     nesting: usize,
     deadline: Duration,
 }
 impl Bounds {
-    pub(super) fn new(limits: &Limits) -> Result<Self, Error> {
+    pub(super) fn new(limits: &Limits, response_bound: usize) -> Result<Self, Error> {
         // Cover the SDK/codec's initial buffers, duplex, and bounded task metadata.
         const FIXED: usize = 64 * 1024;
         let available = limits
             .buffered_bytes
             .checked_sub(FIXED)
-            .ok_or_else(Self::capacity_error)?;
-        let input = limits.envelope_bytes.min(64 * 1024).min(available / 1024);
-        let output = limits.envelope_bytes.min(1024 * 1024).min(available / 64);
-        // 128x covers worst-case tiny JSON Value nodes, BTree entries, SDK
-        // deserialization scratch and cloned request metadata. The ingress line,
-        // codec/read buffer capacities and duplex coexist with that decoder.
-        // Initialization also retains the bounded client description/capabilities
-        // for the session after the initialize request reservation is released.
-        // The SDK also retains its output encoder's capacity between responses.
-        let control = 272 * input + 4 * output;
-        // An accepted request can retain input/metadata while its normalized
-        // envelope, structured Value, escaped JSON text and SDK encoding coexist.
-        // Include task/map overhead and the bounded operation-specific tool schema.
-        let request = 128 * input + 32 * output + 16 * 1024;
-        let requests = available.saturating_sub(control) / request;
-        if input < 1024 || output < 1024 || requests == 0 {
-            return Err(Self::capacity_error());
+            .ok_or_else(Error::setup_required)?;
+        let fits = |input, envelope| {
+            let (_, control, request) = Self::reservations(input, envelope, limits.accounts);
+            control + request <= available
+        };
+        // Preserve the complete application allowance whenever a reservation
+        // fits. A large response takes precedence over a larger input frame;
+        // only the configured memory ceiling may narrow the response budget.
+        let mut envelope = 0;
+        let mut upper = response_bound.min(limits.envelope_bytes);
+        while envelope < upper {
+            let candidate = envelope + (upper - envelope).div_ceil(2);
+            if fits(1024, candidate) {
+                envelope = candidate;
+            } else {
+                upper = candidate - 1;
+            }
         }
+        if envelope < 1024 {
+            return Err(Error::setup_required());
+        }
+        let mut input = 1024;
+        let mut upper = limits.envelope_bytes.min(64 * 1024);
+        while input < upper {
+            let candidate = input + (upper - input).div_ceil(2);
+            if fits(candidate, envelope) {
+                input = candidate;
+            } else {
+                upper = candidate - 1;
+            }
+        }
+        let (output, control, request) = Self::reservations(input, envelope, limits.accounts);
+        let requests = (available - control) / request;
         Ok(Self {
             input,
+            envelope,
             output,
             requests: requests.min(limits.active_requests + limits.queued_requests),
             nesting: limits.json_nesting,
@@ -67,10 +84,30 @@ impl Bounds {
         })
     }
 
-    fn capacity_error() -> Error {
-        let mut error = Error::setup_required();
-        error.message = "MCP buffer limits cannot admit a request; increase buffered_bytes or envelope_bytes in the selected grant, then run mailctl-mcp setup".into();
-        error
+    fn reservations(input: usize, envelope: usize, accounts: usize) -> (usize, usize, usize) {
+        // Nonempty identity strings occupy at least three encoded bytes, with
+        // at most 100 per discovered account. Count both String/Value descriptors
+        // and account/BTree overhead, rather than multiplying all field bytes by
+        // a JSON node worst case. Service reserves >=160 bytes per account before
+        // cloning; health may include up to 256 accounts independent of page size.
+        let structure = 64 * 1024
+            + 64 * (accounts * 100).min(envelope / 3)
+            + 4096 * accounts.min(envelope / 160)
+            + 1024 * 256.min(envelope / 160);
+        // MCP contains the envelope once as a Value and once as JSON text.
+        // Escaping that already serialized text adds at most one byte per byte.
+        // Account for the caller's JSON-RPC id and fixed protocol/tool schemas.
+        let output = (3 * envelope + input + 1024).max(16 * 1024);
+        // The permanent control allocation covers one decoder, retained client
+        // initialization data and ingress scratch. SDK/Tokio encoder capacities
+        // remain allocated after a response: each can grow to twice its payload;
+        // Tokio's pinned STDIO implementation copies at most 2 MiB per write.
+        let control = 272 * input + 2 * output + 2 * output.min(2 * 1024 * 1024);
+        // The input/metadata survives to output completion. Domain-to-Value
+        // conversion holds at most two copies of field bytes; Value plus text
+        // holds at most three, including String capacity growth.
+        let request = 128 * input + 3 * envelope + structure;
+        (output, control, request)
     }
 }
 

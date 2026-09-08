@@ -46,17 +46,47 @@ pub struct Narrowing {
 /// Created by the application from a configured access grant.
 #[derive(Clone, Debug)]
 pub struct RequestContext {
-    pub(crate) installation: String,
-    pub(crate) grant: String,
-    pub(crate) accounts: Vec<String>,
-    pub(crate) permissions: Vec<Permission>,
-    pub(crate) response_limit: usize,
+    service_id: String,
+    grant: String,
+    accounts: Vec<String>,
+    permissions: Vec<Permission>,
+    response_limit: usize,
 }
 
 impl RequestContext {
+    pub(crate) fn new(
+        service_id: String,
+        grant: String,
+        accounts: Vec<String>,
+        permissions: Vec<Permission>,
+        response_limit: usize,
+    ) -> Self {
+        Self {
+            service_id,
+            grant,
+            accounts,
+            permissions,
+            response_limit,
+        }
+    }
     pub fn with_response_limit(mut self, maximum: usize) -> Self {
         self.response_limit = self.response_limit.min(maximum);
         self
+    }
+    pub(crate) fn belongs_to(&self, service_id: &str) -> bool {
+        self.service_id == service_id
+    }
+    pub(crate) fn grant_name(&self) -> &str {
+        &self.grant
+    }
+    pub(crate) fn accounts(&self) -> &[String] {
+        &self.accounts
+    }
+    pub(crate) fn permissions(&self) -> &[Permission] {
+        &self.permissions
+    }
+    pub(crate) fn response_limit(&self) -> usize {
+        self.response_limit
     }
 }
 

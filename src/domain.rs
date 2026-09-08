@@ -47,14 +47,16 @@ impl Error {
     pub fn setup_required() -> Self {
         Self {
             code: ErrorCode::InvalidRequest,
-            message: "Configuration is unavailable or invalid; run mailctl setup".into(),
+            message:
+                "Configuration is unavailable or invalid; run this executable's setup subcommand"
+                    .into(),
             retryable: false,
         }
     }
     pub fn obsolete_runtime_capacity() -> Self {
         Self {
             code: ErrorCode::InvalidRequest,
-            message: "Configuration uses removed shared runtime capacity settings; remove runtimes, runtime_slots, and shared permit settings. Limits now apply per process; run mailctl setup to migrate".into(),
+            message: "Configuration uses removed shared runtime capacity settings; remove runtimes, runtime_slots, and shared permit settings. Limits now apply per process; run this executable's setup subcommand to migrate".into(),
             retryable: false,
         }
     }
