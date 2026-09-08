@@ -62,28 +62,39 @@ Clippy compiles that optional code.
 
 ## Application boundaries
 
-The four executables currently support `--help` and `--version`. Otherwise they
-exit 2 with a scaffold diagnostic on stderr. Email operations are not implemented.
+`maild` serves authorized account discovery, capabilities, and safe health through
+Unix IPC. `mailctl` and the STDIO `mail-mcp` adapter share the application contract.
+See [the discovery guide](discovery.md) for configuration, protocol, and scope.
+`mail-admin` reserves operator administration and currently returns
+`unsupported_capability`.
 
-The parent spec selects Clap for argument parsing; that choice can be revisited.
-[Issue #2](https://github.com/ueberBrot/mailctl/issues/2) introduces CLI/MCP
-operations, versioned JSON results and human output. Machine commands never prompt
-and diagnostics stay on stderr. [Issue #16](https://github.com/ueberBrot/mailctl/issues/16)
-completes rendering and color verification: interactive human streams may use
-color, with explicit controls and `NO_COLOR`; JSON/MCP remain unstyled.
+`domain` and `policy` remain independent of adapters. `config` validates operator
+configuration; `service` owns account discovery and identity history. The
+in-memory `backend` requires neither a credential store nor a provider connection.
+`ipc` and `frontends` enforce transport and presentation limits. `secret` and
+`adapters/` reserve later credential and IMAP work.
 
-`domain` and `policy` remain independent of adapters. `secret` and `backend`
-reserve credential-source and provider-neutral contracts; `service` owns the
-application contract. `adapters/` holds IMAP and shared email integration; `ipc`
-and `frontends` hold transport DTOs and frontend mapping. The modules are
-placeholders until their feature slices define the contracts.
+Run focused application and Unix transport checks while changing discovery:
 
-Only Clap is a production dependency. Backend adoption and route proofs remain
-in #3 and its dependent tickets. `check-policy` rejects unintended protocol/provider
-features, enabled io-email/io-imap defaults and test support in production
-normal/build dependency paths. `deny.toml` lists accepted licenses and sources;
-exceptions require a reviewed policy change. RustSec advisories stay current
-independently of the lockfile.
+```sh
+cargo test --locked --test contract
+cargo test --locked --test ipc
+cargo test --locked --test process
+cargo run --locked --example discovery-schema
+```
+
+The shared test entry point above includes these suites. Application contract
+checks are portable; Unix-specific IPC/process cases run only on Unix. Windows
+transport is explicitly unsupported until its named-pipe implementation and
+qualification. Native credential stores and isolated deployments need separate
+evidence.
+
+Backend adoption and route proofs remain in #3 and its dependent tickets.
+`check-policy` rejects unintended protocol/provider features, enabled
+io-email/io-imap defaults, and test support in production normal/build dependency
+paths. `deny.toml` lists accepted licenses and sources; exceptions require a
+reviewed policy change. RustSec advisories stay current independently of the
+lockfile.
 
 ## Docker fixture and cleanup
 

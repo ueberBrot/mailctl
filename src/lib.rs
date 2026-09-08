@@ -1,6 +1,7 @@
-//! Shared email application boundaries. Email behavior arrives in subsequent slices.
+//! Controlled email discovery through the application contract and protected IPC.
 pub mod adapters;
 pub mod backend;
+pub mod config;
 pub mod domain;
 pub mod frontends;
 pub mod ipc;
