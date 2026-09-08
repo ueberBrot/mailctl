@@ -1,6 +1,3 @@
-fn main() {
-    mailctl::frontends::run(
-        "mailctl",
-        "Command-line access to approved email operations.",
-    );
+fn main() -> std::process::ExitCode {
+    mailctl::frontends::run(mailctl::frontends::Executable::Cli)
 }

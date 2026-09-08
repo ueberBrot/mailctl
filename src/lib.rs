@@ -1,9 +1,9 @@
-//! Shared email application boundaries. Email behavior arrives in subsequent slices.
-pub mod adapters;
-pub mod backend;
+//! Controlled email discovery through a shared embedded application contract.
+pub mod config;
 pub mod domain;
+mod encoding;
+mod file_storage;
+#[cfg(any(feature = "cli", feature = "mcp"))]
 pub mod frontends;
-pub mod ipc;
 pub mod policy;
-pub mod secret;
 pub mod service;

@@ -13,42 +13,51 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0; reads rust-toolchain.toml
-      - uses: taiki-e/install-action@d438492cf8a250514fa2d34b30bc3c0dc37c65ff # v2.87.8
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f  # v2.0.0; reads rust-toolchain.toml
+      - uses: taiki-e/install-action@d438492cf8a250514fa2d34b30bc3c0dc37c65ff  # v2.87.8
         with:
           tool: cargo-deny@0.20.2
       - run: cargo fmt --all -- --check
       - run: cargo run --locked --example check-policy
       - run: cargo deny --locked --all-features check
 
-  shared:
+  components:
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+        features: [cli, mcp, 'cli,mcp']
     runs-on: ${{ matrix.os }}
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
-      - run: cargo build --locked --workspace --all-targets
-      - run: cargo clippy --locked --workspace --all-targets --no-default-features -- -D warnings
-      - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
-      - run: cargo test --locked --workspace --no-default-features
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f  # v2.0.0
+      - run: cargo build --locked --workspace --all-targets --no-default-features --features "$MAILCTL_FEATURES"
+        shell: bash
+        env:
+          MAILCTL_FEATURES: ${{ matrix.features }}
+      - run: cargo clippy --locked --workspace --all-targets --no-default-features --features "$MAILCTL_FEATURES" -- -D warnings
+        shell: bash
+        env:
+          MAILCTL_FEATURES: ${{ matrix.features }}
+      - run: cargo test --locked --workspace --no-default-features --features "$MAILCTL_FEATURES"
+        shell: bash
+        env:
+          MAILCTL_FEATURES: ${{ matrix.features }}
 
   greenmail:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f  # v2.0.0
       - run: docker info
       - run: openssl version
       - run: cargo test --locked --test greenmail --features docker-tests -- --nocapture

@@ -16,7 +16,7 @@ pub fn run(suite: impl std::future::Future<Output = Result<()>>) {
         match tokio::time::timeout(std::time::Duration::from_secs(240), suite).await {
             Ok(Ok(())) => (),
             Ok(Err(error)) => {
-                panic!("GreenMail integration failed: {error}. See docs/development.md")
+                panic!("GreenMail integration failed: {error}")
             }
             Err(_) => {
                 panic!("GreenMail suite exceeded 240 seconds; check Docker and image availability")
