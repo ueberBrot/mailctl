@@ -19,14 +19,7 @@ fn busy() -> Error {
 
 pub(super) fn directory(path: &Path, create: bool) -> Result<PathBuf, Error> {
     if create {
-        let mut builder = fs::DirBuilder::new();
-        builder.recursive(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
-        }
-        builder.create(path).map_err(|_| invalid())?;
+        file_storage::create_directory(path).map_err(|_| invalid())?;
     }
     let metadata = fs::symlink_metadata(path).map_err(|_| invalid())?;
     if !path.is_absolute() || !metadata.is_dir() || redirected(&metadata) {

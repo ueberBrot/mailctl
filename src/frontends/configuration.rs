@@ -67,16 +67,7 @@ pub(super) fn setup(
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
-    builder
-        .create(parent)
-        .map_err(|_| Error::setup_required())?;
+    crate::file_storage::create_directory(parent).map_err(|_| Error::setup_required())?;
     let parent = std::fs::canonicalize(parent).map_err(|_| Error::setup_required())?;
     let destination = parent.join(path.file_name().ok_or_else(Error::setup_required)?);
     let mut config = match &previous {

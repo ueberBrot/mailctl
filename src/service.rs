@@ -2,7 +2,7 @@
 mod state;
 use crate::encoding::{OutputBudget, serialized_size};
 use crate::{
-    config::Config,
+    config::{AccountConfig, Config},
     domain::{
         Account, AccountDiscovery, AccountHealth, Availability, Capabilities, Capacity, Error,
         ErrorCode, Health, Operation, OperationResult, ProcessCapacity, Setup,
@@ -109,12 +109,7 @@ impl Service {
             .envelope_bytes
             .min(context.response_limit());
         let mut size = 2048usize.min(maximum);
-        for account in self
-            .config
-            .accounts
-            .iter()
-            .filter(|account| context.accounts().contains(&account.key))
-        {
+        for account in self.visible_accounts(context) {
             // Covers account identity, generation, operation names and envelope
             // fields; capability/health entries are smaller than this discovery entry.
             size = size.saturating_add(512).min(maximum);
@@ -136,12 +131,6 @@ impl Service {
     ) -> Result<OperationResult, Error> {
         let grant = self.grant(context)?;
         self.registry.check_revision()?;
-        let accounts = || {
-            self.config
-                .accounts
-                .iter()
-                .filter(|account| context.accounts().contains(&account.key))
-        };
         let operations = || {
             vec![
                 "list_accounts".to_string(),
@@ -156,7 +145,7 @@ impl Service {
                     return Err(Error::new(ErrorCode::InvalidRequest));
                 }
                 // Count encoded field bytes before cloning operator-controlled labels.
-                let mut ordered = accounts().collect::<Vec<_>>();
+                let mut ordered = self.visible_accounts(context).collect::<Vec<_>>();
                 ordered.sort_by_key(|account| self.registry.identity(&account.key).0);
                 let complete = ordered.len() <= limit;
                 ordered.truncate(limit);
@@ -189,17 +178,15 @@ impl Service {
             Operation::Capabilities => OperationResult::Capabilities(Capabilities {
                 operations: operations(),
                 permissions: context.permissions().to_vec(),
-                health: self.health(context, context.response_limit())?,
-                capacity: self.capacity(&grant.limits),
+                health: self.health(context)?,
+                capacity: Self::capacity(&grant.limits),
             }),
-            Operation::Health => {
-                OperationResult::Health(self.health(context, context.response_limit())?)
-            }
+            Operation::Health => OperationResult::Health(self.health(context)?),
         };
         serialized_size(&result, context.response_limit().saturating_sub(512))?;
         Ok(result)
     }
-    fn capacity(&self, limits: &crate::config::Limits) -> Capacity {
+    fn capacity(limits: &crate::config::Limits) -> Capacity {
         Capacity {
             per_process: ProcessCapacity {
                 active_requests: limits.active_requests as u64,
@@ -209,29 +196,34 @@ impl Service {
         }
     }
 
-    fn health(&self, context: &RequestContext, frame_bytes: usize) -> Result<Health, Error> {
-        let mut budget = OutputBudget::new(frame_bytes.saturating_sub(512));
-        budget.reserve(256 + context.accounts().len() * 160)?;
-        let mut accounts = self
-            .config
-            .accounts
-            .iter()
-            .filter(|account| context.accounts().contains(&account.key))
-            .map(|account| {
-                let (account_id, generation) = self.registry.identity(&account.key);
-                AccountHealth {
-                    account_id: account_id.to_owned(),
-                    generation,
-                    availability: Availability::Unknown,
-                }
-            })
-            .collect::<Vec<_>>();
+    fn health(&self, context: &RequestContext) -> Result<Health, Error> {
+        let mut budget = OutputBudget::new(context.response_limit().saturating_sub(512));
+        budget.reserve(256)?;
+        let mut accounts = Vec::new();
+        for account in self.visible_accounts(context) {
+            budget.reserve(160)?;
+            let (account_id, generation) = self.registry.identity(&account.key);
+            accounts.push(AccountHealth {
+                account_id: account_id.to_owned(),
+                generation,
+                availability: Availability::Unknown,
+            });
+        }
         accounts.sort_by(|a, b| a.account_id.cmp(&b.account_id));
         Ok(Health {
             status: "ready".into(),
             grant: context.grant_name().into(),
             accounts,
         })
+    }
+    fn visible_accounts<'a>(
+        &'a self,
+        context: &'a RequestContext,
+    ) -> impl Iterator<Item = &'a AccountConfig> {
+        self.config
+            .accounts
+            .iter()
+            .filter(|account| context.accounts().contains(&account.key))
     }
     fn grant(&self, context: &RequestContext) -> Result<&crate::config::AccessGrant, Error> {
         if !context.belongs_to(self.context_id) {

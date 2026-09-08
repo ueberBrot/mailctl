@@ -45,28 +45,15 @@ pub(crate) fn serialized_size<T: Serialize>(value: &T, maximum: usize) -> Result
 }
 
 pub(crate) fn serialize_bounded<T: Serialize>(value: &T, maximum: usize) -> Result<Vec<u8>, Error> {
-    struct Bounded {
-        bytes: Vec<u8>,
-        budget: OutputBudget,
-    }
-    impl Write for Bounded {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            self.budget.write_all(bytes)?;
-            self.bytes.extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
     let length = serialized_size(value, maximum)?;
-    let mut output = Bounded {
-        bytes: Vec::with_capacity(length),
-        budget: OutputBudget::new(length),
-    };
+    let mut bytes = vec![0; length];
+    // A slice writer cannot grow, even if a serializer emits more on its second pass.
+    let mut output = bytes.as_mut_slice();
     serde_json::to_writer(&mut output, value)
         .map_err(|_| Error::new(ErrorCode::ResponseTooLarge))?;
-    Ok(output.bytes)
+    let written = length - output.len();
+    bytes.truncate(written);
+    Ok(bytes)
 }
 
 /// Check nesting before the JSON decoder allocates nested values.

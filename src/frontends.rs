@@ -120,11 +120,7 @@ async fn execute(invocation: Invocation) -> Result<u8, Error> {
         })
         .await
         .map_err(|_| Error::new(ErrorCode::InternalError))??;
-        let envelope = Envelope::from_result(
-            uuid::Uuid::new_v4().to_string(),
-            Ok(OperationResult::Setup(setup)),
-        );
-        return Ok(report(json, color, Ok(envelope), None, 30).await);
+        return Ok(report(json, color, Ok(OperationResult::Setup(setup)), None, 30).await);
     }
     let config = configuration::load(&options.config)?;
     #[cfg(feature = "cli")]
@@ -165,14 +161,11 @@ async fn execute(invocation: Invocation) -> Result<u8, Error> {
         }
         #[cfg(feature = "cli")]
         Action::Email(operation) => {
-            let envelope = Envelope::from_result(
-                uuid::Uuid::new_v4().to_string(),
-                service.execute(&context, operation),
-            );
+            let result = service.execute(&context, operation);
             Ok(report(
                 options.json,
                 options.diagnostics.color,
-                Ok(envelope),
+                result,
                 Some(service),
                 deadline,
             )
@@ -205,13 +198,11 @@ fn termination_signal() -> Result<impl Future<Output = ()>, Error> {
 async fn report(
     json: bool,
     color: Color,
-    result: Result<Envelope, Error>,
+    result: Result<OperationResult, Error>,
     owner: Option<Service>,
     seconds: usize,
 ) -> u8 {
-    let envelope = result.unwrap_or_else(|error| {
-        Envelope::from_result(uuid::Uuid::new_v4().to_string(), Err(error))
-    });
+    let envelope = Envelope::from_result(uuid::Uuid::new_v4().to_string(), result);
     diagnostics::result(envelope.request_id(), envelope.error());
     let code = envelope.error().map_or(0, Error::exit_code);
     let output = if json {

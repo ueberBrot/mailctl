@@ -5,6 +5,17 @@ use std::{
     path::Path,
 };
 
+pub(crate) fn create_directory(path: &Path) -> io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)
+}
+
 pub(crate) fn redirected(metadata: &fs::Metadata) -> bool {
     #[cfg(windows)]
     {

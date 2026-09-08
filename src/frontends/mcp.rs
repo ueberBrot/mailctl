@@ -109,22 +109,16 @@ impl ServerHandler for EmailTools {
                 ));
             }
         };
-        let request_id = uuid::Uuid::new_v4().to_string();
-        let mut envelope = match operation {
-            Err(error) => Envelope::from_result(request_id, Err(error)),
-            Ok(operation) => {
-                // Discovery is bounded, synchronous in-memory work. Future provider
-                // operations must propagate this request's deadline/cancellation.
-                let result = self.service.execute(&self.context, operation);
-                if result
-                    .as_ref()
-                    .is_err_and(|error| error.code == ErrorCode::OperationConflict)
-                {
-                    self.shutdown.cancel();
-                }
-                Envelope::from_result(request_id, result)
-            }
-        };
+        // Discovery is bounded, synchronous in-memory work. Future provider
+        // operations must propagate this request's deadline/cancellation.
+        let result = operation.and_then(|operation| self.service.execute(&self.context, operation));
+        if result
+            .as_ref()
+            .is_err_and(|error| error.code == ErrorCode::OperationConflict)
+        {
+            self.shutdown.cancel();
+        }
+        let mut envelope = Envelope::from_result(uuid::Uuid::new_v4().to_string(), result);
         if crate::encoding::serialized_size(&envelope, self.envelope_limit).is_err() {
             envelope = Envelope::from_result(
                 envelope.request_id().to_owned(),
@@ -144,24 +138,25 @@ impl ServerHandler for EmailTools {
 }
 
 pub(super) async fn run(service: Service, context: ApplicationContext) -> Result<(), Error> {
-    let limits = service.limits(&context)?.clone();
-    let bounds = Bounds::new(&limits, service.response_bound(&context)?)?;
+    let limits = service.limits(&context)?;
+    let bounds = Bounds::new(limits, service.response_bound(&context)?)?;
     let expires = tokio::time::Instant::now()
         + Duration::from_secs(limits.connection_lifetime_seconds as u64);
+    let initialization_expires = expires.min(
+        tokio::time::Instant::now() + Duration::from_secs(limits.initialization_seconds as u64),
+    );
     let shutdown = CancellationToken::new();
     let _cancel_on_exit = shutdown.clone().drop_guard();
     let handler = EmailTools {
-        service,
-        context: context.with_response_limit(bounds.envelope),
         active: Semaphore::new(limits.active_requests),
         envelope_limit: bounds.envelope,
         deadline: Duration::from_secs(limits.operation_seconds as u64),
+        service,
+        context: context.with_response_limit(bounds.envelope),
         shutdown: shutdown.clone(),
     };
     let service = tokio::time::timeout_at(
-        expires.min(
-            tokio::time::Instant::now() + Duration::from_secs(limits.initialization_seconds as u64),
-        ),
+        initialization_expires,
         handler.serve_with_ct(BoundedStdio::new(bounds), shutdown),
     )
     .await
