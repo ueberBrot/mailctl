@@ -1,6 +1,11 @@
+use rustix::{
+    fs::{OFlags, fcntl_getfl, fcntl_setfl},
+    process::{Pid, Signal, getpgid, kill_process_group},
+};
 use std::{
-    io::{Read, Write},
-    process::{Child, Output},
+    io::{ErrorKind, Read, Write},
+    os::fd::AsFd,
+    process::{Child, ChildStdin, Output},
     thread,
     time::{Duration, Instant},
 };
@@ -16,91 +21,175 @@ struct Stream {
     exceeded_limit: bool,
 }
 
-fn join(stream: Option<thread::JoinHandle<std::io::Result<Stream>>>) -> Result<Stream, ()> {
-    match stream {
-        Some(stream) => stream.join().ok().and_then(Result::ok).ok_or(()),
-        None => Ok(Stream {
-            bytes: Vec::new(),
-            exceeded_limit: false,
-        }),
-    }
+fn nonblocking(stream: impl AsFd) -> Result<(), ()> {
+    let flags = fcntl_getfl(stream.as_fd()).map_err(|_| ())?;
+    fcntl_setfl(stream.as_fd(), flags | OFlags::NONBLOCK).map_err(|_| ())
 }
 
-fn drain(mut stream: impl Read, limit: usize) -> std::io::Result<Stream> {
-    let mut bytes = Vec::new();
+/// Returns whether the stream reached EOF after draining every available byte.
+fn drain(
+    stream: &mut impl Read,
+    captured: &mut Stream,
+    limit: usize,
+    deadline: Instant,
+) -> Result<bool, ()> {
     let mut buffer = [0; 4096];
-    let mut exceeded_limit = false;
     loop {
-        let count = stream.read(&mut buffer)?;
-        if count == 0 {
-            return Ok(Stream {
-                bytes,
-                exceeded_limit,
-            });
+        if Instant::now() >= deadline {
+            return Err(());
         }
-        let remaining = limit.saturating_sub(bytes.len());
-        bytes.extend_from_slice(&buffer[..count.min(remaining)]);
-        exceeded_limit |= count > remaining;
+        match stream.read(&mut buffer) {
+            Ok(0) => return Ok(true),
+            Ok(count) => {
+                let remaining = limit.saturating_sub(captured.bytes.len());
+                captured
+                    .bytes
+                    .extend_from_slice(&buffer[..count.min(remaining)]);
+                captured.exceeded_limit |= count > remaining;
+            }
+            Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(false),
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(_) => return Err(()),
+        }
     }
 }
 
-fn collect(
-    stdout: Option<thread::JoinHandle<std::io::Result<Stream>>>,
-    stderr: Option<thread::JoinHandle<std::io::Result<Stream>>>,
-    writer: Option<thread::JoinHandle<std::io::Result<()>>>,
-    status: Result<std::process::ExitStatus, ()>,
-) -> Result<Captured, ()> {
-    let stdout = join(stdout);
-    let stderr = join(stderr);
-    let writer = writer.map_or(Ok(()), |writer| {
-        writer.join().ok().and_then(Result::ok).ok_or(())
-    });
-    let (Ok(stdout), Ok(stderr), Ok(()), Ok(status)) = (stdout, stderr, writer, status) else {
-        return Err(());
-    };
-    Ok(Captured {
-        output: Output {
-            status,
-            stdout: stdout.bytes,
-            stderr: stderr.bytes,
-        },
-        stdout_exceeded_limit: stdout.exceeded_limit,
-        stderr_exceeded_limit: stderr.exceeded_limit,
-    })
+fn write_input(
+    stdin: &mut ChildStdin,
+    input: &[u8],
+    offset: &mut usize,
+    deadline: Instant,
+) -> Result<(), ()> {
+    while *offset < input.len() {
+        if Instant::now() >= deadline {
+            return Err(());
+        }
+        match stdin.write(&input[*offset..]) {
+            Ok(0) => return Err(()),
+            Ok(count) => *offset += count,
+            Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(()),
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(_) => return Err(()),
+        }
+    }
+    Ok(())
 }
 
-/// Reaps a fixture child by its deadline while continuously draining both output pipes.
-/// Errors deliberately carry no fixture output.
+fn terminate(child: &mut Child, group: Option<Pid>) {
+    if let Some(group) = group {
+        let _ = kill_process_group(group, Signal::KILL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Reap one fixture command under an absolute deadline while continuously draining pipes.
+/// The deadline includes pipe writers inherited by descendants after their direct parent exits.
 pub(crate) fn capture(
     mut child: Child,
     input: Option<Vec<u8>>,
     output_limit: usize,
-    deadline: Duration,
+    timeout: Duration,
 ) -> Result<Captured, ()> {
-    let stdout = child
-        .stdout
-        .take()
-        .map(|stdout| thread::spawn(move || drain(stdout, output_limit)));
-    let stderr = child
-        .stderr
-        .take()
-        .map(|stderr| thread::spawn(move || drain(stderr, output_limit)));
-    let stdin = child.stdin.take();
-    let writer = input.map(|input| {
-        let mut stdin = stdin.expect("capture bounded process stdin");
-        thread::spawn(move || stdin.write_all(&input))
-    });
-    let deadline = Instant::now() + deadline;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Ok(status),
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break Err(());
+    let pid = Pid::from_child(&child);
+    let group = getpgid(Some(pid)).ok().filter(|group| *group == pid);
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    let mut stdin = child.stdin.take();
+    if stdout
+        .as_ref()
+        .is_some_and(|stream| nonblocking(stream).is_err())
+        || stderr
+            .as_ref()
+            .is_some_and(|stream| nonblocking(stream).is_err())
+        || stdin
+            .as_ref()
+            .is_some_and(|stream| nonblocking(stream).is_err())
+    {
+        terminate(&mut child, group);
+        return Err(());
+    }
+    let input = input.unwrap_or_default();
+    let mut offset = 0;
+    let mut captured_stdout = Stream {
+        bytes: Vec::new(),
+        exceeded_limit: false,
+    };
+    let mut captured_stderr = Stream {
+        bytes: Vec::new(),
+        exceeded_limit: false,
+    };
+    let deadline = Instant::now() + timeout;
+    let mut status = None;
+    loop {
+        let stdout_eof = match stdout
+            .as_mut()
+            .map(|stream| drain(stream, &mut captured_stdout, output_limit, deadline))
+            .transpose()
+        {
+            Ok(value) => value,
+            Err(()) => {
+                terminate(&mut child, group);
+                return Err(());
+            }
+        };
+        if stdout_eof == Some(true) {
+            stdout = None;
+        }
+        let stderr_eof = match stderr
+            .as_mut()
+            .map(|stream| drain(stream, &mut captured_stderr, output_limit, deadline))
+            .transpose()
+        {
+            Ok(value) => value,
+            Err(()) => {
+                terminate(&mut child, group);
+                return Err(());
+            }
+        };
+        if stderr_eof == Some(true) {
+            stderr = None;
+        }
+        if status.is_none() {
+            if let Some(stream) = stdin.as_mut() {
+                if write_input(stream, &input, &mut offset, deadline).is_err() {
+                    terminate(&mut child, group);
+                    return Err(());
+                }
+                if offset == input.len() {
+                    stdin = None;
+                }
+            }
+            status = match child.try_wait() {
+                Ok(status) => status,
+                Err(_) => {
+                    terminate(&mut child, group);
+                    return Err(());
+                }
+            };
+            if status.is_some() {
+                stdin = None;
             }
         }
-    };
-    collect(stdout, stderr, writer, status)
+        if let Some(status) = status
+            && stdout.is_none()
+            && stderr.is_none()
+            && offset == input.len()
+        {
+            return Ok(Captured {
+                output: Output {
+                    status,
+                    stdout: captured_stdout.bytes,
+                    stderr: captured_stderr.bytes,
+                },
+                stdout_exceeded_limit: captured_stdout.exceeded_limit,
+                stderr_exceeded_limit: captured_stderr.exceeded_limit,
+            });
+        }
+        if Instant::now() >= deadline {
+            terminate(&mut child, group);
+            return Err(());
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
 }

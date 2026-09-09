@@ -87,6 +87,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f  # v2.0.0
       - run: cargo test --locked --features isolated --test isolation_process
       - name: Qualify isolated access with disposable macOS identities
+        timeout-minutes: 5
         shell: bash
         run: |
           test_binary=$(cargo test --locked --features isolated \

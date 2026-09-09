@@ -47,12 +47,15 @@ const WORK_SECRET: &str = "isolated-native-work-secret";
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires root and MAILCTL_DISPOSABLE_MACOS=1 on a disposable macOS runner"]
 async fn isolated_launchd_qualification_uses_disposable_identities_and_a_real_native_keychain() {
+    eprintln!("native isolation: provision disposable identities and install");
     let fixture = Qualification::begin(Path::new(ISOLATED), Path::new(CLI), Path::new(MCP));
     let mut provider = server::NativeServer::new(Path::new(SERVICE_HOME));
 
+    eprintln!("native isolation: configure synthetic accounts");
     operator_setup(&fixture, "work", "work@isolated.example.test");
     operator_setup(&fixture, "private", "private@isolated.example.test");
     patch_service_configuration(provider.port);
+    eprintln!("native isolation: provision service Keychain and credential");
     let keychain = fixture.create_keychain(&provider.certificate);
     fixture.provision_credential("work", WORK_SECRET);
     let work_account = service_account_id(&fixture, "work");
@@ -68,6 +71,7 @@ async fn isolated_launchd_qualification_uses_disposable_identities_and_a_real_na
         "service identity reads its native mailctl credential",
     );
 
+    eprintln!("native isolation: start launchd and verify protected resources");
     fixture.start();
     assert_deployment_identity(&fixture, &keychain);
     record_environment(&fixture);
@@ -76,6 +80,8 @@ async fn isolated_launchd_qualification_uses_disposable_identities_and_a_real_na
     assert_unassigned_identity_is_denied(&fixture);
     assert_embedded_service_shares_maintenance_lock(&fixture);
 
+    eprintln!("native isolation: compare CLI/MCP and authenticate through service");
+    assert_published_capacity(&fixture);
     let cli = listed_accounts(&fixture);
     let mcp = listed_accounts_over_mcp(&fixture).await;
     assert_eq!(
@@ -113,6 +119,7 @@ async fn isolated_launchd_qualification_uses_disposable_identities_and_a_real_na
         "doctor uses the service identity's native Keychain credential"
     );
 
+    eprintln!("native isolation: verify IPC bounds, substitution, and restart");
     assert_bounded_malformed_and_exhausted_sessions(&fixture);
     assert_mapped_grant_limits(&fixture);
     assert_wrong_service_peer_is_rejected(&fixture);
@@ -326,6 +333,7 @@ fn assert_unassigned_identity_is_denied(fixture: &Qualification) {
         Some(3),
         "route rejects an unassigned OS identity"
     );
+    fixture.unauthorized_hello();
 }
 
 fn assert_embedded_service_shares_maintenance_lock(fixture: &Qualification) {
@@ -344,6 +352,21 @@ fn assert_embedded_service_shares_maintenance_lock(fixture: &Qualification) {
         "rate_limited",
         "the shared maintenance lock rejects concurrent mutation rather than creating a caller-owned installation"
     );
+}
+
+fn assert_published_capacity(fixture: &Qualification) {
+    let output = bounded(
+        fixture
+            .caller_command(fixture.broker("mailctl").to_str().unwrap())
+            .args(["--isolated", "--json", "capability", "show"]),
+    );
+    assert_success(&output, "publish broker capacity");
+    let capacity = &envelope(&output)["result"]["capacity"];
+    assert_eq!(capacity["per_process"]["active_requests"], 4);
+    assert_eq!(capacity["per_process"]["queued_requests"], 0);
+    assert_eq!(capacity["isolation"]["sessions"], 4);
+    assert_eq!(capacity["isolation"]["active_requests_per_session"], 1);
+    assert_eq!(capacity["isolation"]["request_bytes"], 65536);
 }
 
 fn listed_accounts(fixture: &Qualification) -> Value {

@@ -8,7 +8,10 @@ use std::{
     collections::HashSet,
     fs,
     io::{BufRead, BufReader},
-    os::unix::fs::{FileTypeExt, PermissionsExt},
+    os::unix::{
+        fs::{FileTypeExt, PermissionsExt},
+        process::CommandExt,
+    },
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
     thread,
@@ -272,14 +275,18 @@ impl Qualification {
             .arg(PROBE)
             .arg("hold")
             .arg(SOCKET)
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .expect("open raw isolated session");
         let line = readiness_line(&mut child, "session");
         assert_eq!(line, "ready\n", "raw session connected");
-        HoldSession { child }
+        let release = child.stdin.take().expect("probe session control pipe");
+        HoldSession {
+            child,
+            release: Some(release),
+        }
     }
 
     pub(crate) fn malformed_frame(&self) {
@@ -320,6 +327,16 @@ impl Qualification {
                 .arg(SOCKET),
         );
         assert_success(&output, "gateway enforces the mapped JSON nesting ceiling");
+    }
+
+    pub(crate) fn unauthorized_hello(&self) {
+        let output = bounded(
+            self.denied_command("python3")
+                .arg(PROBE)
+                .arg("unauthorized-hello")
+                .arg(SOCKET),
+        );
+        assert_success(&output, "gateway closes an unauthorized raw hello");
     }
 
     pub(crate) fn start_wrong_peer(&self) -> WrongPeer {
@@ -417,12 +434,20 @@ impl Drop for Qualification {
 
 pub(crate) struct HoldSession {
     child: Child,
+    release: Option<std::process::ChildStdin>,
 }
 
 impl Drop for HoldSession {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        drop(self.release.take());
+        let deadline = Instant::now() + DEADLINE;
+        while Instant::now() < deadline {
+            match self.child.try_wait() {
+                Ok(Some(_)) | Err(_) => return,
+                Ok(None) => thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        terminate_probe(&mut self.child);
     }
 }
 
@@ -432,12 +457,22 @@ pub(crate) struct WrongPeer {
 
 impl Drop for WrongPeer {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        terminate_probe(&mut self.child);
     }
 }
 
+fn terminate_probe(child: &mut Child) {
+    use rustix::process::{Pid, Signal, getpgid, kill_process_group};
+    let pid = Pid::from_child(child);
+    if getpgid(Some(pid)).is_ok_and(|group| group == pid) {
+        let _ = kill_process_group(pid, Signal::KILL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 pub(crate) fn bounded(command: &mut Command) -> Output {
+    eprintln!("native isolation command: {}", command_identity(command));
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let child = command.spawn().expect("start bounded command");
     let captured = process::capture(child, None, OUTPUT_BYTES, DEADLINE)
@@ -469,13 +504,34 @@ pub(crate) fn assert_denied(output: &Output, action: &str) {
 }
 
 pub(crate) fn command(program: &str) -> Command {
-    Command::new(program)
+    let mut command = Command::new(program);
+    command.process_group(0);
+    command
 }
 
 pub(crate) fn command_as(user: &str, program: &str) -> Command {
-    let mut command = Command::new("/usr/bin/sudo");
+    let mut command = command("/usr/bin/sudo");
     command.args(["-u", user, "-H", "--", program]);
     command
+}
+
+fn command_identity(command: &Command) -> String {
+    let program = command.get_program().to_string_lossy();
+    if program == "/usr/bin/sudo" {
+        let target = command
+            .get_args()
+            .skip_while(|argument| *argument != "--")
+            .nth(1)
+            .map(|argument| argument.to_string_lossy())
+            .unwrap_or_else(|| "<missing target>".into());
+        return format!("{program} -> {target}");
+    }
+    if program == "/usr/bin/security"
+        && let Some(subcommand) = command.get_args().next()
+    {
+        return format!("{program} {}", subcommand.to_string_lossy());
+    }
+    program.into_owned()
 }
 
 pub(crate) fn sha256(path: &Path) -> String {
@@ -649,8 +705,7 @@ fn readiness_line(child: &mut Child, name: &str) -> String {
         let _ = send.send(result);
     });
     let line = receive.recv_timeout(DEADLINE).unwrap_or_else(|_| {
-        let _ = child.kill();
-        let _ = child.wait();
+        terminate_probe(child);
         panic!("{name} probe did not report readiness before deadline")
     });
     reader.join().expect("join probe readiness reader");

@@ -6,8 +6,9 @@ mod support;
 #[path = "native_support/terminal.rs"]
 mod terminal;
 use std::{
+    fs,
     process::{Command, Stdio},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use support::{Installation, MAILCTL, assert_success, run_bounded};
 
@@ -30,6 +31,36 @@ fn bounded_capture_drains_large_pipes_before_the_child_exits() {
     assert!(captured.stderr_exceeded_limit);
     assert_eq!(captured.output.stdout.len(), 4096);
     assert_eq!(captured.output.stderr.len(), 4096);
+}
+
+#[test]
+fn bounded_capture_returns_when_an_exited_wrapper_leaves_pipe_writers() {
+    let pid_file = std::env::temp_dir().join(format!("mailctl-capture-{}.pid", std::process::id()));
+    let _ = fs::remove_file(&pid_file);
+    let child = Command::new("python3")
+        .args([
+            "-c",
+            "import os, subprocess\nchild = subprocess.Popen(['python3', '-c', 'import time; time.sleep(30)'])\nopen(os.environ['PID_FILE'], 'w').write(str(child.pid))",
+        ])
+        .env("PID_FILE", &pid_file)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start wrapper with inherited pipe writer");
+    let started = Instant::now();
+    assert!(process::capture(child, None, 4096, Duration::from_millis(200)).is_err());
+    assert!(started.elapsed() < Duration::from_secs(2));
+    let pid: i32 = fs::read_to_string(&pid_file)
+        .expect("wrapper records descendant PID")
+        .trim()
+        .parse()
+        .expect("numeric descendant PID");
+    let _ = rustix::process::kill_process(
+        rustix::process::Pid::from_raw(pid).expect("positive descendant PID"),
+        rustix::process::Signal::KILL,
+    );
+    let _ = fs::remove_file(pid_file);
 }
 
 #[test]

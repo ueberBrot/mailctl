@@ -18,18 +18,28 @@ def read_exact(connection, length):
         data.extend(chunk)
     return bytes(data)
 
-if mode in ("hold", "initialization-timeout", "null-hello", "account-hello"):
+if mode in ("hold", "initialization-timeout", "null-hello", "account-hello", "unauthorized-hello"):
     connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     connection.settimeout(3)
     connection.connect(path)
-if mode in ("hold", "null-hello", "account-hello"):
+if mode in ("hold", "null-hello", "account-hello", "unauthorized-hello"):
     accounts = b'["work"]' if mode == "account-hello" else b"null"
     hello = (b'{"type":"hello","version":1,"narrowing":'
              b'{"read_only":false,"accounts":' + accounts + b"}}")
-    connection.sendall(struct.pack(">I", len(hello)) + hello)
-    if mode == "account-hello":
-        if connection.recv(1) != b"":
-            raise RuntimeError("gateway accepted an account-scoped hello over its nesting ceiling")
+    try:
+        connection.sendall(struct.pack(">I", len(hello)) + hello)
+    except (BrokenPipeError, ConnectionResetError):
+        if mode != "unauthorized-hello":
+            raise
+    if mode in ("account-hello", "unauthorized-hello"):
+        try:
+            response = connection.recv(1)
+        except (BrokenPipeError, ConnectionResetError):
+            response = b""
+        if response != b"":
+            if mode == "account-hello":
+                raise RuntimeError("gateway accepted an account-scoped hello over its nesting ceiling")
+            raise RuntimeError("gateway admitted an unauthorized hello")
     else:
         length = struct.unpack(">I", read_exact(connection, 4))[0]
         response = json.loads(read_exact(connection, length))
@@ -37,7 +47,8 @@ if mode in ("hold", "null-hello", "account-hello"):
             raise RuntimeError("gateway did not acknowledge a valid session hello")
         if mode == "hold":
             print("ready", flush=True)
-            time.sleep(30)
+            sys.stdin.buffer.read()
+            connection.close()
 elif mode == "initialization-timeout":
     if connection.recv(1) != b"":
         raise RuntimeError("gateway did not enforce the hello deadline")
