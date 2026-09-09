@@ -303,6 +303,10 @@ async fn decoder_and_work_budgets_stop_after_the_selected_literal() {
             max_decode_steps: 12,
             ..Limits::default()
         },
+        Limits {
+            max_decode_steps: 40,
+            ..Limits::default()
+        },
     ] {
         let structure = structure.clone();
         let mut fixture = fixture(TlsMode::Implicit, limits, move |mut wire| {
@@ -341,6 +345,11 @@ async fn malformed_transfer_tails_keep_the_decoded_prefix_and_mark_replacement()
         ("QUOTED-PRINTABLE", b"hello=".as_slice(), "\u{fffd}hello"),
         ("QUOTED-PRINTABLE", b"hello=A".as_slice(), "\u{fffd}hello"),
         ("QUOTED-PRINTABLE", b"hello=QZ".as_slice(), "\u{fffd}hello"),
+        (
+            "QUOTED-PRINTABLE",
+            b"hello\rworld".as_slice(),
+            "\u{fffd}helloworld",
+        ),
     ] {
         let structure = format!(
             "({} \"MIXED\" NIL NIL NIL NIL)",

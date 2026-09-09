@@ -132,7 +132,7 @@ pub(super) fn render(selected: &Selected, wire: &[u8], limits: &Limits) -> Resul
         return Err(Error::Limit);
     }
     let transfer_work = wire.len().checked_mul(4).ok_or(Error::Limit)?;
-    require_work(work.checked_add(transfer_work).ok_or(Error::Limit)?, limits)?;
+    work = add_work(work, transfer_work, limits)?;
     let (decoded, mut replacements) = decode_transfer(wire, &selected.transfer_encoding)?;
     if decoded.len() > limits.max_decoded_bytes {
         return Err(Error::Limit);
@@ -565,7 +565,13 @@ fn quoted_printable_prefix_len(wire: &[u8]) -> usize {
     let mut index = 0;
     while let Some(&byte) = wire.get(index) {
         if byte != b'=' {
-            index += 1;
+            if byte == b'\r' && wire.get(index + 1) == Some(&b'\n') {
+                index += 2;
+            } else if matches!(byte, b'\t' | b' '..=b'~') {
+                index += 1;
+            } else {
+                break;
+            }
             continue;
         }
         let Some(&next) = wire.get(index + 1) else {

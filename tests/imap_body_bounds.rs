@@ -406,7 +406,7 @@ fn whole_message_budget_and_continuation_have_measured_finite_costs() {
                 assert_eq!(page.text.len(), limits.max_text_bytes);
                 assert!(page.text.bytes().all(|byte| byte == b'x'));
                 assert_eq!(page.metrics.decoded_bytes, body_size);
-                assert!(page.metrics.decode_steps > body_size);
+                assert!(page.metrics.decode_steps >= body_size * 7);
                 assert!(page.metrics.decode_steps <= limits.max_decode_steps);
                 assert!(page.metrics.parser_steps <= limits.max_parser_steps);
                 assert!(page.metrics.max_literal_bytes <= 16384);
