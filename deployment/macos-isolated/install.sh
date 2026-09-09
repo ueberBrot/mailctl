@@ -212,6 +212,8 @@ make_directory "$INSTALL_ROOT" root wheel 0755
 make_directory "$PUBLIC_ROOT" root wheel 0755
 make_directory "$RUN_DIRECTORY" "$SERVICE_USER" "$SERVICE_GROUP" 0711
 make_directory "$SERVICE_HOME" "$SERVICE_USER" "$SERVICE_GROUP" 0700
+make_directory "$SERVICE_HOME/Library" "$SERVICE_USER" "$SERVICE_GROUP" 0700
+make_directory "$SERVICE_HOME/Library/Preferences" "$SERVICE_USER" "$SERVICE_GROUP" 0700
 make_directory "$STATE_DIRECTORY" "$SERVICE_USER" "$SERVICE_GROUP" 0700
 
 install_artifact mailctl-isolated

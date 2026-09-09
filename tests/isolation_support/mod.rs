@@ -256,26 +256,12 @@ impl Qualification {
             "user",
         ]));
         assert_success(&default, "inspect service default keychain");
-        eprintln!(
-            "native isolation service keychain: {}",
-            String::from_utf8_lossy(&default.stdout)
-        );
-        let probe = bounded(self.service_command("/usr/bin/env").args([
-            "-i",
-            "/usr/bin/security",
-            "add-generic-password",
-            "-A",
-            "-s",
-            "mailctl-qualification",
-            "-a",
-            "empty-metadata-probe",
-            "-w",
-            "",
-        ]));
-        eprintln!(
-            "native isolation empty metadata probe: {:?}: {}",
-            probe.status.code(),
-            String::from_utf8_lossy(&probe.stderr)
+        let selected: String =
+            serde_json::from_slice(&default.stdout).expect("quoted service default keychain");
+        assert_eq!(
+            fs::canonicalize(selected).unwrap(),
+            fs::canonicalize(&keychain).unwrap(),
+            "service User-domain default persists across processes"
         );
         keychain
     }

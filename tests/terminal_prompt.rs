@@ -37,7 +37,7 @@ fn bounded_capture_drains_large_pipes_before_the_child_exits() {
 fn bounded_capture_returns_when_an_exited_wrapper_leaves_pipe_writers() {
     let pid_file = std::env::temp_dir().join(format!("mailctl-capture-{}.pid", std::process::id()));
     let _ = fs::remove_file(&pid_file);
-    let child = Command::new("python3")
+    let mut child = Command::new("python3")
         .args([
             "-c",
             "import os, subprocess\nchild = subprocess.Popen(['python3', '-c', 'import time; time.sleep(30)'])\nopen(os.environ['PID_FILE'], 'w').write(str(child.pid))",
@@ -48,6 +48,15 @@ fn bounded_capture_returns_when_an_exited_wrapper_leaves_pipe_writers() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("start wrapper with inherited pipe writer");
+    let ready_deadline = Instant::now() + Duration::from_secs(5);
+    while !pid_file.exists() || child.try_wait().expect("inspect wrapper").is_none() {
+        if Instant::now() >= ready_deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("wrapper did not establish inherited pipes");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
     let started = Instant::now();
     assert!(process::capture(child, None, 4096, Duration::from_millis(200)).is_err());
     assert!(started.elapsed() < Duration::from_secs(2));

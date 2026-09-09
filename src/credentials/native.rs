@@ -7,7 +7,11 @@ use security_framework::{
 };
 use std::{
     collections::HashMap,
-    process::{Command, Stdio},
+    ffi::OsString,
+    io::{ErrorKind, Read},
+    os::{fd::AsFd, unix::ffi::OsStringExt},
+    path::{Path, PathBuf},
+    process::{Child, ChildStdout, Command, ExitStatus, Stdio},
     sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
@@ -105,10 +109,15 @@ pub(super) fn disable_interaction() -> Result<(), SourceError> {
 }
 
 fn create_shared_entry(account: Uuid) -> Result<(), SourceError> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let keychain = default_user_keychain(deadline)?;
+    if Instant::now() >= deadline {
+        return Err(SourceError::Unavailable);
+    }
     // Create only empty metadata with the cooperative same-login access policy.
     // Password bytes enter Keychain through keyring-core afterward. Omitting -U
     // makes a concurrent creator fail safely without changing an existing ACL.
-    let mut child = Command::new("/usr/bin/security")
+    let mut child = security_command()
         .args([
             "add-generic-password",
             "-A",
@@ -119,28 +128,153 @@ fn create_shared_entry(account: Uuid) -> Result<(), SourceError> {
             "-w",
             "",
         ])
+        .arg(keychain)
+        .stdout(Stdio::null())
+        .spawn()
+        .map_err(|_| SourceError::Unavailable)?;
+    wait_for_security(&mut child, deadline).and_then(|status| {
+        status
+            .success()
+            .then_some(())
+            .ok_or(SourceError::Unavailable)
+    })
+}
+
+const DEFAULT_KEYCHAIN_OUTPUT_BYTES: usize = 8 * 1024;
+
+fn default_user_keychain(deadline: Instant) -> Result<PathBuf, SourceError> {
+    if Instant::now() >= deadline {
+        return Err(SourceError::Unavailable);
+    }
+    let mut child = security_command()
+        .args(["default-keychain", "-d", "user"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|_| SourceError::Unavailable)?;
+    let Some(mut stdout) = child.stdout.take() else {
+        terminate_security(&mut child);
+        return Err(SourceError::Unavailable);
+    };
+    if set_nonblocking(&stdout).is_err() {
+        terminate_security(&mut child);
+        return Err(SourceError::Unavailable);
+    }
+    let (status, output) = match collect_stdout(&mut child, &mut stdout, deadline) {
+        Ok(result) => result,
+        Err(error) => {
+            terminate_security(&mut child);
+            return Err(error);
+        }
+    };
+    if !status.success() {
+        return Err(SourceError::Unavailable);
+    }
+    parse_default_keychain(&output)
+}
+
+fn security_command() -> Command {
+    let mut command = Command::new("/usr/bin/security");
+    command
         .env_clear()
         .current_dir("/")
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|_| SourceError::Unavailable)?;
-    let deadline = Instant::now() + Duration::from_secs(5);
+        .stderr(Stdio::null());
+    command
+}
+
+fn set_nonblocking(stdout: &ChildStdout) -> Result<(), SourceError> {
+    let flags = rustix::fs::fcntl_getfl(stdout.as_fd()).map_err(|_| SourceError::Unavailable)?;
+    rustix::fs::fcntl_setfl(stdout.as_fd(), flags | rustix::fs::OFlags::NONBLOCK)
+        .map_err(|_| SourceError::Unavailable)
+}
+
+fn collect_stdout(
+    child: &mut Child,
+    stdout: &mut ChildStdout,
+    deadline: Instant,
+) -> Result<(ExitStatus, Vec<u8>), SourceError> {
+    let mut output = Vec::new();
+    let mut exceeded_limit = false;
+    let mut exited = None;
+    let mut eof = false;
+    let mut buffer = [0; 1024];
     loop {
-        match child.try_wait() {
-            Ok(Some(status)) if status.success() => return Ok(()),
-            Ok(Some(_)) => return Err(SourceError::Unavailable),
-            Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(10));
+        if Instant::now() >= deadline {
+            return Err(SourceError::Unavailable);
+        }
+        while !eof {
+            if Instant::now() >= deadline {
+                return Err(SourceError::Unavailable);
             }
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
+            match stdout.read(&mut buffer) {
+                Ok(0) => eof = true,
+                Ok(count) => {
+                    let remaining = DEFAULT_KEYCHAIN_OUTPUT_BYTES.saturating_sub(output.len());
+                    output.extend_from_slice(&buffer[..count.min(remaining)]);
+                    exceeded_limit |= count > remaining;
+                }
+                Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                Err(_) => return Err(SourceError::Unavailable),
+            }
+        }
+        if exited.is_none() {
+            exited = child.try_wait().map_err(|_| SourceError::Unavailable)?;
+        }
+        if let Some(status) = exited
+            && eof
+        {
+            return (!exceeded_limit)
+                .then_some((status, output))
+                .ok_or(SourceError::Unavailable);
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn wait_for_security(child: &mut Child, deadline: Instant) -> Result<ExitStatus, SourceError> {
+    loop {
+        if Instant::now() >= deadline {
+            terminate_security(child);
+            return Err(SourceError::Unavailable);
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => std::thread::sleep(Duration::from_millis(1)),
+            Err(_) => {
+                terminate_security(child);
                 return Err(SourceError::Unavailable);
             }
         }
     }
+}
+
+fn terminate_security(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn parse_default_keychain(output: &[u8]) -> Result<PathBuf, SourceError> {
+    let output = output.strip_suffix(b"\n").unwrap_or(output);
+    let output = output.strip_suffix(b"\r").unwrap_or(output);
+    let mut output = output;
+    while matches!(output.first(), Some(b' ' | b'\t')) {
+        output = &output[1..];
+    }
+    let Some(keychain) = output
+        .strip_prefix(b"\"")
+        .and_then(|value| value.strip_suffix(b"\""))
+    else {
+        return Err(SourceError::Unavailable);
+    };
+    let keychain = OsString::from_vec(keychain.to_vec());
+    if keychain.is_empty()
+        || keychain.as_encoded_bytes().iter().any(u8::is_ascii_control)
+        || !Path::new(&keychain).is_absolute()
+    {
+        return Err(SourceError::Unavailable);
+    }
+    Ok(PathBuf::from(keychain))
 }
 
 fn source_error(error: keyring_core::Error) -> SourceError {
@@ -180,5 +314,32 @@ fn platform_code(code: i32) -> SourceError {
         -61 | -128 | -25293 | -25244 | -25292 => SourceError::AccessDenied,
         -25291 | -25294 | -25295 => SourceError::Unavailable,
         _ => SourceError::Internal,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_default_keychain;
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt, path::PathBuf};
+
+    #[test]
+    fn default_keychain_output_preserves_a_quoted_raw_path() {
+        assert_eq!(
+            parse_default_keychain(
+                b"    \"/Users/fixture/Library/Keychains/with\\slash-and\"quote.keychain-db\"\n",
+            )
+            .unwrap(),
+            PathBuf::from(OsString::from_vec(
+                b"/Users/fixture/Library/Keychains/with\\slash-and\"quote.keychain-db".to_vec()
+            ))
+        );
+        for output in [
+            br#""relative.keychain-db""#.as_slice(),
+            b"    \"/Users/fixture/one\"\n    \"/Users/fixture/two\"\n".as_slice(),
+            br#"["/Users/fixture/one"]"#.as_slice(),
+            b"\"/Users/fixture/one\n\"".as_slice(),
+        ] {
+            assert!(parse_default_keychain(output).is_err());
+        }
     }
 }

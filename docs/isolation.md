@@ -48,7 +48,8 @@ sudo deployment/macos-isolated/install.sh \
 
 Substitute your dedicated account names. The installer explains the isolated
 deployment, refuses existing deployment paths, installs the selected binaries
-and launchd definition, and creates protected directories. It does not start the
+and launchd definition, and creates protected directories, including the service
+account's Keychain preferences directory. It does not start the
 service, copy credentials, or change the standard installation.
 
 Use the installed CLI for explicit administration under the service identity:
