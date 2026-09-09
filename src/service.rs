@@ -226,7 +226,7 @@ impl Service {
     fn visible_accounts<'a>(
         &'a self,
         context: &'a RequestContext,
-    ) -> impl Iterator<Item = &'a AccountConfig> {
+    ) -> impl ExactSizeIterator<Item = &'a AccountConfig> {
         context
             .account_indices()
             .iter()

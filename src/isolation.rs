@@ -238,14 +238,13 @@ impl Client {
             },
         )
         .await
-        .map_err(|_| Error::new(ErrorCode::Timeout))?;
+        .map_err(|_| Error::new(ErrorCode::Timeout))??;
         match response {
-            Ok(ServerFrame::Result { envelope }) => {
+            ServerFrame::Result { envelope } => {
                 *retained = Some(stream);
                 envelope.into_result()
             }
-            Ok(ServerFrame::Hello { .. }) => Err(Error::new(ErrorCode::ProtocolMismatch)),
-            Err(error) => Err(error),
+            ServerFrame::Hello { .. } => Err(Error::new(ErrorCode::ProtocolMismatch)),
         }
     }
 }
@@ -316,7 +315,7 @@ async fn server() -> Result<(), Error> {
         let context = service.context(&caller.grant, &Narrowing::default())?;
         let cap = service.limits(&context)?.active_requests.min(session_cap);
         grant_permits
-            .entry(caller.grant.clone())
+            .entry(caller.grant.as_str())
             .or_insert_with(|| (Arc::new(Semaphore::new(cap)), cap));
     }
     let mut sessions = JoinSet::new();

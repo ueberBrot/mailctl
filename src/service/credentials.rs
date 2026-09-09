@@ -2,8 +2,8 @@
 use super::Service;
 use crate::{
     authentication::{self, Runtime},
-    config::{AccountConfig, Topology},
-    credentials::{self},
+    config::Topology,
+    credentials,
     domain::{
         AuthenticationCheck, AuthenticationOutcome, CredentialFailure, Doctor, DoctorAccount,
         Error, ErrorCode,
@@ -41,9 +41,9 @@ impl Service {
         if !context.permissions().contains(&Permission::ListAccounts) {
             return Err(Error::new(ErrorCode::PermissionDenied));
         }
-        let accounts: Vec<_> = self.visible_accounts(context).collect();
+        let accounts = self.visible_accounts(context);
         if check_account && accounts.len() != 1 {
-            return Err(if accounts.is_empty() {
+            return Err(if accounts.len() == 0 {
                 Error::new(ErrorCode::AccountNotAllowed)
             } else {
                 select_account()
@@ -76,8 +76,10 @@ impl Service {
         }
         let runtime = self.authentication().await?;
         for configured in accounts {
-            let account = self.authentication_account(configured)?;
-            if let Some(prerequisite) = account.source.prerequisite()
+            let (id, generation) = self.registry.identity(&configured.key);
+            let id = Uuid::parse_str(id).map_err(|_| Error::new(ErrorCode::InternalError))?;
+            let source = credentials::source_for(&configured.credential);
+            if let Some(prerequisite) = source.prerequisite()
                 && !result
                     .prerequisites
                     .iter()
@@ -85,17 +87,12 @@ impl Service {
             {
                 result.prerequisites.push(prerequisite.into());
             }
-            let source = runtime
-                .inspect_with_limits(
-                    account.id,
-                    account.generation,
-                    account.source.clone(),
-                    &grant.limits,
-                )
+            let availability = runtime
+                .inspect_with_limits(id, generation, source.clone(), &grant.limits)
                 .await
                 .map_err(authentication_error)?;
             if matches!(
-                source,
+                availability,
                 credentials::Availability::Missing
                     | credentials::Availability::Locked
                     | credentials::Availability::AccessDenied
@@ -107,6 +104,12 @@ impl Service {
                 result.status = "degraded".into();
             }
             let authentication = if check_account {
+                let account = authentication::Account {
+                    id,
+                    generation,
+                    config: configured.clone(),
+                    source,
+                };
                 let outcome = match runtime.doctor(&account, &grant.limits).await {
                     Ok(()) => AuthenticationOutcome::Authenticated,
                     Err(error) => {
@@ -127,9 +130,9 @@ impl Service {
                 None
             };
             result.accounts.push(DoctorAccount {
-                account_id: account.id.to_string(),
-                generation: account.generation,
-                source,
+                account_id: id.to_string(),
+                generation,
+                source: availability,
                 authentication,
             });
         }
@@ -154,19 +157,6 @@ impl Service {
                 Runtime::new(self.config.limits.clone(), roots).map_err(authentication_error)
             })
             .await
-    }
-
-    fn authentication_account(
-        &self,
-        configured: &AccountConfig,
-    ) -> Result<authentication::Account, Error> {
-        let (id, generation) = self.registry.identity(&configured.key);
-        Ok(authentication::Account {
-            id: Uuid::parse_str(id).map_err(|_| Error::new(ErrorCode::InternalError))?,
-            generation,
-            config: configured.clone(),
-            source: credentials::source_for(&configured.credential),
-        })
     }
 
     #[cfg(any(feature = "cli", feature = "mcp"))]

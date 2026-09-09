@@ -37,12 +37,8 @@ trait Stream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Stream for T {}
 
 pub(super) struct Connection<'a> {
-    stream: BufReader<Box<dyn Stream>>,
-    fragmentizer: Fragmentizer,
-    limits: Limits,
+    session: Session,
     metrics: &'a mut Metrics,
-    command: CommandState,
-    uid_validity: Option<NonZeroU32>,
 }
 /// Transport state kept between completed operations, without borrowed metrics.
 pub(super) struct Session {
@@ -55,24 +51,14 @@ pub(super) struct Session {
 impl Session {
     pub(super) fn resume(self, metrics: &mut Metrics) -> Connection<'_> {
         Connection {
-            stream: self.stream,
-            fragmentizer: self.fragmentizer,
-            limits: self.limits,
+            session: self,
             metrics,
-            command: self.command,
-            uid_validity: self.uid_validity,
         }
     }
 }
 impl<'a> Connection<'a> {
     pub(super) fn into_session(self) -> Session {
-        Session {
-            stream: self.stream,
-            fragmentizer: self.fragmentizer,
-            limits: self.limits,
-            command: self.command,
-            uid_validity: self.uid_validity,
-        }
+        self.session
     }
     pub async fn connect(
         host: &str,
@@ -94,14 +80,14 @@ impl<'a> Connection<'a> {
             ),
             TlsMode::StartTls => Box::new(tcp),
         };
-        Ok(Self {
+        Ok(Session {
             stream: BufReader::with_capacity(4096, stream),
             fragmentizer: Fragmentizer::new(limits.max_response_bytes as u32),
             limits,
-            metrics,
             command: CommandState::greeting(),
             uid_validity: None,
-        })
+        }
+        .resume(metrics))
     }
     pub(super) fn metrics_mut(&mut self) -> &mut Metrics {
         self.metrics
@@ -117,7 +103,8 @@ impl<'a> Connection<'a> {
             Default::default(),
         ))
         .await?;
-        self.uid_validity
+        self.session
+            .uid_validity
             .map(NonZeroU32::get)
             .ok_or(Error::UnsafeSelection)
     }
@@ -135,19 +122,20 @@ impl<'a> Connection<'a> {
         {
             return Err(Error::Tls);
         }
-        let stream = self.stream;
+        let stream = self.session.stream;
         if !stream.buffer().is_empty() {
             return Err(Error::Protocol);
         }
         let tls = tokio::time::timeout(
-            self.limits.connect_timeout,
+            self.session.limits.connect_timeout,
             TlsConnector::from(tls).connect(server_name(host)?, stream.into_inner()),
         )
         .await
         .map_err(|_| Error::Timeout)?
         .map_err(|_| Error::Tls)?;
-        self.stream = BufReader::with_capacity(4096, Box::new(tls));
-        self.fragmentizer = Fragmentizer::new(self.limits.max_response_bytes as u32);
+        self.session.stream = BufReader::with_capacity(4096, Box::new(tls));
+        self.session.fragmentizer =
+            Fragmentizer::new(self.session.limits.max_response_bytes as u32);
         Ok(self)
     }
     /// The streaming coroutine keeps the frozen MIME out of backend command buffers.
@@ -167,7 +155,7 @@ impl<'a> Connection<'a> {
         let mut header = true;
         loop {
             self.step(1)?;
-            let state = coroutine.resume(&mut self.fragmentizer, frame.as_deref());
+            let state = coroutine.resume(&mut self.session.fragmentizer, frame.as_deref());
             frame = None;
             match state {
                 ImapCoroutineState::Yielded(ImapMessageAppendStreamYield::WantsWrite(bytes)) => {
@@ -184,12 +172,12 @@ impl<'a> Connection<'a> {
                         if !remaining.is_empty() {
                             return Err(Error::Protocol);
                         }
-                        self.command = CommandState::append(command, target)?;
+                        self.session.command = CommandState::append(command, target)?;
                         self.metrics.append_outcome = Some(AppendOutcome::Unknown);
                         header = false;
                     } else if bytes != b"\r\n"
                         || !matches!(
-                            self.command.kind,
+                            self.session.command.kind,
                             CommandKind::Append { streamed: true, .. }
                         )
                     {
@@ -202,7 +190,7 @@ impl<'a> Connection<'a> {
                         continuation: true,
                         streamed,
                         ..
-                    } = &mut self.command.kind
+                    } = &mut self.session.command.kind
                     else {
                         return Err(Error::Protocol);
                     };
@@ -231,6 +219,7 @@ impl<'a> Connection<'a> {
     async fn append_write(&mut self, bytes: &[u8]) -> Result<(), Error> {
         if bytes.len()
             > self
+                .session
                 .limits
                 .max_operation_bytes
                 .saturating_sub(self.metrics.wire_bytes)
@@ -239,14 +228,19 @@ impl<'a> Connection<'a> {
             return Err(Error::Limit);
         }
         self.metrics.append_wire_bytes += bytes.len();
-        self.stream
+        self.session
+            .stream
             .write_all(bytes)
             .await
             .map_err(|_| Error::Transport)
     }
     async fn flush(&mut self) -> Result<(), Error> {
         // TLS may accept plaintext while retaining ciphertext; reads do not flush it.
-        self.stream.flush().await.map_err(|_| Error::Transport)
+        self.session
+            .stream
+            .flush()
+            .await
+            .map_err(|_| Error::Transport)
     }
     pub async fn drive<C, T, E>(&mut self, mut coroutine: C) -> Result<T, Error>
     where
@@ -255,7 +249,7 @@ impl<'a> Connection<'a> {
         let mut frame = None;
         loop {
             self.step(1)?;
-            let state = coroutine.resume(&mut self.fragmentizer, frame.as_deref());
+            let state = coroutine.resume(&mut self.session.fragmentizer, frame.as_deref());
             frame = None;
             match state {
                 ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
@@ -268,20 +262,22 @@ impl<'a> Connection<'a> {
                     if !remaining.is_empty() {
                         return Err(Error::Protocol);
                     }
-                    self.command = CommandState::new(command)?;
+                    self.session.command = CommandState::new(command)?;
                     if self
+                        .session
                         .command
                         .literal_limit()
-                        .is_some_and(|count| count > self.limits.max_literal_bytes)
+                        .is_some_and(|count| count > self.session.limits.max_literal_bytes)
                     {
                         return Err(Error::Limit);
                     }
-                    if matches!(self.command.kind, CommandKind::BodyFetch { .. })
-                        && self.uid_validity.is_none()
+                    if matches!(self.session.command.kind, CommandKind::BodyFetch { .. })
+                        && self.session.uid_validity.is_none()
                     {
                         return Err(Error::UnsafeSelection);
                     }
-                    self.stream
+                    self.session
+                        .stream
                         .write_all(&bytes)
                         .await
                         .map_err(|_| Error::Transport)?;
@@ -289,10 +285,11 @@ impl<'a> Connection<'a> {
                 ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
                     self.flush().await?;
                     let mut received = self.frame().await?;
-                    while self.command.needs_logout_completion() {
+                    while self.session.command.needs_logout_completion() {
                         let next = self.frame().await?;
                         if next.len()
                             > self
+                                .session
                                 .limits
                                 .max_response_bytes
                                 .saturating_sub(received.len())
@@ -304,13 +301,13 @@ impl<'a> Connection<'a> {
                     frame = Some(received);
                 }
                 ImapCoroutineState::Complete(Ok(value)) => {
-                    if let Some(uid_validity) = self.command.finish()? {
-                        self.uid_validity = Some(uid_validity);
+                    if let Some(uid_validity) = self.session.command.finish()? {
+                        self.session.uid_validity = Some(uid_validity);
                     }
                     return Ok(value);
                 }
                 ImapCoroutineState::Complete(Err(_)) => {
-                    return Err(if matches!(self.command.kind, CommandKind::Login) {
+                    return Err(if matches!(self.session.command.kind, CommandKind::Login) {
                         Error::Authentication
                     } else {
                         Error::Protocol
@@ -322,6 +319,7 @@ impl<'a> Connection<'a> {
     fn step(&mut self, count: usize) -> Result<(), Error> {
         if count
             > self
+                .session
                 .limits
                 .max_parser_steps
                 .saturating_sub(self.metrics.parser_steps)
@@ -332,26 +330,26 @@ impl<'a> Connection<'a> {
         Ok(())
     }
     async fn frame(&mut self) -> Result<Vec<u8>, Error> {
-        let mut guard = Fragmentizer::new(self.limits.max_response_bytes as u32);
+        let mut guard = Fragmentizer::new(self.session.limits.max_response_bytes as u32);
         let mut bytes = 0usize;
         let mut nesting = 0usize;
-        if self.metrics.responses >= self.limits.max_responses {
+        if self.metrics.responses >= self.session.limits.max_responses {
             return Err(Error::Limit);
         }
         self.metrics.responses += 1;
         loop {
-            if bytes >= self.limits.max_response_bytes {
+            if bytes >= self.session.limits.max_response_bytes {
                 return Err(Error::Limit);
             }
             if self
                 .metrics
                 .wire_bytes
                 .saturating_add(self.metrics.append_wire_bytes)
-                >= self.limits.max_operation_bytes
+                >= self.session.limits.max_operation_bytes
             {
                 return Err(Error::Limit);
             }
-            let byte = self.stream.read_u8().await.map_err(|e| {
+            let byte = self.session.stream.read_u8().await.map_err(|e| {
                 if e.kind() == io::ErrorKind::UnexpectedEof {
                     Error::Eof
                 } else {
@@ -393,7 +391,7 @@ impl<'a> Connection<'a> {
                         if !quoted {
                             if b == b'(' {
                                 nesting += 1;
-                                if nesting > self.limits.max_nesting {
+                                if nesting > self.session.limits.max_nesting {
                                     return Err(Error::Limit);
                                 }
                             }
@@ -404,14 +402,16 @@ impl<'a> Connection<'a> {
                     }
                     if let Some(a) = announcement {
                         let length = a.length as usize;
-                        if length > self.limits.max_literal_bytes
+                        if length > self.session.limits.max_literal_bytes
                             || self
+                                .session
                                 .command
                                 .literal_limit()
                                 .is_some_and(|count| length > count)
-                            || length > self.limits.max_response_bytes.saturating_sub(bytes)
+                            || length > self.session.limits.max_response_bytes.saturating_sub(bytes)
                             || length
                                 > self
+                                    .session
                                     .limits
                                     .max_operation_bytes
                                     .saturating_sub(self.metrics.wire_bytes)
@@ -423,11 +423,11 @@ impl<'a> Connection<'a> {
                 }
                 if guard.is_message_complete() {
                     self.step(bytes * 2)?;
-                    let repaired = match &self.command.kind {
+                    let repaired = match &self.session.command.kind {
                         CommandKind::BodyFetch { contract, .. } => contract
                             .repair_partial_separator(
                                 guard.message_bytes(),
-                                self.limits.max_response_bytes,
+                                self.session.limits.max_response_bytes,
                             )?,
                         _ => None,
                     };
@@ -441,8 +441,10 @@ impl<'a> Connection<'a> {
                     if !remaining.is_empty() {
                         return Err(Error::Protocol);
                     }
-                    self.command.inspect(response, self.uid_validity)?;
-                    if let CommandKind::Append { outcome, .. } = self.command.kind {
+                    self.session
+                        .command
+                        .inspect(response, self.session.uid_validity)?;
+                    if let CommandKind::Append { outcome, .. } = self.session.command.kind {
                         self.metrics.append_outcome = Some(outcome);
                     }
                     return Ok(repaired.unwrap_or_else(|| guard.message_bytes().to_vec()));
