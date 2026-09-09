@@ -3,7 +3,7 @@ use super::Service;
 use crate::{
     authentication::{self, Runtime},
     config::{AccountConfig, Topology},
-    credentials::{self, SecretSource},
+    credentials::{self},
     domain::{
         AuthenticationCheck, AuthenticationOutcome, CredentialFailure, Doctor, DoctorAccount,
         Error, ErrorCode,
@@ -11,12 +11,11 @@ use crate::{
     encoding::serialized_size,
     policy::{Permission, RequestContext},
 };
-use std::{
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio_rustls::rustls::RootCertStore;
 use uuid::Uuid;
+#[cfg(any(feature = "cli", feature = "mcp"))]
+use {crate::credentials::SecretSource, std::sync::Arc};
 
 impl Service {
     /// Inspects authorized sources. Authentication requires one selected account
@@ -170,6 +169,7 @@ impl Service {
         })
     }
 
+    #[cfg(any(feature = "cli", feature = "mcp"))]
     pub(crate) fn credential_source(
         &self,
         selected: &[String],
@@ -192,6 +192,7 @@ impl Service {
         ))
     }
 
+    #[cfg(any(feature = "cli", feature = "mcp"))]
     pub(crate) fn secret_limit(&self) -> usize {
         self.config.limits.secret_bytes
     }

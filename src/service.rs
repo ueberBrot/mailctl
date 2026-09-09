@@ -1,5 +1,6 @@
 //! Account discovery and access-grant authorization through one application interface.
 mod credentials;
+#[cfg(any(feature = "cli", feature = "mcp"))]
 pub(crate) use credentials::credential_error;
 mod state;
 use crate::encoding::{OutputBudget, serialized_size};

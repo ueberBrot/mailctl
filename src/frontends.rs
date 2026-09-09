@@ -136,21 +136,7 @@ async fn execute(invocation: Invocation) -> Result<u8, Error> {
         .as_deref()
         .unwrap_or(&config.default_grant)
         .to_owned();
-    #[allow(unused_mut)]
-    let mut narrowing = Narrowing {
-        read_only: options.read_only,
-        accounts: (!options.accounts.is_empty()).then_some(options.accounts.clone()),
-    };
-    #[cfg(feature = "mcp")]
-    if let Action::Mcp {
-        use_configured_grant,
-    } = action
-    {
-        if options.json {
-            return Err(Error::new(ErrorCode::InvalidRequest));
-        }
-        narrowing.read_only |= !use_configured_grant;
-    }
+    let narrowing = invocation_narrowing(&options, &action)?;
     let shutdown = termination_signal()?;
     tokio::pin!(shutdown);
     let config_path = options.config.clone();
@@ -199,6 +185,20 @@ async fn execute_isolated(options: arguments::Options, action: Action) -> Result
     if matches!(action, Action::Setup(_) | Action::Credential(_)) {
         return Err(Error::new(ErrorCode::InvalidRequest));
     }
+    let narrowing = invocation_narrowing(&options, &action)?;
+    let shutdown = termination_signal()?;
+    tokio::pin!(shutdown);
+    let client = tokio::select! {
+        _ = &mut shutdown => return Err(Error::new(ErrorCode::Cancelled)),
+        result = crate::isolation::Client::connect(narrowing) => result?,
+    };
+    execute_application(options, action, Application::Isolated(Box::new(client))).await
+}
+
+fn invocation_narrowing(
+    options: &arguments::Options,
+    _action: &Action,
+) -> Result<Narrowing, Error> {
     #[allow(unused_mut)]
     let mut narrowing = Narrowing {
         read_only: options.read_only,
@@ -207,20 +207,14 @@ async fn execute_isolated(options: arguments::Options, action: Action) -> Result
     #[cfg(feature = "mcp")]
     if let Action::Mcp {
         use_configured_grant,
-    } = action
+    } = _action
     {
         if options.json {
             return Err(Error::new(ErrorCode::InvalidRequest));
         }
-        narrowing.read_only |= !use_configured_grant;
+        narrowing.read_only |= !*use_configured_grant;
     }
-    let shutdown = termination_signal()?;
-    tokio::pin!(shutdown);
-    let client = tokio::select! {
-        _ = &mut shutdown => return Err(Error::new(ErrorCode::Cancelled)),
-        result = crate::isolation::Client::connect(narrowing) => result?,
-    };
-    execute_application(options, action, Application::Isolated(Box::new(client))).await
+    Ok(narrowing)
 }
 
 async fn execute_application(

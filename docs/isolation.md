@@ -144,6 +144,10 @@ or start the service.
 ## Capacity and installation history
 
 The broker admits at most four sessions, with one request at a time per session.
+The configured active-request limit reduces the global session ceiling. Each
+grant has a shared session ceiling that also honors its narrower active-request
+limit, including when multiple caller identities use that grant. Excess sessions
+are rejected without queueing.
 Initialization is limited to five seconds, request frames to 64 KiB, and session
 lifetime to five minutes. Configured access-grant limits can reduce these
 ceilings. Capability results include the isolated session limits. The broker's

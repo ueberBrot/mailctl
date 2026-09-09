@@ -14,6 +14,14 @@ use crate::{
     service::Service,
 };
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "isolated")]
+use std::{
+    collections::HashMap,
+    fs::File,
+    os::unix::fs::{FileTypeExt, PermissionsExt},
+    process::ExitCode,
+    sync::Arc,
+};
 use std::{
     collections::HashSet,
     fs::{self, OpenOptions},
@@ -21,13 +29,6 @@ use std::{
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
     time::Duration,
-};
-#[cfg(feature = "isolated")]
-use std::{
-    fs::File,
-    os::unix::fs::{FileTypeExt, PermissionsExt},
-    process::ExitCode,
-    sync::Arc,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -167,7 +168,7 @@ impl Client {
                 version,
                 limits,
                 response_bound,
-            } = read_frame(&mut stream, REQUEST_BYTES).await?
+            } = read_frame(&mut stream, REQUEST_BYTES, 32).await?
             else {
                 return Err(Error::new(ErrorCode::ProtocolMismatch));
             };
@@ -179,7 +180,7 @@ impl Client {
         .await
         .map_err(|_| Error::new(ErrorCode::Timeout))??;
         if limits.validate().is_err()
-            || response_bound == 0
+            || response_bound < 1024
             || response_bound > limits.envelope_bytes
         {
             return Err(Error::new(ErrorCode::ProtocolMismatch));
@@ -231,7 +232,7 @@ impl Client {
             Duration::from_secs(self.limits.operation_seconds as u64),
             async {
                 write_frame(&mut stream, &request, REQUEST_BYTES).await?;
-                read_frame(&mut stream, self.response_bound).await
+                read_frame(&mut stream, self.response_bound, 32).await
             },
         )
         .await
@@ -287,6 +288,7 @@ async fn server() -> Result<(), Error> {
     let home = verify_service_home(service_uid)?;
     let config = load_service_config(service_uid)?;
     verify_service_state(&config, &home, service_uid)?;
+    let session_cap = SESSIONS.min(config.limits.active_requests);
     let expected =
         serde_json::to_vec(&config).map_err(|_| Error::new(ErrorCode::BrokerUnavailable))?;
     let service = Arc::new(Service::open_checked(config, || {
@@ -306,7 +308,15 @@ async fn server() -> Result<(), Error> {
     fs::set_permissions(SOCKET, fs::Permissions::from_mode(0o666))
         .map_err(|_| Error::new(ErrorCode::BrokerUnavailable))?;
 
-    let permits = Arc::new(Semaphore::new(SESSIONS));
+    let permits = Arc::new(Semaphore::new(session_cap));
+    let mut grant_permits = HashMap::new();
+    for caller in &route.callers {
+        let context = service.context(&caller.grant, &Narrowing::default())?;
+        let cap = service.limits(&context)?.active_requests.min(session_cap);
+        grant_permits
+            .entry(caller.grant.clone())
+            .or_insert_with(|| (Arc::new(Semaphore::new(cap)), cap));
+    }
     let mut sessions = JoinSet::new();
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
@@ -317,9 +327,18 @@ async fn server() -> Result<(), Error> {
             accepted = listener.accept() => {
                 let (stream, _) = accepted.map_err(|_| Error::new(ErrorCode::BrokerUnavailable))?;
                 let Ok(permit) = permits.clone().try_acquire_owned() else { drop(stream); continue; };
+                let Ok(peer) = stream.peer_cred() else { drop(stream); continue; };
+                let caller = peer.uid();
+                let Some(grant) = route.grant(caller) else { drop(stream); continue; };
+                let (grant_slots, cap) = &grant_permits[grant];
+                let Ok(grant_permit) = grant_slots.clone().try_acquire_owned() else { drop(stream); continue; };
+                let cap = *cap;
+                let grant = grant.to_owned();
                 let service = service.clone();
-                let route = route.clone();
-                sessions.spawn(async move { let _permit = permit; let _ = serve_session(stream, service, route).await; });
+                sessions.spawn(async move {
+                    let (_permit, _grant_permit) = (permit, grant_permit);
+                    let _ = serve_session(stream, service, grant, cap).await;
+                });
             }
         }
     }
@@ -334,22 +353,17 @@ async fn server() -> Result<(), Error> {
 async fn serve_session(
     mut stream: UnixStream,
     service: Arc<Service>,
-    route: Route,
+    grant: String,
+    session_cap: usize,
 ) -> Result<(), Error> {
-    let caller = stream
-        .peer_cred()
-        .map_err(|_| Error::new(ErrorCode::BrokerUnavailable))?
-        .uid();
-    let grant = route
-        .grant(caller)
-        .ok_or_else(|| Error::new(ErrorCode::PermissionDenied))?
-        .to_owned();
+    let base = service.context(&grant, &Narrowing::default())?;
+    let (base_limits, _) = session_limits(&service, &base)?;
     let ClientFrame::Hello {
         version: 1,
         narrowing,
     } = timeout(
-        Duration::from_secs(5),
-        read_frame(&mut stream, REQUEST_BYTES),
+        Duration::from_secs(base_limits.initialization_seconds as u64),
+        read_frame(&mut stream, REQUEST_BYTES, base_limits.json_nesting),
     )
     .await
     .map_err(|_| Error::new(ErrorCode::Timeout))??
@@ -373,19 +387,13 @@ async fn serve_session(
         loop {
             let request = timeout(
                 Duration::from_secs(limits.operation_seconds as u64),
-                read_frame(&mut stream, REQUEST_BYTES),
+                read_frame(&mut stream, REQUEST_BYTES, limits.json_nesting),
             )
             .await
             .map_err(|_| Error::new(ErrorCode::Timeout))??;
-            let (operation, doctor, client_bound) = match request {
-                ClientFrame::Operation {
-                    operation,
-                    response_limit,
-                } => (Some(operation), None, response_limit),
-                ClientFrame::Doctor {
-                    check_account,
-                    response_limit,
-                } => (None, Some(check_account), response_limit),
+            let client_bound = match &request {
+                ClientFrame::Operation { response_limit, .. }
+                | ClientFrame::Doctor { response_limit, .. } => *response_limit,
                 ClientFrame::Hello { .. } => return Err(Error::new(ErrorCode::ProtocolMismatch)),
             };
             if client_bound < 1024 || client_bound > response_bound {
@@ -396,13 +404,15 @@ async fn serve_session(
                 .with_response_limit(client_bound.saturating_sub(256));
             let operation_deadline = Duration::from_secs(limits.operation_seconds as u64);
             let result = timeout(operation_deadline, async {
-                match (operation, doctor) {
-                    (Some(operation), None) => service.execute(&narrowed, operation),
-                    (None, Some(check_account)) => service
+                match request {
+                    ClientFrame::Operation { operation, .. } => {
+                        service.execute(&narrowed, operation)
+                    }
+                    ClientFrame::Doctor { check_account, .. } => service
                         .doctor(&narrowed, check_account)
                         .await
                         .map(OperationResult::Doctor),
-                    _ => Err(Error::new(ErrorCode::ProtocolMismatch)),
+                    ClientFrame::Hello { .. } => Err(Error::new(ErrorCode::ProtocolMismatch)),
                 }
             })
             .await
@@ -411,7 +421,7 @@ async fn serve_session(
                 operation_deadline,
                 write_result(
                     &mut stream,
-                    isolated_capacity(result, &limits),
+                    isolated_capacity(result, &limits, session_cap),
                     client_bound,
                 ),
             )
@@ -430,7 +440,7 @@ fn session_limits(service: &Service, context: &RequestContext) -> Result<(Limits
     limits.initialization_seconds = limits.initialization_seconds.min(5);
     limits.connection_lifetime_seconds = limits.connection_lifetime_seconds.min(300);
     limits.active_requests = 1;
-    limits.queued_requests = 0;
+    limits.json_nesting = limits.json_nesting.min(32);
     // Each session retains decoded request fields and the application result
     // while serializing its framed JSON. Sixteen response-sized units cover
     // those two payloads, serde's map/string allocation growth, frame writes,
@@ -452,13 +462,14 @@ fn session_limits(service: &Service, context: &RequestContext) -> Result<(Limits
 fn isolated_capacity(
     result: Result<OperationResult, Error>,
     limits: &Limits,
+    session_cap: usize,
 ) -> Result<OperationResult, Error> {
     let mut result = result?;
     if let OperationResult::Capabilities(capabilities) = &mut result {
-        capabilities.capacity.per_process.active_requests = 1;
+        capabilities.capacity.per_process.active_requests = session_cap as u64;
         capabilities.capacity.per_process.queued_requests = 0;
         capabilities.capacity.isolation = Some(IsolationCapacity {
-            sessions: SESSIONS as u64,
+            sessions: session_cap as u64,
             active_requests_per_session: 1,
             request_bytes: REQUEST_BYTES as u64,
             session_seconds: limits.connection_lifetime_seconds as u64,
@@ -494,6 +505,7 @@ async fn write_result(
 async fn read_frame<T: for<'de> Deserialize<'de>>(
     stream: &mut UnixStream,
     maximum: usize,
+    nesting: usize,
 ) -> Result<T, Error> {
     let length = stream
         .read_u32()
@@ -507,7 +519,7 @@ async fn read_frame<T: for<'de> Deserialize<'de>>(
         .read_exact(&mut bytes)
         .await
         .map_err(|_| Error::new(ErrorCode::BrokerUnavailable))?;
-    validate_json_depth(&bytes, 32)?;
+    validate_json_depth(&bytes, nesting)?;
     serde_json::from_slice(&bytes).map_err(|_| Error::new(ErrorCode::InvalidRequest))
 }
 
@@ -601,21 +613,7 @@ fn verify_service_home(uid: u32) -> Result<PathBuf, Error> {
     if home != Path::new("/private/var/db/mailctl-isolated") {
         return Err(Error::new(ErrorCode::BrokerUnavailable));
     }
-    for ancestor in home.ancestors() {
-        let metadata =
-            fs::symlink_metadata(ancestor).map_err(|_| Error::new(ErrorCode::BrokerUnavailable))?;
-        if metadata.file_type().is_symlink()
-            || !metadata.is_dir()
-            || (metadata.uid() != 0 && metadata.uid() != uid)
-            || metadata.mode() & 0o022 != 0
-        {
-            return Err(Error::new(ErrorCode::BrokerUnavailable));
-        }
-    }
-    let metadata = fs::metadata(&home).map_err(|_| Error::new(ErrorCode::BrokerUnavailable))?;
-    if metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
-        return Err(Error::new(ErrorCode::BrokerUnavailable));
-    }
+    verify_private_directory(&home, uid)?;
     Ok(home)
 }
 
@@ -626,7 +624,12 @@ fn verify_service_state(config: &Config, home: &Path, uid: u32) -> Result<(), Er
     if !state.starts_with(home) {
         return Err(Error::new(ErrorCode::BrokerUnavailable));
     }
-    for ancestor in state.ancestors() {
+    verify_private_directory(&state, uid)
+}
+
+#[cfg(feature = "isolated")]
+fn verify_private_directory(path: &Path, uid: u32) -> Result<(), Error> {
+    for ancestor in path.ancestors() {
         let metadata =
             fs::symlink_metadata(ancestor).map_err(|_| Error::new(ErrorCode::BrokerUnavailable))?;
         if metadata.file_type().is_symlink()
@@ -637,7 +640,7 @@ fn verify_service_state(config: &Config, home: &Path, uid: u32) -> Result<(), Er
             return Err(Error::new(ErrorCode::BrokerUnavailable));
         }
     }
-    let metadata = fs::metadata(state).map_err(|_| Error::new(ErrorCode::BrokerUnavailable))?;
+    let metadata = fs::metadata(path).map_err(|_| Error::new(ErrorCode::BrokerUnavailable))?;
     if metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
         return Err(Error::new(ErrorCode::BrokerUnavailable));
     }
