@@ -20,8 +20,8 @@ use io_imap::{
 };
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
-    fmt::{self, Write},
+    collections::{HashMap, hash_map::Entry},
+    fmt,
     num::NonZeroU32,
     sync::{Arc, Mutex, MutexGuard, Weak},
     time::Instant,
@@ -108,8 +108,8 @@ impl AttachmentRequest {
 /// }
 /// ```
 pub struct AttachmentTransfer {
-    value: String,
-    owner: Weak<Mutex<HashMap<String, TransferState>>>,
+    value: [u8; 32],
+    owner: Weak<Mutex<HashMap<[u8; 32], TransferState>>>,
 }
 impl fmt::Debug for AttachmentTransfer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -150,10 +150,10 @@ pub struct AttachmentIntegrity {
 
 #[derive(Default)]
 pub(super) struct TransferStore {
-    entries: Arc<Mutex<HashMap<String, TransferState>>>,
+    entries: Arc<Mutex<HashMap<[u8; 32], TransferState>>>,
 }
 impl TransferStore {
-    fn entries(&self) -> MutexGuard<'_, HashMap<String, TransferState>> {
+    fn entries(&self) -> MutexGuard<'_, HashMap<[u8; 32], TransferState>> {
         self.entries
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -179,14 +179,13 @@ impl TransferStore {
         state.ok_or(Error::TransferExpired)
     }
     fn insert(&mut self, state: TransferState) -> Result<AttachmentTransfer, Error> {
-        let mut bytes = [0_u8; 32];
-        getrandom::fill(&mut bytes).map_err(|_| Error::Transport)?;
-        let mut value = String::with_capacity(bytes.len() * 2);
-        for byte in bytes {
-            let _ = write!(value, "{byte:02x}");
-        }
-        if self.entries().insert(value.clone(), state).is_some() {
-            return Err(Error::Transport);
+        let mut value = [0_u8; 32];
+        getrandom::fill(&mut value).map_err(|_| Error::Transport)?;
+        match self.entries().entry(value) {
+            Entry::Vacant(entry) => {
+                entry.insert(state);
+            }
+            Entry::Occupied(_) => return Err(Error::Transport),
         }
         Ok(AttachmentTransfer {
             value,
@@ -207,7 +206,6 @@ struct TransferState {
     expires: Instant,
 }
 
-#[derive(Clone)]
 struct AttachmentDefinition {
     part: Part,
     filename: Option<String>,
@@ -468,14 +466,13 @@ fn parse_part(part: &str, limits: &Limits) -> Result<Part, Error> {
     if part.is_empty() || part.len() > limits.max_nesting.saturating_mul(11) {
         return Err(Error::InvalidInput);
     }
-    let mut values = Vec::new();
+    let mut values = Vec::<NonZeroU32>::new();
     for value in part.split('.') {
         if value.is_empty() || value.len() > 10 || !value.bytes().all(|byte| byte.is_ascii_digit())
         {
             return Err(Error::InvalidInput);
         }
-        let value = value.parse::<u32>().map_err(|_| Error::InvalidInput)?;
-        values.push(NonZeroU32::new(value).ok_or(Error::InvalidInput)?);
+        values.push(value.parse().map_err(|_| Error::InvalidInput)?);
         if values.len() > limits.max_nesting {
             return Err(Error::Limit);
         }
@@ -497,14 +494,13 @@ fn attachments(
                 body,
                 extension_data,
             } => {
-                let part = path
-                    .cloned()
-                    .unwrap_or_else(|| Part(NonZeroU32::MIN.into()));
-                if is_attachment(extension_data.as_ref().and_then(|data| data.tail.as_ref())) {
+                let disposition = extension_data.as_ref().and_then(|data| data.tail.as_ref());
+                if is_attachment(disposition) {
                     output.push(attachment_definition(
-                        part.clone(),
+                        path.cloned()
+                            .unwrap_or_else(|| Part(NonZeroU32::MIN.into())),
                         body,
-                        extension_data.as_ref().and_then(|data| data.tail.as_ref()),
+                        disposition,
                     )?);
                 }
                 // An attached message is transferred as its enclosing RFC822 part. Traversing its
@@ -544,24 +540,23 @@ fn attachment_definition(
         })
         .and_then(|(_, value)| imap_string(value).ok())
         .and_then(safe_filename);
-    let encoding = match imap_string(&body.basic.content_transfer_encoding)?
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
+    let encoding = imap_string(&body.basic.content_transfer_encoding)?.trim();
+    let encoding = if encoding.eq_ignore_ascii_case("7bit") || encoding.eq_ignore_ascii_case("8bit")
     {
-        "7bit" | "8bit" => Some(TransferEncoding::Identity),
-        "base64" => Some(TransferEncoding::Base64),
-        "quoted-printable" => Some(TransferEncoding::QuotedPrintable),
-        _ => None,
+        Some(TransferEncoding::Identity)
+    } else if encoding.eq_ignore_ascii_case("base64") {
+        Some(TransferEncoding::Base64)
+    } else if encoding.eq_ignore_ascii_case("quoted-printable") {
+        Some(TransferEncoding::QuotedPrintable)
+    } else {
+        None
     };
+    let mut media_type = format!("{kind}/{subtype}");
+    media_type.make_ascii_lowercase();
     Ok(AttachmentDefinition {
         part,
         filename,
-        media_type: format!(
-            "{}/{}",
-            kind.to_ascii_lowercase(),
-            subtype.to_ascii_lowercase()
-        ),
+        media_type,
         declared_size: Some(body.basic.size as u64),
         encoding,
     })
@@ -590,7 +585,5 @@ fn safe_filename(value: &str) -> Option<String> {
 }
 
 fn principal(username: &str) -> [u8; 32] {
-    let mut digest = Sha256::new();
-    digest.update(username.as_bytes());
-    digest.finalize().into()
+    Sha256::digest(username.as_bytes()).into()
 }

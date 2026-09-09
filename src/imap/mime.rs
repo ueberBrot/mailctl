@@ -46,9 +46,7 @@ pub(super) fn validate_structure(
 pub(super) fn attachment(disposition: Option<&Disposition<'_>>) -> bool {
     disposition
         .and_then(|disposition| disposition.disposition.as_ref())
-        .is_some_and(|(kind, _)| {
-            imap_text(kind).is_ok_and(|kind| kind.eq_ignore_ascii_case("attachment"))
-        })
+        .is_some_and(|(kind, _)| kind.as_ref().eq_ignore_ascii_case(b"attachment"))
 }
 
 pub(super) fn imap_text<'a>(value: &'a IString<'_>) -> Result<&'a str, Error> {

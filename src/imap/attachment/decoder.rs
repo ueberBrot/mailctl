@@ -36,9 +36,9 @@ impl Decoder {
         Self {
             encoding,
             pending: Vec::new(),
-            base64: Vec::with_capacity(4),
+            base64: Vec::new(),
             base64_padded: false,
-            quoted_printable: Vec::with_capacity(2),
+            quoted_printable: Vec::new(),
             whitespace: Vec::new(),
             carriage_return: false,
             decoded_offset: 0,
@@ -116,8 +116,11 @@ impl Decoder {
     }
 
     pub(super) fn take_chunk(&mut self, max: usize) -> Vec<u8> {
-        let take = max.min(self.pending.len());
-        let bytes: Vec<_> = self.pending.drain(..take).collect();
+        let bytes = if self.pending.len() <= max {
+            std::mem::take(&mut self.pending)
+        } else {
+            self.pending.drain(..max).collect()
+        };
         self.digest.update(&bytes);
         // append() has already checked this sum against the decoded byte ceiling.
         self.decoded_offset += bytes.len();
@@ -140,11 +143,8 @@ impl Decoder {
         }
     }
 
-    pub(super) fn integrity(&self) -> (u64, [u8; 32]) {
-        (
-            self.decoded_offset as u64,
-            self.digest.clone().finalize().into(),
-        )
+    pub(super) fn integrity(self) -> (u64, [u8; 32]) {
+        (self.decoded_offset as u64, self.digest.finalize().into())
     }
 
     fn raw_quoted_printable(&mut self, byte: u8, limits: &Limits) -> Result<(), Error> {
@@ -186,10 +186,11 @@ impl Decoder {
     }
 
     fn flush_raw_prefix(&mut self, limits: &Limits) -> Result<(), Error> {
-        let whitespace = std::mem::take(&mut self.whitespace);
-        for byte in whitespace {
+        let mut whitespace = std::mem::take(&mut self.whitespace);
+        for byte in whitespace.drain(..) {
             self.quoted_printable_octet(byte, limits)?;
         }
+        self.whitespace = whitespace;
         if self.carriage_return {
             self.carriage_return = false;
             self.quoted_printable_octet(b'\r', limits)?;

@@ -46,6 +46,10 @@ fn fixture_payload(encoding: Encoding, decoded_len: usize) -> (Vec<u8>, u64, [u8
     }
     if matches!(encoding, Encoding::QuotedPrintable) {
         decoded.fill(b'a');
+        // Frequent interior spaces exercise retained padding without allocating per word.
+        for index in (1..decoded_len - 1).step_by(8) {
+            decoded[index] = b' ';
+        }
         // Split the first =3D escape across two 16 KiB PEEK literals.
         for index in (WIRE_SLICE - 1..decoded_len).step_by(WIRE_SLICE) {
             decoded[index] = b'=';
@@ -269,8 +273,14 @@ fn full_attachment_transfers_have_payload_independent_memory_and_bounded_counter
             "{}: {allocations:?}",
             encoding.name()
         );
+        if matches!(encoding, Encoding::QuotedPrintable) {
+            assert!(
+                allocations.count_total < sessions as u64 * 1024,
+                "whitespace must not allocate per word: {allocations:?}"
+            );
+        }
         println!(
-            "attachment allocation proof encoding={} decoded={} transfer_wire={} response_wire={} sessions={} peak={} total={} state={} parser={}",
+            "attachment allocation proof encoding={} decoded={} transfer_wire={} response_wire={} sessions={} peak={} total={} allocations={} state={} parser={}",
             encoding.name(),
             expected_len,
             payload_len,
@@ -278,6 +288,7 @@ fn full_attachment_transfers_have_payload_independent_memory_and_bounded_counter
             transfers,
             allocations.bytes_max,
             allocations.bytes_total,
+            allocations.count_total,
             metrics.max_transfer_state_bytes,
             reported_parser_steps,
         );

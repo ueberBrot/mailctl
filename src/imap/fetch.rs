@@ -40,6 +40,13 @@ impl Fetch {
         else {
             return Ok(None);
         };
+        let Some(end) = frame.windows(2).position(|bytes| bytes == b"\r\n") else {
+            return Ok(None);
+        };
+        let line = &frame[..end];
+        if !line.windows(2).any(|bytes| bytes == b">{") {
+            return Ok(None);
+        }
         let section = match section {
             None => String::new(),
             Some(Section::Header(None)) => "HEADER".to_owned(),
@@ -48,10 +55,6 @@ impl Fetch {
             _ => return Ok(None),
         };
         let prefix = format!("BODY[{section}]<{offset}>");
-        let Some(end) = frame.windows(2).position(|bytes| bytes == b"\r\n") else {
-            return Ok(None);
-        };
-        let line = &frame[..end];
         let mut quoted = false;
         let mut escaped = false;
         for (index, byte) in line.iter().enumerate() {
