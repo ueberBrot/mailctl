@@ -9,8 +9,6 @@ use crate::{
 use crate::{
     config::{Config, MAX_BYTES},
     domain::IsolationCapacity,
-    encoding::request_buffer_bytes,
-    policy::RequestContext,
     service::Service,
 };
 use serde::{Deserialize, Serialize};
@@ -201,8 +199,12 @@ impl Client {
     }
 
     pub fn with_response_limit(mut self, maximum: usize) -> Self {
-        self.response_bound = self.response_bound.min(maximum);
+        self.limit_response(maximum);
         self
+    }
+
+    pub(crate) fn limit_response(&mut self, maximum: usize) {
+        self.response_bound = self.response_bound.min(maximum);
     }
 
     pub async fn execute(&self, operation: Operation) -> Result<OperationResult, Error> {
@@ -358,7 +360,7 @@ async fn serve_session(
     session_cap: usize,
 ) -> Result<(), Error> {
     let base = service.context(&grant, &Narrowing::default())?;
-    let (base_limits, _) = session_limits(&service, &base)?;
+    let (base_limits, _) = session_limits(service.limits(&base)?)?;
     let ClientFrame::Hello {
         version: 1,
         narrowing,
@@ -372,7 +374,8 @@ async fn serve_session(
         return Err(Error::new(ErrorCode::ProtocolMismatch));
     };
     let context = service.context(&grant, &narrowing)?;
-    let (limits, response_bound) = session_limits(&service, &context)?;
+    drop(narrowing);
+    let (limits, response_bound) = session_limits(service.limits(&context)?)?;
     write_frame(
         &mut stream,
         &ServerFrame::Hello {
@@ -400,8 +403,8 @@ async fn serve_session(
             if client_bound < 1024 || client_bound > response_bound {
                 return Err(Error::new(ErrorCode::InvalidRequest));
             }
-            let narrowed = service
-                .context(&grant, &narrowing)?
+            let narrowed = context
+                .clone()
                 .with_response_limit(client_bound.saturating_sub(256));
             let operation_deadline = Duration::from_secs(limits.operation_seconds as u64);
             let result = timeout(operation_deadline, async {
@@ -435,22 +438,23 @@ async fn serve_session(
 }
 
 #[cfg(feature = "isolated")]
-fn session_limits(service: &Service, context: &RequestContext) -> Result<(Limits, usize), Error> {
-    let mut limits = service.limits(context)?.clone();
+fn session_limits(configured: &Limits) -> Result<(Limits, usize), Error> {
+    let mut limits = configured.clone();
     limits.operation_seconds = limits.operation_seconds.min(30);
     limits.initialization_seconds = limits.initialization_seconds.min(5);
     limits.connection_lifetime_seconds = limits.connection_lifetime_seconds.min(300);
     limits.active_requests = 1;
     limits.json_nesting = limits.json_nesting.min(32);
-    // Each session retains decoded request fields and the application result
-    // while serializing its framed JSON. Sixteen response-sized units cover
-    // those two payloads, serde's map/string allocation growth, frame writes,
-    // and bounded task metadata without relying on a fixed response ceiling.
+    // Internally tagged ClientFrame buffers generic serde Content before typed
+    // field bounds reject unknown or oversized fields. Reserve generic JSON
+    // decoding space, including vector growth and scratch, for every wire byte.
+    // Sixteen response-sized units separately cover result fields, serialization
+    // growth, framed output, and bounded task metadata.
     let response_bound = limits.envelope_bytes.min(
         limits
             .buffered_bytes
             .saturating_div(SESSIONS)
-            .saturating_sub(request_buffer_bytes(REQUEST_BYTES))
+            .saturating_sub(128 * REQUEST_BYTES)
             .saturating_div(16),
     );
     if response_bound < 1024 {
@@ -708,4 +712,58 @@ async fn shutdown_signal() {
         return;
     };
     tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = terminate.recv() => {} }
+}
+
+#[cfg(all(test, feature = "isolated"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejected_tagged_json_fits_the_session_request_reservation() {
+        let (limits, response_bound) = session_limits(&Limits::default()).unwrap();
+        limits.validate().unwrap();
+        let request_reservation = limits.buffered_bytes / SESSIONS - 16 * response_bound;
+        let payload = format!(
+            r#"{{"type":"hello","version":1,"narrowing":{{}},"padding":[{}0]}}"#,
+            "0,".repeat(32_000),
+        );
+        assert!(payload.len() <= REQUEST_BYTES);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (mut sender, mut receiver) = {
+            let _runtime = runtime.enter();
+            UnixStream::pair().unwrap()
+        };
+        let allocations = allocation_counter::measure(|| {
+            runtime.block_on(async {
+                let (sent, received) = tokio::join!(
+                    write_bytes(&mut sender, payload.as_bytes()),
+                    read_frame::<ClientFrame>(&mut receiver, REQUEST_BYTES, limits.json_nesting),
+                );
+                sent.unwrap();
+                assert_eq!(received.err().unwrap().code, ErrorCode::InvalidRequest);
+            });
+        });
+        assert!(
+            allocations.bytes_max <= request_reservation as u64,
+            "tagged JSON allocation exceeds its session reservation: {allocations:?}"
+        );
+    }
+
+    #[test]
+    fn session_admission_requires_space_for_generic_json_decoding() {
+        let limits = Limits {
+            envelope_bytes: 1024,
+            buffered_bytes: 1024 * 1024,
+            ..Limits::default()
+        };
+        limits.validate().unwrap();
+        assert_eq!(
+            session_limits(&limits).unwrap_err().code,
+            ErrorCode::BrokerUnavailable
+        );
+        assert!(session_limits(&Limits::default()).unwrap().1 >= 1024);
+    }
 }

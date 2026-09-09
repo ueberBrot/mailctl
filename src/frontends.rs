@@ -225,47 +225,36 @@ async fn execute_application(
     let deadline = application.limits()?.operation_seconds;
     let shutdown = termination_signal()?;
     tokio::pin!(shutdown);
-    match action {
-        Action::Doctor { check_account } => {
-            let result = tokio::select! {
-                _ = &mut shutdown => Err(Error::new(ErrorCode::Cancelled)),
-                result = tokio::time::timeout(Duration::from_secs(deadline as u64), application.doctor(check_account)) =>
-                    result.map_err(|_| Error::new(ErrorCode::Timeout)).flatten(),
-            };
-            Ok(report(
-                options.json,
-                options.diagnostics.color,
-                result,
-                application,
-                deadline,
-            )
-            .await)
-        }
-        #[cfg(feature = "mcp")]
-        Action::Mcp { .. } => {
-            tokio::select! {
-                _ = &mut shutdown => Err(Error::new(ErrorCode::Cancelled)),
-                result = mcp::run(application) => result.map(|()| 0),
-            }
-        }
-        #[cfg(feature = "cli")]
-        Action::Email(operation) => {
-            let result = tokio::select! {
-                _ = &mut shutdown => Err(Error::new(ErrorCode::Cancelled)),
-                result = tokio::time::timeout(Duration::from_secs(deadline as u64), application.execute(operation)) =>
-                    result.map_err(|_| Error::new(ErrorCode::Timeout)).flatten(),
-            };
-            Ok(report(
-                options.json,
-                options.diagnostics.color,
-                result,
-                application,
-                deadline,
-            )
-            .await)
-        }
-        Action::Setup(_) | Action::Credential(_) => unreachable!(),
+    #[cfg(feature = "mcp")]
+    if matches!(action, Action::Mcp { .. }) {
+        return tokio::select! {
+            _ = &mut shutdown => Err(Error::new(ErrorCode::Cancelled)),
+            result = mcp::run(application) => result.map(|()| 0),
+        };
     }
+    let operation = async {
+        match action {
+            Action::Doctor { check_account } => application.doctor(check_account).await,
+            #[cfg(feature = "cli")]
+            Action::Email(operation) => application.execute(operation).await,
+            #[cfg(feature = "mcp")]
+            Action::Mcp { .. } => unreachable!(),
+            Action::Setup(_) | Action::Credential(_) => unreachable!(),
+        }
+    };
+    let result = tokio::select! {
+        _ = &mut shutdown => Err(Error::new(ErrorCode::Cancelled)),
+        result = tokio::time::timeout(Duration::from_secs(deadline as u64), operation) =>
+            result.map_err(|_| Error::new(ErrorCode::Timeout)).flatten(),
+    };
+    Ok(report(
+        options.json,
+        options.diagnostics.color,
+        result,
+        application,
+        deadline,
+    )
+    .await)
 }
 
 fn termination_signal() -> Result<impl Future<Output = ()>, Error> {

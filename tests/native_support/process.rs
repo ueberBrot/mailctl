@@ -93,23 +93,30 @@ pub(crate) fn capture(
 ) -> Result<Captured, ()> {
     let pid = Pid::from_child(&child);
     let group = getpgid(Some(pid)).ok().filter(|group| *group == pid);
+    let result = capture_output(
+        &mut child,
+        input.as_deref().unwrap_or_default(),
+        output_limit,
+        timeout,
+    );
+    if result.is_err() {
+        terminate(&mut child, group);
+    }
+    result
+}
+
+fn capture_output(
+    child: &mut Child,
+    input: &[u8],
+    output_limit: usize,
+    timeout: Duration,
+) -> Result<Captured, ()> {
     let mut stdout = child.stdout.take();
     let mut stderr = child.stderr.take();
     let mut stdin = child.stdin.take();
-    if stdout
-        .as_ref()
-        .is_some_and(|stream| nonblocking(stream).is_err())
-        || stderr
-            .as_ref()
-            .is_some_and(|stream| nonblocking(stream).is_err())
-        || stdin
-            .as_ref()
-            .is_some_and(|stream| nonblocking(stream).is_err())
-    {
-        terminate(&mut child, group);
-        return Err(());
-    }
-    let input = input.unwrap_or_default();
+    stdout.as_ref().map(nonblocking).transpose()?;
+    stderr.as_ref().map(nonblocking).transpose()?;
+    stdin.as_ref().map(nonblocking).transpose()?;
     let mut offset = 0;
     let mut captured_stdout = Stream {
         bytes: Vec::new(),
@@ -122,51 +129,28 @@ pub(crate) fn capture(
     let deadline = Instant::now() + timeout;
     let mut status = None;
     loop {
-        let stdout_eof = match stdout
+        let stdout_eof = stdout
             .as_mut()
             .map(|stream| drain(stream, &mut captured_stdout, output_limit, deadline))
-            .transpose()
-        {
-            Ok(value) => value,
-            Err(()) => {
-                terminate(&mut child, group);
-                return Err(());
-            }
-        };
+            .transpose()?;
         if stdout_eof == Some(true) {
             stdout = None;
         }
-        let stderr_eof = match stderr
+        let stderr_eof = stderr
             .as_mut()
             .map(|stream| drain(stream, &mut captured_stderr, output_limit, deadline))
-            .transpose()
-        {
-            Ok(value) => value,
-            Err(()) => {
-                terminate(&mut child, group);
-                return Err(());
-            }
-        };
+            .transpose()?;
         if stderr_eof == Some(true) {
             stderr = None;
         }
         if status.is_none() {
             if let Some(stream) = stdin.as_mut() {
-                if write_input(stream, &input, &mut offset, deadline).is_err() {
-                    terminate(&mut child, group);
-                    return Err(());
-                }
+                write_input(stream, input, &mut offset, deadline)?;
                 if offset == input.len() {
                     stdin = None;
                 }
             }
-            status = match child.try_wait() {
-                Ok(status) => status,
-                Err(_) => {
-                    terminate(&mut child, group);
-                    return Err(());
-                }
-            };
+            status = child.try_wait().map_err(|_| ())?;
             if status.is_some() {
                 stdin = None;
             }
@@ -187,7 +171,6 @@ pub(crate) fn capture(
             });
         }
         if Instant::now() >= deadline {
-            terminate(&mut child, group);
             return Err(());
         }
         thread::sleep(Duration::from_millis(1));

@@ -7,9 +7,9 @@ use security_framework::{
 };
 use std::{
     collections::HashMap,
-    ffi::OsString,
+    ffi::OsStr,
     io::{ErrorKind, Read},
-    os::{fd::AsFd, unix::ffi::OsStringExt},
+    os::{fd::AsFd, unix::ffi::OsStrExt},
     path::{Path, PathBuf},
     process::{Child, ChildStdout, Command, ExitStatus, Stdio},
     sync::{Arc, OnceLock},
@@ -151,25 +151,19 @@ fn default_user_keychain(deadline: Instant) -> Result<PathBuf, SourceError> {
         .stdout(Stdio::piped())
         .spawn()
         .map_err(|_| SourceError::Unavailable)?;
-    let Some(mut stdout) = child.stdout.take() else {
-        terminate_security(&mut child);
-        return Err(SourceError::Unavailable);
-    };
-    if set_nonblocking(&stdout).is_err() {
-        terminate_security(&mut child);
-        return Err(SourceError::Unavailable);
-    }
-    let (status, output) = match collect_stdout(&mut child, &mut stdout, deadline) {
-        Ok(result) => result,
-        Err(error) => {
-            terminate_security(&mut child);
-            return Err(error);
+    let result = (|| {
+        let mut stdout = child.stdout.take().ok_or(SourceError::Unavailable)?;
+        set_nonblocking(&stdout)?;
+        let (status, output) = collect_stdout(&mut child, &mut stdout, deadline)?;
+        if !status.success() {
+            return Err(SourceError::Unavailable);
         }
-    };
-    if !status.success() {
-        return Err(SourceError::Unavailable);
+        parse_default_keychain(&output)
+    })();
+    if result.is_err() {
+        terminate_security(&mut child);
     }
-    parse_default_keychain(&output)
+    result
 }
 
 fn security_command() -> Command {
@@ -267,14 +261,11 @@ fn parse_default_keychain(output: &[u8]) -> Result<PathBuf, SourceError> {
     else {
         return Err(SourceError::Unavailable);
     };
-    let keychain = OsString::from_vec(keychain.to_vec());
-    if keychain.is_empty()
-        || keychain.as_encoded_bytes().iter().any(u8::is_ascii_control)
-        || !Path::new(&keychain).is_absolute()
-    {
+    let path = Path::new(OsStr::from_bytes(keychain));
+    if !path.is_absolute() || keychain.iter().any(u8::is_ascii_control) {
         return Err(SourceError::Unavailable);
     }
-    Ok(PathBuf::from(keychain))
+    Ok(path.to_path_buf())
 }
 
 fn source_error(error: keyring_core::Error) -> SourceError {
@@ -333,7 +324,15 @@ mod tests {
                 b"/Users/fixture/Library/Keychains/with\\slash-and\"quote.keychain-db".to_vec()
             ))
         );
+        assert_eq!(
+            parse_default_keychain(b"\"/Users/fixture/\xff.keychain-db\"\n").unwrap(),
+            PathBuf::from(OsString::from_vec(
+                b"/Users/fixture/\xff.keychain-db".to_vec()
+            ))
+        );
         for output in [
+            b"\"\"".as_slice(),
+            b"\n\"/Users/fixture/one\"".as_slice(),
             br#""relative.keychain-db""#.as_slice(),
             b"    \"/Users/fixture/one\"\n    \"/Users/fixture/two\"\n".as_slice(),
             br#"["/Users/fixture/one"]"#.as_slice(),

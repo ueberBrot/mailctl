@@ -363,22 +363,20 @@ impl Qualification {
             ],
             "secret": secret,
         });
-        let mut child = command("python3")
+        let child = command("python3")
             .arg(TERMINAL)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .expect("start terminal fixture");
-        use std::io::Write;
-        child
-            .stdin
-            .take()
-            .expect("terminal fixture stdin")
-            .write_all(&serde_json::to_vec(&request).expect("serialize terminal request"))
-            .expect("send terminal fixture request");
-        let captured = process::capture(child, None, OUTPUT_BYTES, DEADLINE)
-            .expect("collect terminal fixture");
+        let captured = process::capture(
+            child,
+            Some(serde_json::to_vec(&request).expect("serialize terminal request")),
+            OUTPUT_BYTES,
+            DEADLINE,
+        )
+        .expect("collect terminal fixture");
         assert!(!captured.stdout_exceeded_limit && !captured.stderr_exceeded_limit);
         assert_success(&captured.output, "store service credential");
         let result: serde_json::Value =

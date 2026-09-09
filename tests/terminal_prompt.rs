@@ -34,6 +34,28 @@ fn bounded_capture_drains_large_pipes_before_the_child_exits() {
 }
 
 #[test]
+fn bounded_capture_drains_large_output_while_writing_input() {
+    let input = vec![b'x'; 128 * 1024];
+    let child = Command::new("python3")
+        .args([
+            "-c",
+            "import sys\nwhile chunk := sys.stdin.buffer.read(4096):\n sys.stdout.buffer.write(chunk); sys.stdout.flush()\n sys.stderr.buffer.write(chunk); sys.stderr.flush()",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start full-duplex pipe fixture");
+    let captured = process::capture(child, Some(input), 4096, Duration::from_secs(3))
+        .expect("collect full-duplex pipe fixture");
+    assert!(captured.output.status.success());
+    assert!(captured.stdout_exceeded_limit);
+    assert!(captured.stderr_exceeded_limit);
+    assert_eq!(captured.output.stdout.len(), 4096);
+    assert_eq!(captured.output.stderr.len(), 4096);
+}
+
+#[test]
 fn bounded_capture_returns_when_an_exited_wrapper_leaves_pipe_writers() {
     let pid_file = std::env::temp_dir().join(format!("mailctl-capture-{}.pid", std::process::id()));
     let _ = fs::remove_file(&pid_file);

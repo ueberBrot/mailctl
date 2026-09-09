@@ -60,7 +60,10 @@ impl Application {
                 context: context.with_response_limit(maximum),
             },
             #[cfg(target_os = "macos")]
-            Self::Isolated(client) => Self::Isolated(Box::new(client.with_response_limit(maximum))),
+            Self::Isolated(mut client) => {
+                client.limit_response(maximum);
+                Self::Isolated(client)
+            }
         }
     }
 }
