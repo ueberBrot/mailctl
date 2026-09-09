@@ -149,7 +149,18 @@ async fn mcp_serves_with_a_small_valid_byte_budget() {
     let (client, envelope) = listed_accounts(&installation, &[]).await;
     assert_eq!(envelope["ok"], true);
     assert_eq!(envelope["result"]["accounts"][0]["alias"], "work");
-    assert_eq!(client.list_all_tools().await.unwrap().len(), 2);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        for _ in 0..128 {
+            assert_eq!(client.list_all_tools().await.unwrap().len(), 2);
+            let response = client
+                .call_tool(CallToolRequestParams::new("email_list_accounts"))
+                .await
+                .expect("sequential requests retain their admission slot");
+            assert_eq!(response.structured_content.unwrap()["ok"], true);
+        }
+    })
+    .await
+    .expect("bounded sequential MCP exchanges complete");
     client.cancel().await.unwrap();
 }
 

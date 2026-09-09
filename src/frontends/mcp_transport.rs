@@ -121,6 +121,7 @@ pub(super) struct BoundedStdio {
     deadline: Duration,
     receive_expires: Instant,
     initializing: bool,
+    staged: Option<(RxJsonRpcMessage<RoleServer>, OwnedSemaphorePermit)>,
 }
 
 impl BoundedStdio {
@@ -158,6 +159,7 @@ impl BoundedStdio {
             deadline: bounds.deadline,
             receive_expires: Instant::now() + bounds.deadline,
             initializing: true,
+            staged: None,
         }
     }
 }
@@ -203,14 +205,18 @@ impl Transport<RoleServer> for BoundedStdio {
         // Notifications retain it in SDK extensions through their handler's return,
         // so a flood cannot accumulate detached notification tasks. This permit is
         // independent of request saturation; acquire it before consuming any input.
-        let control = self.control.clone().acquire_owned().await.ok()?;
-        // SDK receive is cancellation-safe; keep the same deadline when the SDK
-        // service loop interrupts it to send a response.
-        let mut item = timeout_at(self.receive_expires, self.sdk.receive())
-            .await
-            .ok()??;
-        self.receive_expires = Instant::now() + self.deadline;
-        if let JsonRpcMessage::Request(request) = &item {
+        if self.staged.is_none() {
+            let control = self.control.clone().acquire_owned().await.ok()?;
+            // SDK receive is cancellation-safe; keep the same deadline when the SDK
+            // service loop interrupts it to send a response.
+            let item = timeout_at(self.receive_expires, self.sdk.receive())
+                .await
+                .ok()??;
+            self.receive_expires = Instant::now() + self.deadline;
+            self.staged = Some((item, control));
+        }
+        let (item, _) = self.staged.as_ref()?;
+        if let JsonRpcMessage::Request(request) = item {
             if self.initializing {
                 match &request.request {
                     ClientRequest::InitializeRequest(_) => self.initializing = false,
@@ -220,8 +226,13 @@ impl Transport<RoleServer> for BoundedStdio {
                     _ => return None,
                 }
             }
-            // Keep cancellation notifications readable when all request slots are occupied.
-            let permit = self.slots.clone().try_acquire_owned().ok()?;
+            // A peer can receive a response before its send future releases the
+            // request reservation. Keep this one decoded request in the control
+            // reservation while waiting; SDK select cancellation must not lose it.
+            let permit = timeout_at(self.receive_expires, self.slots.clone().acquire_owned())
+                .await
+                .ok()?
+                .ok()?;
             let mut pending = self.pending.lock().ok()?;
             match pending.entry(request.id.clone()) {
                 Entry::Vacant(entry) => {
@@ -230,6 +241,7 @@ impl Transport<RoleServer> for BoundedStdio {
                 Entry::Occupied(_) => return None,
             }
         }
+        let (mut item, control) = self.staged.take()?;
         if let JsonRpcMessage::Notification(notification) = &mut item {
             notification
                 .notification
