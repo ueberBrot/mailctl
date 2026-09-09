@@ -20,8 +20,4 @@ Run `./target/debug/mailctl-mcp` to serve MCP over STDIO using the same configur
 Use `--grant` to select an access grant, `--account` to narrow accounts, or `--help`
 for available commands.
 
-For backend development, see the [body retrieval proof](tests/proofs/imap-body-proof.md),
-[attachment streaming proof](tests/proofs/imap-attachment-proof.md), and
-[draft acknowledgement proof](tests/proofs/imap-draft-proof.md).
-
 [ISC License](LICENSE).

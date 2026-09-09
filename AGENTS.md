@@ -15,5 +15,3 @@ Before exploring the codebase or creating or editing `CONTEXT.md` or an ADR, rea
 ### Testing
 
 Use compile-time fixtures to verify the published type contract. Reserve runtime tests for behavior that can fail at runtime; avoid testing guarantees already enforced by the type system.
-
-Keep implementation proof and validation records in `tests/proofs/`.
