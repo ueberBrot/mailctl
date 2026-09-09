@@ -49,7 +49,8 @@ pub struct Narrowing {
 pub struct RequestContext {
     service_id: Uuid,
     grant: String,
-    accounts: Vec<String>,
+    // Indices into the immutable configuration of the issuing Service.
+    account_indices: Vec<usize>,
     permissions: Vec<Permission>,
     response_limit: usize,
 }
@@ -58,14 +59,14 @@ impl RequestContext {
     pub(crate) fn new(
         service_id: Uuid,
         grant: String,
-        accounts: Vec<String>,
+        account_indices: Vec<usize>,
         permissions: Vec<Permission>,
         response_limit: usize,
     ) -> Self {
         Self {
             service_id,
             grant,
-            accounts,
+            account_indices,
             permissions,
             response_limit,
         }
@@ -80,8 +81,8 @@ impl RequestContext {
     pub(crate) fn grant_name(&self) -> &str {
         &self.grant
     }
-    pub(crate) fn accounts(&self) -> &[String] {
-        &self.accounts
+    pub(crate) fn account_indices(&self) -> &[usize] {
+        &self.account_indices
     }
     pub(crate) fn permissions(&self) -> &[Permission] {
         &self.permissions

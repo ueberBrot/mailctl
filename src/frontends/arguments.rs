@@ -2,7 +2,6 @@
 use super::{Executable, diagnostics};
 #[cfg(feature = "cli")]
 use crate::domain::{ListAccountsInput, Operation};
-use crate::policy::Narrowing;
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -21,15 +20,6 @@ pub(super) struct Options {
     #[command(flatten)]
     pub diagnostics: diagnostics::Options,
 }
-impl Options {
-    pub fn narrowing(&self) -> Narrowing {
-        Narrowing {
-            read_only: self.read_only,
-            accounts: (!self.accounts.is_empty()).then(|| self.accounts.clone()),
-        }
-    }
-}
-
 #[derive(Subcommand)]
 enum Administration {
     /// Validate configuration, or add/update one named account without replacing others.

@@ -77,23 +77,24 @@ impl Service {
         }) {
             return Err(Error::new(ErrorCode::InvalidRequest));
         }
-        let accounts = grant
+        let account_indices = self
+            .config
             .accounts
             .iter()
-            .filter(|key| {
-                narrowing.accounts.as_ref().is_none_or(|selected| {
-                    self.config
+            .enumerate()
+            .filter(|(_, account)| {
+                grant.accounts.contains(&account.key)
+                    && narrowing
                         .accounts
-                        .iter()
-                        .any(|account| &account.key == *key && selected.contains(&account.alias))
-                })
+                        .as_ref()
+                        .is_none_or(|selected| selected.contains(&account.alias))
             })
-            .cloned()
+            .map(|(index, _)| index)
             .collect();
         Ok(RequestContext::new(
             self.context_id,
             grant_name.into(),
-            accounts,
+            account_indices,
             grant.profile.permissions(narrowing.read_only),
             grant.limits.envelope_bytes,
         ))
@@ -220,10 +221,10 @@ impl Service {
         &'a self,
         context: &'a RequestContext,
     ) -> impl Iterator<Item = &'a AccountConfig> {
-        self.config
-            .accounts
+        context
+            .account_indices()
             .iter()
-            .filter(|account| context.accounts().contains(&account.key))
+            .map(|&index| &self.config.accounts[index])
     }
     fn grant(&self, context: &RequestContext) -> Result<&crate::config::AccessGrant, Error> {
         if !context.belongs_to(self.context_id) {

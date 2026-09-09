@@ -9,6 +9,7 @@ mod mcp_transport;
 
 use crate::{
     domain::{Envelope, Error, ErrorCode, OperationResult},
+    policy::Narrowing,
     service::Service,
 };
 use arguments::{Action, Invocation};
@@ -131,7 +132,10 @@ async fn execute(invocation: Invocation) -> Result<u8, Error> {
         .unwrap_or(&config.default_grant)
         .to_owned();
     #[allow(unused_mut)]
-    let mut narrowing = options.narrowing();
+    let mut narrowing = Narrowing {
+        read_only: options.read_only,
+        accounts: (!options.accounts.is_empty()).then_some(options.accounts),
+    };
     #[cfg(feature = "mcp")]
     if let Action::Mcp {
         use_configured_grant,

@@ -7,6 +7,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, HashSet},
     fs::File,
     path::{Path, PathBuf},
@@ -139,23 +140,25 @@ struct Lease {
     _maintenance: File,
 }
 
-struct Initialization {
+struct Initialization<'a> {
     directory: PathBuf,
-    config: Config,
+    config: Cow<'a, Config>,
     revision: String,
     marker: Vec<u8>,
     registry: Registry,
     maintenance: File,
-    _initialization: File,
+    initialization: File,
     exclusive: bool,
     changed: bool,
 }
 
-impl Initialization {
-    fn acquire(config: &Config, exclusive: bool) -> Result<Self, Error> {
+impl<'a> Initialization<'a> {
+    fn acquire(config: &'a Config, exclusive: bool) -> Result<Self, Error> {
         let directory = storage::directory(&config.state_dir, exclusive)?;
-        let mut canonical = config.clone();
-        canonical.state_dir = directory.clone();
+        let mut canonical = Cow::Borrowed(config);
+        if config.state_dir.as_os_str() != directory.as_os_str() {
+            canonical.to_mut().state_dir = directory.clone();
+        }
         let revision = fingerprint(&canonical)?;
         let deadline =
             Instant::now() + Duration::from_secs(config.limits.initialization_seconds as u64);
@@ -203,7 +206,7 @@ impl Initialization {
             marker,
             registry,
             maintenance,
-            _initialization: initialization,
+            initialization,
             exclusive,
             changed,
         })
@@ -229,7 +232,7 @@ impl Initialization {
             storage::persist(&self.directory, &bytes)?;
         }
         if self.marker.len() != self.registry.installation.len() {
-            storage::mark_initialized(&mut self._initialization, &self.registry.installation)?;
+            storage::mark_initialized(&mut self.initialization, &self.registry.installation)?;
         }
         Ok(updated)
     }
