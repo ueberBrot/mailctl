@@ -31,7 +31,7 @@ pub async fn fixture(
     limits: Limits,
     script: impl FnOnce(Wire) -> Script + Send + 'static,
 ) -> Fixture {
-    fixture_with_name(mode, limits, "localhost", script).await
+    fixture_with_name(mode, limits, "127.0.0.1", script).await
 }
 
 pub async fn fixture_with_name(
@@ -40,7 +40,7 @@ pub async fn fixture_with_name(
     certificate_name: &str,
     script: impl FnOnce(Wire) -> Script + Send + 'static,
 ) -> Fixture {
-    let wrong_hostname = certificate_name != "localhost";
+    let wrong_hostname = certificate_name != "127.0.0.1";
     let cert = rcgen::generate_simple_self_signed(vec![certificate_name.into()]).unwrap();
     let mut roots = RootCertStore::empty();
     roots.add(cert.cert.der().clone()).unwrap();
@@ -54,9 +54,14 @@ pub async fn fixture_with_name(
     let acceptor = TlsAcceptor::from(Arc::new(config));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let probe = ImapProbe::new("localhost".into(), port, mode, roots, limits).unwrap();
+    // Match the IPv4 listener directly so the operation deadline cannot expire
+    // while localhost first attempts an unavailable IPv6 address on Windows.
+    let probe = ImapProbe::new("127.0.0.1".into(), port, mode, roots, limits).unwrap();
     let task = tokio::spawn(async move {
-        let (mut socket, _) = listener.accept().await.unwrap();
+        let (mut socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .expect("fixture connection deadline")
+            .unwrap();
         if matches!(mode, TlsMode::StartTls) {
             write(&mut socket, "* OK synthetic server ready\r\n").await;
             capability(&mut socket, "IMAP4rev1 STARTTLS LOGINDISABLED").await;
@@ -190,7 +195,7 @@ pub async fn plaintext_fixture(
 ) -> Fixture {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let probe = ImapProbe::new(
-        "localhost".into(),
+        "127.0.0.1".into(),
         listener.local_addr().unwrap().port(),
         TlsMode::StartTls,
         RootCertStore::empty(),
@@ -198,7 +203,10 @@ pub async fn plaintext_fixture(
     )
     .unwrap();
     let task = tokio::spawn(async move {
-        let (socket, _) = listener.accept().await.unwrap();
+        let (socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .expect("fixture connection deadline")
+            .unwrap();
         script(Box::new(socket)).await;
     });
     Fixture { probe, task }
