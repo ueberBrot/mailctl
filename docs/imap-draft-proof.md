@@ -125,3 +125,23 @@ required; the pinned image and fixture provenance are in the
 The existing shared component CI matrix includes the new transcript, journal,
 and allocation suites. The required GreenMail job includes the new independent
 draft observation.
+
+## Local acceptance record
+
+Verified on 2026-09-09 at code commit `2c48b83`, against starting commit
+`a5a5499`, on macOS 26.6.2, arm64, with Rust 1.98.1 and Docker 29.7.2.
+`cargo test --locked --workspace --all-features` passed 157 tests, with no failures
+or ignored tests. This includes 13 APPEND/composition tests, two allocation tests,
+three combined journal/transport tests, nine SQLite tests, and all five GreenMail
+tests. The journal suite includes abrupt process death after in-flight and created
+commits, failed outcome writes, and bounded writer contention.
+
+Formatting, all-feature Clippy with warnings denied, the repository dependency
+policy, and cargo-deny passed. Separate CLI-only and MCP-only workspace typechecks
+also passed. These checks qualify the backend proof; they do not advertise a
+CLI/MCP draft command or a released platform artifact.
+
+The isolated transport measurements used 24,884-byte and 1,573,172-byte MIME
+payloads. Peak client allocation was 44,172 and 84,222 bytes respectively; each
+exchange received 178 response bytes and used 553 parser steps. The executable
+ceilings above remain the regression gates.
