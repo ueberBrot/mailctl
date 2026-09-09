@@ -15,7 +15,7 @@ use io_imap::{
     },
 };
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, num::NonZeroU32};
+use std::{collections::HashMap, num::NonZeroU32};
 
 /// In-memory continuation for this route proof. Public authenticated tokens belong to
 /// the application reading contract. A continuation is revalidated after each fetch.
@@ -92,7 +92,7 @@ impl ImapProbe {
             let fields = metadata.execute(&mut conn).await?;
             let (size, structure) = metadata.metadata(&fields)?;
             // Validate every MIME node, including excluded attachment subtrees.
-            let mut related_ids = BTreeMap::new();
+            let mut related_ids = HashMap::new();
             let needed_headers = representation::related_multipart_headers(structure, &limits)?;
             let mut header_bytes = 0;
             let root_headers = headers(
@@ -108,7 +108,7 @@ impl ImapProbe {
                 let raw = headers(
                     &mut conn,
                     request.uid,
-                    Section::Mime(part(&path)?),
+                    Section::Mime(path.clone()),
                     &limits,
                     &mut header_bytes,
                 )
@@ -147,7 +147,7 @@ impl ImapProbe {
                     raw = bytes(
                         &mut conn,
                         request.uid,
-                        Some(Section::Part(part(&selected.part)?)),
+                        Some(Section::Part(selected.part.clone())),
                         Some(selected.wire_size),
                         limits.max_body_wire_bytes,
                         &limits,
@@ -172,7 +172,7 @@ impl ImapProbe {
             self.metrics = metrics;
             context.update(&raw);
             if let Some(selected) = &selected {
-                context.update(selected.part.as_bytes());
+                context.update(part_name(&selected.part).as_bytes());
                 context.update(selected.media_type.as_bytes());
                 context.update(selected.charset.as_bytes());
                 context.update(selected.transfer_encoding.as_bytes());
@@ -200,7 +200,7 @@ impl ImapProbe {
             });
             Ok(BodyPage {
                 text: text[offset..end].to_owned(),
-                selected_part: selected.as_ref().map(|s| s.part.clone()),
+                selected_part: selected.as_ref().map(|s| part_name(&s.part)),
                 source_media_type: selected.map(|s| s.media_type),
                 representation_version: REPRESENTATION,
                 converted,
@@ -215,12 +215,13 @@ impl ImapProbe {
     }
 }
 
-fn part(path: &str) -> Result<Part, Error> {
-    let parts = path
-        .split('.')
-        .map(|value| value.parse::<NonZeroU32>().map_err(|_| Error::Protocol))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(Part(parts.try_into().map_err(|_| Error::Protocol)?))
+fn part_name(part: &Part) -> String {
+    part.0
+        .as_ref()
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 async fn headers(
@@ -324,14 +325,6 @@ impl Fetch {
         } = self
         else {
             return Ok(None);
-        };
-        let part_name = |part: &Part| {
-            part.0
-                .as_ref()
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(".")
         };
         let section = match section {
             None => String::new(),

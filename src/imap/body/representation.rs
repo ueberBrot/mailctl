@@ -4,9 +4,10 @@ use super::super::{Error, Limits};
 use io_imap::types::{
     body::{Body, BodyStructure, Disposition, SpecificFields},
     core::IString,
+    fetch::Part,
 };
 use mail_parser::{GetHeader, MessageParser, MimeHeaders};
-use std::{collections::BTreeMap, io::Cursor};
+use std::{collections::HashMap, io::Cursor, num::NonZeroU32};
 
 const HTML_TABLE_SPAN_LIMIT: usize = 8;
 const HTML_TABLE_CELL_LIMIT: usize = 128;
@@ -14,7 +15,7 @@ const HTML_RENDER_WIDTH: usize = 80;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Selected {
-    pub(super) part: String,
+    pub(super) part: Part,
     pub(super) media_type: String,
     pub(super) charset: String,
     pub(super) transfer_encoding: String,
@@ -34,7 +35,7 @@ pub(super) struct Rendered {
 pub(super) fn select(
     structure: &BodyStructure<'_>,
     limits: &Limits,
-    content_ids: &BTreeMap<String, String>,
+    content_ids: &HashMap<Part, String>,
 ) -> Result<Option<Selected>, Error> {
     validate_structure(structure, limits)?;
     let mut walker = Walker::new(limits, content_ids);
@@ -45,9 +46,9 @@ pub(super) fn select(
 pub(super) fn related_multipart_headers(
     structure: &BodyStructure<'_>,
     limits: &Limits,
-) -> Result<Vec<String>, Error> {
+) -> Result<Vec<Part>, Error> {
     validate_structure(structure, limits)?;
-    let empty_ids = BTreeMap::new();
+    let empty_ids = HashMap::new();
     let mut walker = Walker::new(limits, &empty_ids);
     let mut paths = Vec::new();
     walker.related_headers(structure, None, 1, &mut paths)?;
@@ -124,12 +125,14 @@ pub(super) fn render(selected: &Selected, wire: &[u8], limits: &Limits) -> Resul
     }
     let mut work = wire.len();
     require_work(work, limits)?;
-    // Transfer decoding never expands beyond the input length. Reserve before
-    // calling dependency code so a narrowed output/work budget remains effective.
+    // Base64 and quoted-printable validation scan the input before calling the
+    // decoder. A malformed input can add a scan and a prefix decode, so admit
+    // all bounded passes before invoking dependency code.
     if wire.len() > limits.max_decoded_bytes {
         return Err(Error::Limit);
     }
-    require_work(work.checked_add(wire.len()).ok_or(Error::Limit)?, limits)?;
+    let transfer_work = wire.len().checked_mul(4).ok_or(Error::Limit)?;
+    require_work(work.checked_add(transfer_work).ok_or(Error::Limit)?, limits)?;
     let (decoded, mut replacements) = decode_transfer(wire, &selected.transfer_encoding)?;
     if decoded.len() > limits.max_decoded_bytes {
         return Err(Error::Limit);
@@ -170,7 +173,7 @@ pub(super) fn render(selected: &Selected, wire: &[u8], limits: &Limits) -> Resul
 
 struct Walker<'a> {
     limits: &'a Limits,
-    content_ids: &'a BTreeMap<String, String>,
+    content_ids: &'a HashMap<Part, String>,
     parts: usize,
 }
 
@@ -208,7 +211,7 @@ fn validate_structure(structure: &BodyStructure<'_>, limits: &Limits) -> Result<
 }
 
 impl<'a> Walker<'a> {
-    fn new(limits: &'a Limits, content_ids: &'a BTreeMap<String, String>) -> Self {
+    fn new(limits: &'a Limits, content_ids: &'a HashMap<Part, String>) -> Self {
         Self {
             limits,
             content_ids,
@@ -227,7 +230,7 @@ impl<'a> Walker<'a> {
     fn select(
         &mut self,
         structure: &BodyStructure<'_>,
-        path: Option<&str>,
+        path: Option<&Part>,
         depth: usize,
     ) -> Result<Option<Selected>, Error> {
         self.visit(depth)?;
@@ -239,7 +242,11 @@ impl<'a> Walker<'a> {
                 if attachment(extension_data.as_ref().and_then(|data| data.tail.as_ref())) {
                     return Ok(None);
                 }
-                leaf(body, path.unwrap_or("1"))
+                leaf(
+                    body,
+                    path.cloned()
+                        .unwrap_or_else(|| Part(NonZeroU32::MIN.into())),
+                )
             }
             BodyStructure::Multi {
                 bodies,
@@ -253,7 +260,7 @@ impl<'a> Walker<'a> {
                 let children = bodies.as_ref();
                 let mut selected = Vec::with_capacity(children.len());
                 for (index, child) in children.iter().enumerate() {
-                    let child_path = child_path(path, index + 1);
+                    let child_path = child_path(path, index + 1)?;
                     selected.push((
                         child_path.clone(),
                         self.select(child, Some(&child_path), depth + 1)?,
@@ -300,9 +307,9 @@ impl<'a> Walker<'a> {
     fn related_headers(
         &mut self,
         structure: &BodyStructure<'_>,
-        path: Option<&str>,
+        path: Option<&Part>,
         depth: usize,
-        paths: &mut Vec<String>,
+        paths: &mut Vec<Part>,
     ) -> Result<(), Error> {
         self.visit(depth)?;
         match structure {
@@ -324,7 +331,7 @@ impl<'a> Walker<'a> {
                     )?
                     .is_some();
                 for (index, child) in bodies.as_ref().iter().enumerate() {
-                    let child_path = child_path(path, index + 1);
+                    let child_path = child_path(path, index + 1)?;
                     if related && matches!(child, BodyStructure::Multi { .. }) {
                         paths.push(child_path.clone());
                     }
@@ -336,7 +343,7 @@ impl<'a> Walker<'a> {
     }
 }
 
-fn leaf(body: &Body<'_>, part: &str) -> Result<Option<Selected>, Error> {
+fn leaf(body: &Body<'_>, part: Part) -> Result<Option<Selected>, Error> {
     let SpecificFields::Text { subtype, .. } = &body.specific else {
         return Ok(None);
     };
@@ -345,7 +352,7 @@ fn leaf(body: &Body<'_>, part: &str) -> Result<Option<Selected>, Error> {
         return Ok(None);
     }
     Ok(Some(Selected {
-        part: part.to_owned(),
+        part,
         media_type: format!("text/{subtype}"),
         charset: parameter(&body.basic.parameter_list, "charset")?
             .unwrap_or_else(|| "us-ascii".to_owned()),
@@ -393,17 +400,23 @@ fn imap_text(value: &IString<'_>) -> Result<String, Error> {
     String::from_utf8(value.clone().into_inner().into_owned()).map_err(|_| Error::Protocol)
 }
 
-fn child_path(parent: Option<&str>, child: usize) -> String {
-    parent.map_or_else(|| child.to_string(), |parent| format!("{parent}.{child}"))
+fn child_path(parent: Option<&Part>, child: usize) -> Result<Part, Error> {
+    let child =
+        NonZeroU32::new(u32::try_from(child).map_err(|_| Error::Limit)?).ok_or(Error::Limit)?;
+    let mut parts = parent.map_or_else(Vec::new, |parent| parent.0.as_ref().to_vec());
+    parts.push(child);
+    Ok(Part(
+        parts.try_into().expect("child makes the path nonempty"),
+    ))
 }
 
-fn first(candidates: &[(String, Option<Selected>)]) -> Option<Selected> {
+fn first(candidates: &[(Part, Option<Selected>)]) -> Option<Selected> {
     candidates
         .iter()
         .find_map(|(_, candidate)| candidate.clone())
 }
 
-fn first_type(candidates: &[(String, Option<Selected>)], media_type: &str) -> Option<Selected> {
+fn first_type(candidates: &[(Part, Option<Selected>)], media_type: &str) -> Option<Selected> {
     candidates.iter().find_map(|(_, candidate)| {
         candidate
             .as_ref()
@@ -431,18 +444,146 @@ fn normalize_content_id(value: &str) -> Result<String, Error> {
 fn decode_transfer(wire: &[u8], transfer_encoding: &str) -> Result<(Vec<u8>, bool), Error> {
     match transfer_encoding.trim().to_ascii_lowercase().as_str() {
         "7bit" | "8bit" | "binary" => Ok((wire.to_vec(), false)),
-        "base64" => match mail_parser::decoders::base64::base64_decode(wire) {
-            Some(decoded) => Ok((decoded, false)),
-            None => Ok((wire.to_vec(), true)),
-        },
-        "quoted-printable" => {
-            match mail_parser::decoders::quoted_printable::quoted_printable_decode(wire) {
-                Some(decoded) => Ok((decoded, false)),
-                None => Ok((wire.to_vec(), true)),
-            }
-        }
+        "base64" => Ok(decode_base64(wire)),
+        "quoted-printable" => Ok(decode_quoted_printable(wire)),
         _ => Ok((wire.to_vec(), true)),
     }
+}
+
+fn decode_base64(wire: &[u8]) -> (Vec<u8>, bool) {
+    let malformed = !well_formed_base64(wire);
+    if let Some(decoded) = mail_parser::decoders::base64::base64_decode(wire) {
+        return (decoded, malformed);
+    }
+
+    // The pinned decoder rejects an invalid byte wholesale. Keep the complete MIME quanta before
+    // that byte, which are independently decodable, and make the loss visible to the caller.
+    let complete = complete_base64_quanta(wire);
+    let recovered =
+        mail_parser::decoders::base64::base64_decode(&wire[..complete]).unwrap_or_default();
+    (recovered, true)
+}
+
+fn well_formed_base64(wire: &[u8]) -> bool {
+    let mut quartet = [0; 4];
+    let mut len = 0;
+    let mut padded = false;
+    for byte in wire.iter().copied() {
+        if byte.is_ascii_whitespace() {
+            continue;
+        }
+        if padded || !(base64_alphabet(byte) || byte == b'=') {
+            return false;
+        }
+        quartet[len] = byte;
+        len += 1;
+        if len == quartet.len() {
+            if !valid_base64_quartet(quartet) {
+                return false;
+            }
+            padded = quartet[2] == b'=' || quartet[3] == b'=';
+            len = 0;
+        }
+    }
+    len == 0
+}
+
+fn complete_base64_quanta(wire: &[u8]) -> usize {
+    let mut complete = 0;
+    let mut quartet = [0; 4];
+    let mut len = 0;
+    for (index, byte) in wire.iter().copied().enumerate() {
+        if byte.is_ascii_whitespace() {
+            continue;
+        }
+        if !(base64_alphabet(byte) || byte == b'=') {
+            break;
+        }
+        quartet[len] = byte;
+        len += 1;
+        if len == quartet.len() {
+            if !valid_base64_quartet(quartet) {
+                break;
+            }
+            complete = index + 1;
+            if quartet[2] == b'=' || quartet[3] == b'=' {
+                break;
+            }
+            len = 0;
+        }
+    }
+    complete
+}
+
+fn base64_alphabet(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/')
+}
+
+fn valid_base64_quartet(quartet: [u8; 4]) -> bool {
+    (quartet.iter().all(|byte| base64_alphabet(*byte)))
+        || (base64_alphabet(quartet[0])
+            && base64_alphabet(quartet[1])
+            && base64_alphabet(quartet[2])
+            && quartet[3] == b'='
+            && base64_value(quartet[2]).is_some_and(|value| value & 0b11 == 0))
+        || (base64_alphabet(quartet[0])
+            && base64_alphabet(quartet[1])
+            && quartet[2] == b'='
+            && quartet[3] == b'='
+            && base64_value(quartet[1]).is_some_and(|value| value & 0b1111 == 0))
+}
+
+fn base64_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
+}
+
+fn decode_quoted_printable(wire: &[u8]) -> (Vec<u8>, bool) {
+    let malformed = !well_formed_quoted_printable(wire);
+    if let Some(decoded) = mail_parser::decoders::quoted_printable::quoted_printable_decode(wire) {
+        return (decoded, malformed);
+    }
+
+    let prefix = quoted_printable_prefix_len(wire);
+    let recovered =
+        mail_parser::decoders::quoted_printable::quoted_printable_decode(&wire[..prefix])
+            .unwrap_or_default();
+    (recovered, true)
+}
+
+fn well_formed_quoted_printable(wire: &[u8]) -> bool {
+    quoted_printable_prefix_len(wire) == wire.len()
+}
+
+fn quoted_printable_prefix_len(wire: &[u8]) -> usize {
+    let mut index = 0;
+    while let Some(&byte) = wire.get(index) {
+        if byte != b'=' {
+            index += 1;
+            continue;
+        }
+        let Some(&next) = wire.get(index + 1) else {
+            break;
+        };
+        if next == b'\r' && wire.get(index + 2) == Some(&b'\n') {
+            index += 3;
+        } else if let Some(&last) = wire.get(index + 2) {
+            if next.is_ascii_hexdigit() && last.is_ascii_hexdigit() {
+                index += 3;
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    index
 }
 
 fn decode_charset(bytes: &[u8], charset: &str) -> (String, bool) {

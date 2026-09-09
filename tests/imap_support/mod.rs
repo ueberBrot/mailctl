@@ -112,6 +112,30 @@ pub async fn write<S: AsyncWrite + Unpin + ?Sized>(wire: &mut S, response: &str)
     wire.flush().await.unwrap();
 }
 
+pub async fn literal_bytes(
+    wire: &mut Wire,
+    section: &str,
+    offset: usize,
+    count: usize,
+    value: &[u8],
+) {
+    let tag = expect(
+        wire,
+        &format!("UID FETCH 4 (UID BODY.PEEK[{section}]<{offset}.{count}>)"),
+    )
+    .await;
+    write(
+        wire,
+        &format!(
+            "* 1 FETCH (UID 4 BODY[{section}]<{offset}> {{{}}}\r\n",
+            value.len()
+        ),
+    )
+    .await;
+    wire.write_all(value).await.unwrap();
+    write(wire, &format!(")\r\n{tag} OK fetched\r\n")).await;
+}
+
 /// Compare decoded command bodies, leaving tags and literal framing unconstrained.
 pub async fn expect<S: AsyncRead + AsyncWrite + Unpin + ?Sized>(
     wire: &mut S,
@@ -199,6 +223,17 @@ pub fn dedicated_fixture(
     limits: Limits,
     script: impl FnOnce(Wire) -> Script + Send + 'static,
 ) -> (ImapProbe, std::thread::JoinHandle<()>) {
+    let mut script = Some(script);
+    dedicated_sessions(mode, limits, 1, move |wire| script.take().unwrap()(wire))
+}
+
+/// Measure successive reads against the same endpoint without counting server allocations.
+pub fn dedicated_sessions(
+    mode: TlsMode,
+    limits: Limits,
+    sessions: usize,
+    script: impl FnMut(Wire) -> Script + Send + 'static,
+) -> (ImapProbe, std::thread::JoinHandle<()>) {
     let (send, receive) = std::sync::mpsc::sync_channel(1);
     let server = std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -206,7 +241,8 @@ pub fn dedicated_fixture(
             .build()
             .unwrap();
         runtime.block_on(async {
-            let Fixture { probe, task } = fixture(mode, limits, script).await;
+            let Fixture { probe, task } =
+                fixture_sessions(mode, limits, "127.0.0.1", sessions, script).await;
             send.send(probe).unwrap();
             task.await.unwrap();
         });

@@ -78,6 +78,13 @@ plaintext server output. The server runs on a separate thread; its allocations
 are excluded. The byte count is checked against actual server writes, independently
 of the production metrics. The transcript accepts no attachment payload request.
 
+The whole-message measurement reads exactly the default 2 MiB wire budget, then
+continues against the same endpoint. Each operation must stay below 32 MiB peak
+client allocation and 128 MiB total allocation. It checks parser/decoding work,
+16 KiB literal chunks, frame limits, and actual server output against the reported
+wire count. Oversized announcements and malformed whole-message responses fail
+with less than 2 MiB peak allocation and 4 KiB of server output.
+
 Run the proof with the pinned toolchain:
 
 ```sh
@@ -112,6 +119,7 @@ GreenMail 2.1.13 has several relevant differences from compliant transcripts:
   retrieval; its response cannot establish bytes that its own extraction discards.
 
 Malformed or unsupported structures fail explicitly. The pinned IMAP decoder also
-has a recursion ceiling below the configurable MIME maximum; the nesting regression
-records its effective boundary. The configurable maximum is a resource ceiling,
-not a claim that the backend accepts every MIME tree at that depth.
+accepts six multipart wrappers with a text leaf at depth seven; a seventh wrapper
+returns `Protocol`. Narrowing `max_nesting` to six rejects that depth-seven tree
+with `Limit`. The configurable maximum is a resource ceiling, not a claim that
+the backend accepts every MIME tree at that depth.

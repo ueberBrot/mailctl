@@ -4,7 +4,6 @@ mod imap_support;
 
 use imap_support::*;
 use mailctl::imap::{BodyRequest, Error, Limits, TlsMode};
-use tokio::io::AsyncWriteExt;
 
 const ROOT_HEADERS: &str =
     "MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=fixture\r\n\r\n";
@@ -12,6 +11,12 @@ const ROOT_HEADERS: &str =
 fn text_part(subtype: &str, size: usize, disposition: &str) -> String {
     format!(
         "(\"TEXT\" \"{subtype}\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" {size} 1 NIL {disposition} NIL NIL)"
+    )
+}
+
+fn transfer_text_part(transfer_encoding: &str, size: usize) -> String {
+    format!(
+        "(\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"{transfer_encoding}\" {size} 1 NIL NIL NIL NIL)"
     )
 }
 
@@ -24,24 +29,6 @@ async fn metadata(wire: &mut Wire, structure: &str, size: usize) {
         ),
     )
     .await;
-}
-
-async fn literal_bytes(wire: &mut Wire, section: &str, offset: usize, count: usize, value: &[u8]) {
-    let tag = expect(
-        wire,
-        &format!("UID FETCH 4 (UID BODY.PEEK[{section}]<{offset}.{count}>)"),
-    )
-    .await;
-    write(
-        wire,
-        &format!(
-            "* 1 FETCH (UID 4 BODY[{section}]<{offset}> {{{}}}\r\n",
-            value.len()
-        ),
-    )
-    .await;
-    wire.write_all(value).await.unwrap();
-    write(wire, &format!(")\r\n{tag} OK fetched\r\n")).await;
 }
 
 async fn complete_body(wire: &mut Wire, part: &str, value: &[u8]) {
@@ -339,6 +326,50 @@ async fn decoder_and_work_budgets_stop_after_the_selected_literal() {
                 .unwrap_err(),
             Error::Limit
         );
+        fixture.task.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn malformed_transfer_tails_keep_the_decoded_prefix_and_mark_replacement() {
+    for (transfer_encoding, wire, expected) in [
+        ("BASE64", b"SGVsbG8".as_slice(), "\u{fffd}Hel"),
+        ("BASE64", b"TQ=".as_slice(), "\u{fffd}M"),
+        ("BASE64", b"SGVs%G8=".as_slice(), "\u{fffd}Hel"),
+        ("BASE64", b"SGVsbG8=!".as_slice(), "\u{fffd}Hello"),
+        ("BASE64", b"Zh==".as_slice(), "\u{fffd}f"),
+        ("QUOTED-PRINTABLE", b"hello=".as_slice(), "\u{fffd}hello"),
+        ("QUOTED-PRINTABLE", b"hello=A".as_slice(), "\u{fffd}hello"),
+        ("QUOTED-PRINTABLE", b"hello=QZ".as_slice(), "\u{fffd}hello"),
+    ] {
+        let structure = format!(
+            "({} \"MIXED\" NIL NIL NIL NIL)",
+            transfer_text_part(transfer_encoding, wire.len())
+        );
+        let mut fixture = fixture(
+            TlsMode::Implicit,
+            Limits::default(),
+            move |mut wire_stream| {
+                Box::pin(async move {
+                    selected_prefix(&mut wire_stream, &structure, 100).await;
+                    complete_body(&mut wire_stream, "1", wire).await;
+                    logout(&mut wire_stream).await;
+                })
+            },
+        )
+        .await;
+        let page = fixture
+            .probe
+            .read_body(
+                "fixture",
+                "disposable-password",
+                "INBOX",
+                BodyRequest::new(4, 77),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.text, expected, "{transfer_encoding}/{wire:?}");
+        assert!(page.replacements, "{transfer_encoding}/{wire:?}");
         fixture.task.await.unwrap();
     }
 }

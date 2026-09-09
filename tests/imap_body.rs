@@ -3,7 +3,6 @@ mod imap_support;
 
 use imap_support::*;
 use mailctl::imap::{BodyRequest, Limits, TlsMode};
-use tokio::io::AsyncWriteExt;
 
 const ROOT_HEADERS: &str =
     "MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=fixture\r\n\r\n";
@@ -13,24 +12,6 @@ const LARGE_MIXED: &str = "((\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL 
 
 async fn literal(wire: &mut Wire, section: &str, offset: usize, count: usize, value: &str) {
     literal_bytes(wire, section, offset, count, value.as_bytes()).await;
-}
-
-async fn literal_bytes(wire: &mut Wire, section: &str, offset: usize, count: usize, value: &[u8]) {
-    let tag = expect(
-        wire,
-        &format!("UID FETCH 4 (UID BODY.PEEK[{section}]<{offset}.{count}>)"),
-    )
-    .await;
-    write(
-        wire,
-        &format!(
-            "* 1 FETCH (UID 4 BODY[{section}]<{offset}> {{{}}}\r\n",
-            value.len()
-        ),
-    )
-    .await;
-    wire.write_all(value).await.unwrap();
-    write(wire, &format!(")\r\n{tag} OK fetched\r\n")).await;
 }
 
 #[tokio::test]
@@ -109,13 +90,7 @@ fn mime(subtype: &str, charset: &str, encoding: &str) -> String {
     )
 }
 
-async fn selected_script(
-    wire: &mut Wire,
-    structure: &str,
-    part: Option<&str>,
-    _headers: &str,
-    body: &[u8],
-) {
+async fn selected_script(wire: &mut Wire, structure: &str, part: Option<&str>, body: &[u8]) {
     authenticate(wire).await;
     examine(wire).await;
     let tag = expect(wire, "UID FETCH 4 (UID RFC822.SIZE BODYSTRUCTURE)").await;
@@ -130,13 +105,12 @@ async fn selected_script(
 async fn read_selected(
     structure: String,
     part: Option<&str>,
-    headers: String,
     body: Vec<u8>,
 ) -> mailctl::imap::BodyPage {
     let part = part.map(str::to_owned);
     let mut fixture = fixture(TlsMode::Implicit, Limits::default(), move |mut wire| {
         Box::pin(async move {
-            selected_script(&mut wire, &structure, part.as_deref(), &headers, &body).await;
+            selected_script(&mut wire, &structure, part.as_deref(), &body).await;
         })
     })
     .await;
@@ -168,13 +142,7 @@ async fn alternatives_prefer_plain_while_mixed_uses_the_first_eligible_subtree()
     );
     let alternatives = format!("({html}{plain} \"ALTERNATIVE\" NIL NIL NIL NIL)");
     let structure = format!("({attachment}{alternatives}{plain} \"MIXED\" NIL NIL NIL NIL)");
-    let page = read_selected(
-        structure,
-        Some("2.2"),
-        mime("plain", "utf-8", "7bit"),
-        b"Hello".to_vec(),
-    )
-    .await;
+    let page = read_selected(structure, Some("2.2"), b"Hello".to_vec()).await;
     assert_eq!(page.text, "Hello");
     assert_eq!(page.selected_part.as_deref(), Some("2.2"));
     assert!(!page.converted);
@@ -182,7 +150,6 @@ async fn alternatives_prefer_plain_while_mixed_uses_the_first_eligible_subtree()
     let page = read_selected(
         format!("({html}{plain} \"MIXED\" NIL NIL NIL NIL)"),
         Some("1"),
-        mime("html", "utf-8", "7bit"),
         b"<p>Hello</p>".to_vec(),
     )
     .await;
@@ -198,7 +165,6 @@ async fn html_preserves_inert_link_targets_and_quotes_without_active_content() {
     let page = read_selected(
         format!("({html} \"ALTERNATIVE\" NIL NIL NIL NIL)"),
         Some("1"),
-        mime("html", "utf-8", "7bit"),
         body.to_vec(),
     )
     .await;
@@ -223,13 +189,7 @@ async fn related_uses_its_declared_root_and_falls_back_when_the_root_is_absent()
     for (root, part, body) in [("<second>", "2", "Second"), ("<missing>", "1", "First!")] {
         let body = if part == "1" { "First" } else { body };
         let structure = format!("({first}{second} \"RELATED\" (\"START\" \"{root}\") NIL NIL NIL)");
-        let page = read_selected(
-            structure,
-            Some(part),
-            mime("plain", "utf-8", "7bit"),
-            body.as_bytes().to_vec(),
-        )
-        .await;
+        let page = read_selected(structure, Some(part), body.as_bytes().to_vec()).await;
         assert_eq!(page.text, body);
         assert_eq!(page.selected_part.as_deref(), Some(part));
     }
@@ -245,7 +205,7 @@ async fn unsupported_and_attached_bodies_return_an_explicit_empty_representation
     let binary =
         "(\"APPLICATION\" \"OCTET-STREAM\" NIL NIL NIL \"BASE64\" 3000000 NIL NIL NIL NIL)";
     let structure = format!("({message}{attached}{binary} \"MIXED\" NIL NIL NIL NIL)");
-    let page = read_selected(structure, None, String::new(), vec![]).await;
+    let page = read_selected(structure, None, vec![]).await;
     assert_eq!(page.text, "");
     assert!(page.selected_part.is_none());
     assert!(page.source_media_type.is_none());
@@ -275,7 +235,6 @@ async fn decoding_preserves_plain_quotes_and_marks_malformed_data() {
         let page = read_selected(
             format!("({part} \"MIXED\" NIL NIL NIL NIL)"),
             Some("1"),
-            mime("plain", charset, encoding),
             body.to_vec(),
         )
         .await;
@@ -309,14 +268,7 @@ async fn continuation_reconstructs_utf8_text_and_rejects_changed_content() {
             let structure = structure.clone();
             let body = if session == 5 { "b🦀éxyz" } else { body };
             Box::pin(async move {
-                selected_script(
-                    &mut wire,
-                    &structure,
-                    Some("1"),
-                    &mime("plain", "utf-8", "8bit"),
-                    body.as_bytes(),
-                )
-                .await;
+                selected_script(&mut wire, &structure, Some("1"), body.as_bytes()).await;
             })
         },
     )

@@ -27,19 +27,7 @@ async fn metadata(wire: &mut Wire, response: &str) {
 }
 
 async fn literal(wire: &mut Wire, section: &str, offset: usize, count: usize, value: &str) {
-    let tag = expect(
-        wire,
-        &format!("UID FETCH 4 (UID BODY.PEEK[{section}]<{offset}.{count}>)"),
-    )
-    .await;
-    write(
-        wire,
-        &format!(
-            "* 1 FETCH (UID 4 BODY[{section}]<{offset}> {{{}}}\r\n{value})\r\n{tag} OK fetched\r\n",
-            value.len()
-        ),
-    )
-    .await;
+    literal_bytes(wire, section, offset, count, value.as_bytes()).await;
 }
 
 async fn successful_large_attachment_route(wire: &mut Wire, size: u32) {
@@ -369,6 +357,143 @@ fn selected_body_allocations_do_not_follow_attachment_metadata_size() {
         peaks.push(allocations.bytes_max);
     }
     assert!(peaks[0].abs_diff(peaks[1]) < 512 * 1024, "{peaks:?}");
+}
+
+#[test]
+fn whole_message_budget_and_continuation_have_measured_finite_costs() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let limits = Limits::default();
+    let size = limits.max_body_wire_bytes;
+    let body_size = size - TEXT_HEADERS.len();
+    let server_bytes = Arc::new(AtomicUsize::new(0));
+    let counted = server_bytes.clone();
+    let (mut probe, server) = dedicated_sessions(
+        TlsMode::Implicit,
+        limits.clone(),
+        2,
+        move |wire| {
+            counted.fetch_add(b"* OK synthetic server ready\r\n".len(), Ordering::Relaxed);
+            let mut wire: Wire = Box::new(CountedWire {
+                wire,
+                written: counted.clone(),
+            });
+            Box::pin(async move {
+                authenticate(&mut wire).await;
+                examine(&mut wire).await;
+                metadata(&mut wire, &format!("* 1 FETCH (UID 4 RFC822.SIZE {size} BODYSTRUCTURE (\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" {body_size} 1 NIL NIL NIL NIL))\r\n{{tag}} OK fetched\r\n")).await;
+                literal(&mut wire, "HEADER", 0, 16384, TEXT_HEADERS).await;
+                let whole = format!("{TEXT_HEADERS}{}", "x".repeat(body_size));
+                for offset in (0..size).step_by(16384) {
+                    literal(&mut wire, "", offset, 16384, &whole[offset..offset + 16384]).await;
+                }
+                literal(&mut wire, "", size, 1, "").await;
+                logout(&mut wire).await;
+            })
+        },
+    );
+    let mut request = BodyRequest::new(4, 77);
+    let mut observed_bytes = 0;
+    for _ in 0..2 {
+        let allocations = allocation_counter::measure(|| {
+            runtime.block_on(async {
+                let page = probe
+                    .read_body("fixture", "disposable-password", "INBOX", request.clone())
+                    .await
+                    .unwrap();
+                assert_eq!(page.text.len(), limits.max_text_bytes);
+                assert!(page.text.bytes().all(|byte| byte == b'x'));
+                assert_eq!(page.metrics.decoded_bytes, body_size);
+                assert!(page.metrics.decode_steps > body_size);
+                assert!(page.metrics.decode_steps <= limits.max_decode_steps);
+                assert!(page.metrics.parser_steps <= limits.max_parser_steps);
+                assert!(page.metrics.max_literal_bytes <= 16384);
+                assert!(page.metrics.max_response_bytes <= limits.max_response_bytes);
+                assert!(page.metrics.wire_bytes < size + 64 * 1024);
+                observed_bytes += page.metrics.wire_bytes;
+                request.continuation = page.continuation;
+                assert!(request.continuation.is_some());
+            });
+        });
+        assert!(allocations.bytes_max < 32 * 1024 * 1024, "{allocations:?}");
+        assert!(
+            allocations.bytes_total < 128 * 1024 * 1024,
+            "{allocations:?}"
+        );
+    }
+    server.join().unwrap();
+    assert_eq!(observed_bytes, server_bytes.load(Ordering::Relaxed));
+}
+
+#[test]
+fn whole_message_oversized_and_malformed_literals_fail_with_bounded_allocations() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    for oversized in [true, false] {
+        let server_bytes = Arc::new(AtomicUsize::new(b"* OK synthetic server ready\r\n".len()));
+        let counted = server_bytes.clone();
+        let (mut probe, server) = dedicated_fixture(
+            TlsMode::Implicit,
+            Limits::default(),
+            move |wire| {
+                let mut wire: Wire = Box::new(CountedWire {
+                    wire,
+                    written: counted,
+                });
+                Box::pin(async move {
+                    authenticate(&mut wire).await;
+                    examine(&mut wire).await;
+                    let size = TEXT_HEADERS.len() + 5;
+                    metadata(&mut wire, &format!("* 1 FETCH (UID 4 RFC822.SIZE {size} BODYSTRUCTURE (\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" 5 1 NIL NIL NIL NIL))\r\n{{tag}} OK fetched\r\n")).await;
+                    literal(&mut wire, "HEADER", 0, 16384, TEXT_HEADERS).await;
+                    expect(
+                        &mut wire,
+                        &format!("UID FETCH 4 (UID BODY.PEEK[]<0.{}>)", size + 1),
+                    )
+                    .await;
+                    if oversized {
+                        write(&mut wire, "* 1 FETCH (UID 4 BODY[]<0> {4294967295}\r\n").await;
+                    } else {
+                        write(&mut wire, "* 1 FETCH (UID 4 BODY[]<1> NIL)\r\n").await;
+                    }
+                    dropped(&mut wire).await;
+                })
+            },
+        );
+        let allocations = allocation_counter::measure(|| {
+            runtime.block_on(async {
+                let error = probe
+                    .read_body(
+                        "fixture",
+                        "disposable-password",
+                        "INBOX",
+                        BodyRequest::new(4, 77),
+                    )
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    error,
+                    if oversized {
+                        Error::Limit
+                    } else {
+                        Error::Protocol
+                    }
+                );
+            })
+        });
+        server.join().unwrap();
+        assert!(server_bytes.load(Ordering::Relaxed) < 4096);
+        assert!(probe.metrics().max_literal_bytes <= TEXT_HEADERS.len());
+        assert!(allocations.bytes_max < 2 * 1024 * 1024, "{allocations:?}");
+        assert!(
+            allocations.bytes_total < 16 * 1024 * 1024,
+            "{allocations:?}"
+        );
+    }
 }
 
 /// Measures actual server writes independently of the production counters.
