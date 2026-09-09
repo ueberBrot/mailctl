@@ -5,6 +5,8 @@ mod imap_support;
 #[path = "native_support/server.rs"]
 mod server;
 mod support;
+#[path = "native_support/terminal.rs"]
+mod terminal;
 
 use security_framework::os::macos::keychain::{CreateOptions, SecKeychain};
 use std::{
@@ -308,25 +310,7 @@ fn provision(installation: &Installation, executable: &str, alias: &str, secret:
         "command": [executable, "--config", installation.config().to_str().unwrap(), "--account", alias, "credential", "set"],
         "secret": secret,
     });
-    let mut child = Command::new("python3")
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/native_support/terminal.py"
-        ))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("start bounded PTY fixture");
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(request.to_string().as_bytes())
-        .unwrap();
-    let output = child.wait_with_output().expect("reap terminal fixture");
-    assert!(output.status.success(), "terminal fixture failed");
-    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let result = terminal::run(request);
     assert_private_output(result["output"].as_str().unwrap().as_bytes());
     assert_eq!(
         result["secret_disclosed"], false,

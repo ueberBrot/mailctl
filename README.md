@@ -22,4 +22,8 @@ for available commands.
 
 [Configure credentials, check authentication, and rotate passwords](docs/credentials.md).
 
+Native Keychain acceptance runs in a dedicated macOS CI job. Its ignored local
+test requires a disposable macOS user: it temporarily selects a test Keychain,
+uses synthetic passwords, and restores the original preferences during cleanup.
+
 [ISC License](LICENSE).

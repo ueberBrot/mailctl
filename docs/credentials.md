@@ -26,6 +26,14 @@ credential bytes remain in Keychain. Its state gives each account a stable UUID.
 Both components use the service name `mailctl` and that UUID to find the
 credential. Keep the configuration and state together.
 
+New entries allow applications running under the same macOS login to retrieve
+the credential from an unlocked Keychain. This permits both executables to work
+after relocation or rebuild. During explicit provisioning, mailctl uses
+`/usr/bin/security` to create an empty entry with those permissions, then writes
+the password through the native library. Password bytes never enter that
+command's arguments or output. Existing entries keep their access permissions.
+Unlock the selected Keychain before provisioning a new entry.
+
 Credential commands are operator administration. `--account` selects from all
 configured accounts. `--grant` scopes email operations and `doctor`; it does not
 authorize or restrict credential commands.
@@ -48,8 +56,9 @@ An explicit check selects one authorized account, resolves its credential,
 authenticates over verified TLS, and disconnects. It does not open or change a
 mailbox. The result includes `authentication.checked_at` in Unix seconds and an
 `outcome` of `authenticated` or `failed`; a failed outcome includes a categorized
-error. A completed diagnostic can report `status: degraded`. Use the
-authentication outcome to determine whether an account works. A failed check still
+error. A completed diagnostic reports `status: degraded` when a source needs
+attention or an explicit authentication check fails. Use the authentication
+outcome to determine whether an account works. A failed check still
 returns this diagnostic and exits with the failed outcome's categorized error code.
 
 Source availability and authentication answer different questions:
@@ -116,7 +125,8 @@ source; Windows-hosted WSL requires the Windows execution identity's store and
 Windows executables.
 
 Access grants govern mailctl requests. They are not an ACL for the login's
-Keychain: an unrestricted application running as the same macOS login can access
-these credentials if macOS permits it. A deployment that isolates credentials
+Keychain: other applications running as the same macOS login can read entries
+provisioned by mailctl while that Keychain is unlocked. A deployment that isolates
+credentials
 from callers requires separate qualification; this embedded setup makes no such
 isolation guarantee.

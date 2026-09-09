@@ -2,7 +2,7 @@
 use super::Service;
 use crate::{
     authentication::{self, Runtime},
-    config::{AccountConfig, CredentialSource, Topology},
+    config::{AccountConfig, Topology},
     credentials::{self, SecretSource},
     domain::{
         AuthenticationCheck, AuthenticationOutcome, CredentialFailure, Doctor, DoctorAccount,
@@ -71,31 +71,6 @@ impl Service {
             Topology::WindowsHostedWsl => result.prerequisites.push(
                 "Windows-hosted WSL requires Windows executables and the Windows execution identity's credential store".into()),
         }
-        for account in &accounts {
-            let prerequisite = match account.credential {
-                CredentialSource::Native {} if !cfg!(target_os = "macos") => {
-                    Some("Native credential resolution in this build requires macOS")
-                }
-                CredentialSource::Native {} => None,
-                CredentialSource::Systemd { .. } => Some(
-                    "Systemd credentials need provisioning for the execution identity; source resolution is unavailable in this build",
-                ),
-                CredentialSource::Command { .. } => Some(
-                    "Trusted credential commands need a provisioned helper; source execution is unavailable in this build",
-                ),
-                CredentialSource::Session {} => {
-                    Some("Foreground session credential resolution is unavailable in this build")
-                }
-            };
-            if let Some(prerequisite) = prerequisite
-                && !result
-                    .prerequisites
-                    .iter()
-                    .any(|entry| entry == prerequisite)
-            {
-                result.prerequisites.push(prerequisite.into());
-            }
-        }
         // Reserve a fixed upper bound for each safe status before source work.
         if accounts.len().saturating_mul(1024).saturating_add(1024) > context.response_limit() {
             return Err(Error::new(ErrorCode::ResponseTooLarge));
@@ -103,6 +78,14 @@ impl Service {
         let runtime = self.authentication().await?;
         for configured in accounts {
             let account = self.authentication_account(configured)?;
+            if let Some(prerequisite) = account.source.prerequisite()
+                && !result
+                    .prerequisites
+                    .iter()
+                    .any(|entry| entry == prerequisite)
+            {
+                result.prerequisites.push(prerequisite.into());
+            }
             let source = runtime
                 .inspect_with_limits(
                     account.id,
@@ -112,6 +95,18 @@ impl Service {
                 )
                 .await
                 .map_err(authentication_error)?;
+            if matches!(
+                source,
+                credentials::Availability::Missing
+                    | credentials::Availability::Locked
+                    | credentials::Availability::AccessDenied
+                    | credentials::Availability::Unavailable
+                    | credentials::Availability::InteractionRequired
+            ) {
+                // Local administration remains usable even when an account's
+                // credential source needs attention. This is not authentication.
+                result.status = "degraded".into();
+            }
             let authentication = if check_account {
                 let outcome = match runtime.doctor(&account, &grant.limits).await {
                     Ok(()) => AuthenticationOutcome::Authenticated,
@@ -149,13 +144,14 @@ impl Service {
     async fn authentication(&self) -> Result<&Runtime, Error> {
         self.authentication
             .get_or_try_init(|| async {
-                let roots = tokio::task::spawn_blocking(|| {
+                let roots = tokio::task::spawn_blocking(|| -> Result<_, Error> {
+                    credentials::prepare_native_access().map_err(credential_error)?;
                     let mut roots = RootCertStore::empty();
                     roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
-                    roots
+                    Ok(roots)
                 })
                 .await
-                .map_err(|_| Error::new(ErrorCode::InternalError))?;
+                .map_err(|_| Error::new(ErrorCode::InternalError))??;
                 Runtime::new(self.config.limits.clone(), roots).map_err(authentication_error)
             })
             .await

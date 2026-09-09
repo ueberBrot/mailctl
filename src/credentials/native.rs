@@ -7,7 +7,9 @@ use security_framework::{
 };
 use std::{
     collections::HashMap,
+    process::{Command, Stdio},
     sync::{Arc, OnceLock},
+    time::{Duration, Instant},
 };
 use uuid::Uuid;
 use zeroize::Zeroize;
@@ -23,21 +25,14 @@ impl NativeSource {
         SOURCE
             .get_or_init(|| {
                 Arc::new(Self {
-                    store: Store::new().map_err(source_error),
+                    store: disable_interaction().and_then(|()| Store::new().map_err(source_error)),
                 })
             })
             .clone()
     }
 
     fn store(&self) -> Result<&Store, SourceError> {
-        // This process-wide guard is retained until exit. Per-call guards would
-        // re-enable prompts while another credential worker was still running.
-        static NONINTERACTIVE: OnceLock<Result<KeychainUserInteractionLock, SourceError>> =
-            OnceLock::new();
-        NONINTERACTIVE
-            .get_or_init(|| SecKeychain::disable_user_interaction().map_err(platform_error))
-            .as_ref()
-            .map_err(|error| *error)?;
+        disable_interaction()?;
         self.store.as_deref().map_err(|error| *error)
     }
 
@@ -81,6 +76,9 @@ impl SecretSource for NativeSource {
 
 impl MutableSecretStore for NativeSource {
     fn set(&self, account: Uuid, secret: &Secret) -> Result<(), SourceError> {
+        if self.availability(account) == Availability::Missing {
+            create_shared_entry(account)?;
+        }
         self.entry(account)?
             .set_secret(secret.expose().as_bytes())
             .map_err(source_error)
@@ -90,6 +88,58 @@ impl MutableSecretStore for NativeSource {
         self.entry(account)?
             .delete_credential()
             .map_err(source_error)
+    }
+}
+
+/// Must precede every in-process Keychain operation, including TLS trust loading.
+pub(super) fn disable_interaction() -> Result<(), SourceError> {
+    // Retained until process exit. Dropping a per-call guard would allow another
+    // credential worker or trust-store enumeration to open a dialog.
+    static NONINTERACTIVE: OnceLock<Result<KeychainUserInteractionLock, SourceError>> =
+        OnceLock::new();
+    NONINTERACTIVE
+        .get_or_init(|| SecKeychain::disable_user_interaction().map_err(platform_error))
+        .as_ref()
+        .map(|_| ())
+        .map_err(|error| *error)
+}
+
+fn create_shared_entry(account: Uuid) -> Result<(), SourceError> {
+    // Create only empty metadata with the cooperative same-login access policy.
+    // Password bytes enter Keychain through keyring-core afterward. Omitting -U
+    // makes a concurrent creator fail safely without changing an existing ACL.
+    let mut child = Command::new("/usr/bin/security")
+        .args([
+            "add-generic-password",
+            "-A",
+            "-s",
+            SERVICE_NAME,
+            "-a",
+            &account.to_string(),
+            "-w",
+            "",
+        ])
+        .env_clear()
+        .current_dir("/")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| SourceError::Unavailable)?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(_)) => return Err(SourceError::Unavailable),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(SourceError::Unavailable);
+            }
+        }
     }
 }
 

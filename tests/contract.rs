@@ -60,7 +60,7 @@ async fn doctor_separates_safe_source_status_from_explicit_rate_limited_authenti
     let service = Service::in_memory(config).unwrap();
     let context = service.context("reader", &Narrowing::default()).unwrap();
     let local = service.doctor(&context, false).await.unwrap();
-    assert_eq!(local.status, "ready");
+    assert_eq!(local.status, "degraded");
     assert_eq!(local.topology, "native");
     assert_eq!(local.accounts.len(), 1);
     assert_eq!(
@@ -68,9 +68,17 @@ async fn doctor_separates_safe_source_status_from_explicit_rate_limited_authenti
         SourceAvailability::InteractionRequired
     );
     assert!(local.accounts[0].authentication.is_none());
+    assert_eq!(
+        local.prerequisites,
+        ["Foreground session credential resolution is unavailable in this build"]
+    );
 
     let checked = service.doctor(&context, true).await.unwrap();
     assert_eq!(checked.status, "degraded");
+    assert_eq!(
+        checked.accounts[0].source,
+        SourceAvailability::InteractionRequired
+    );
     let check = checked.accounts[0].authentication.as_ref().unwrap();
     assert!(check.checked_at > 1_700_000_000);
     let AuthenticationOutcome::Failed { error } = &check.outcome else {
@@ -114,14 +122,10 @@ async fn doctor_rejects_foreign_contexts_and_denied_accounts_before_source_or_pr
             },
         )
         .unwrap();
-    assert!(
-        service
-            .doctor(&denied, false)
-            .await
-            .unwrap()
-            .accounts
-            .is_empty()
-    );
+    let hidden = service.doctor(&denied, false).await.unwrap();
+    assert!(hidden.accounts.is_empty());
+    assert!(hidden.prerequisites.is_empty());
+    assert_eq!(hidden.status, "ready");
     assert_eq!(
         service.doctor(&denied, true).await.unwrap_err().code,
         ErrorCode::AccountNotAllowed

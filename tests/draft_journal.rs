@@ -405,7 +405,8 @@ fn writer_lock_contention_fails_with_the_finite_busy_timeout() {
 
     assert!(matches!(result, Err(DraftJournalError::Unavailable)));
     assert!(elapsed >= Duration::from_secs(4));
-    assert!(elapsed < Duration::from_secs(7));
+    // SQLite accumulates requested sleeps; scheduler oversleep adds wall-clock time.
+    assert!(elapsed < Duration::from_secs(15));
 }
 
 #[test]

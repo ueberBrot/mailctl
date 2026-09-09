@@ -13,6 +13,14 @@ pub use native::NativeSource;
 pub const SERVICE_NAME: &str = "mailctl";
 pub const MAX_SECRET_BYTES: usize = 64 * 1024;
 
+/// Suppress native dialogs before credential or TLS trust-store access.
+pub(crate) fn prepare_native_access() -> Result<(), SourceError> {
+    #[cfg(target_os = "macos")]
+    return native::disable_interaction();
+    #[cfg(not(target_os = "macos"))]
+    Ok(())
+}
+
 /// Owned authentication material. Debug output contains no secret bytes.
 ///
 /// Secret values cannot enter a serialized result:
@@ -99,6 +107,10 @@ impl From<SourceError> for Availability {
 
 /// Blocking operations run on the application's bounded credential workers.
 pub trait SecretSource: Send + Sync {
+    /// Safe provisioning or platform requirements, without inspecting the source.
+    fn prerequisite(&self) -> Option<&'static str> {
+        None
+    }
     /// Inspects metadata without authentication, secret retrieval, or prompting.
     fn availability(&self, account: Uuid) -> Availability;
     fn resolve(&self, account: Uuid) -> Result<Secret, SourceError>;
@@ -116,10 +128,18 @@ pub trait MutableSecretStore: Send + Sync {
 pub fn source_for(source: &CredentialSource) -> Arc<dyn SecretSource> {
     match source {
         CredentialSource::Native {} => native_source(),
-        CredentialSource::Session {} => Arc::new(DeferredSource(SourceError::InteractionRequired)),
-        CredentialSource::Systemd { .. } | CredentialSource::Command { .. } => {
-            Arc::new(DeferredSource(SourceError::Unavailable))
-        }
+        CredentialSource::Session {} => Arc::new(DeferredSource {
+            failure: SourceError::InteractionRequired,
+            prerequisite: "Foreground session credential resolution is unavailable in this build",
+        }),
+        CredentialSource::Systemd { .. } => Arc::new(DeferredSource {
+            failure: SourceError::Unavailable,
+            prerequisite: "Systemd credentials need provisioning for the execution identity; source resolution is unavailable in this build",
+        }),
+        CredentialSource::Command { .. } => Arc::new(DeferredSource {
+            failure: SourceError::Unavailable,
+            prerequisite: "Trusted credential commands need a provisioned helper; source execution is unavailable in this build",
+        }),
     }
 }
 
@@ -130,18 +150,28 @@ fn native_source() -> Arc<dyn SecretSource> {
 
 #[cfg(not(target_os = "macos"))]
 fn native_source() -> Arc<dyn SecretSource> {
-    Arc::new(DeferredSource(SourceError::Unavailable))
+    Arc::new(DeferredSource {
+        failure: SourceError::Unavailable,
+        prerequisite: "Native credential resolution in this build requires macOS",
+    })
 }
 
 // Platform qualification and external-source execution belong to later slices.
-struct DeferredSource(SourceError);
+struct DeferredSource {
+    failure: SourceError,
+    prerequisite: &'static str,
+}
 
 impl SecretSource for DeferredSource {
+    fn prerequisite(&self) -> Option<&'static str> {
+        Some(self.prerequisite)
+    }
+
     fn availability(&self, _: Uuid) -> Availability {
-        self.0.into()
+        self.failure.into()
     }
 
     fn resolve(&self, _: Uuid) -> Result<Secret, SourceError> {
-        Err(self.0)
+        Err(self.failure)
     }
 }

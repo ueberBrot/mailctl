@@ -1,17 +1,9 @@
 #![cfg(all(target_os = "macos", feature = "cli"))]
 
 mod support;
-
-use std::{
-    io::Write,
-    process::{Command, Stdio},
-};
+#[path = "native_support/terminal.rs"]
+mod terminal;
 use support::{Installation, MAILCTL, assert_success, run_bounded};
-
-const TERMINAL: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/native_support/terminal.py"
-);
 
 #[test]
 fn credential_prompt_restores_echo_after_invalid_input_and_cancellation() {
@@ -66,22 +58,7 @@ fn assert_prompt(installation: &Installation, request: serde_json::Value, exit: 
             "set",
         ]),
     );
-    let mut child = Command::new("python3")
-        .arg(TERMINAL)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("start terminal fixture");
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(serde_json::to_string(&request).unwrap().as_bytes())
-        .unwrap();
-    let output = child.wait_with_output().expect("collect terminal fixture");
-    assert!(output.status.success(), "terminal fixture failed");
-    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let result = terminal::run(serde_json::Value::Object(request));
     assert_eq!(result["exit"], exit, "fixture output: {}", result["output"]);
     assert_eq!(result["prompted"], true);
     assert_eq!(result["echo_enabled"], true);

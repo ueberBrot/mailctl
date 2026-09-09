@@ -71,3 +71,8 @@ jobs:
           persist-credentials: false
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f  # v2.0.0
       - run: cargo test --locked --test native_credentials -- --ignored --test-threads=1
+      - name: Record native acceptance artifacts
+        run: |
+          sw_vers
+          uname -m
+          shasum -a 256 target/debug/mailctl target/debug/mailctl-mcp

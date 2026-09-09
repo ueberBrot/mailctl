@@ -212,6 +212,7 @@ impl<'a> Connection<'a> {
                     self.append_write(mime).await?;
                 }
                 ImapCoroutineState::Yielded(ImapMessageAppendStreamYield::WantsRead) => {
+                    self.flush().await?;
                     frame = Some(self.frame().await?);
                     if matches!(
                         self.metrics.append_outcome,
@@ -241,6 +242,10 @@ impl<'a> Connection<'a> {
             .write_all(bytes)
             .await
             .map_err(|_| Error::Transport)
+    }
+    async fn flush(&mut self) -> Result<(), Error> {
+        // TLS may accept plaintext while retaining ciphertext; reads do not flush it.
+        self.stream.flush().await.map_err(|_| Error::Transport)
     }
     pub async fn drive<C, T, E>(&mut self, mut coroutine: C) -> Result<T, Error>
     where
@@ -281,6 +286,7 @@ impl<'a> Connection<'a> {
                         .map_err(|_| Error::Transport)?;
                 }
                 ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
+                    self.flush().await?;
                     let mut received = self.frame().await?;
                     while self.command.needs_logout_completion() {
                         let next = self.frame().await?;
