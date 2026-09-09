@@ -30,14 +30,20 @@ It does not download a payload to learn its name. Unsafe or oversized filenames
 are omitted. Declared sizes are hints; actual bytes remain subject to transfer
 and framing limits.
 
+The proof lists single parts with an explicit attachment disposition, including
+an attached message as one whole part. Embedded message structures still consume
+the MIME limits; their nested attachments are not listed separately. Inferred
+attachments, inline resources, and multipart attachment envelopes are outside
+this metadata qualification.
+
 ## Transfer contract
 
-Each result contains raw decoded bytes, their decoded offset, completion status,
-and an optional continuation. Only a final result contains the total byte count
-and SHA-256 of the complete decoded payload. A result may contain fewer bytes
+Each result contains raw decoded bytes, their decoded offset, and an
+`AttachmentProgress` outcome: `Continue` carries the next continuation; `Complete`
+carries the total byte count and SHA-256 of the complete decoded payload. A result may contain fewer bytes
 than the configured chunk size, including zero bytes while an encoding spans
-wire chunks or while a final request establishes EOF. Continue until `complete`
-is true.
+wire chunks or while a final request establishes EOF. Continue until the outcome
+is `Complete`.
 
 Supported transfer encodings are base64, quoted-printable, 7bit, and 8bit.
 Base64 and quoted-printable preserve arbitrary decoded bytes, including NUL.
@@ -46,7 +52,8 @@ need a separately proved IMAP BINARY/literal8 route. Unknown encodings also fail
 before payload retrieval.
 
 The incremental decoder preserves base64 quartets and quoted-printable escapes
-and soft line breaks across fetches. Malformed encodings fail explicitly instead
+and soft line breaks across fetches. It removes quoted-printable transport padding
+while retaining explicitly encoded whitespace. Malformed encodings fail explicitly instead
 of substituting attachment bytes. Payloads are never opened, interpreted as text,
 unpacked, or executed.
 
@@ -57,7 +64,10 @@ the expected UIDVALIDITY on its exclusive connection, including when enough
 decoded bytes are already buffered. A mismatch fails before returning those bytes.
 Public session/grant-bound tokens are separate application work.
 
-Completed, cancelled, and failed transfers release their decoder state. Idle
+Completed, cancelled, and failed transfers release their decoder state, including
+resumes rejected during local input validation. Dropping a continuation also
+releases its issuing slot, including after rejection by another probe. The absolute transfer deadline
+also bounds authentication, fetches, and cleanup. Idle
 transfers hold no connection. Expired entries are removed on the next attachment
 operation; an expired continuation returns `TransferExpired`. Dropping a probe
 releases all its entries. Dropping an in-flight read disposes of the connection
@@ -73,8 +83,10 @@ and its removed or newly created transfer state.
 | Transfer lifetime | 5 minutes | 10 minutes |
 | Retained transfers per probe | 2 | 4 |
 
-Each call fetches at most one 16 KiB slice, narrowed by the literal, frame, and
-remaining transfer budgets. At the exact wire limit, a one-byte request must
+Each call fills a decoded chunk through PEEK slices of at most 16 KiB, narrowed
+by the literal, frame, and remaining transfer budgets. It returns an available
+prefix at a clean command boundary when another maximum response pair would
+approach the operation budget. At the exact wire limit, a one-byte request must
 prove EOF; receiving another byte fails. A short response proves EOF independently
 of the declared size. Both encoded and decoded limits apply throughout a transfer.
 
@@ -83,12 +95,15 @@ deadline limits also apply. Decoding work accumulates across continuations under
 `max_decode_steps`. Metrics expose operation wire/parser counters and cumulative
 transfer payload, decoded bytes, decoding work, and retained decoder state.
 The allocation suite measures the client separately from the fixture server and
-compares reported wire bytes with independently counted server writes.
+compares reported wire bytes with independently counted server writes. For each
+supported decoder, it transfers 64 KiB and 1 MiB fixtures while requiring peak
+client allocation below 512 KiB. The client retains only the current chunk.
 
 ## Reproduce the evidence
 
 ```sh
-cargo test --locked --test imap_attachment --test imap_attachment_bounds --test imap_attachment_allocations -- --nocapture
+cargo test --locked --test imap_attachment --test imap_attachment_bounds --test imap_attachment_allocations --test imap_attachment_decoding --test imap_attachment_types -- --nocapture
+cargo test --locked --doc
 cargo test --locked --test greenmail --features docker-tests
 ```
 
@@ -97,3 +112,15 @@ GreenMail additionally needs Docker and OpenSSL. Its independent observers compa
 message contents, UIDVALIDITY, UIDs, and seen/unseen flags before and after reads.
 The existing component CI matrix includes all transcript and allocation tests;
 the required Docker job includes the GreenMail proof.
+
+Local acceptance passed on macOS 26.6.2, arm64, with Rust 1.98.1 and the pinned
+GreenMail image in [the fixture reference](../tests/specs/README.md).
+`cargo test --locked --workspace --all-features` passed, including GreenMail and
+the ownership compile-fail fixtures. Formatting, all-feature Clippy, repository
+dependency policy, cargo-deny, and separate CLI-only/MCP-only typechecks passed.
+
+For the 1 MiB+13-byte decoded fixtures, measured peak client allocations were
+125,226 bytes for 8bit, 176,681 bytes for base64, and 155,730 bytes for
+quoted-printable. Listing a declared 4,294,967,295-byte attachment used 547 wire
+bytes and 26,579 bytes of peak client allocation. These are local measurements;
+the executable ceilings above remain the regression gates.

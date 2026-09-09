@@ -1,4 +1,4 @@
-use super::{Error, Limits, Metrics, TlsMode, body::Fetch as BodyFetch, projection::Projection};
+use super::{Error, Limits, Metrics, TlsMode, fetch::Fetch as BodyFetch, projection::Projection};
 use io_imap::{
     codec::{
         CommandCodec, ResponseCodec,
@@ -64,6 +64,9 @@ impl<'a> Connection<'a> {
             command: CommandState::greeting(),
             uid_validity: None,
         })
+    }
+    pub(super) fn metrics_mut(&mut self) -> &mut Metrics {
+        self.metrics
     }
     pub fn metrics(&self) -> Metrics {
         *self.metrics

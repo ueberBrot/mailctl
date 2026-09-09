@@ -3,19 +3,16 @@
 mod attachment_support;
 mod imap_support;
 
-use attachment_support::{metadata, payload_session, structure};
+use attachment_support::{continuation, metadata, payload_session, structure};
 use imap_support::*;
-use mailctl::imap::{AttachmentListRequest, AttachmentRequest, Limits, TlsMode};
-use sha2::{Digest, Sha256};
-use std::{
-    pin::Pin,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
-    task::{Context, Poll},
+use mailctl::imap::{
+    AttachmentListRequest, AttachmentProgress, AttachmentRequest, Limits, TlsMode,
 };
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use sha2::{Digest, Sha256};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 const GREETING: &[u8] = b"* OK synthetic server ready\r\n";
 const WIRE_SLICE: usize = 16 * 1024;
@@ -112,7 +109,10 @@ fn full_attachment_transfers_have_payload_independent_memory_and_bounded_counter
     };
     let cases = [
         (Encoding::Raw, 64 * 1024 + 13),
-        (Encoding::Base64, 256 * 1024 + 13),
+        (Encoding::Raw, 1024 * 1024 + 13),
+        (Encoding::Base64, 64 * 1024 + 13),
+        (Encoding::Base64, 1024 * 1024 + 13),
+        (Encoding::QuotedPrintable, 64 * 1024 + 13),
         (Encoding::QuotedPrintable, 1024 * 1024 + 13),
     ];
     let mut peaks = Vec::new();
@@ -124,7 +124,7 @@ fn full_attachment_transfers_have_payload_independent_memory_and_bounded_counter
             0,
             "fixture must prove EOF without an extra request"
         );
-        let sessions = payload.len().div_ceil(WIRE_SLICE);
+        let sessions = decoded_len.div_ceil(DECODED_CHUNK);
         let payload_len = payload.len();
         let source: Arc<[u8]> = payload.into();
         let position = Arc::new(AtomicUsize::new(0));
@@ -190,14 +190,14 @@ fn full_attachment_transfers_have_payload_independent_memory_and_bounded_counter
                         encoding.name(),
                         chunk.metrics
                     );
-                    if chunk.complete {
+                    if let AttachmentProgress::Complete(integrity) = chunk.progress {
                         assert_eq!(
-                            chunk.total_decoded_bytes,
-                            Some(expected_len),
+                            integrity.total_decoded_bytes,
+                            expected_len,
                             "{}",
                             encoding.name()
                         );
-                        assert_eq!(chunk.sha256, Some(expected_digest), "{}", encoding.name());
+                        assert_eq!(integrity.sha256, expected_digest, "{}", encoding.name());
                         assert_eq!(
                             chunk.metrics.transfer_wire_bytes,
                             payload_len,
@@ -221,9 +221,7 @@ fn full_attachment_transfers_have_payload_independent_memory_and_bounded_counter
                         break;
                     }
                     assert_eq!(chunk.metrics.active_transfers, 1, "{}", encoding.name());
-                    request = AttachmentRequest::resume(
-                        chunk.continuation.expect("incomplete transfer token"),
-                    );
+                    request = AttachmentRequest::resume(continuation(chunk));
                 }
             });
         });
@@ -262,7 +260,7 @@ fn full_attachment_transfers_have_payload_independent_memory_and_bounded_counter
             encoding.name()
         );
         assert!(
-            allocations.bytes_max < 4 * 1024 * 1024,
+            allocations.bytes_max < 512 * 1024,
             "{}: {allocations:?}",
             encoding.name()
         );
@@ -286,7 +284,7 @@ fn full_attachment_transfers_have_payload_independent_memory_and_bounded_counter
         peaks.push(allocations.bytes_max);
     }
     assert!(
-        peaks.iter().all(|peak| *peak < 4 * 1024 * 1024),
+        peaks.iter().all(|peak| *peak < 512 * 1024),
         "payload growth must not grow peak client allocation: {peaks:?}"
     );
 }
@@ -344,48 +342,4 @@ fn huge_declared_attachment_metadata_never_allocates_a_payload() {
         allocations.bytes_max,
         allocations.bytes_total,
     );
-}
-
-/// Counts bytes independently at the synthetic server's decrypted write boundary.
-struct CountedWire {
-    wire: Wire,
-    written: Arc<AtomicUsize>,
-}
-
-impl AsyncRead for CountedWire {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-        buffer: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.wire).poll_read(context, buffer)
-    }
-}
-
-impl AsyncWrite for CountedWire {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-        bytes: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        let result = Pin::new(&mut self.wire).poll_write(context, bytes);
-        if let Poll::Ready(Ok(count)) = &result {
-            self.written.fetch_add(*count, Ordering::Relaxed);
-        }
-        result
-    }
-
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.wire).poll_flush(context)
-    }
-
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.wire).poll_shutdown(context)
-    }
 }

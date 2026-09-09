@@ -3,19 +3,17 @@ mod attachment_support;
 #[allow(dead_code)]
 mod imap_support;
 
+use attachment_support::{continuation, metadata};
 use imap_support::*;
-use mailctl::imap::{AttachmentListRequest, AttachmentRequest, Error, Limits, TlsMode};
+use mailctl::imap::{
+    AttachmentListRequest, AttachmentProgress, AttachmentRequest, Error, Limits, TlsMode,
+};
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
 
 const MIXED: &str = "((\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" 13 1 NIL NIL NIL NIL)(\"APPLICATION\" \"OCTET-STREAM\" NIL NIL NIL \"BASE64\" 3000000 NIL (\"ATTACHMENT\" (\"FILENAME\" \"large.bin\")) NIL NIL) \"MIXED\" (\"BOUNDARY\" \"fixture\") NIL NIL NIL)";
-
-async fn metadata(wire: &mut Wire, structure: &str) {
-    let tag = expect(wire, "UID FETCH 4 (UID RFC822.SIZE BODYSTRUCTURE)").await;
-    write(wire, &format!("* 1 FETCH (UID 4 RFC822.SIZE 3000300 BODYSTRUCTURE {structure})\r\n{tag} OK fetched\r\n")).await;
-}
 
 #[tokio::test]
 async fn supported_encodings_preserve_bytes_across_wire_and_decoded_chunk_boundaries() {
@@ -30,11 +28,7 @@ async fn supported_encodings_preserve_bytes_across_wire_and_decoded_chunk_bounda
         ("8BIT", b"Hello, world!", b"Hello, world!"),
     ];
     for &(encoding, payload, expected) in cases {
-        let chunks = if matches!(encoding, "BASE64" | "QUOTED-PRINTABLE") {
-            5
-        } else {
-            4
-        };
+        let chunks = 4;
         let position = Arc::new(AtomicUsize::new(0));
         let observed = position.clone();
         let mut session = 0;
@@ -77,24 +71,22 @@ async fn supported_encodings_preserve_bytes_across_wire_and_decoded_chunk_bounda
             assert!(chunk.metrics.max_literal_bytes <= 5);
             bytes.extend(&chunk.bytes);
             if chunk_number + 1 == chunks {
-                assert!(chunk.complete);
-                assert!(chunk.continuation.is_none());
-                assert_eq!(chunk.total_decoded_bytes, Some(13));
+                let AttachmentProgress::Complete(integrity) = chunk.progress else {
+                    panic!("expected completion");
+                };
+                assert_eq!(integrity.total_decoded_bytes, 13);
                 // SHA-256 of the independent fixture text, not of client output.
                 assert_eq!(
-                    chunk.sha256,
-                    Some([
+                    integrity.sha256,
+                    [
                         0x31, 0x5f, 0x5b, 0xdb, 0x76, 0xd0, 0x78, 0xc4, 0x3b, 0x8a, 0xc0, 0x06,
                         0x4e, 0x4a, 0x01, 0x64, 0x61, 0x2b, 0x1f, 0xce, 0x77, 0xc8, 0x69, 0x34,
                         0x5b, 0xfc, 0x94, 0xc7, 0x58, 0x94, 0xed, 0xd3,
-                    ])
+                    ]
                 );
                 break;
             }
-            assert!(!chunk.complete);
-            assert!(chunk.sha256.is_none());
-            assert!(chunk.total_decoded_bytes.is_none());
-            request = AttachmentRequest::resume(chunk.continuation.unwrap());
+            request = AttachmentRequest::resume(continuation(chunk));
         }
         assert_eq!(bytes, expected, "{encoding}");
         assert_eq!(observed.load(Ordering::Relaxed), payload.len());
@@ -167,7 +159,7 @@ async fn binary_attachment_preserves_nul_high_bytes_and_line_endings() {
             b"\0\xff\r\nx"
         };
         assert_eq!(chunk.bytes, expected, "{encoding}");
-        assert!(chunk.complete);
+        assert!(matches!(chunk.progress, AttachmentProgress::Complete(_)));
         fixture.task.await.unwrap();
     }
 }

@@ -1,8 +1,11 @@
 //! Deterministic MIME body selection and bounded text rendering.
 
-use super::super::{Error, Limits};
+use super::super::{
+    Error, Limits,
+    mime::{attachment, child_path, imap_text, validate_structure},
+};
 use io_imap::types::{
-    body::{Body, BodyStructure, Disposition, SpecificFields},
+    body::{Body, BodyStructure, SpecificFields},
     core::IString,
     fetch::Part,
 };
@@ -169,39 +172,6 @@ pub(super) fn render(selected: &Selected, wire: &[u8], limits: &Limits) -> Resul
     })
 }
 
-/// Count the complete server-provided structure before selection cuts off attached-message and
-/// attachment subtrees. Those subtrees are ineligible for rendering, but still consume the MIME
-/// structure budget.
-fn validate_structure(structure: &BodyStructure<'_>, limits: &Limits) -> Result<(), Error> {
-    fn visit(
-        structure: &BodyStructure<'_>,
-        limits: &Limits,
-        parts: &mut usize,
-        depth: usize,
-    ) -> Result<(), Error> {
-        *parts = parts.checked_add(1).ok_or(Error::Limit)?;
-        if *parts > limits.max_mime_parts || depth > limits.max_nesting {
-            return Err(Error::Limit);
-        }
-        match structure {
-            BodyStructure::Single { body, .. } => {
-                if let SpecificFields::Message { body_structure, .. } = &body.specific {
-                    visit(body_structure, limits, parts, depth + 1)?;
-                }
-            }
-            BodyStructure::Multi { bodies, .. } => {
-                for body in bodies.as_ref() {
-                    visit(body, limits, parts, depth + 1)?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    let mut parts = 0;
-    visit(structure, limits, &mut parts, 1)
-}
-
 fn select_part(
     structure: &BodyStructure<'_>,
     path: Option<&Part>,
@@ -340,14 +310,6 @@ fn structure_content_id<'a>(structure: &'a BodyStructure<'_>) -> Result<Option<&
         .transpose()
 }
 
-fn attachment(disposition: Option<&Disposition<'_>>) -> bool {
-    disposition
-        .and_then(|disposition| disposition.disposition.as_ref())
-        .is_some_and(|(kind, _)| {
-            imap_text(kind).is_ok_and(|kind| kind.eq_ignore_ascii_case("attachment"))
-        })
-}
-
 fn parameter<'a>(
     parameters: &'a [(IString<'_>, IString<'_>)],
     wanted: &str,
@@ -358,20 +320,6 @@ fn parameter<'a>(
         }
     }
     Ok(None)
-}
-
-fn imap_text<'a>(value: &'a IString<'_>) -> Result<&'a str, Error> {
-    std::str::from_utf8(value.as_ref()).map_err(|_| Error::Protocol)
-}
-
-fn child_path(parent: Option<&Part>, child: usize) -> Result<Part, Error> {
-    let child =
-        NonZeroU32::new(u32::try_from(child).map_err(|_| Error::Limit)?).ok_or(Error::Limit)?;
-    let mut parts = parent.map_or_else(Vec::new, |parent| parent.0.as_ref().to_vec());
-    parts.push(child);
-    Ok(Part(
-        parts.try_into().expect("child makes the path nonempty"),
-    ))
 }
 
 fn first(candidates: &mut [(Part, Option<Selected>)]) -> Option<Selected> {

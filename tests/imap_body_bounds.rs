@@ -4,15 +4,10 @@ mod imap_support;
 
 use imap_support::*;
 use mailctl::imap::{BodyRequest, Error, Limits, TlsMode};
-use std::{
-    pin::Pin,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
-    task::{Context, Poll},
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
 };
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 const ROOT_HEADERS: &str =
     "MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=fixture\r\n\r\n";
@@ -493,45 +488,5 @@ fn whole_message_oversized_and_malformed_literals_fail_with_bounded_allocations(
             allocations.bytes_total < 16 * 1024 * 1024,
             "{allocations:?}"
         );
-    }
-}
-
-/// Measures actual server writes independently of the production counters.
-struct CountedWire {
-    wire: Wire,
-    written: Arc<AtomicUsize>,
-}
-impl AsyncRead for CountedWire {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-        buffer: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.wire).poll_read(context, buffer)
-    }
-}
-impl AsyncWrite for CountedWire {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-        bytes: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        let result = Pin::new(&mut self.wire).poll_write(context, bytes);
-        if let Poll::Ready(Ok(count)) = &result {
-            self.written.fetch_add(*count, Ordering::Relaxed);
-        }
-        result
-    }
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.wire).poll_flush(context)
-    }
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.wire).poll_shutdown(context)
     }
 }

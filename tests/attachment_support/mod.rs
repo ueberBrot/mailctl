@@ -7,6 +7,13 @@ use std::sync::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+pub fn continuation(chunk: mailctl::imap::AttachmentChunk) -> mailctl::imap::AttachmentTransfer {
+    let mailctl::imap::AttachmentProgress::Continue(token) = chunk.progress else {
+        panic!("expected an incomplete attachment transfer");
+    };
+    token
+}
+
 pub fn structure(encoding: &str, size: usize) -> String {
     format!(
         "((\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" 5 1 NIL NIL NIL NIL)(\"APPLICATION\" \"OCTET-STREAM\" NIL NIL NIL \"{encoding}\" {size} NIL (\"ATTACHMENT\" (\"FILENAME\" \"fixture.bin\")) NIL NIL) \"MIXED\" NIL NIL NIL NIL)"

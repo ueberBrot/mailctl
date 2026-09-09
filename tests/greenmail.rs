@@ -206,7 +206,8 @@ fn imap_body_reads_selected_text_without_downloading_a_large_attachment() {
 fn imap_attachment_listing_and_chunks_preserve_exact_base64_decoded_data() {
     greenmail_support::run(async {
         use mailctl::imap::{
-            AttachmentListRequest, AttachmentRequest, Error, ImapProbe, Limits, TlsMode,
+            AttachmentListRequest, AttachmentProgress, AttachmentRequest, Error, ImapProbe, Limits,
+            TlsMode,
         };
         use sha2::{Digest, Sha256};
         use std::time::Duration;
@@ -273,12 +274,10 @@ fn imap_attachment_listing_and_chunks_preserve_exact_base64_decoded_data() {
                 ),
             )
             .await?;
-        assert!(!cancelled.complete);
-        probe.cancel_attachment(
-            cancelled
-                .continuation
-                .expect("incomplete attachment has a transfer"),
-        )?;
+        let AttachmentProgress::Continue(cancelled) = cancelled.progress else {
+            panic!("expected continuation");
+        };
+        probe.cancel_attachment(cancelled)?;
         assert_eq!(probe.metrics().active_transfers, 0);
 
         let mut request = AttachmentRequest::new(
@@ -305,21 +304,17 @@ fn imap_attachment_listing_and_chunks_preserve_exact_base64_decoded_data() {
             let end = received.len() + chunk.bytes.len();
             assert_eq!(chunk.bytes, expected[received.len()..end]);
             received.extend_from_slice(&chunk.bytes);
-            if chunk.complete {
+            if let AttachmentProgress::Complete(integrity) = chunk.progress {
                 assert_eq!(received.len(), expected.len());
-                assert!(chunk.continuation.is_none());
-                assert_eq!(chunk.total_decoded_bytes, Some(expected.len() as u64));
-                assert_eq!(chunk.sha256, Some(expected_digest));
-                final_digest = chunk.sha256;
+                assert_eq!(integrity.total_decoded_bytes, expected.len() as u64);
+                assert_eq!(integrity.sha256, expected_digest);
+                final_digest = Some(integrity.sha256);
                 break;
             }
-            assert!(chunk.total_decoded_bytes.is_none());
-            assert!(chunk.sha256.is_none());
-            request = AttachmentRequest::resume(
-                chunk
-                    .continuation
-                    .expect("incomplete attachment has a transfer"),
-            );
+            let AttachmentProgress::Continue(token) = chunk.progress else {
+                unreachable!();
+            };
+            request = AttachmentRequest::resume(token);
         }
         assert_eq!(received, expected);
         assert_eq!(final_digest, Some(Sha256::digest(&received).into()));
@@ -348,9 +343,9 @@ fn imap_attachment_listing_and_chunks_preserve_exact_base64_decoded_data() {
                 ),
             )
             .await?;
-        let expired = incomplete
-            .continuation
-            .expect("large attachment requires a continuation");
+        let AttachmentProgress::Continue(expired) = incomplete.progress else {
+            panic!("expected continuation");
+        };
         tokio::time::sleep(Duration::from_millis(1100)).await;
         assert!(matches!(
             expiring_probe

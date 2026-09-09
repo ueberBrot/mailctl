@@ -1,12 +1,17 @@
 //! Bounded, read-only IMAP route proof. Each operation owns and disposes its connection.
+mod attachment;
 mod body;
+mod fetch;
+mod mime;
 mod projection;
 mod wire;
 
-pub use body::{
-    AttachmentChunk, AttachmentList, AttachmentListRequest, AttachmentMetadata, AttachmentRequest,
-    AttachmentTransfer, BodyCursor, BodyPage, BodyRequest,
+pub use attachment::{
+    AttachmentChunk, AttachmentIntegrity, AttachmentList, AttachmentListRequest,
+    AttachmentMetadata, AttachmentProgress, AttachmentRequest, AttachmentTransfer,
 };
+
+pub use body::{BodyCursor, BodyPage, BodyRequest};
 
 use io_imap::{
     rfc3501::{
@@ -246,7 +251,7 @@ pub struct ImapProbe {
     tls: Arc<rustls::ClientConfig>,
     limits: Limits,
     metrics: Metrics,
-    transfers: body::TransferStore,
+    transfers: attachment::TransferStore,
 }
 impl ImapProbe {
     pub fn new(
@@ -274,12 +279,15 @@ impl ImapProbe {
             tls: Arc::new(tls),
             limits,
             metrics: Metrics::default(),
-            transfers: body::TransferStore::default(),
+            transfers: attachment::TransferStore::default(),
         })
     }
     /// Last progress snapshot, including a failed or cancelled operation.
     pub fn metrics(&self) -> Metrics {
-        self.metrics
+        Metrics {
+            active_transfers: self.transfers.active_count(),
+            ..self.metrics
+        }
     }
     /// A probe permits one operation at a time, including while its future is suspended.
     ///
