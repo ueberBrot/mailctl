@@ -100,6 +100,8 @@ impl Qualification {
         );
         assert_success(&installed, "install isolated gateway");
         fixture.installed = true;
+        let plist = fs::read_to_string(PLIST).unwrap().replace("</dict>\n</plist>", "<key>StandardErrorPath</key><string>/var/db/mailctl-isolated/diagnostic.log</string>\n</dict>\n</plist>");
+        fs::write(PLIST, plist).unwrap();
         fixture
     }
 
@@ -457,6 +459,14 @@ impl Qualification {
 
 impl Drop for Qualification {
     fn drop(&mut self) {
+        if let Ok(log) = fs::read_to_string("/var/db/mailctl-isolated/diagnostic.log") {
+            for line in log
+                .lines()
+                .filter(|line| line.starts_with("[DEBUG-keychain]"))
+            {
+                eprintln!("{line}");
+            }
+        }
         if let Some((certificate, fingerprint)) = self.trusted_certificate.take() {
             cleanup_command(command("/usr/bin/security").args([
                 "remove-trusted-cert",

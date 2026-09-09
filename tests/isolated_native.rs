@@ -103,6 +103,23 @@ async fn isolated_launchd_qualification_uses_disposable_identities_and_a_real_na
         "the unassigned account is inaccessible to the isolated caller"
     );
 
+    assert_service_authentication(&fixture, &provider);
+
+    eprintln!("native isolation: verify IPC bounds, substitution, and restart");
+    assert_bounded_malformed_and_exhausted_sessions(&fixture);
+    assert_mapped_grant_limits(&fixture);
+    assert_wrong_service_peer_is_rejected(&fixture);
+    fixture.restart();
+    assert_eq!(
+        eventually_listed_accounts(&fixture)["result"],
+        cli["result"],
+        "restart retains the installation"
+    );
+    assert_service_authentication(&fixture, &provider);
+    provider.finish();
+}
+
+fn assert_service_authentication(fixture: &Qualification, provider: &server::NativeServer) {
     provider.expect("work@isolated.example.test", WORK_SECRET);
     let doctor = bounded(
         fixture
@@ -122,18 +139,6 @@ async fn isolated_launchd_qualification_uses_disposable_identities_and_a_real_na
         doctor["result"]["accounts"][0]["authentication"]["outcome"]["status"], "authenticated",
         "doctor uses the service identity's native Keychain credential"
     );
-
-    eprintln!("native isolation: verify IPC bounds, substitution, and restart");
-    assert_bounded_malformed_and_exhausted_sessions(&fixture);
-    assert_mapped_grant_limits(&fixture);
-    assert_wrong_service_peer_is_rejected(&fixture);
-    fixture.restart();
-    assert_eq!(
-        eventually_listed_accounts(&fixture)["result"],
-        cli["result"],
-        "restart retains the installation"
-    );
-    provider.finish();
 }
 
 fn operator_setup(fixture: &Qualification, alias: &str, username: &str) {
