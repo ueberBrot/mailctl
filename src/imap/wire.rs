@@ -188,10 +188,8 @@ impl<'a> Connection<'a> {
                         self.metrics.append_outcome,
                         Some(AppendOutcome::Created { .. } | AppendOutcome::Rejected)
                     ) {
-                        // The guarded response is authoritative before any further coroutine
-                        // work, cleanup, or optional reference lookup can fail.
-                        self.step(1)?;
-                        let _ = coroutine.resume(&mut self.fragmentizer, frame.as_deref());
+                        // The guarded response is authoritative; the connection is disposed
+                        // without further coroutine work or optional reference lookup.
                         return Ok(());
                     }
                 }

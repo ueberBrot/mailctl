@@ -62,7 +62,7 @@ fn streamed_append_keeps_backend_allocations_independent_of_mime_size() {
 }
 
 #[test]
-fn composition_allocations_stay_within_reserved_mime_and_bounded_input() {
+fn composition_reuses_normalized_body_within_reserved_mime() {
     for bytes in [16 * 1024, 1024 * 1024] {
         let mut input = input();
         input.body = "é\n".repeat(bytes / 3);
@@ -75,7 +75,7 @@ fn composition_allocations_stay_within_reserved_mime_and_bounded_input() {
             measured.bytes_max, measured.bytes_total, measured.count_total
         );
         assert!(
-            measured.bytes_max <= 2 * 1024 * 1024 + bytes as u64 * 8 + 128 * 1024,
+            measured.bytes_total <= 2 * 1024 * 1024 + 128 * 1024,
             "{measured:?}"
         );
     }

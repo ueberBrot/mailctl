@@ -232,7 +232,7 @@ impl DraftJournal {
         }
         transaction.commit().map_err(unavailable)?;
         Ok(PersistedDraftOperation {
-            operation: operation.clone(),
+            operation: persisted.operation,
             state: DraftOperationState::InFlight,
         })
     }
@@ -389,31 +389,23 @@ fn schema_is_current(connection: &Connection) -> Result<bool, DraftJournalError>
     let mut statement = connection
         .prepare("PRAGMA table_info(draft_operations)")
         .map_err(unavailable)?;
-    let columns = statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, i64>(5)?,
-            ))
-        })
-        .map_err(unavailable)?;
-    let columns = columns
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(unavailable)?;
-    Ok(columns.len() == expected.len()
-        && columns.iter().zip(expected).all(
-            |(
-                (name, ty, not_null, primary_key),
-                (expected_name, expected_ty, expected_not_null, expected_primary_key),
-            )| {
-                name == expected_name
-                    && ty.eq_ignore_ascii_case(expected_ty)
-                    && *not_null == expected_not_null
-                    && *primary_key == expected_primary_key
-            },
-        ))
+    let mut columns = statement.query([]).map_err(unavailable)?;
+    for (name, ty, not_null, primary_key) in expected {
+        let Some(column) = columns.next().map_err(unavailable)? else {
+            return Ok(false);
+        };
+        if column.get::<_, String>(1).map_err(unavailable)? != name
+            || !column
+                .get::<_, String>(2)
+                .map_err(unavailable)?
+                .eq_ignore_ascii_case(ty)
+            || column.get::<_, i64>(3).map_err(unavailable)? != not_null
+            || column.get::<_, i64>(5).map_err(unavailable)? != primary_key
+        {
+            return Ok(false);
+        }
+    }
+    Ok(columns.next().map_err(unavailable)?.is_none())
 }
 
 fn read_by_identity(
@@ -505,7 +497,6 @@ fn validate_operation(operation: &PreparedDraftOperation) -> Result<(), DraftJou
     if operation.mailbox_identity.is_empty() || operation.mailbox_identity.chars().count() > 4096 {
         return Err(DraftJournalError::InvalidOperation);
     }
-    sqlite_generation(operation.identity.account_generation)?;
     Ok(())
 }
 

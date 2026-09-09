@@ -269,6 +269,25 @@ fn frozen_composition_preserves_bcc_body_and_reply_metadata_with_exact_size_limi
 }
 
 #[test]
+fn composition_normalizes_line_endings_without_changing_frozen_mime() {
+    for (body, normalized) in [
+        ("", ""),
+        ("é\nsecond\n", "é\nsecond\n"),
+        ("é\r\nsecond\r\n", "é\nsecond\n"),
+        ("é\rsecond\r", "é\nsecond\n"),
+        ("é\r\r\nsecond\n\r", "é\n\nsecond\n\n"),
+    ] {
+        let mut input = input();
+        input.body = body.into();
+        let draft = PreparedDraft::compose(input.clone(), 1024 * 1024).unwrap();
+        input.body = normalized.into();
+        let expected = PreparedDraft::compose(input, 1024 * 1024).unwrap();
+        assert_eq!(draft.bytes(), expected.bytes());
+        assert_eq!(draft.sha256(), expected.sha256());
+    }
+}
+
+#[test]
 fn composition_bounds_recipient_count_subject_body_and_header_injection() {
     let mut accepted = input();
     accepted.to = vec!["reader@example.test".into(); 100];
@@ -297,6 +316,9 @@ fn composition_bounds_recipient_count_subject_body_and_header_injection() {
         "victim@example.test\r\nBcc: other@example.test",
         "missing-at",
         "two@@example.test",
+        ".local@example.test",
+        "local.@example.test",
+        "local..part@example.test",
     ] {
         let mut invalid = input();
         invalid.from = value.into();

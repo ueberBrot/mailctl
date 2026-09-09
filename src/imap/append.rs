@@ -58,7 +58,11 @@ impl PreparedDraft {
         {
             return Err(Error::InvalidInput);
         }
-        let normalized = input.body.replace("\r\n", "\n").replace('\r', "\n");
+        let normalized = if input.body.contains('\r') {
+            input.body.replace("\r\n", "\n").replace('\r', "\n")
+        } else {
+            input.body
+        };
         let mut builder = MessageBuilder::new()
             .from(input.from)
             .subject(input.subject)
@@ -116,14 +120,8 @@ fn address(value: &str) -> Result<(), Error> {
     let Some((local, domain)) = value.split_once('@') else {
         return Err(Error::InvalidInput);
     };
-    if local.is_empty()
-        || local.len() > 64
-        || local.starts_with('.')
-        || local.ends_with('.')
-        || local.contains("..")
-        || !local
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b".!#$%&'*+-/=?^_`{|}~".contains(&b))
+    if local.len() > 64
+        || !dot_atom(local)
         || domain.is_empty()
         || !domain.split('.').all(|label| {
             !label.is_empty()
@@ -146,18 +144,18 @@ fn identifier(value: &str) -> Result<(), Error> {
     let Some((left, right)) = value.split_once('@') else {
         return Err(Error::InvalidInput);
     };
-    let dot_atom = |part: &str| {
-        part.split('.').all(|atom| {
-            !atom.is_empty()
-                && atom.bytes().all(|byte| {
-                    byte.is_ascii_alphanumeric() || b"!#$%&'*+-/=?^_`{|}~".contains(&byte)
-                })
-        })
-    };
     if !dot_atom(left) || !dot_atom(right) {
         return Err(Error::InvalidInput);
     }
     Ok(())
+}
+fn dot_atom(value: &str) -> bool {
+    value.split('.').all(|atom| {
+        !atom.is_empty()
+            && atom
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-/=?^_`{|}~".contains(&byte))
+    })
 }
 struct BoundedMime {
     bytes: Vec<u8>,

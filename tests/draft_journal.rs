@@ -337,6 +337,26 @@ fn refusing_an_unknown_schema_preserves_it_before_pragmas_can_mutate_it() {
 }
 
 #[test]
+fn schema_validation_rejects_missing_extra_and_renamed_columns() {
+    for change in [
+        "ALTER TABLE draft_operations DROP COLUMN content_sha256",
+        "ALTER TABLE draft_operations ADD COLUMN unexpected TEXT",
+        "ALTER TABLE draft_operations RENAME COLUMN mailbox_identity TO target",
+    ] {
+        let temporary = TemporaryJournal::new();
+        DraftJournal::open(&temporary.path).unwrap();
+        let connection = Connection::open(&temporary.path).unwrap();
+        connection.execute_batch(change).unwrap();
+        drop(connection);
+
+        assert!(matches!(
+            DraftJournal::open(&temporary.path),
+            Err(DraftJournalError::InvalidDatabase)
+        ));
+    }
+}
+
+#[test]
 fn invalid_persisted_uid_identity_is_refused() {
     let temporary = TemporaryJournal::new();
     let operation = operation(Uuid::new_v4(), 1, Uuid::new_v4(), 13);
