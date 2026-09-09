@@ -199,16 +199,10 @@ impl Qualification {
     /// Unlock the disposable fixture keychain in the broker's launchd session.
     pub(crate) fn unlock_broker_keychain(&self, keychain: &Path) {
         let broker_pid = self.launchd_pid().to_string();
-        let service_uid = format!("#{}", self.service_uid);
         let keychain = keychain.to_str().expect("UTF-8 fixture keychain path");
         let output = bounded(command("/bin/launchctl").args([
             "bsexec",
             &broker_pid,
-            "/usr/bin/sudo",
-            "-H",
-            "-u",
-            &service_uid,
-            "--",
             "/usr/bin/security",
             "unlock-keychain",
             "-p",
