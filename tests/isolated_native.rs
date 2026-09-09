@@ -72,8 +72,8 @@ async fn isolated_launchd_qualification_uses_disposable_identities_and_a_real_na
     );
 
     eprintln!("native isolation: start launchd and verify protected resources");
+    fixture.unlock_service_keychain_context(&keychain);
     fixture.start();
-    fixture.unlock_broker_keychain(&keychain);
     assert_deployment_identity(&fixture, &keychain);
     record_environment(&fixture);
     assert_caller_cannot_mutate_protected_assets(&fixture, &keychain, &work_account);
@@ -111,7 +111,6 @@ async fn isolated_launchd_qualification_uses_disposable_identities_and_a_real_na
     assert_mapped_grant_limits(&fixture);
     assert_wrong_service_peer_is_rejected(&fixture);
     fixture.restart();
-    fixture.unlock_broker_keychain(&keychain);
     assert_eq!(
         eventually_listed_accounts(&fixture)["result"],
         cli["result"],

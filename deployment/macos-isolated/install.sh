@@ -225,7 +225,10 @@ install_artifact mailctl-mcp
 /usr/bin/install -o root -g wheel -m 0644 "$ROUTE_TEMP" "$ROUTE_PATH"
 /bin/chmod -N "$ROUTE_PATH"
 
-/usr/bin/sed "s|__SERVICE_USER__|$SERVICE_USER|g" "$PLIST_TEMPLATE" >"$PLIST_TEMP"
+/usr/bin/sed \
+  -e "s|__SERVICE_USER__|$SERVICE_USER|g" \
+  -e "s|__SERVICE_UID__|$SERVICE_UID|g" \
+  "$PLIST_TEMPLATE" >"$PLIST_TEMP"
 /usr/bin/plutil -lint "$PLIST_TEMP" >/dev/null || die 'generated launchd plist is invalid'
 /usr/bin/install -o root -g wheel -m 0644 "$PLIST_TEMP" "$PLIST_PATH"
 /bin/chmod -N "$PLIST_PATH"

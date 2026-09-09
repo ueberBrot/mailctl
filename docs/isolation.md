@@ -113,14 +113,24 @@ the service identity, and restart it to apply changes.
 
 ## Start and use the selected mode
 
-Start the explicitly provisioned service:
+Unlock the dedicated Keychain in the service user's launchctl context, then start
+the explicitly provisioned service:
 
 ```sh
+service_uid=$(/usr/bin/id -u mailctl_service)
+sudo /bin/launchctl asuser "$service_uid" /usr/bin/security unlock-keychain \
+  /var/db/mailctl-isolated/service.keychain-db
 sudo deployment/macos-isolated/service.sh start
 ```
 
-The installed launchd job runs in its own security audit session under the
-service identity. It starts at boot and restarts after process failure.
+Enter the Keychain password at the terminal prompt. Keychain unlock state belongs
+to a security session: unlocking during credential provisioning alone does not
+unlock it for launchd. The installed job uses the same service user's launchctl
+context and runs under the unprivileged service identity.
+
+The job starts at boot and restarts after process failure. Repeat the explicit
+unlock after boot or when the Keychain locks. A broker process restart retains
+the shared launchctl context and does not itself require another unlock.
 Use `service.sh restart` after an administrative change and `service.sh stop`
 to stop it. A locked or unavailable Keychain produces a credential error;
 serving never prompts to unlock it.

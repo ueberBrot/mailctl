@@ -6,12 +6,13 @@
   <string>org.ueberbrot.mailctl-isolated</string>
   <key>ProgramArguments</key>
   <array>
+    <string>/bin/launchctl</string>
+    <string>asuser</string>
+    <string>__SERVICE_UID__</string>
     <string>/Library/PrivilegedHelperTools/org.ueberbrot.mailctl/mailctl-isolated</string>
   </array>
   <key>UserName</key>
   <string>__SERVICE_USER__</string>
-  <key>SessionCreate</key>
-  <true/>
   <key>EnvironmentVariables</key>
   <dict>
     <key>HOME</key>

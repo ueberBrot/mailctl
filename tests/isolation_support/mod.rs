@@ -196,35 +196,13 @@ impl Qualification {
             .expect("numeric service UID")
     }
 
-    /// Unlock the disposable fixture keychain in the broker's launchd session.
-    pub(crate) fn unlock_broker_keychain(&self, keychain: &Path) {
-        let broker_pid = self.launchd_pid().to_string();
-        for output in [
-            bounded(command("/bin/launchctl").args(["procinfo", &broker_pid])),
-            bounded(command("/bin/launchctl").args([
-                "asuser",
-                "0",
-                "/bin/sh",
-                "-c",
-                "/bin/launchctl procinfo \"$$\"",
-            ])),
-        ] {
-            for line in String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .filter(|line| {
-                    line.contains("audit")
-                        || line.contains("bootstrap")
-                        || line.contains("session")
-                        || line.contains("uid")
-                })
-            {
-                eprintln!("[DEBUG-keychain] context {line}");
-            }
-        }
+    /// Unlock the disposable fixture keychain in the service user's launch context.
+    pub(crate) fn unlock_service_keychain_context(&self, keychain: &Path) {
+        let service_uid = self.service_uid.to_string();
         let keychain = keychain.to_str().expect("UTF-8 fixture keychain path");
         let output = bounded(command("/bin/launchctl").args([
             "asuser",
-            "0",
+            &service_uid,
             "/usr/bin/security",
             "unlock-keychain",
             "-p",
@@ -233,7 +211,7 @@ impl Qualification {
         ]));
         assert_success(
             &output,
-            "unlock disposable keychain in the broker launchd session",
+            "unlock disposable keychain in the service launch context",
         );
     }
 
