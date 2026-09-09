@@ -2,7 +2,7 @@
 
 This reference records the backend proof for [issue #4](https://github.com/ueberBrot/mailctl/issues/4),
 under [the parent contract](https://github.com/ueberBrot/mailctl/issues/1) and
-[ADR-0004](adr/0004-read-bodies-independently-of-attachments.md).
+[ADR-0004](../../docs/adr/0004-read-bodies-independently-of-attachments.md).
 `ImapProbe::read_body` exercises the route directly. CLI/MCP reading and authenticated
 public continuation tokens remain separate delivery work in #11 and #13.
 
@@ -97,7 +97,7 @@ mail; they do not use operator credentials. Shared transcript tests run in the
 existing CLI/MCP component CI matrix. The existing required Docker job includes
 the GreenMail proof. Local acceptance was run on macOS 26.6.2, arm64, Rust 1.98.1,
 with the pinned native-arm64 GreenMail image recorded in
-[the fixture reference](../tests/specs/README.md).
+[the fixture reference](../specs/README.md).
 
 ## Pinned server constraints
 

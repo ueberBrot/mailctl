@@ -114,7 +114,7 @@ The existing component CI matrix includes all transcript and allocation tests;
 the required Docker job includes the GreenMail proof.
 
 Local acceptance passed on macOS 26.6.2, arm64, with Rust 1.98.1 and the pinned
-GreenMail image in [the fixture reference](../tests/specs/README.md).
+GreenMail image in [the fixture reference](../specs/README.md).
 `cargo test --locked --workspace --all-features` passed, including GreenMail and
 the ownership compile-fail fixtures. Formatting, all-feature Clippy, repository
 dependency policy, cargo-deny, and separate CLI-only/MCP-only typechecks passed.

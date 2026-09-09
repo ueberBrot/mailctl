@@ -59,7 +59,7 @@ also leaves recovery work; it does not establish rejection.
 This adapter proves storage transitions. SQLite transactions do not coordinate
 the network effect across independent processes. The application workflow must
 hold the account writer lock through inspection, dispatch, and outcome recording,
-as required by [ADR-0002](adr/0002-coordinate-draft-creation.md).
+as required by [ADR-0002](../../docs/adr/0002-coordinate-draft-creation.md).
 
 The journal retains identity, original target, hashes, and outcome metadata.
 Composition input remains with the caller; credentials and message content are
@@ -120,7 +120,7 @@ through the administrative interface. A separate non-mutating IMAP observer chec
 the Draft flag, UID identity, unchanged existing messages, and unchanged INBOX.
 Only disposable accounts and synthetic email are used. Docker and OpenSSL are
 required; the pinned image and fixture provenance are in the
-[fixture reference](../tests/specs/README.md).
+[fixture reference](../specs/README.md).
 
 The existing shared component CI matrix includes the new transcript, journal,
 and allocation suites. The required GreenMail job includes the new independent
