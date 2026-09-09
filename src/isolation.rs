@@ -321,6 +321,7 @@ async fn server() -> Result<(), Error> {
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
     loop {
+        while sessions.try_join_next().is_some() {}
         tokio::select! {
             _ = &mut shutdown => break,
             joined = sessions.join_next(), if !sessions.is_empty() => { let _ = joined; }

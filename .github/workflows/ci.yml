@@ -76,3 +76,24 @@ jobs:
           sw_vers
           uname -m
           shasum -a 256 target/debug/mailctl target/debug/mailctl-mcp
+
+  native-isolation:
+    runs-on: macos-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f  # v2.0.0
+      - run: cargo test --locked --features isolated --test isolation_process
+      - name: Qualify isolated access with disposable macOS identities
+        shell: bash
+        run: |
+          test_binary=$(cargo test --locked --features isolated \
+            --test isolated_native --no-run --message-format=json |
+            jq -r 'select(.reason == "compiler-artifact" and
+              .target.name == "isolated_native" and .executable != null) |
+              .executable')
+          test -n "$test_binary"
+          sudo env MAILCTL_DISPOSABLE_MACOS=1 \
+            "$test_binary" --ignored --nocapture --test-threads=1
