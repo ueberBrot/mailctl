@@ -69,6 +69,51 @@ fn composition_rejects_malformed_ids_before_mime_encoding() {
     }
 }
 
+#[test]
+fn composition_accepts_only_dot_atom_message_ids_in_all_id_headers() {
+    for id in [
+        "one,two@example.test",
+        "one:two@example.test",
+        "one;two@example.test",
+        ".one@example.test",
+        "one.@example.test",
+        "one..two@example.test",
+        "one@.example.test",
+        "one@example.test.",
+        "one@example..test",
+        "one@example,test",
+        "one@example:test",
+        "one@example;test",
+    ] {
+        for header in 0..3 {
+            let mut input = input();
+            match header {
+                0 => input.message_id = id.into(),
+                1 => input.in_reply_to = Some(id.into()),
+                _ => input.references = vec![id.into()],
+            }
+            assert!(
+                matches!(
+                    PreparedDraft::compose(input, 1024 * 1024),
+                    Err(Error::InvalidInput)
+                ),
+                "invalid identifier accepted in header {header}: {id}"
+            );
+        }
+    }
+    for id in [
+        "operation@example.test",
+        "first.second+third@example.test",
+        "!#$%&'*+-/=?^_`{|}~@example.test",
+    ] {
+        let mut input = input();
+        input.message_id = id.into();
+        input.in_reply_to = Some(id.into());
+        input.references = vec![id.into()];
+        PreparedDraft::compose(input, 1024 * 1024).unwrap();
+    }
+}
+
 #[tokio::test]
 async fn tagged_no_and_bad_are_rejections_before_or_after_literal() {
     for sent in [false, true] {

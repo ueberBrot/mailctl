@@ -4,6 +4,8 @@ use sha2::{Digest, Sha256};
 use std::io::{self, Write};
 
 /// Plain-text composition for the route proof. Addresses use ASCII addr-spec syntax.
+/// Message-ID and reply identifiers use ASCII dot-atoms on both sides of `@`,
+/// without angle brackets. Quoted identifiers and domain literals remain unsupported.
 #[derive(Clone, Default)]
 pub struct DraftInput {
     pub from: String,
@@ -144,13 +146,15 @@ fn identifier(value: &str) -> Result<(), Error> {
     let Some((left, right)) = value.split_once('@') else {
         return Err(Error::InvalidInput);
     };
-    if left.is_empty()
-        || right.is_empty()
-        || right.contains('@')
-        || !value
-            .bytes()
-            .all(|b| b.is_ascii_graphic() && !b"<>\\\"()[]".contains(&b))
-    {
+    let dot_atom = |part: &str| {
+        part.split('.').all(|atom| {
+            !atom.is_empty()
+                && atom.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || b"!#$%&'*+-/=?^_`{|}~".contains(&byte)
+                })
+        })
+    };
+    if !dot_atom(left) || !dot_atom(right) {
         return Err(Error::InvalidInput);
     }
     Ok(())
