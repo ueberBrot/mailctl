@@ -62,6 +62,7 @@ pub(crate) struct Qualification {
     trusted_certificate: Option<(PathBuf, String)>,
 }
 
+#[derive(serde::Deserialize)]
 pub(crate) struct BrokerPeer {
     pub(crate) pid: u32,
     pub(crate) uid: u32,
@@ -214,19 +215,18 @@ impl Qualification {
         .expect("nonnegative process group ID")
     }
 
-    pub(crate) async fn broker_peer(&self) -> BrokerPeer {
-        let stream = tokio::time::timeout(DEADLINE, tokio::net::UnixStream::connect(SOCKET))
-            .await
-            .expect("connect to the fixed broker socket before deadline")
-            .expect("connect to the fixed broker socket");
-        let peer = stream
-            .peer_cred()
-            .expect("read the socket-serving broker credentials");
-        BrokerPeer {
-            pid: u32::try_from(peer.pid().expect("macOS supplies the peer process ID"))
-                .expect("positive peer process ID"),
-            uid: peer.uid(),
-        }
+    pub(crate) fn broker_peer(&self) -> BrokerPeer {
+        let output = bounded(
+            self.caller_command("python3")
+                .arg(PROBE)
+                .arg("peer")
+                .arg(SOCKET),
+        );
+        assert_success(
+            &output,
+            "read the socket-serving broker credentials as an authorized caller",
+        );
+        serde_json::from_slice(&output.stdout).expect("broker peer credential JSON")
     }
 
     pub(crate) async fn wait_for_process_exit(&self, pid: u32) {

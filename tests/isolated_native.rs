@@ -75,8 +75,8 @@ async fn isolated_launchd_qualification_uses_disposable_identities_and_a_real_na
     eprintln!("native isolation: start launchd and verify protected resources");
     fixture.unlock_service_keychain_context(&keychain);
     fixture.start();
-    assert_deployment_identity(&fixture, &keychain).await;
-    record_environment(&fixture).await;
+    assert_deployment_identity(&fixture, &keychain);
+    record_environment(&fixture);
     assert_caller_cannot_mutate_protected_assets(&fixture, &keychain, &work_account);
     assert_client_has_no_embedded_administration_path(&fixture);
     assert_unassigned_identity_is_denied(&fixture);
@@ -111,11 +111,11 @@ async fn isolated_launchd_qualification_uses_disposable_identities_and_a_real_na
     assert_bounded_malformed_and_exhausted_sessions(&fixture);
     assert_mapped_grant_limits(&fixture).await;
     assert_wrong_service_peer_is_rejected(&fixture);
-    let previous_broker = fixture.broker_peer().await;
+    let previous_broker = fixture.broker_peer();
     fixture.restart();
     fixture.wait_for_process_exit(previous_broker.pid).await;
     let restarted_accounts = eventually_listed_accounts(&fixture);
-    let restarted_broker = assert_deployment_identity(&fixture, &keychain).await;
+    let restarted_broker = assert_deployment_identity(&fixture, &keychain);
     assert_ne!(
         restarted_broker.pid, previous_broker.pid,
         "restart replaces the socket-serving broker process"
@@ -125,7 +125,7 @@ async fn isolated_launchd_qualification_uses_disposable_identities_and_a_real_na
         "restart retains the installation"
     );
     assert_service_authentication(&fixture, &provider);
-    let final_broker = fixture.broker_peer().await;
+    let final_broker = fixture.broker_peer();
     fixture.stop();
     fixture.wait_for_process_exit(final_broker.pid).await;
     provider.finish();
@@ -193,9 +193,9 @@ fn service_account_id(fixture: &Qualification, alias: &str) -> String {
         .to_owned()
 }
 
-async fn assert_deployment_identity(fixture: &Qualification, keychain: &Path) -> BrokerPeer {
+fn assert_deployment_identity(fixture: &Qualification, keychain: &Path) -> BrokerPeer {
     let launcher_pid = fixture.launchd_pid();
-    let broker = fixture.broker_peer().await;
+    let broker = fixture.broker_peer();
     assert_eq!(
         broker.uid, fixture.service_uid,
         "the socket-serving broker uses the dedicated service UID"
@@ -253,13 +253,13 @@ async fn assert_deployment_identity(fixture: &Qualification, keychain: &Path) ->
     broker
 }
 
-async fn record_environment(fixture: &Qualification) {
+fn record_environment(fixture: &Qualification) {
     let os = bounded(isolation_support::command("/usr/bin/sw_vers").arg("-productVersion"));
     assert_success(&os, "read macOS version");
     let architecture = bounded(isolation_support::command("/usr/bin/uname").arg("-m"));
     assert_success(&architecture, "read architecture");
     let launcher_pid = fixture.launchd_pid();
-    let broker = fixture.broker_peer().await;
+    let broker = fixture.broker_peer();
     eprintln!(
         "isolated native qualification: macOS={} arch={} launcher_pid={} launcher_uid={} broker_pid={} broker_peer_uid={} broker_process_uid={} service_uid={} caller_uid={} denied_uid={} mailctl-isolated_sha256={} mailctl_sha256={} mailctl-mcp_sha256={}",
         String::from_utf8_lossy(&os.stdout).trim(),
@@ -481,14 +481,14 @@ fn assert_bounded_malformed_and_exhausted_sessions(fixture: &Qualification) {
 
 async fn assert_mapped_grant_limits(fixture: &Qualification) {
     fixture.initialization_timeout();
-    let first_broker = fixture.broker_peer().await;
+    let first_broker = fixture.broker_peer();
     fixture.stop();
     fixture.wait_for_process_exit(first_broker.pid).await;
     set_grant_json_nesting(2);
     fixture.start();
     fixture.null_hello();
     fixture.account_hello_over_nesting_ceiling();
-    let second_broker = fixture.broker_peer().await;
+    let second_broker = fixture.broker_peer();
     fixture.stop();
     fixture.wait_for_process_exit(second_broker.pid).await;
     set_grant_json_nesting(12);
