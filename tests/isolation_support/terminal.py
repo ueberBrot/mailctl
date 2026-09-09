@@ -68,6 +68,7 @@ json.dump(
         "prompted": prompted,
         "echo_enabled": echo_enabled,
         "secret_disclosed": request["secret"] in text,
+        "diagnostic": text.replace(request["secret"], "<redacted>"),
     },
     sys.stdout,
 )

@@ -250,6 +250,33 @@ impl Qualification {
             ])),
             "administrator trusts only the disposable synthetic provider certificate",
         );
+        let default = bounded(self.service_command("/usr/bin/security").args([
+            "default-keychain",
+            "-d",
+            "user",
+        ]));
+        assert_success(&default, "inspect service default keychain");
+        eprintln!(
+            "native isolation service keychain: {}",
+            String::from_utf8_lossy(&default.stdout)
+        );
+        let probe = bounded(self.service_command("/usr/bin/env").args([
+            "-i",
+            "/usr/bin/security",
+            "add-generic-password",
+            "-A",
+            "-s",
+            "mailctl-qualification",
+            "-a",
+            "empty-metadata-probe",
+            "-w",
+            "",
+        ]));
+        eprintln!(
+            "native isolation empty metadata probe: {:?}: {}",
+            probe.status.code(),
+            String::from_utf8_lossy(&probe.stderr)
+        );
         keychain
     }
 
@@ -292,7 +319,11 @@ impl Qualification {
             result["secret_disclosed"], false,
             "credential stayed private"
         );
-        assert_eq!(result["exit"], 0, "credential command completed");
+        assert_eq!(
+            result["exit"], 0,
+            "credential command completed: {}",
+            result["diagnostic"]
+        );
     }
 
     pub(crate) fn hold_session(&self) -> HoldSession {
