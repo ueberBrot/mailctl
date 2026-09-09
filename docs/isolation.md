@@ -181,8 +181,9 @@ replacing binaries does not migrate credentials or combine installation history.
 
 ## Verify the deployment
 
-Isolation is qualified only for the exact macOS version, architecture, artifacts,
-and service setup recorded in [issue #8](https://github.com/ueberBrot/mailctl/issues/8).
+The qualified platform is macOS 26.6.2 (build 25G83) on arm64, using the service
+setup above. Qualification applies only to the executable hashes recorded in
+[issue #8](https://github.com/ueberBrot/mailctl/issues/8).
 The dedicated native acceptance suite uses disposable service and caller
 identities. It verifies access through launchd, credential resolution, peer
 identity, protected resources, bounded requests, and restart behavior. Missing

@@ -44,6 +44,8 @@ const ISOLATED: &str = env!("CARGO_BIN_EXE_mailctl-isolated");
 const CLI: &str = env!("CARGO_BIN_EXE_mailctl");
 const MCP: &str = env!("CARGO_BIN_EXE_mailctl-mcp");
 const WORK_SECRET: &str = "isolated-native-work-secret";
+// Exceeds the fixture's 12-per-minute doctor limit; this is not a Keychain-settling delay.
+const DOCTOR_RECHECK: Duration = Duration::from_secs(6);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires root and MAILCTL_DISPOSABLE_MACOS=1 on a disposable macOS runner"]
@@ -125,6 +127,7 @@ async fn isolated_launchd_qualification_uses_disposable_identities_and_a_real_na
         "restart retains the installation"
     );
     assert_service_authentication(&fixture, &provider);
+    assert_locked_keychain_failure(&fixture, &keychain, &provider).await;
     let final_broker = fixture.broker_peer();
     fixture.stop();
     fixture.wait_for_process_exit(final_broker.pid).await;
@@ -151,6 +154,56 @@ fn assert_service_authentication(fixture: &Qualification, provider: &server::Nat
         doctor["result"]["accounts"][0]["authentication"]["outcome"]["status"], "authenticated",
         "doctor uses the service identity's native Keychain credential"
     );
+}
+
+async fn assert_locked_keychain_failure(
+    fixture: &Qualification,
+    keychain: &Path,
+    provider: &server::NativeServer,
+) {
+    tokio::time::sleep(DOCTOR_RECHECK).await;
+    fixture.lock_service_keychain_context(keychain);
+    let previous_connections = provider.accepted();
+    let doctor = bounded(
+        fixture
+            .caller_command(fixture.broker("mailctl").to_str().unwrap())
+            .args([
+                "--isolated",
+                "--json",
+                "--account",
+                "work",
+                "doctor",
+                "--check-account",
+            ]),
+    );
+    assert_eq!(
+        doctor.status.code(),
+        Some(4),
+        "a locked service keychain makes authentication fail safely"
+    );
+    let doctor = envelope(&doctor);
+    let authentication = &doctor["result"]["accounts"][0]["authentication"];
+    assert_eq!(
+        authentication["outcome"]["status"], "failed",
+        "doctor records the failed authentication"
+    );
+    let failure = &authentication["outcome"]["error"];
+    assert_eq!(
+        failure["code"], "credential_unavailable",
+        "the locked keychain is reported as a credential failure"
+    );
+    assert!(matches!(
+        failure["credential_failure"].as_str(),
+        Some("access_denied" | "interaction_required")
+    ));
+    assert_eq!(
+        provider.accepted(),
+        previous_connections,
+        "the locked keychain failure does not contact the provider"
+    );
+    fixture.unlock_service_keychain_context(keychain);
+    tokio::time::sleep(DOCTOR_RECHECK).await;
+    assert_service_authentication(fixture, provider);
 }
 
 fn operator_setup(fixture: &Qualification, alias: &str, username: &str) {

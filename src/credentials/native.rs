@@ -70,15 +70,7 @@ impl SecretSource for NativeSource {
     }
 
     fn resolve(&self, account: Uuid) -> Result<Secret, SourceError> {
-        let entry = self
-            .entry(account)
-            .inspect_err(|_| eprintln!("[DEBUG-keychain] entry failed"))?;
-        Secret::new(
-            entry
-                .get_secret()
-                .map_err(source_error)
-                .inspect_err(|_| eprintln!("[DEBUG-keychain] get_secret failed"))?,
-        )
+        Secret::new(self.entry(account)?.get_secret().map_err(source_error)?)
     }
 
     fn mutable_store(&self) -> Option<&dyn MutableSecretStore> {
@@ -314,7 +306,6 @@ fn platform_error(error: PlatformError) -> SourceError {
 }
 
 fn platform_code(code: i32) -> SourceError {
-    eprintln!("[DEBUG-keychain] OSStatus {code}");
     match code {
         -25300 => SourceError::Missing,
         // macOS uses the same code for a locked keychain and an item whose

@@ -25,6 +25,12 @@ def read_exact(connection, length):
 
 def peer_credentials(connection):
     libc = ctypes.CDLL(None, use_errno=True)
+    libc.getpeereid.argtypes = [
+        ctypes.c_int, ctypes.POINTER(ctypes.c_uint), ctypes.POINTER(ctypes.c_uint)
+    ]
+    libc.getsockopt.argtypes = [
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint)
+    ]
     uid = ctypes.c_uint()
     gid = ctypes.c_uint()
     if libc.getpeereid(connection.fileno(), ctypes.byref(uid), ctypes.byref(gid)) != 0:
@@ -33,8 +39,10 @@ def peer_credentials(connection):
     length = ctypes.c_uint(ctypes.sizeof(pid))
     if libc.getsockopt(
         connection.fileno(), SOL_LOCAL, LOCAL_PEEREPID, ctypes.byref(pid), ctypes.byref(length)
-    ) != 0 or length.value != ctypes.sizeof(pid):
+    ) != 0:
         raise OSError(ctypes.get_errno(), "getsockopt(LOCAL_PEEREPID)")
+    if length.value != ctypes.sizeof(pid):
+        raise RuntimeError("unexpected LOCAL_PEEREPID size")
     if pid.value <= 0:
         raise RuntimeError("gateway peer did not report a positive process ID")
     return {"uid": uid.value, "pid": pid.value}

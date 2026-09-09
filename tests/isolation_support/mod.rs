@@ -106,8 +106,6 @@ impl Qualification {
         );
         assert_success(&installed, "install isolated gateway");
         fixture.installed = true;
-        let plist = fs::read_to_string(PLIST).unwrap().replace("</dict>\n</plist>", "<key>StandardErrorPath</key><string>/var/db/mailctl-isolated/diagnostic.log</string>\n</dict>\n</plist>");
-        fs::write(PLIST, plist).unwrap();
         fixture
     }
 
@@ -264,6 +262,22 @@ impl Qualification {
         assert_success(
             &output,
             "unlock disposable keychain in the service launch context",
+        );
+    }
+
+    pub(crate) fn lock_service_keychain_context(&self, keychain: &Path) {
+        let service_uid = self.service_uid.to_string();
+        let keychain = keychain.to_str().expect("UTF-8 fixture keychain path");
+        let output = bounded(command("/bin/launchctl").args([
+            "asuser",
+            &service_uid,
+            "/usr/bin/security",
+            "lock-keychain",
+            keychain,
+        ]));
+        assert_success(
+            &output,
+            "lock disposable keychain in the service launch context",
         );
     }
 
@@ -530,16 +544,6 @@ impl Qualification {
 
 impl Drop for Qualification {
     fn drop(&mut self) {
-        if let Ok(log) = fs::read_to_string("/var/db/mailctl-isolated/diagnostic.log") {
-            for line in log.lines().filter(|line| {
-                line.starts_with("[DEBUG-keychain]")
-                    || line.contains("Could not")
-                    || line.contains("Operation not permitted")
-                    || line.contains("launchctl")
-            }) {
-                eprintln!("{line}");
-            }
-        }
         if let Some((certificate, fingerprint)) = self.trusted_certificate.take() {
             cleanup_command(command("/usr/bin/security").args([
                 "remove-trusted-cert",
@@ -702,6 +706,7 @@ pub(crate) fn patch_service_configuration(port: u16) {
     let mut configuration: toml::Value =
         toml::from_str(&fs::read_to_string(CONFIG).expect("read service configuration"))
             .expect("parse service configuration");
+    configuration["limits"]["doctor_checks_per_minute"] = 12.into();
     let accounts = configuration["accounts"]
         .as_array_mut()
         .expect("service accounts");
@@ -722,6 +727,7 @@ pub(crate) fn patch_service_configuration(port: u16) {
     grant["name"] = "isolated".into();
     grant["accounts"] = toml::Value::Array(vec![work.into()]);
     grant["limits"] = toml::Value::Table(toml::map::Map::from_iter([
+        ("doctor_checks_per_minute".into(), 12.into()),
         ("initialization_seconds".into(), 1.into()),
         ("json_nesting".into(), 12.into()),
     ]));
