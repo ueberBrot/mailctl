@@ -8,14 +8,19 @@ use io_imap::{
         logout::ImapLogout,
     },
     types::{
-        body::BodyStructure,
+        body::{Body, BodyStructure, Disposition, SpecificFields},
         command::CommandBody,
         fetch::{MacroOrMessageDataItemNames, MessageDataItem, MessageDataItemName, Part, Section},
         sequence::{SeqOrUid, Sequence, SequenceSet},
     },
 };
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, fmt::Write, num::NonZeroU32};
+use std::{
+    collections::HashMap,
+    fmt::{self, Write},
+    num::NonZeroU32,
+    time::Instant,
+};
 
 /// In-memory continuation for this route proof. Public authenticated tokens belong to
 /// the application reading contract. A continuation is revalidated after each fetch.
@@ -52,6 +57,145 @@ pub struct BodyPage {
     pub truncated: bool,
     pub continuation: Option<BodyCursor>,
     pub metrics: Metrics,
+}
+
+/// A metadata-only attachment locator. Its part identifier is safe to retain in a message
+/// reference; it is not a transfer credential.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttachmentListRequest {
+    pub uid: u32,
+    pub uid_validity: u32,
+}
+impl AttachmentListRequest {
+    pub fn new(uid: u32, uid_validity: u32) -> Self {
+        Self { uid, uid_validity }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttachmentMetadata {
+    pub part: String,
+    pub filename: Option<String>,
+    pub media_type: String,
+    /// The transfer-encoded size reported by BODYSTRUCTURE, when the server supplied one.
+    pub declared_size: Option<u64>,
+    pub available: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct AttachmentList {
+    pub attachments: Vec<AttachmentMetadata>,
+    pub metrics: Metrics,
+}
+
+/// Starts a transfer from an attachment part, or consumes a continuation issued by this probe.
+/// The continuation constructor intentionally carries no caller-controlled message identity.
+#[derive(Debug)]
+pub struct AttachmentRequest {
+    start: Option<(u32, u32, String)>,
+    transfer: Option<AttachmentTransfer>,
+}
+impl AttachmentRequest {
+    pub fn new(uid: u32, uid_validity: u32, part: impl Into<String>) -> Self {
+        Self {
+            start: Some((uid, uid_validity, part.into())),
+            transfer: None,
+        }
+    }
+    pub fn resume(transfer: AttachmentTransfer) -> Self {
+        Self {
+            start: None,
+            transfer: Some(transfer),
+        }
+    }
+}
+
+/// An opaque, probe-session-local transfer capability. It is deliberately non-cloneable: a
+/// continuation or cancellation consumes ownership of the admitted in-memory decoder state.
+pub struct AttachmentTransfer {
+    value: String,
+}
+impl fmt::Debug for AttachmentTransfer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AttachmentTransfer(..)")
+    }
+}
+
+#[derive(Debug)]
+pub struct AttachmentChunk {
+    pub bytes: Vec<u8>,
+    pub decoded_offset: u64,
+    pub complete: bool,
+    pub continuation: Option<AttachmentTransfer>,
+    pub total_decoded_bytes: Option<u64>,
+    pub sha256: Option<[u8; 32]>,
+    pub metrics: Metrics,
+}
+
+#[derive(Default)]
+pub(super) struct TransferStore {
+    entries: HashMap<String, TransferState>,
+}
+impl TransferStore {
+    fn prune(&mut self) {
+        let now = Instant::now();
+        self.entries.retain(|_, state| state.expires > now);
+    }
+    fn remove(&mut self, token: AttachmentTransfer) -> Result<TransferState, Error> {
+        self.prune();
+        self.entries
+            .remove(&token.value)
+            .ok_or(Error::TransferExpired)
+    }
+    fn insert(&mut self, state: TransferState) -> Result<AttachmentTransfer, Error> {
+        let mut bytes = [0_u8; 32];
+        getrandom::fill(&mut bytes).map_err(|_| Error::Transport)?;
+        let mut value = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            let _ = write!(value, "{byte:02x}");
+        }
+        if self.entries.insert(value.clone(), state).is_some() {
+            return Err(Error::Transport);
+        }
+        Ok(AttachmentTransfer { value })
+    }
+}
+
+struct TransferState {
+    principal: [u8; 32],
+    mailbox: String,
+    uid: u32,
+    uid_validity: u32,
+    part: Part,
+    encoding: TransferEncoding,
+    wire_offset: usize,
+    decoded_offset: usize,
+    pending: Vec<u8>,
+    base64: Vec<u8>,
+    base64_padded: bool,
+    quoted_printable: Vec<u8>,
+    eof: bool,
+    expires: Instant,
+    digest: Sha256,
+    wire_bytes: usize,
+    decoded_bytes: usize,
+    decode_steps: usize,
+    max_state_bytes: usize,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TransferEncoding {
+    Identity,
+    Base64,
+    QuotedPrintable,
+}
+
+#[derive(Clone)]
+struct AttachmentDefinition {
+    part: Part,
+    filename: Option<String>,
+    media_type: String,
+    declared_size: Option<u64>,
+    encoding: Option<TransferEncoding>,
 }
 
 const REPRESENTATION: &str = "mailctl-body-1/mail-parser-0.11.8/html2text-0.17.1";
@@ -222,6 +366,594 @@ impl ImapProbe {
         .await
         .map_err(|_| Error::Timeout)?
     }
+
+    /// Lists attachment metadata from BODYSTRUCTURE only. It never requests an attachment
+    /// section, so a large payload cannot affect this route's allocation or wire budget.
+    pub async fn list_attachments(
+        &mut self,
+        username: &str,
+        password: &str,
+        name: &str,
+        request: AttachmentListRequest,
+    ) -> Result<AttachmentList, Error> {
+        self.metrics = Metrics::default();
+        self.transfers.prune();
+        credentials(username, password)?;
+        mailbox(name)?;
+        if request.uid == 0 || request.uid_validity == 0 {
+            return Err(Error::InvalidInput);
+        }
+        let limits = self.limits.clone();
+        let active = self.transfers.entries.len();
+        tokio::time::timeout(limits.operation_timeout, async {
+            let mut conn = self.authenticate(username, password).await?;
+            if conn.examine(name).await? != request.uid_validity {
+                return Err(Error::UnsafeSelection);
+            }
+            let fetch = Fetch::Metadata { uid: request.uid };
+            let fields = fetch.execute(&mut conn).await?;
+            let (_, structure) = fetch.metadata(&fields)?;
+            let attachments = attachments(structure, &limits)?
+                .into_iter()
+                .map(|attachment| AttachmentMetadata {
+                    part: part_name(&attachment.part),
+                    filename: attachment.filename,
+                    media_type: attachment.media_type,
+                    declared_size: attachment.declared_size,
+                    available: attachment.encoding.is_some(),
+                })
+                .collect();
+            conn.drive(ImapLogout::new()).await?;
+            let mut metrics = conn.metrics();
+            metrics.active_transfers = active;
+            self.metrics = metrics;
+            Ok(AttachmentList {
+                attachments,
+                metrics,
+            })
+        })
+        .await
+        .map_err(|_| Error::Timeout)?
+    }
+
+    /// Fetches and decodes at most one bounded wire slice. EOF is proved by a short PEEK
+    /// response rather than trusted BODYSTRUCTURE sizes, so each continuation rechecks mailbox
+    /// incarnation before it can advance its decoder.
+    pub async fn read_attachment(
+        &mut self,
+        username: &str,
+        password: &str,
+        name: &str,
+        request: AttachmentRequest,
+    ) -> Result<AttachmentChunk, Error> {
+        self.metrics = Metrics::default();
+        self.transfers.prune();
+        credentials(username, password)?;
+        mailbox(name)?;
+        let limits = self.limits.clone();
+        let mut state = match (request.start, request.transfer) {
+            (Some(_), Some(_)) | (None, None) => return Err(Error::InvalidInput),
+            (None, Some(token)) => self.transfers.remove(token)?,
+            (Some((uid, uid_validity, part)), None) => {
+                if uid == 0 || uid_validity == 0 {
+                    return Err(Error::InvalidInput);
+                }
+                if self.transfers.entries.len() >= limits.max_transfers {
+                    return Err(Error::Limit);
+                }
+                let part = parse_part(&part, &limits)?;
+                TransferState::new(
+                    username,
+                    name,
+                    uid,
+                    uid_validity,
+                    part,
+                    TransferEncoding::Identity,
+                    &limits,
+                )
+            }
+        };
+        if state.mailbox != name || state.principal != principal(username) {
+            return Err(Error::TransferExpired);
+        }
+        tokio::time::timeout(limits.operation_timeout, async {
+            let mut conn = self.authenticate(username, password).await?;
+            if conn.examine(name).await? != state.uid_validity {
+                return Err(Error::UnsafeSelection);
+            }
+            // A new transfer validates that its requested part is an attachment without fetching
+            // any payload. Resumed transfers use the state admitted by that same check.
+            if state.wire_offset == 0 && state.decoded_offset == 0 && !state.eof {
+                let metadata = Fetch::Metadata { uid: state.uid };
+                let fields = metadata.execute(&mut conn).await?;
+                let (_, structure) = metadata.metadata(&fields)?;
+                let definition = attachments(structure, &limits)?
+                    .into_iter()
+                    .find(|definition| definition.part == state.part)
+                    .ok_or(Error::InvalidInput)?;
+                state.encoding = definition.encoding.ok_or(Error::Unsupported)?;
+            }
+            let decoded_offset = state.decoded_offset as u64;
+            let bytes = attachment_bytes(&mut conn, &mut state, &limits).await?;
+            conn.drive(ImapLogout::new()).await?;
+            let mut metrics = conn.metrics();
+            metrics.transfer_wire_bytes = state.wire_bytes;
+            metrics.transfer_decoded_bytes = state.decoded_bytes;
+            metrics.transfer_decode_steps = state.decode_steps;
+            metrics.max_transfer_state_bytes = state.max_state_bytes;
+            let complete = state.eof && state.pending.is_empty();
+            let (continuation, total_decoded_bytes, sha256) = if complete {
+                (
+                    None,
+                    Some(state.decoded_bytes as u64),
+                    Some(state.digest.clone().finalize().into()),
+                )
+            } else {
+                let continuation = self.transfers.insert(state)?;
+                (Some(continuation), None, None)
+            };
+            metrics.active_transfers = self.transfers.entries.len();
+            self.metrics = metrics;
+            Ok(AttachmentChunk {
+                bytes,
+                decoded_offset,
+                complete,
+                continuation,
+                total_decoded_bytes,
+                sha256,
+                metrics,
+            })
+        })
+        .await
+        .map_err(|_| Error::Timeout)?
+    }
+
+    /// Cancels an admitted transfer and releases its bounded decoder state immediately.
+    pub fn cancel_attachment(&mut self, transfer: AttachmentTransfer) -> Result<(), Error> {
+        self.transfers.remove(transfer)?;
+        self.metrics.active_transfers = self.transfers.entries.len();
+        Ok(())
+    }
+}
+
+impl TransferState {
+    fn new(
+        username: &str,
+        mailbox: &str,
+        uid: u32,
+        uid_validity: u32,
+        part: Part,
+        encoding: TransferEncoding,
+        limits: &Limits,
+    ) -> Self {
+        Self {
+            principal: principal(username),
+            mailbox: mailbox.to_owned(),
+            uid,
+            uid_validity,
+            part,
+            encoding,
+            wire_offset: 0,
+            decoded_offset: 0,
+            pending: Vec::new(),
+            base64: Vec::with_capacity(4),
+            base64_padded: false,
+            quoted_printable: Vec::with_capacity(2),
+            eof: false,
+            expires: Instant::now() + limits.max_transfer_lifetime,
+            digest: Sha256::new(),
+            wire_bytes: 0,
+            decoded_bytes: 0,
+            decode_steps: 0,
+            max_state_bytes: 0,
+        }
+    }
+    fn account_state(&mut self) {
+        self.max_state_bytes = self.max_state_bytes.max(
+            self.pending
+                .len()
+                .saturating_add(self.base64.len())
+                .saturating_add(self.quoted_printable.len())
+                .saturating_add(128),
+        );
+    }
+}
+
+async fn attachment_bytes(
+    conn: &mut Connection<'_>,
+    state: &mut TransferState,
+    limits: &Limits,
+) -> Result<Vec<u8>, Error> {
+    let chunk = limits.max_attachment_chunk_bytes;
+    // A resume may have enough retained decoded bytes to complete a chunk. It still owns a fresh
+    // EXAMINE lease (the caller did that before this function), but need not fetch redundant wire.
+    if state.pending.len() < chunk && !state.eof {
+        let remaining = limits
+            .max_attachment_wire_bytes
+            .checked_sub(state.wire_bytes)
+            .ok_or(Error::Limit)?;
+        let count = (16 * 1024)
+            .min(limits.max_literal_bytes)
+            .min(limits.max_response_bytes / 2)
+            .min(remaining.saturating_add(1));
+        if count == 0 {
+            return Err(Error::InvalidInput);
+        }
+        let fetch = Fetch::Bytes {
+            uid: state.uid,
+            section: Some(Section::Part(state.part.clone())),
+            offset: u32::try_from(state.wire_offset).map_err(|_| Error::Limit)?,
+            count: u32::try_from(count).map_err(|_| Error::Limit)?,
+        };
+        let fields = fetch.execute(conn).await?;
+        let wire = fetch.data(&fields)?;
+        if wire.len() > remaining {
+            return Err(Error::Limit);
+        }
+        state.wire_offset = state
+            .wire_offset
+            .checked_add(wire.len())
+            .ok_or(Error::Limit)?;
+        state.wire_bytes = state
+            .wire_bytes
+            .checked_add(wire.len())
+            .ok_or(Error::Limit)?;
+        decode_attachment(state, wire, limits)?;
+        if wire.len() < count {
+            state.eof = true;
+            finish_attachment_decoder(state)?;
+        }
+    }
+    let take = chunk.min(state.pending.len());
+    let bytes: Vec<_> = state.pending.drain(..take).collect();
+    state.digest.update(&bytes);
+    state.decoded_offset = state
+        .decoded_offset
+        .checked_add(bytes.len())
+        .ok_or(Error::Limit)?;
+    state.decoded_bytes = state.decoded_offset;
+    state.account_state();
+    Ok(bytes)
+}
+
+fn decode_attachment(state: &mut TransferState, wire: &[u8], limits: &Limits) -> Result<(), Error> {
+    state.decode_steps = state
+        .decode_steps
+        .checked_add(wire.len())
+        .ok_or(Error::Limit)?;
+    if state.decode_steps > limits.max_decode_steps {
+        return Err(Error::Limit);
+    }
+    match state.encoding {
+        TransferEncoding::Identity => append_decoded(state, wire, limits),
+        TransferEncoding::Base64 => {
+            for byte in wire.iter().copied() {
+                if byte.is_ascii_whitespace() {
+                    continue;
+                }
+                if state.base64_padded
+                    || !(base64_value(byte).is_some() || byte == b'=')
+                    || state.base64.len() == 4
+                {
+                    return Err(Error::Protocol);
+                }
+                state.base64.push(byte);
+                if state.base64.len() == 4 {
+                    let quartet: [u8; 4] = state
+                        .base64
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| Error::Protocol)?;
+                    let padded = quartet[2] == b'=' || quartet[3] == b'=';
+                    append_base64_quartet(state, quartet, limits)?;
+                    state.base64_padded = padded;
+                    state.base64.clear();
+                }
+            }
+            Ok(())
+        }
+        TransferEncoding::QuotedPrintable => {
+            let mut input = std::mem::take(&mut state.quoted_printable);
+            input.extend_from_slice(wire);
+            let mut index = 0;
+            while index < input.len() {
+                if input[index] != b'=' {
+                    append_decoded(state, &input[index..index + 1], limits)?;
+                    index += 1;
+                    continue;
+                }
+                if input.len() - index < 3 {
+                    break;
+                }
+                let first = input[index + 1];
+                let second = input[index + 2];
+                if first == b'\r' && second == b'\n' {
+                    index += 3;
+                } else if let (Some(first), Some(second)) = (hex(first), hex(second)) {
+                    append_decoded(state, &[first << 4 | second], limits)?;
+                    index += 3;
+                } else {
+                    return Err(Error::Protocol);
+                }
+            }
+            state.quoted_printable.extend_from_slice(&input[index..]);
+            if state.quoted_printable.len() > 2 {
+                return Err(Error::Protocol);
+            }
+            Ok(())
+        }
+    }
+}
+
+fn finish_attachment_decoder(state: &mut TransferState) -> Result<(), Error> {
+    match state.encoding {
+        TransferEncoding::Identity => Ok(()),
+        TransferEncoding::Base64 if state.base64.is_empty() => Ok(()),
+        TransferEncoding::QuotedPrintable if state.quoted_printable.is_empty() => Ok(()),
+        _ => Err(Error::Protocol),
+    }
+}
+
+fn append_decoded(state: &mut TransferState, bytes: &[u8], limits: &Limits) -> Result<(), Error> {
+    if bytes.len() > limits_remaining(state, limits.max_attachment_decoded_bytes)
+        || bytes.len()
+            > (16_usize * 1024)
+                .saturating_add(limits.max_attachment_chunk_bytes)
+                .saturating_sub(state.pending.len())
+    {
+        return Err(Error::Limit);
+    }
+    state.pending.extend_from_slice(bytes);
+    state.account_state();
+    Ok(())
+}
+
+fn limits_remaining(state: &TransferState, max: usize) -> usize {
+    max.saturating_sub(state.decoded_offset.saturating_add(state.pending.len()))
+}
+
+fn append_base64_quartet(
+    state: &mut TransferState,
+    quartet: [u8; 4],
+    limits: &Limits,
+) -> Result<(), Error> {
+    let values = [
+        base64_value(quartet[0]).ok_or(Error::Protocol)?,
+        base64_value(quartet[1]).ok_or(Error::Protocol)?,
+    ];
+    let mut decoded = [0; 3];
+    decoded[0] = (values[0] << 2) | (values[1] >> 4);
+    let length = match (quartet[2], quartet[3]) {
+        (b'=', b'=') if values[1] & 0b1111 == 0 => 1,
+        (third, b'=') => {
+            let third = base64_value(third).ok_or(Error::Protocol)?;
+            if third & 0b11 != 0 {
+                return Err(Error::Protocol);
+            }
+            decoded[1] = (values[1] << 4) | (third >> 2);
+            2
+        }
+        (third, fourth) => {
+            let third = base64_value(third).ok_or(Error::Protocol)?;
+            let fourth = base64_value(fourth).ok_or(Error::Protocol)?;
+            decoded[1] = (values[1] << 4) | (third >> 2);
+            decoded[2] = (third << 6) | fourth;
+            3
+        }
+    };
+    append_decoded(state, &decoded[..length], limits)
+}
+
+fn base64_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
+}
+
+fn hex(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn parse_part(part: &str, limits: &Limits) -> Result<Part, Error> {
+    if part.is_empty() || part.len() > limits.max_nesting.saturating_mul(11) {
+        return Err(Error::InvalidInput);
+    }
+    let mut values = Vec::new();
+    for value in part.split('.') {
+        if value.is_empty() || value.len() > 10 || !value.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return Err(Error::InvalidInput);
+        }
+        let value = value.parse::<u32>().map_err(|_| Error::InvalidInput)?;
+        values.push(NonZeroU32::new(value).ok_or(Error::InvalidInput)?);
+        if values.len() > limits.max_nesting {
+            return Err(Error::Limit);
+        }
+    }
+    Ok(Part(values.try_into().map_err(|_| Error::InvalidInput)?))
+}
+
+fn attachments(
+    structure: &BodyStructure<'_>,
+    limits: &Limits,
+) -> Result<Vec<AttachmentDefinition>, Error> {
+    fn visit(
+        structure: &BodyStructure<'_>,
+        path: Option<&Part>,
+        depth: usize,
+        parts: &mut usize,
+        output: &mut Vec<AttachmentDefinition>,
+        limits: &Limits,
+    ) -> Result<(), Error> {
+        *parts = parts.checked_add(1).ok_or(Error::Limit)?;
+        if *parts > limits.max_mime_parts || depth > limits.max_nesting {
+            return Err(Error::Limit);
+        }
+        match structure {
+            BodyStructure::Single {
+                body,
+                extension_data,
+            } => {
+                let part = path
+                    .cloned()
+                    .unwrap_or_else(|| Part(NonZeroU32::MIN.into()));
+                if is_attachment(extension_data.as_ref().and_then(|data| data.tail.as_ref())) {
+                    output.push(attachment_definition(
+                        part.clone(),
+                        body,
+                        extension_data.as_ref().and_then(|data| data.tail.as_ref()),
+                    )?);
+                }
+                // An attached message is transferred as its enclosing RFC822 part. Traversing its
+                // embedded body would fabricate duplicate/ambiguous IMAP section locators.
+            }
+            BodyStructure::Multi { bodies, .. } => {
+                for (index, child) in bodies.as_ref().iter().enumerate() {
+                    let path = child_part(path, index + 1)?;
+                    visit(child, Some(&path), depth + 1, parts, output, limits)?;
+                }
+            }
+        }
+        Ok(())
+    }
+    validate_attachment_structure(structure, limits)?;
+    let mut output = Vec::new();
+    visit(structure, None, 1, &mut 0, &mut output, limits)?;
+    Ok(output)
+}
+
+/// Selection stops at an attached RFC822 message because its outer section is the only stable
+/// attachment locator. Validation still visits that embedded structure so hostile nesting cannot
+/// hide behind an excluded attachment subtree.
+fn validate_attachment_structure(
+    structure: &BodyStructure<'_>,
+    limits: &Limits,
+) -> Result<(), Error> {
+    fn visit(
+        structure: &BodyStructure<'_>,
+        depth: usize,
+        parts: &mut usize,
+        limits: &Limits,
+    ) -> Result<(), Error> {
+        *parts = parts.checked_add(1).ok_or(Error::Limit)?;
+        if *parts > limits.max_mime_parts || depth > limits.max_nesting {
+            return Err(Error::Limit);
+        }
+        match structure {
+            BodyStructure::Single { body, .. } => {
+                if let SpecificFields::Message { body_structure, .. } = &body.specific {
+                    visit(body_structure, depth + 1, parts, limits)?;
+                }
+            }
+            BodyStructure::Multi { bodies, .. } => {
+                for child in bodies.as_ref() {
+                    visit(child, depth + 1, parts, limits)?;
+                }
+            }
+        }
+        Ok(())
+    }
+    visit(structure, 1, &mut 0, limits)
+}
+
+fn child_part(parent: Option<&Part>, child: usize) -> Result<Part, Error> {
+    let child =
+        NonZeroU32::new(u32::try_from(child).map_err(|_| Error::Limit)?).ok_or(Error::Limit)?;
+    let mut values = parent.map_or_else(Vec::new, |parent| parent.0.as_ref().to_vec());
+    values.push(child);
+    Ok(Part(values.try_into().map_err(|_| Error::Limit)?))
+}
+
+fn attachment_definition(
+    part: Part,
+    body: &Body<'_>,
+    disposition: Option<&Disposition<'_>>,
+) -> Result<AttachmentDefinition, Error> {
+    let (kind, subtype) = match &body.specific {
+        SpecificFields::Basic { r#type, subtype } => (imap_string(r#type)?, imap_string(subtype)?),
+        SpecificFields::Text { subtype, .. } => ("text", imap_string(subtype)?),
+        SpecificFields::Message { .. } => ("message", "rfc822"),
+    };
+    let filename = disposition
+        .and_then(|value| value.disposition.as_ref())
+        .and_then(|(_, parameters)| {
+            parameters.iter().find(|(name, _)| {
+                imap_string(name).is_ok_and(|name| name.eq_ignore_ascii_case("filename"))
+            })
+        })
+        .and_then(|(_, value)| imap_string(value).ok())
+        .and_then(safe_filename);
+    let encoding = match imap_string(&body.basic.content_transfer_encoding)?
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "7bit" | "8bit" => Some(TransferEncoding::Identity),
+        "base64" => Some(TransferEncoding::Base64),
+        "quoted-printable" => Some(TransferEncoding::QuotedPrintable),
+        _ => None,
+    };
+    Ok(AttachmentDefinition {
+        part,
+        filename,
+        media_type: format!(
+            "{}/{}",
+            kind.to_ascii_lowercase(),
+            subtype.to_ascii_lowercase()
+        ),
+        declared_size: Some(body.basic.size as u64),
+        encoding,
+    })
+}
+
+fn is_attachment(disposition: Option<&Disposition<'_>>) -> bool {
+    disposition
+        .and_then(|value| value.disposition.as_ref())
+        .is_some_and(|(kind, _)| {
+            imap_string(kind).is_ok_and(|kind| kind.eq_ignore_ascii_case("attachment"))
+        })
+}
+
+fn imap_string<'a>(value: &'a io_imap::types::core::IString<'a>) -> Result<&'a str, Error> {
+    std::str::from_utf8(value.as_ref()).map_err(|_| Error::Protocol)
+}
+
+fn safe_filename(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.chars().take(257).count() > 256
+        || value.chars().any(|character| {
+            character.is_control()
+                || matches!(
+                    character,
+                    '\u{061c}'
+                        | '\u{200e}'
+                        | '\u{200f}'
+                        | '\u{202a}'..='\u{202e}'
+                        | '\u{2066}'..='\u{2069}'
+                )
+        })
+    {
+        None
+    } else {
+        Some(value.to_owned())
+    }
+}
+
+fn principal(username: &str) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(username.as_bytes());
+    digest.finalize().into()
 }
 
 fn part_name(part: &Part) -> String {

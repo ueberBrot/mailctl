@@ -21,6 +21,10 @@ pub(crate) const SEEN_MESSAGE_ID: &str = "<observed-seen@example.test>";
 pub(crate) const MULTIPART_MESSAGE_ID: &str = "<large-attachment-body@example.test>";
 pub(crate) const MULTIPART_SUBJECT: &str = "Large attachment body route";
 pub(crate) const MULTIPART_BODY: &str = "Synthetic multipart body.\r\n";
+/// The large attachment is deliberately zero bytes: its valid base64 payload is
+/// almost entirely `A`, which keeps this generated test fixture readable while
+/// retaining a deterministic decoded value for chunk and digest assertions.
+pub const LARGE_ATTACHMENT_DECODED_BYTES: usize = 2 * 1024 * 1024 + 1;
 pub(crate) const BODY: &str = "Synthetic bootstrap message.";
 pub(crate) const SEEN_BODY: &str = "Synthetic seen message.";
 pub(crate) const MESSAGE: &str = "From: sender@example.test\r\nTo: fixture+smoke@example.test\r\nMessage-ID: <bootstrap-smoke@example.test>\r\nSubject: Bootstrap smoke\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nSynthetic bootstrap message.\r\n";
@@ -166,11 +170,9 @@ pub(crate) async fn seed(port: u16) -> Result<()> {
 /// This is deliberately opt-in: the default fixture mailbox remains small for suites
 /// that only exercise discovery and search.
 pub(crate) async fn seed_multipart_with_large_attachment(port: u16) -> Result<()> {
-    const ATTACHMENT_BYTES: usize = 2 * 1024 * 1024 + 1;
     const BOUNDARY: &str = "mailctl-large-attachment-boundary";
 
-    let attachment = "A".repeat(76).to_owned() + "\r\n";
-    let attachment = attachment.repeat(ATTACHMENT_BYTES.div_ceil(76));
+    let attachment = large_attachment_base64();
     let message = format!(
         "From: sender@example.test\r\n\
 To: {EMAIL}\r\n\
@@ -194,7 +196,7 @@ Content-Type: text/html; charset=utf-8\r\n\
 --{BOUNDARY}\r\n\
 Content-Type: application/octet-stream; name=\"large.bin\"\r\n\
 Content-Disposition: attachment; filename=\"large.bin\"\r\n\
-Content-Transfer-Encoding: 8bit\r\n\
+Content-Transfer-Encoding: base64\r\n\
 \r\n\
 {attachment}\r\n\
 --{BOUNDARY}--\r\n"
@@ -211,6 +213,31 @@ Content-Transfer-Encoding: 8bit\r\n\
     })
     .await
     .map_err(|_| "Large multipart SMTP fixture seeding timed out")?
+}
+
+/// Exact decoded contents of the opt-in large attachment fixture.
+pub fn large_attachment_bytes() -> Vec<u8> {
+    vec![0; LARGE_ATTACHMENT_DECODED_BYTES]
+}
+
+fn large_attachment_base64() -> String {
+    let full_groups = LARGE_ATTACHMENT_DECODED_BYTES / 3;
+    let remainder = LARGE_ATTACHMENT_DECODED_BYTES % 3;
+    let mut encoded = "AAAA".repeat(full_groups);
+    match remainder {
+        0 => {}
+        1 => encoded.push_str("AA=="),
+        2 => encoded.push_str("AAA="),
+        _ => unreachable!("modulo three has only three values"),
+    }
+
+    let mut wrapped = String::with_capacity(encoded.len() + encoded.len() / 76 * 2 + 2);
+    for line in encoded.as_bytes().chunks(76) {
+        // Base64 output is ASCII; preserve that fact without accepting arbitrary bytes.
+        wrapped.push_str(std::str::from_utf8(line).expect("base64 is ASCII"));
+        wrapped.push_str("\r\n");
+    }
+    wrapped
 }
 
 /// Fixture setup marks one synthetic message as seen to prove readers preserve both states.

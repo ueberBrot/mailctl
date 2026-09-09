@@ -201,3 +201,176 @@ fn imap_body_reads_selected_text_without_downloading_a_large_attachment() {
         Ok(())
     });
 }
+
+#[test]
+fn imap_attachment_listing_and_chunks_preserve_exact_base64_decoded_data() {
+    greenmail_support::run(async {
+        use mailctl::imap::{
+            AttachmentListRequest, AttachmentRequest, Error, ImapProbe, Limits, TlsMode,
+        };
+        use sha2::{Digest, Sha256};
+        use std::time::Duration;
+
+        const MULTIPART_MESSAGE_ID: &str = "<large-attachment-body@example.test>";
+
+        let fixture = greenmail_support::Fixture::start().await?;
+        fixture.seed_multipart_with_large_attachment().await?;
+        let contents_before = fixture.contents().await?;
+        let snapshot_before = fixture.snapshot().await?;
+        let multipart = contents_before
+            .iter()
+            .find(|message| message.message_id == MULTIPART_MESSAGE_ID)
+            .expect("fixture seeds the multipart message");
+        let multipart_uid = multipart.uid.parse::<u32>()?;
+        let expected = greenmail_support::large_attachment_bytes();
+        let expected_digest: [u8; 32] = Sha256::digest(&expected).into();
+        assert!(multipart.mime_message.len() > 2 * 1024 * 1024);
+        assert!(
+            multipart
+                .mime_message
+                .contains("Content-Transfer-Encoding: base64")
+        );
+
+        let mut probe = ImapProbe::new(
+            "localhost".to_owned(),
+            fixture.imaps_port(),
+            TlsMode::Implicit,
+            fixture.tls_roots(),
+            Limits::default(),
+        )?;
+        let listed = probe
+            .list_attachments(
+                "fixture+smoke@example.test",
+                "disposable-fixture-password",
+                "INBOX",
+                AttachmentListRequest {
+                    uid: multipart_uid,
+                    uid_validity: snapshot_before.uid_validity,
+                },
+            )
+            .await?;
+        // Listing is a metadata route: its response must not include the multi-megabyte
+        // encoded payload that a full message fetch would contain.
+        assert!(listed.metrics.wire_bytes < 64 * 1024);
+        assert_eq!(listed.attachments.len(), 1);
+        let attachment = &listed.attachments[0];
+        assert_eq!(attachment.part, "2");
+        assert_eq!(attachment.filename.as_deref(), Some("large.bin"));
+        assert_eq!(attachment.media_type, "application/octet-stream");
+        assert!(attachment.declared_size.is_some());
+        assert!(attachment.available);
+
+        // A partial transfer can be explicitly cancelled and frees its session-local state.
+        let cancelled = probe
+            .read_attachment(
+                "fixture+smoke@example.test",
+                "disposable-fixture-password",
+                "INBOX",
+                AttachmentRequest::new(
+                    multipart_uid,
+                    snapshot_before.uid_validity,
+                    attachment.part.clone(),
+                ),
+            )
+            .await?;
+        assert!(!cancelled.complete);
+        probe.cancel_attachment(
+            cancelled
+                .continuation
+                .expect("incomplete attachment has a transfer"),
+        )?;
+        assert_eq!(probe.metrics().active_transfers, 0);
+
+        let mut request = AttachmentRequest::new(
+            multipart_uid,
+            snapshot_before.uid_validity,
+            attachment.part.clone(),
+        );
+        let mut received = Vec::with_capacity(expected.len());
+        let mut final_digest = None;
+        // The route may fetch a smaller encoded wire slice than the decoded output ceiling;
+        // leave room for the pinned 16 KiB wire fetches and base64 expansion.
+        for _ in 0..256 {
+            let chunk = probe
+                .read_attachment(
+                    "fixture+smoke@example.test",
+                    "disposable-fixture-password",
+                    "INBOX",
+                    request,
+                )
+                .await?;
+            assert_eq!(chunk.decoded_offset, received.len() as u64);
+            assert!(!chunk.bytes.is_empty());
+            assert!(chunk.bytes.len() <= Limits::default().max_attachment_chunk_bytes);
+            let end = received.len() + chunk.bytes.len();
+            assert_eq!(chunk.bytes, expected[received.len()..end]);
+            received.extend_from_slice(&chunk.bytes);
+            if chunk.complete {
+                assert_eq!(received.len(), expected.len());
+                assert!(chunk.continuation.is_none());
+                assert_eq!(chunk.total_decoded_bytes, Some(expected.len() as u64));
+                assert_eq!(chunk.sha256, Some(expected_digest));
+                final_digest = chunk.sha256;
+                break;
+            }
+            assert!(chunk.total_decoded_bytes.is_none());
+            assert!(chunk.sha256.is_none());
+            request = AttachmentRequest::resume(
+                chunk
+                    .continuation
+                    .expect("incomplete attachment has a transfer"),
+            );
+        }
+        assert_eq!(received, expected);
+        assert_eq!(final_digest, Some(Sha256::digest(&received).into()));
+        assert_eq!(probe.metrics().active_transfers, 0);
+
+        // Expired opaque transfers cannot be revived and must release their retained state.
+        let mut expiring_probe = ImapProbe::new(
+            "localhost".to_owned(),
+            fixture.imaps_port(),
+            TlsMode::Implicit,
+            fixture.tls_roots(),
+            Limits {
+                max_transfer_lifetime: Duration::from_secs(1),
+                ..Limits::default()
+            },
+        )?;
+        let incomplete = expiring_probe
+            .read_attachment(
+                "fixture+smoke@example.test",
+                "disposable-fixture-password",
+                "INBOX",
+                AttachmentRequest::new(
+                    multipart_uid,
+                    snapshot_before.uid_validity,
+                    attachment.part.clone(),
+                ),
+            )
+            .await?;
+        let expired = incomplete
+            .continuation
+            .expect("large attachment requires a continuation");
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert!(matches!(
+            expiring_probe
+                .read_attachment(
+                    "fixture+smoke@example.test",
+                    "disposable-fixture-password",
+                    "INBOX",
+                    AttachmentRequest::resume(expired),
+                )
+                .await,
+            Err(Error::TransferExpired)
+        ));
+        assert_eq!(expiring_probe.metrics().active_transfers, 0);
+
+        // Both the administrative API and a fresh non-mutating IMAP observer must
+        // agree that listing/streaming did not alter UIDVALIDITY, UID identity,
+        // raw content, or the independent seen/unseen observations.
+        assert_eq!(fixture.snapshot().await?, snapshot_before);
+        assert_eq!(fixture.contents().await?, contents_before);
+        fixture.shutdown().await?;
+        Ok(())
+    });
+}

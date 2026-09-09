@@ -3,7 +3,10 @@ mod body;
 mod projection;
 mod wire;
 
-pub use body::{BodyCursor, BodyPage, BodyRequest};
+pub use body::{
+    AttachmentChunk, AttachmentList, AttachmentListRequest, AttachmentMetadata, AttachmentRequest,
+    AttachmentTransfer, BodyCursor, BodyPage, BodyRequest,
+};
 
 use io_imap::{
     rfc3501::{
@@ -35,6 +38,7 @@ pub enum Error {
     Authentication,
     UnsafeSelection,
     StaleCursor,
+    TransferExpired,
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -50,6 +54,7 @@ impl fmt::Display for Error {
             Self::Authentication => "IMAP authentication failed",
             Self::UnsafeSelection => "IMAP read-only selection was not established",
             Self::StaleCursor => "message body continuation is stale",
+            Self::TransferExpired => "attachment transfer expired",
         })
     }
 }
@@ -79,6 +84,11 @@ pub struct Limits {
     pub max_decoded_bytes: usize,
     pub max_text_bytes: usize,
     pub max_decode_steps: usize,
+    pub max_attachment_decoded_bytes: usize,
+    pub max_attachment_wire_bytes: usize,
+    pub max_attachment_chunk_bytes: usize,
+    pub max_transfer_lifetime: Duration,
+    pub max_transfers: usize,
     pub operation_timeout: Duration,
     pub connect_timeout: Duration,
 }
@@ -100,6 +110,11 @@ impl Default for Limits {
             max_decoded_bytes: 8 * 1024 * 1024,
             max_text_bytes: 256 * 1024,
             max_decode_steps: 32 * 1024 * 1024,
+            max_attachment_decoded_bytes: 10 * 1024 * 1024,
+            max_attachment_wire_bytes: 16 * 1024 * 1024,
+            max_attachment_chunk_bytes: 64 * 1024,
+            max_transfer_lifetime: Duration::from_secs(5 * 60),
+            max_transfers: 2,
             operation_timeout: Duration::from_secs(30),
             connect_timeout: Duration::from_secs(10),
         }
@@ -137,6 +152,16 @@ impl Limits {
             || self.max_text_bytes > 2 * 1024 * 1024
             || self.max_decode_steps == 0
             || self.max_decode_steps > 128 * 1024 * 1024
+            || self.max_attachment_decoded_bytes == 0
+            || self.max_attachment_decoded_bytes > 32 * 1024 * 1024
+            || self.max_attachment_wire_bytes == 0
+            || self.max_attachment_wire_bytes > 64 * 1024 * 1024
+            || self.max_attachment_chunk_bytes == 0
+            || self.max_attachment_chunk_bytes > 256 * 1024
+            || self.max_transfer_lifetime.is_zero()
+            || self.max_transfer_lifetime > Duration::from_secs(10 * 60)
+            || self.max_transfers == 0
+            || self.max_transfers > 4
             || self.operation_timeout.is_zero()
             || self.operation_timeout > Duration::from_secs(120)
             || self.connect_timeout.is_zero()
@@ -158,6 +183,12 @@ pub struct Metrics {
     pub max_literal_bytes: usize,
     pub decode_steps: usize,
     pub decoded_bytes: usize,
+    /// Cumulative attachment payload bytes obtained over the current transfer.
+    pub transfer_wire_bytes: usize,
+    pub transfer_decoded_bytes: usize,
+    pub transfer_decode_steps: usize,
+    pub max_transfer_state_bytes: usize,
+    pub active_transfers: usize,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Mailbox {
@@ -215,6 +246,7 @@ pub struct ImapProbe {
     tls: Arc<rustls::ClientConfig>,
     limits: Limits,
     metrics: Metrics,
+    transfers: body::TransferStore,
 }
 impl ImapProbe {
     pub fn new(
@@ -242,6 +274,7 @@ impl ImapProbe {
             tls: Arc::new(tls),
             limits,
             metrics: Metrics::default(),
+            transfers: body::TransferStore::default(),
         })
     }
     /// Last progress snapshot, including a failed or cancelled operation.

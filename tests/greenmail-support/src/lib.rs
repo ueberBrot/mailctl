@@ -8,6 +8,7 @@ mod fixtures;
 mod observer;
 
 pub use container::{AdministrativeMessage, Fixture};
+pub use fixtures::large_attachment_bytes;
 pub use observer::{MailboxSnapshot, MessageSnapshot};
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
