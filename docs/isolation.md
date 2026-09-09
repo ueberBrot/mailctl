@@ -125,8 +125,10 @@ sudo deployment/macos-isolated/service.sh start
 
 Enter the Keychain password at the terminal prompt. Keychain unlock state belongs
 to a security session: unlocking during credential provisioning alone does not
-unlock it for launchd. The installed job uses the same service user's launchctl
-context and runs under the unprivileged service identity.
+unlock it for launchd. The installed job uses `launchctl` as root to enter that
+same service user's context, then `sudo` drops to the unprivileged service
+identity before executing the broker. The launcher uses fixed arguments in the
+root-owned plist; callers cannot select the executable or service identity.
 
 The job starts at boot and restarts after process failure. Repeat the explicit
 unlock after boot or when the Keychain locks. A broker process restart retains

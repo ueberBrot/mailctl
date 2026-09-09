@@ -26,8 +26,9 @@ mod process;
 mod server;
 
 use isolation_support::{
-    CONFIG, INSTALL_ROOT, Qualification, ROUTE, RUN, SERVICE_HOME, SOCKET, STATE, assert_denied,
-    assert_success, bounded, metadata, patch_service_configuration, set_grant_json_nesting, sha256,
+    BrokerPeer, CONFIG, INSTALL_ROOT, Qualification, ROUTE, RUN, SERVICE_HOME, SOCKET, STATE,
+    assert_denied, assert_success, bounded, metadata, patch_service_configuration,
+    set_grant_json_nesting, sha256,
 };
 use rmcp::{ServiceExt, model::CallToolRequestParams, transport::TokioChildProcess};
 use serde_json::Value;
@@ -74,8 +75,8 @@ async fn isolated_launchd_qualification_uses_disposable_identities_and_a_real_na
     eprintln!("native isolation: start launchd and verify protected resources");
     fixture.unlock_service_keychain_context(&keychain);
     fixture.start();
-    assert_deployment_identity(&fixture, &keychain);
-    record_environment(&fixture);
+    assert_deployment_identity(&fixture, &keychain).await;
+    record_environment(&fixture).await;
     assert_caller_cannot_mutate_protected_assets(&fixture, &keychain, &work_account);
     assert_client_has_no_embedded_administration_path(&fixture);
     assert_unassigned_identity_is_denied(&fixture);
@@ -108,15 +109,25 @@ async fn isolated_launchd_qualification_uses_disposable_identities_and_a_real_na
 
     eprintln!("native isolation: verify IPC bounds, substitution, and restart");
     assert_bounded_malformed_and_exhausted_sessions(&fixture);
-    assert_mapped_grant_limits(&fixture);
+    assert_mapped_grant_limits(&fixture).await;
     assert_wrong_service_peer_is_rejected(&fixture);
+    let previous_broker = fixture.broker_peer().await;
     fixture.restart();
+    fixture.wait_for_process_exit(previous_broker.pid).await;
+    let restarted_accounts = eventually_listed_accounts(&fixture);
+    let restarted_broker = assert_deployment_identity(&fixture, &keychain).await;
+    assert_ne!(
+        restarted_broker.pid, previous_broker.pid,
+        "restart replaces the socket-serving broker process"
+    );
     assert_eq!(
-        eventually_listed_accounts(&fixture)["result"],
-        cli["result"],
+        restarted_accounts["result"], cli["result"],
         "restart retains the installation"
     );
     assert_service_authentication(&fixture, &provider);
+    let final_broker = fixture.broker_peer().await;
+    fixture.stop();
+    fixture.wait_for_process_exit(final_broker.pid).await;
     provider.finish();
 }
 
@@ -182,12 +193,22 @@ fn service_account_id(fixture: &Qualification, alias: &str) -> String {
         .to_owned()
 }
 
-fn assert_deployment_identity(fixture: &Qualification, keychain: &Path) {
-    let service_pid = fixture.launchd_pid();
+async fn assert_deployment_identity(fixture: &Qualification, keychain: &Path) -> BrokerPeer {
+    let launcher_pid = fixture.launchd_pid();
+    let broker = fixture.broker_peer().await;
     assert_eq!(
-        fixture.uid_of_pid(service_pid),
+        broker.uid, fixture.service_uid,
+        "the socket-serving broker uses the dedicated service UID"
+    );
+    assert_eq!(
+        fixture.uid_of_pid(broker.pid),
         fixture.service_uid,
-        "launchd uses the dedicated service UID"
+        "the socket-serving broker process retains the expected service UID"
+    );
+    assert_eq!(
+        fixture.process_group(broker.pid),
+        launcher_pid,
+        "the socket-serving broker remains in the launchd service process group"
     );
     for (path, owner) in [
         (Path::new(CONFIG), fixture.service_uid),
@@ -229,18 +250,25 @@ fn assert_deployment_identity(fixture: &Qualification, keychain: &Path) {
         metadata(Path::new(SOCKET)).file_type().is_socket(),
         "service bound the fixed Unix socket"
     );
+    broker
 }
 
-fn record_environment(fixture: &Qualification) {
+async fn record_environment(fixture: &Qualification) {
     let os = bounded(isolation_support::command("/usr/bin/sw_vers").arg("-productVersion"));
     assert_success(&os, "read macOS version");
     let architecture = bounded(isolation_support::command("/usr/bin/uname").arg("-m"));
     assert_success(&architecture, "read architecture");
+    let launcher_pid = fixture.launchd_pid();
+    let broker = fixture.broker_peer().await;
     eprintln!(
-        "isolated native qualification: macOS={} arch={} launchd_uid={} service_uid={} caller_uid={} denied_uid={} mailctl-isolated_sha256={} mailctl_sha256={} mailctl-mcp_sha256={}",
+        "isolated native qualification: macOS={} arch={} launcher_pid={} launcher_uid={} broker_pid={} broker_peer_uid={} broker_process_uid={} service_uid={} caller_uid={} denied_uid={} mailctl-isolated_sha256={} mailctl_sha256={} mailctl-mcp_sha256={}",
         String::from_utf8_lossy(&os.stdout).trim(),
         String::from_utf8_lossy(&architecture.stdout).trim(),
-        fixture.uid_of_pid(fixture.launchd_pid()),
+        launcher_pid,
+        fixture.uid_of_pid(launcher_pid),
+        broker.pid,
+        broker.uid,
+        fixture.uid_of_pid(broker.pid),
         fixture.service_uid,
         fixture.caller_uid,
         fixture.denied_uid,
@@ -451,14 +479,18 @@ fn assert_bounded_malformed_and_exhausted_sessions(fixture: &Qualification) {
     );
 }
 
-fn assert_mapped_grant_limits(fixture: &Qualification) {
+async fn assert_mapped_grant_limits(fixture: &Qualification) {
     fixture.initialization_timeout();
+    let first_broker = fixture.broker_peer().await;
     fixture.stop();
+    fixture.wait_for_process_exit(first_broker.pid).await;
     set_grant_json_nesting(2);
     fixture.start();
     fixture.null_hello();
     fixture.account_hello_over_nesting_ceiling();
+    let second_broker = fixture.broker_peer().await;
     fixture.stop();
+    fixture.wait_for_process_exit(second_broker.pid).await;
     set_grant_json_nesting(12);
     fixture.start();
 }

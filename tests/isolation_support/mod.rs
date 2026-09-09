@@ -62,6 +62,11 @@ pub(crate) struct Qualification {
     trusted_certificate: Option<(PathBuf, String)>,
 }
 
+pub(crate) struct BrokerPeer {
+    pub(crate) pid: u32,
+    pub(crate) uid: u32,
+}
+
 impl Qualification {
     pub(crate) fn begin(isolated: &Path, cli: &Path, mcp: &Path) -> Self {
         prerequisites();
@@ -194,6 +199,53 @@ impl Qualification {
             .trim()
             .parse()
             .expect("numeric service UID")
+    }
+
+    pub(crate) fn process_group(&self, pid: u32) -> u32 {
+        let pid = rustix::process::Pid::from_raw(
+            i32::try_from(pid).expect("process ID fits in the native PID type"),
+        )
+        .expect("positive process ID");
+        u32::try_from(
+            rustix::process::getpgid(Some(pid))
+                .expect("inspect broker process group")
+                .as_raw_pid(),
+        )
+        .expect("nonnegative process group ID")
+    }
+
+    pub(crate) async fn broker_peer(&self) -> BrokerPeer {
+        let stream = tokio::time::timeout(DEADLINE, tokio::net::UnixStream::connect(SOCKET))
+            .await
+            .expect("connect to the fixed broker socket before deadline")
+            .expect("connect to the fixed broker socket");
+        let peer = stream
+            .peer_cred()
+            .expect("read the socket-serving broker credentials");
+        BrokerPeer {
+            pid: u32::try_from(peer.pid().expect("macOS supplies the peer process ID"))
+                .expect("positive peer process ID"),
+            uid: peer.uid(),
+        }
+    }
+
+    pub(crate) async fn wait_for_process_exit(&self, pid: u32) {
+        let pid = rustix::process::Pid::from_raw(
+            i32::try_from(pid).expect("process ID fits in the native PID type"),
+        )
+        .expect("positive process ID");
+        let deadline = tokio::time::Instant::now() + DEADLINE;
+        loop {
+            match rustix::process::test_kill_process(pid) {
+                Err(rustix::io::Errno::SRCH) => return,
+                Ok(()) => assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "previous socket-serving broker did not exit before deadline"
+                ),
+                Err(error) => panic!("inspect previous socket-serving broker: {error}"),
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     /// Unlock the disposable fixture keychain in the service user's launch context.
@@ -504,6 +556,9 @@ impl Drop for Qualification {
         if self.installed {
             let _ = command("/bin/launchctl")
                 .args(["bootout", "system", PLIST])
+                .output();
+            let _ = command("/bin/launchctl")
+                .args(["bootout", &format!("user/{}", self.service_uid)])
                 .output();
             remove_if_present(Path::new(PLIST));
             remove_directory_if_present(Path::new(INSTALL_ROOT));

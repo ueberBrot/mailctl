@@ -9,10 +9,14 @@
     <string>/bin/launchctl</string>
     <string>asuser</string>
     <string>__SERVICE_UID__</string>
+    <string>/usr/bin/sudo</string>
+    <string>-n</string>
+    <string>-H</string>
+    <string>-u</string>
+    <string>__SERVICE_USER__</string>
+    <string>--</string>
     <string>/Library/PrivilegedHelperTools/org.ueberbrot.mailctl/mailctl-isolated</string>
   </array>
-  <key>UserName</key>
-  <string>__SERVICE_USER__</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>HOME</key>
