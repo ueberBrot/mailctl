@@ -8,10 +8,15 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
+    sync::Mutex,
     thread,
     time::{Duration, Instant},
 };
 use uuid::Uuid;
+
+// Avoid inheriting a writable executable-copy descriptor in a concurrent child.
+// Only copying and spawning are serialized; child processes still run together.
+static COPY_OR_SPAWN: Mutex<()> = Mutex::new(());
 
 #[cfg(feature = "cli")]
 pub(crate) const MAILCTL: &str = env!("CARGO_BIN_EXE_mailctl");
@@ -119,6 +124,7 @@ mailboxes = ["INBOX", "Drafts"]
     }
 
     pub(crate) fn copy_executable(&self, executable: &str, name: &str) -> PathBuf {
+        let _copy_guard = COPY_OR_SPAWN.lock().expect("copy/spawn fixture lock");
         #[cfg(windows)]
         let copy = self.directory.join(format!("{name}.exe"));
         #[cfg(not(windows))]
@@ -145,12 +151,14 @@ impl Drop for Installation {
 }
 
 pub(crate) fn run_bounded(mut command: Command) -> Output {
+    let spawn_guard = COPY_OR_SPAWN.lock().expect("copy/spawn fixture lock");
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("start process");
+    drop(spawn_guard);
     let deadline = Instant::now() + Duration::from_secs(10);
     while child.try_wait().expect("inspect process").is_none() {
         if Instant::now() >= deadline {

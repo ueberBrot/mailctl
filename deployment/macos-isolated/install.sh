@@ -61,7 +61,7 @@ require_non_admin() {
   else
     status=$?
   fi
-  [ "$status" -eq 1 ] || die "cannot determine administrator membership: $1"
+  [ "$status" -eq 67 ] || die "cannot determine administrator membership: $1"
 }
 
 require_service_shell() {

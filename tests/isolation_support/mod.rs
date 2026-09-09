@@ -135,7 +135,7 @@ impl Qualification {
         );
         self.wait_for_socket();
         let deadline = Instant::now() + DEADLINE;
-        while self.launchd_pid() == previous {
+        while self.current_launchd_pid().is_none_or(|pid| pid == previous) {
             assert!(
                 Instant::now() < deadline,
                 "launchd restart did not replace the service process"
@@ -164,6 +164,11 @@ impl Qualification {
     }
 
     pub(crate) fn launchd_pid(&self) -> u32 {
+        self.current_launchd_pid()
+            .expect("launchd reported a service PID")
+    }
+
+    fn current_launchd_pid(&self) -> Option<u32> {
         let output = self.run_root("/bin/launchctl", ["print", &format!("system/{LABEL}")]);
         assert_success(&output, "inspect launchd service");
         String::from_utf8_lossy(&output.stdout)
@@ -173,7 +178,6 @@ impl Qualification {
                     .strip_prefix("pid = ")
                     .and_then(|value| value.trim_end_matches(';').parse().ok())
             })
-            .expect("launchd reported a service PID")
     }
 
     pub(crate) fn uid_of_pid(&self, pid: u32) -> u32 {
