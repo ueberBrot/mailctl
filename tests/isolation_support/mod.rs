@@ -479,10 +479,12 @@ impl Qualification {
 impl Drop for Qualification {
     fn drop(&mut self) {
         if let Ok(log) = fs::read_to_string("/var/db/mailctl-isolated/diagnostic.log") {
-            for line in log
-                .lines()
-                .filter(|line| line.starts_with("[DEBUG-keychain]"))
-            {
+            for line in log.lines().filter(|line| {
+                line.starts_with("[DEBUG-keychain]")
+                    || line.contains("Could not")
+                    || line.contains("Operation not permitted")
+                    || line.contains("launchctl")
+            }) {
                 eprintln!("{line}");
             }
         }
