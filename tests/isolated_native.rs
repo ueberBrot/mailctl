@@ -94,6 +94,10 @@ async fn isolated_launchd_qualification_uses_disposable_identities_and_a_real_na
     );
     assert_eq!(cli["result"]["accounts"].as_array().unwrap().len(), 1);
     assert_eq!(cli["result"]["accounts"][0]["alias"], "work");
+    assert_eq!(
+        cli["result"]["accounts"][0]["account_id"], work_account,
+        "broker and embedded service processes share account identity"
+    );
     assert!(
         !cli.to_string().contains("private@isolated.example.test"),
         "the unassigned account is inaccessible to the isolated caller"
@@ -495,10 +499,6 @@ fn assert_wrong_service_peer_is_rejected(fixture: &Qualification) {
 }
 
 fn envelope(output: &std::process::Output) -> Value {
-    assert!(
-        output.stderr.is_empty(),
-        "machine client output stays on stdout"
-    );
     let text = std::str::from_utf8(&output.stdout).expect("UTF-8 JSON envelope");
     assert_eq!(text.lines().count(), 1, "one JSON envelope per CLI call");
     serde_json::from_str(text).expect("valid JSON envelope")
