@@ -71,10 +71,11 @@ Source availability and authentication answer different questions:
 | `configured`, `unknown` | The source's configuration or availability does not establish authentication. |
 | `unavailable` | This build or execution environment cannot use the source. |
 
-A locked Keychain can still expose entry metadata. macOS also uses the same error
-for some lock and access-policy prompts, so resolution can report
-`interaction_required` instead of distinguishing those causes. Applications never
-open Keychain prompts during authentication.
+A locked Keychain can still expose entry metadata. With prompts disabled, macOS
+can report `access_denied` or `interaction_required` for a locked Keychain or an
+entry whose access policy needs confirmation. These errors do not reliably
+distinguish the cause. Applications never open Keychain prompts during
+authentication.
 
 `mailctl-mcp doctor` provides the same explicit diagnostic in MCP-only installs.
 Bare `mailctl-mcp` continues to serve STDIO. Credential commands and doctor are

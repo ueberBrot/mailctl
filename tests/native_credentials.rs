@@ -180,10 +180,15 @@ fn native_credentials_cross_components_rotate_and_clean_up() {
     assert_private_output(&output.stdout);
     assert_private_output(&output.stderr);
     let result = envelope(&output);
-    assert_eq!(
-        result["result"]["accounts"][0]["authentication"]["outcome"]["error"]["credential_failure"],
-        "interaction_required"
-    );
+    let failure = &result["result"]["accounts"][0]["authentication"]["outcome"]["error"];
+    assert_eq!(output.status.code(), Some(4));
+    assert_eq!(failure["code"], "credential_unavailable");
+    // macOS can report either authorization failure or interaction refusal
+    // when a locked keychain is accessed with prompts disabled.
+    assert!(matches!(
+        failure["credential_failure"].as_str(),
+        Some("access_denied" | "interaction_required")
+    ));
     assert_eq!(server.accepted(), previous_connections);
     keychain.unlock();
     authenticate(
