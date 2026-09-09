@@ -48,7 +48,7 @@ const REQUEST_BYTES: usize = 64 * 1024;
 #[cfg(feature = "isolated")]
 const SESSIONS: usize = 4;
 
-#[derive(Clone, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Route {
     version: u32,
@@ -57,7 +57,7 @@ struct Route {
     callers: Vec<Caller>,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Caller {
     uid: u32,
@@ -326,15 +326,15 @@ async fn server() -> Result<(), Error> {
         while sessions.try_join_next().is_some() {}
         tokio::select! {
             _ = &mut shutdown => break,
-            joined = sessions.join_next(), if !sessions.is_empty() => { let _ = joined; }
+            _ = sessions.join_next(), if !sessions.is_empty() => {}
             accepted = listener.accept() => {
                 let (stream, _) = accepted.map_err(|_| Error::new(ErrorCode::BrokerUnavailable))?;
-                let Ok(permit) = permits.clone().try_acquire_owned() else { drop(stream); continue; };
-                let Ok(peer) = stream.peer_cred() else { drop(stream); continue; };
+                let Ok(permit) = permits.clone().try_acquire_owned() else { continue; };
+                let Ok(peer) = stream.peer_cred() else { continue; };
                 let caller = peer.uid();
-                let Some(grant) = route.grant(caller) else { drop(stream); continue; };
+                let Some(grant) = route.grant(caller) else { continue; };
                 let (grant_slots, cap) = &grant_permits[grant];
-                let Ok(grant_permit) = grant_slots.clone().try_acquire_owned() else { drop(stream); continue; };
+                let Ok(grant_permit) = grant_slots.clone().try_acquire_owned() else { continue; };
                 let cap = *cap;
                 let grant = grant.to_owned();
                 let service = service.clone();

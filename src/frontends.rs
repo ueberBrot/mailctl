@@ -114,7 +114,10 @@ pub fn run(executable: Executable) -> ExitCode {
 }
 
 async fn execute(invocation: Invocation) -> Result<u8, Error> {
-    let Invocation { options, action } = invocation;
+    let Invocation {
+        mut options,
+        action,
+    } = invocation;
     #[cfg(target_os = "macos")]
     if options.isolated {
         return execute_isolated(options, action).await;
@@ -133,10 +136,9 @@ async fn execute(invocation: Invocation) -> Result<u8, Error> {
     let deadline = config.limits.operation_seconds;
     let selected = options
         .grant
-        .as_deref()
-        .unwrap_or(&config.default_grant)
-        .to_owned();
-    let narrowing = invocation_narrowing(&options, &action)?;
+        .take()
+        .unwrap_or_else(|| config.default_grant.clone());
+    let narrowing = invocation_narrowing(&mut options, &action)?;
     let shutdown = termination_signal()?;
     tokio::pin!(shutdown);
     let config_path = options.config.clone();
@@ -181,11 +183,11 @@ async fn execute(invocation: Invocation) -> Result<u8, Error> {
 }
 
 #[cfg(target_os = "macos")]
-async fn execute_isolated(options: arguments::Options, action: Action) -> Result<u8, Error> {
+async fn execute_isolated(mut options: arguments::Options, action: Action) -> Result<u8, Error> {
     if matches!(action, Action::Setup(_) | Action::Credential(_)) {
         return Err(Error::new(ErrorCode::InvalidRequest));
     }
-    let narrowing = invocation_narrowing(&options, &action)?;
+    let narrowing = invocation_narrowing(&mut options, &action)?;
     let shutdown = termination_signal()?;
     tokio::pin!(shutdown);
     let client = tokio::select! {
@@ -196,13 +198,13 @@ async fn execute_isolated(options: arguments::Options, action: Action) -> Result
 }
 
 fn invocation_narrowing(
-    options: &arguments::Options,
+    options: &mut arguments::Options,
     _action: &Action,
 ) -> Result<Narrowing, Error> {
     #[allow(unused_mut)]
     let mut narrowing = Narrowing {
         read_only: options.read_only,
-        accounts: (!options.accounts.is_empty()).then_some(options.accounts.clone()),
+        accounts: (!options.accounts.is_empty()).then(|| std::mem::take(&mut options.accounts)),
     };
     #[cfg(feature = "mcp")]
     if let Action::Mcp {
