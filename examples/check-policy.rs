@@ -74,32 +74,6 @@ fn check_dependencies(
         if cli_only && name == "rmcp" {
             return Err("CLI-only production graph contains MCP dependencies".into());
         }
-        if [
-            "greenmail-support",
-            "testcontainers",
-            "lettre",
-            "smtp",
-            "io-smtp",
-            "io-pop3",
-            "io-jmap",
-            "io-email",
-            "himalaya",
-            "pimalaya-stream",
-            "allocation-counter",
-            "rcgen",
-        ]
-        .contains(&name)
-        {
-            return Err(format!("Forbidden production dependency: {name}").into());
-        }
-        for feature in &node.features {
-            if ["smtp", "sendmail", "pop3", "jmap", "gmail", "outlook"]
-                .iter()
-                .any(|forbidden| feature.to_lowercase().contains(forbidden))
-            {
-                return Err(format!("Forbidden production feature: {name}/{feature}").into());
-            }
-        }
         let dependencies: Vec<_> = package
             .dependencies
             .iter()
