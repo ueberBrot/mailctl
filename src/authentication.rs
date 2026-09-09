@@ -7,10 +7,7 @@ use crate::{
 };
 use std::{
     collections::{HashMap, VecDeque},
-    sync::{
-        Arc, Mutex, Weak,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::{Arc, Mutex, Weak},
     time::Duration,
 };
 use tokio::{
@@ -57,14 +54,32 @@ enum Work {
 }
 struct Flight {
     result: watch::Receiver<Option<Result<Work, Error>>>,
-    waiters: AtomicUsize,
+    // None closes queued work to new waiters before its worker reservation is dropped.
+    waiters: Mutex<Option<usize>>,
     abandoned: Notify,
 }
 impl Flight {
+    fn join(&self) -> bool {
+        let mut waiters = self.waiters.lock().unwrap();
+        let Some(count) = waiters.as_mut() else {
+            return false;
+        };
+        *count += 1;
+        true
+    }
+
+    fn abandon_if_unobserved(&self) -> bool {
+        let mut waiters = self.waiters.lock().unwrap();
+        if *waiters == Some(0) {
+            *waiters = None;
+        }
+        waiters.is_none()
+    }
+
     async fn cancelled(&self) {
         loop {
             let abandoned = self.abandoned.notified();
-            if self.waiters.load(Ordering::Acquire) == 0 {
+            if self.abandon_if_unobserved() {
                 return;
             }
             abandoned.await;
@@ -74,7 +89,10 @@ impl Flight {
 struct Waiter(Arc<Flight>);
 impl Drop for Waiter {
     fn drop(&mut self) {
-        if self.0.waiters.fetch_sub(1, Ordering::AcqRel) == 1 {
+        let mut waiters = self.0.waiters.lock().unwrap();
+        let count = waiters.as_mut().expect("live credential waiter");
+        *count -= 1;
+        if *count == 0 {
             self.0.abandoned.notify_one();
         }
     }
@@ -127,21 +145,20 @@ struct Idle {
 
 /// Dropping a lease disposes its connection. Return it only at a clean operation boundary.
 pub struct Lease {
-    idle: Option<Idle>,
+    idle: Idle,
     admission: Admission,
     pool: Arc<Pool>,
     generation: u64,
     capacity: usize,
 }
 impl Lease {
-    pub fn release(mut self) {
-        let Some(idle) = self.idle.take() else { return };
+    pub fn release(self) {
         let mut state = self.pool.state.lock().unwrap();
         if state.generation == self.generation
-            && idle.expires_at > Instant::now()
+            && self.idle.expires_at > Instant::now()
             && state.idle.len() + self.admission.gate.state.lock().unwrap().active <= self.capacity
         {
-            state.idle.push(idle);
+            state.idle.push(self.idle);
             self.pool.expiry_changed.notify_one();
         }
     }
@@ -180,23 +197,18 @@ impl Gate {
             let mut state = self.state.lock().unwrap();
             if state.waiting.is_empty() && state.active < active {
                 state.active += 1;
-                return Ok(Admission {
-                    gate: self.clone(),
-                    ticket: None,
-                });
+                None
+            } else {
+                if state.waiting.len() >= pending {
+                    return Err(Error::RateLimited);
+                }
+                let ticket = state.next_ticket;
+                state.next_ticket = state.next_ticket.wrapping_add(1);
+                state.waiting.push_back(ticket);
+                Some(ticket)
             }
-            if state.waiting.len() >= pending {
-                return Err(Error::RateLimited);
-            }
-            let ticket = state.next_ticket;
-            state.next_ticket = state.next_ticket.wrapping_add(1);
-            state.waiting.push_back(ticket);
-            ticket
         };
-        Ok(Admission {
-            gate: self,
-            ticket: Some(ticket),
-        })
+        Ok(Admission { gate: self, ticket })
     }
     async fn admit(self: Arc<Self>, active: usize, pending: usize) -> Result<Admission, Error> {
         Ok(self.reserve(active, pending)?.wait(active).await)
@@ -285,12 +297,12 @@ impl Runtime {
         tokio::time::timeout(
             Duration::from_secs(limits.operation_seconds as u64),
             async {
-                let mut lease = self.acquire_inner(account, limits, pool, true).await?;
-                let connection = lease.idle.take().unwrap().connection;
-                connection
-                    .disconnect(Duration::from_secs(limits.operation_seconds as u64))
-                    .await
-                    .map_err(Error::Imap)
+                let Lease {
+                    idle,
+                    admission: _admission,
+                    ..
+                } = self.acquire_inner(account, limits, pool, true).await?;
+                idle.connection.disconnect().await.map_err(Error::Imap)
             },
         )
         .await
@@ -434,7 +446,7 @@ impl Runtime {
             }
         };
         Ok(Lease {
-            idle: Some(idle),
+            idle,
             admission,
             pool,
             generation: account.generation,
@@ -457,9 +469,8 @@ impl Runtime {
             if let Some(flight) = flights
                 .get(&key)
                 .and_then(Weak::upgrade)
-                .filter(|flight| flight.result.borrow().is_none())
+                .filter(|flight| flight.result.borrow().is_none() && flight.join())
             {
-                flight.waiters.fetch_add(1, Ordering::AcqRel);
                 flight
             } else {
                 let admission = self
@@ -469,7 +480,7 @@ impl Runtime {
                 let (sender, receiver) = watch::channel(None);
                 let flight = Arc::new(Flight {
                     result: receiver,
-                    waiters: AtomicUsize::new(1),
+                    waiters: Mutex::new(Some(1)),
                     abandoned: Notify::new(),
                 });
                 flights.insert(key, Arc::downgrade(&flight));
@@ -488,7 +499,7 @@ impl Runtime {
                             return;
                         }
                     };
-                    if running.waiters.load(Ordering::Acquire) == 0 {
+                    if running.abandon_if_unobserved() {
                         return;
                     }
                     let result = tokio::task::spawn_blocking(move || {

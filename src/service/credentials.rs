@@ -6,7 +6,7 @@ use crate::{
     credentials::{self, SecretSource},
     domain::{
         AuthenticationCheck, AuthenticationOutcome, CredentialFailure, Doctor, DoctorAccount,
-        Error, ErrorCode, SourceAvailability,
+        Error, ErrorCode,
     },
     encoding::serialized_size,
     policy::{Permission, RequestContext},
@@ -130,7 +130,7 @@ impl Service {
             result.accounts.push(DoctorAccount {
                 account_id: account.id.to_string(),
                 generation: account.generation,
-                source: source_availability(source),
+                source,
                 authentication,
             });
         }
@@ -185,8 +185,11 @@ impl Service {
                 .ok_or_else(|| Error::new(ErrorCode::AccountNotAllowed))?,
             _ => return Err(select_account()),
         };
-        let binding = self.authentication_account(account)?;
-        Ok((binding.id, binding.source))
+        let (id, _) = self.registry.identity(&account.key);
+        Ok((
+            Uuid::parse_str(id).map_err(|_| Error::new(ErrorCode::InternalError))?,
+            credentials::source_for(&account.credential),
+        ))
     }
 
     pub(crate) fn secret_limit(&self) -> usize {
@@ -201,29 +204,7 @@ fn select_account() -> Error {
     }
 }
 
-pub(crate) fn source_availability(value: credentials::Availability) -> SourceAvailability {
-    match value {
-        credentials::Availability::Available => SourceAvailability::Available,
-        credentials::Availability::Missing => SourceAvailability::Missing,
-        credentials::Availability::Locked => SourceAvailability::Locked,
-        credentials::Availability::AccessDenied => SourceAvailability::AccessDenied,
-        credentials::Availability::Unavailable => SourceAvailability::Unavailable,
-        credentials::Availability::Configured => SourceAvailability::Configured,
-        credentials::Availability::InteractionRequired => SourceAvailability::InteractionRequired,
-        credentials::Availability::Unknown => SourceAvailability::Unknown,
-    }
-}
-
 pub(crate) fn credential_error(failure: credentials::SourceError) -> Error {
-    let failure = match failure {
-        credentials::SourceError::Missing => CredentialFailure::Missing,
-        credentials::SourceError::Locked => CredentialFailure::Locked,
-        credentials::SourceError::AccessDenied => CredentialFailure::AccessDenied,
-        credentials::SourceError::Unavailable => CredentialFailure::Unavailable,
-        credentials::SourceError::InvalidSecret => CredentialFailure::InvalidSecret,
-        credentials::SourceError::InteractionRequired => CredentialFailure::InteractionRequired,
-        credentials::SourceError::Internal => CredentialFailure::Internal,
-    };
     Error {
         message: match failure {
             CredentialFailure::InteractionRequired => {

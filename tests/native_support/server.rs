@@ -98,7 +98,7 @@ impl NativeServer {
     }
 
     pub fn finish(&mut self) {
-        self.stop.send(true).unwrap();
+        let _ = self.stop.send(true);
         self.task
             .take()
             .unwrap()

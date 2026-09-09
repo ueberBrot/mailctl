@@ -1,9 +1,36 @@
 #![cfg(all(target_os = "macos", feature = "cli"))]
 
+#[path = "native_support/process.rs"]
+mod process;
 mod support;
 #[path = "native_support/terminal.rs"]
 mod terminal;
+use std::{
+    process::{Command, Stdio},
+    time::Duration,
+};
 use support::{Installation, MAILCTL, assert_success, run_bounded};
+
+#[test]
+fn bounded_capture_drains_large_pipes_before_the_child_exits() {
+    let child = Command::new("python3")
+        .args([
+            "-c",
+            "import sys\nfor _ in range(128):\n sys.stdout.write('x' * 1024); sys.stdout.flush()\n sys.stderr.write('y' * 1024); sys.stderr.flush()",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start large-output fixture");
+    let captured = process::capture(child, None, 4096, Duration::from_secs(3))
+        .expect("collect large-output fixture");
+    assert!(captured.output.status.success());
+    assert!(captured.stdout_exceeded_limit);
+    assert!(captured.stderr_exceeded_limit);
+    assert_eq!(captured.output.stdout.len(), 4096);
+    assert_eq!(captured.output.stderr.len(), 4096);
+}
 
 #[test]
 fn credential_prompt_restores_echo_after_invalid_input_and_cancellation() {

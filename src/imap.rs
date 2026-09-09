@@ -36,12 +36,10 @@ use wire::Connection;
 /// An authenticated connection with no selected mailbox or retained credential.
 pub(crate) struct AuthenticatedConnection(wire::Session);
 impl AuthenticatedConnection {
-    pub(crate) async fn disconnect(self, deadline: Duration) -> Result<(), Error> {
+    pub(crate) async fn disconnect(self) -> Result<(), Error> {
         let mut metrics = Metrics::default();
         let mut connection = self.0.resume(&mut metrics);
-        tokio::time::timeout(deadline, connection.drive(ImapLogout::new()))
-            .await
-            .map_err(|_| Error::Timeout)?
+        connection.drive(ImapLogout::new()).await
     }
 }
 
@@ -445,11 +443,10 @@ impl ImapProbe {
                     .as_slice()
                     .try_into()
                     .map_err(|_| Error::InvalidInput)?;
-                let items = Projection::request();
                 let fetched = conn
                     .drive(ImapMessageFetch::new(
                         set,
-                        items,
+                        Projection::FIELDS.to_vec().into(),
                         ImapMessageFetchOptions {
                             uid: true,
                             ..Default::default()

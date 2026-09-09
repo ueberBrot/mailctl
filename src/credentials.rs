@@ -1,9 +1,10 @@
 //! Credential sources expose safe status separately from secret resolution.
 
 use crate::config::CredentialSource;
+pub use crate::domain::{CredentialFailure as SourceError, SourceAvailability as Availability};
 use std::{fmt, sync::Arc};
 use uuid::Uuid;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 #[cfg(target_os = "macos")]
 mod native;
@@ -41,13 +42,17 @@ pub(crate) fn prepare_native_access() -> Result<(), SourceError> {
 pub struct Secret(Zeroizing<String>);
 
 impl Secret {
-    pub fn new(bytes: Vec<u8>) -> Result<Self, SourceError> {
-        let bytes = Zeroizing::new(bytes);
+    pub fn new(mut bytes: Vec<u8>) -> Result<Self, SourceError> {
         if bytes.is_empty() || bytes.len() > MAX_SECRET_BYTES {
+            bytes.zeroize();
             return Err(SourceError::InvalidSecret);
         }
-        let text = std::str::from_utf8(&bytes).map_err(|_| SourceError::InvalidSecret)?;
-        Ok(Self(Zeroizing::new(text.to_owned())))
+        String::from_utf8(bytes)
+            .map(|text| Self(Zeroizing::new(text)))
+            .map_err(|error| {
+                error.into_bytes().zeroize();
+                SourceError::InvalidSecret
+            })
     }
 
     pub fn len(&self) -> usize {
@@ -67,29 +72,6 @@ impl fmt::Debug for Secret {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("Secret([REDACTED])")
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SourceError {
-    Missing,
-    Locked,
-    AccessDenied,
-    Unavailable,
-    InvalidSecret,
-    InteractionRequired,
-    Internal,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Availability {
-    Available,
-    Missing,
-    Locked,
-    AccessDenied,
-    Unavailable,
-    Configured,
-    InteractionRequired,
-    Unknown,
 }
 
 impl From<SourceError> for Availability {

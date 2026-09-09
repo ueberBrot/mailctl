@@ -299,6 +299,43 @@ async fn cancelling_queued_credential_work_releases_its_reservation() {
     assert_eq!(source.calls.load(Ordering::SeqCst), 2);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn immediate_same_account_replacement_survives_queued_cancellation() {
+    let limits = Limits {
+        credential_workers: 1,
+        queued_credentials: 2,
+        ..Default::default()
+    };
+    for _ in 0..64 {
+        let runtime = Arc::new(Runtime::new(limits.clone(), RootCertStore::empty()).unwrap());
+        let source = Source::new(true);
+        let active = {
+            let runtime = runtime.clone();
+            let source = source.clone();
+            tokio::spawn(async move { runtime.inspect(Uuid::new_v4(), 1, source).await })
+        };
+        source.wait_calls(1).await;
+        let queued_id = Uuid::new_v4();
+        // Poll the public operation into its occupied worker queue, then cancel it.
+        tokio::select! {
+            biased;
+            result = runtime.inspect(queued_id, 1, source.clone()) => {
+                panic!("queued inspection completed before cancellation: {result:?}");
+            }
+            _ = tokio::task::yield_now() => {}
+        }
+        let replacement = {
+            let runtime = runtime.clone();
+            let source = source.clone();
+            tokio::spawn(async move { runtime.inspect(queued_id, 1, source).await })
+        };
+        source.unblock();
+        assert_eq!(active.await.unwrap(), Ok(Availability::Configured));
+        assert_eq!(replacement.await.unwrap(), Ok(Availability::Configured));
+        assert_eq!(source.calls.load(Ordering::SeqCst), 2);
+    }
+}
+
 #[tokio::test]
 async fn account_connections_and_pending_requests_are_bounded_and_cancel_safe() {
     let (port, roots, fixture) = fixture(2, false).await;
@@ -444,10 +481,9 @@ async fn idle_connections_close_at_the_narrowed_lifetime_without_another_request
     if closed.is_err() {
         fixture.await.unwrap();
     }
-    assert!(
-        closed.is_ok(),
-        "an idle provider connection must close by its lifetime"
-    );
+    closed
+        .expect("an idle provider connection must close by its lifetime")
+        .unwrap();
 }
 
 #[tokio::test]
@@ -475,10 +511,9 @@ async fn a_broader_grant_cannot_extend_an_existing_connections_lifetime() {
     if closed.is_err() {
         fixture.await.unwrap();
     }
-    assert!(
-        closed.is_ok(),
-        "the original connection expiry must survive grant widening"
-    );
+    closed
+        .expect("the original connection expiry must survive grant widening")
+        .unwrap();
 }
 
 #[tokio::test]

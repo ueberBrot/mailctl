@@ -126,7 +126,6 @@ async fn execute(invocation: Invocation) -> Result<u8, Error> {
     }
     let config = configuration::load(&options.config)?;
     let deadline = config.limits.operation_seconds;
-    let accounts = options.accounts.clone();
     let selected = options
         .grant
         .as_deref()
@@ -156,14 +155,18 @@ async fn execute(invocation: Invocation) -> Result<u8, Error> {
         result = initialization => result.map_err(|_| Error::new(ErrorCode::InternalError))??,
     };
     if let Action::Credential(command) = action {
-        let work = credentials::execute(service, accounts, command, options.json);
-        tokio::pin!(work);
-        let result = tokio::select! {
+        let (status, service) = tokio::select! {
             _ = &mut shutdown => return Err(Error::new(ErrorCode::Cancelled)),
-            result = tokio::time::timeout(Duration::from_secs(deadline as u64), &mut work) =>
-                result.map_err(|_| Error::new(ErrorCode::Timeout))?,
+            result = tokio::time::timeout(
+                Duration::from_secs(deadline as u64),
+                credentials::execute(
+                    service,
+                    narrowing.accounts.as_deref().unwrap_or_default(),
+                    command,
+                    options.json,
+                ),
+            ) => result.map_err(|_| Error::new(ErrorCode::Timeout))??,
         };
-        let (status, service) = result?;
         return Ok(report(
             options.json,
             options.diagnostics.color,
@@ -179,7 +182,7 @@ async fn execute(invocation: Invocation) -> Result<u8, Error> {
             let result = tokio::select! {
                 _ = &mut shutdown => Err(Error::new(ErrorCode::Cancelled)),
                 result = tokio::time::timeout(Duration::from_secs(deadline as u64), service.doctor(&context, check_account)) =>
-                    result.map_err(|_| Error::new(ErrorCode::Timeout)).and_then(|result| result),
+                    result.map_err(|_| Error::new(ErrorCode::Timeout)).flatten(),
             };
             Ok(report(
                 options.json,

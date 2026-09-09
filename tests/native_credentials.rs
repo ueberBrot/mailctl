@@ -2,6 +2,8 @@
 
 #[allow(dead_code)]
 mod imap_support;
+#[path = "native_support/process.rs"]
+mod process;
 #[path = "native_support/server.rs"]
 mod server;
 mod support;
@@ -14,8 +16,7 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
-    thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 use support::{Installation, MAILCTL, MAILCTL_MCP, assert_success, envelope, run_bounded};
 use uuid::Uuid;
@@ -24,6 +25,7 @@ const KEYCHAIN_PASSWORD: &str = "disposable-native-keychain-fixture";
 const FIRST: &str = "first-synthetic-account-password";
 const SECOND: &str = "second-distinct-synthetic-password";
 const ROTATED: &str = "replacement-synthetic-password-for-first-account";
+const SECURITY_OUTPUT_BYTES: usize = 32 * 1024;
 
 #[test]
 #[ignore = "changes the User default keychain; run explicitly on a disposable macOS user"]
@@ -449,9 +451,9 @@ impl NativeKeychain {
         if failed {
             return Err("native-keychain cleanup failed; consult private recovery file");
         }
+        remove_if_exists(&self.recovery_path).map_err(|_| "remove recovery file")?;
+        remove_if_exists(&self.lock_path).map_err(|_| "release native qualification lock")?;
         self.active = false;
-        fs::remove_file(&self.recovery_path).map_err(|_| "remove recovery file")?;
-        fs::remove_file(&self.lock_path).map_err(|_| "release native qualification lock")?;
         Ok(())
     }
 }
@@ -476,24 +478,25 @@ fn security_result(arguments: &[&str]) -> bool {
 }
 
 fn security_output(arguments: &[&str]) -> Result<Output, ()> {
-    let mut child = Command::new("/usr/bin/security")
+    let child = Command::new("/usr/bin/security")
         .args(arguments)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .map_err(|_| ())?;
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return child.wait_with_output().map_err(|_| ()),
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(());
-            }
-        }
+    let captured = process::capture(child, None, SECURITY_OUTPUT_BYTES, Duration::from_secs(10))?;
+    if captured.stdout_exceeded_limit || captured.stderr_exceeded_limit {
+        return Err(());
+    }
+    Ok(captured.output)
+}
+
+fn remove_if_exists(path: &Path) -> std::io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
     }
 }
 

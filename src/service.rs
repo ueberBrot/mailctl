@@ -1,6 +1,6 @@
 //! Account discovery and access-grant authorization through one application interface.
 mod credentials;
-pub(crate) use credentials::{credential_error, source_availability};
+pub(crate) use credentials::credential_error;
 mod state;
 use crate::encoding::{OutputBudget, serialized_size};
 use crate::{

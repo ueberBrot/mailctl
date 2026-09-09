@@ -28,7 +28,7 @@ pub(super) async fn prompt(maximum: usize) -> Result<Secret, SourceError> {
     struct Terminal {
         input: Input,
         output: File,
-        previous: Option<Termios>,
+        previous: Termios,
         flags: OFlags,
         active: bool,
     }
@@ -36,9 +36,7 @@ pub(super) async fn prompt(maximum: usize) -> Result<Secret, SourceError> {
         fn drop(&mut self) {
             // Discard unread input, including an oversized secret, before the shell resumes.
             if self.active {
-                if let Some(previous) = &self.previous {
-                    let _ = tcsetattr(self.input.file(), OptionalActions::Flush, previous);
-                }
+                let _ = tcsetattr(self.input.file(), OptionalActions::Flush, &self.previous);
                 let mut output = &self.output;
                 let _ = writeln!(output);
             }
@@ -93,6 +91,11 @@ pub(super) async fn prompt(maximum: usize) -> Result<Secret, SourceError> {
     if !input.is_terminal() || !output.is_terminal() {
         return Err(SourceError::InteractionRequired);
     }
+    let previous = tcgetattr(&input).map_err(|_| SourceError::InteractionRequired)?;
+    let mut quiet = previous.clone();
+    quiet
+        .local_modes
+        .remove(LocalModes::ECHO | LocalModes::ECHONL | LocalModes::ICANON);
     let flags = fcntl_getfl(&input).map_err(|_| SourceError::InteractionRequired)?;
     fcntl_setfl(&input, flags | OFlags::NONBLOCK).map_err(|_| SourceError::InteractionRequired)?;
     let input = match AsyncFd::try_with_interest(input, Interest::READABLE) {
@@ -102,17 +105,10 @@ pub(super) async fn prompt(maximum: usize) -> Result<Secret, SourceError> {
     let mut terminal = Terminal {
         input,
         output,
-        previous: None,
+        previous,
         flags,
         active: false,
     };
-    let previous =
-        tcgetattr(terminal.input.file()).map_err(|_| SourceError::InteractionRequired)?;
-    terminal.previous = Some(previous.clone());
-    let mut quiet = previous.clone();
-    quiet
-        .local_modes
-        .remove(LocalModes::ECHO | LocalModes::ECHONL | LocalModes::ICANON);
     tcsetattr(terminal.input.file(), OptionalActions::Flush, &quiet)
         .map_err(|_| SourceError::InteractionRequired)?;
     terminal.active = true;

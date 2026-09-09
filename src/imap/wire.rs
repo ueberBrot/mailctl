@@ -18,6 +18,7 @@ use io_imap::{
     types::{
         command::{Command, CommandBody},
         core::TagGenerator,
+        fetch::MacroOrMessageDataItemNames,
         flag::Flag,
         response::{Code, Data, Response, Status, StatusKind},
     },
@@ -535,10 +536,10 @@ impl CommandState {
             CommandBody::Search { uid: true, .. } => CommandKind::Search { seen: false },
             CommandBody::Fetch {
                 uid: true,
-                macro_or_item_names,
+                macro_or_item_names: MacroOrMessageDataItemNames::MessageDataItemNames(names),
                 modifiers,
                 ..
-            } if modifiers.is_empty() && macro_or_item_names == Projection::request() => {
+            } if modifiers.is_empty() && names.as_slice() == Projection::FIELDS => {
                 CommandKind::Fetch {
                     sequences: BTreeSet::new(),
                 }

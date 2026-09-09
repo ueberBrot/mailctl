@@ -5,16 +5,16 @@ use crate::credentials::Secret;
 use crate::{
     credentials::SourceError,
     domain::{CredentialStatus, Error, ErrorCode, Provisioning},
-    service::{Service, credential_error, source_availability},
+    service::{Service, credential_error},
 };
 
 pub(super) async fn execute(
     service: Service,
-    selected: Vec<String>,
+    selected: &[String],
     command: Credential,
     json: bool,
 ) -> Result<(CredentialStatus, Service), Error> {
-    let (id, source) = service.credential_source(&selected)?;
+    let (id, source) = service.credential_source(selected)?;
     let mutable = source.mutable_store().is_some();
     let secret = match command {
         Credential::Set => {
@@ -35,34 +35,33 @@ pub(super) async fn execute(
         }
         Credential::Delete | Credential::Status => None,
     };
-    let (result, service) = tokio::task::spawn_blocking(move || {
-        let result = match command {
+    // Retain the installation lease until blocking work finishes, even after cancellation.
+    tokio::task::spawn_blocking(move || {
+        match command {
             Credential::Set => source
                 .mutable_store()
                 .expect("credential store was validated before prompting")
-                .set(id, secret.as_ref().expect("prompt supplied a credential"))
-                .map_err(credential_error),
+                .set(id, secret.as_ref().expect("prompt supplied a credential")),
             Credential::Delete => source
                 .mutable_store()
                 .expect("credential store was validated before deletion")
-                .delete(id)
-                .map_err(credential_error),
+                .delete(id),
             Credential::Status => Ok(()),
-        };
-        let status = result.map(|()| CredentialStatus {
+        }
+        .map_err(credential_error)?;
+        let status = CredentialStatus {
             account_id: id.to_string(),
-            availability: source_availability(source.availability(id)),
+            availability: source.availability(id),
             provisioning: if mutable {
                 Provisioning::Operator
             } else {
                 Provisioning::External
             },
-        });
-        (status, service)
+        };
+        Ok((status, service))
     })
     .await
-    .map_err(|_| Error::new(ErrorCode::InternalError))?;
-    result.map(|status| (status, service))
+    .map_err(|_| Error::new(ErrorCode::InternalError))?
 }
 
 #[cfg(unix)]

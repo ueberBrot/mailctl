@@ -4,7 +4,7 @@ use io_imap::types::{
     core::NString,
     datetime::DateTime,
     envelope::Envelope as WireEnvelope,
-    fetch::{MacroOrMessageDataItemNames, MessageDataItem, MessageDataItemName},
+    fetch::{MessageDataItem, MessageDataItemName},
     flag::FlagFetch,
 };
 use std::num::NonZeroU32;
@@ -17,15 +17,13 @@ pub(super) struct Projection<'a, 'b> {
     size: u32,
 }
 impl<'a, 'b> Projection<'a, 'b> {
-    pub fn request() -> MacroOrMessageDataItemNames<'static> {
-        MacroOrMessageDataItemNames::MessageDataItemNames(vec![
-            MessageDataItemName::Uid,
-            MessageDataItemName::Envelope,
-            MessageDataItemName::Flags,
-            MessageDataItemName::InternalDate,
-            MessageDataItemName::Rfc822Size,
-        ])
-    }
+    pub const FIELDS: [MessageDataItemName<'static>; 5] = [
+        MessageDataItemName::Uid,
+        MessageDataItemName::Envelope,
+        MessageDataItemName::Flags,
+        MessageDataItemName::InternalDate,
+        MessageDataItemName::Rfc822Size,
+    ];
     /// Rejects unknown, duplicate, and missing fields before the backend can merge rows.
     pub fn parse(items: &'a [MessageDataItem<'b>]) -> Result<Self, Error> {
         let mut uid = None;
