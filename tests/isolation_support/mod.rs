@@ -199,10 +199,32 @@ impl Qualification {
     /// Unlock the disposable fixture keychain in the broker's launchd session.
     pub(crate) fn unlock_broker_keychain(&self, keychain: &Path) {
         let broker_pid = self.launchd_pid().to_string();
+        for output in [
+            bounded(command("/bin/launchctl").args(["procinfo", &broker_pid])),
+            bounded(command("/bin/launchctl").args([
+                "asuser",
+                "0",
+                "/bin/sh",
+                "-c",
+                "/bin/launchctl procinfo \"$$\"",
+            ])),
+        ] {
+            for line in String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter(|line| {
+                    line.contains("audit")
+                        || line.contains("bootstrap")
+                        || line.contains("session")
+                        || line.contains("uid")
+                })
+            {
+                eprintln!("[DEBUG-keychain] context {line}");
+            }
+        }
         let keychain = keychain.to_str().expect("UTF-8 fixture keychain path");
         let output = bounded(command("/bin/launchctl").args([
-            "bsexec",
-            &broker_pid,
+            "asuser",
+            "0",
             "/usr/bin/security",
             "unlock-keychain",
             "-p",
