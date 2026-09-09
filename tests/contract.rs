@@ -480,14 +480,31 @@ fn repeated_grant_account_keys_do_not_inflate_health_response_budgets() {
     let mut config = Config::parse(&configuration()).unwrap();
     config.grants[0].accounts = vec!["primary".into(); config.limits.accounts];
     let service = Service::in_memory(config).unwrap();
-    let context = service
-        .context("reader", &Narrowing::default())
-        .unwrap()
-        .with_response_limit(2048);
-    let health = execute(&service, &context, Operation::Health).unwrap();
-    assert_eq!(health["accounts"].as_array().unwrap().len(), 1);
-    let capabilities = execute(&service, &context, Operation::Capabilities).unwrap();
-    assert_eq!(capabilities["health"], health);
+    for narrowing in [
+        Narrowing::default(),
+        Narrowing {
+            accounts: Some(vec!["work".into(), "work".into(), "personal".into()]),
+            ..Default::default()
+        },
+    ] {
+        let context = service
+            .context("reader", &narrowing)
+            .unwrap()
+            .with_response_limit(2048);
+        let health = execute(&service, &context, Operation::Health).unwrap();
+        assert_eq!(health["accounts"].as_array().unwrap().len(), 1);
+        let capabilities = execute(&service, &context, Operation::Capabilities).unwrap();
+        assert_eq!(capabilities["health"], health);
+        let discovery = execute(
+            &service,
+            &context,
+            Operation::ListAccounts(ListAccountsInput::default()),
+        )
+        .unwrap();
+        assert_eq!(discovery["accounts"].as_array().unwrap().len(), 1);
+        assert_eq!(discovery["accounts"][0]["alias"], "work");
+        assert_eq!(discovery["complete"], true);
+    }
 }
 
 #[test]
@@ -504,7 +521,10 @@ fn concurrent_processes_share_maintenance_leases_and_exclude_setup_until_they_ar
     let mut config = Config::parse(&configuration()).unwrap();
     config.state_dir = directory.clone();
     let first = Service::open(config.clone()).unwrap();
-    let second = Service::open(config.clone()).unwrap();
+    // Equivalent path spellings must keep the same revision and shared lease.
+    let mut equivalent = config.clone();
+    equivalent.state_dir = directory.join(".");
+    let second = Service::open(equivalent).unwrap();
     assert_eq!(
         Service::setup(config.clone()).unwrap_err().code,
         mailctl::domain::ErrorCode::RateLimited

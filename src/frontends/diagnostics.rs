@@ -88,15 +88,12 @@ impl Options {
                 .location()
                 .map(|location| format!("{}:{}", location.file(), location.line()))
                 .unwrap_or_default();
-            let location: String = location
-                .chars()
+            let start = location
+                .char_indices()
                 .rev()
-                .take(128)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .flat_map(char::escape_default)
-                .collect();
+                .nth(127)
+                .map_or(0, |(index, _)| index);
+            let location = location[start..].escape_default().to_string();
             tracing::error!(target: TARGET, event = "panic", event_id = uuid::Uuid::new_v4().to_string().as_str(), location = location.as_str(), code = "internal_error");
         }));
         Ok(())
