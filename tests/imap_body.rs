@@ -186,8 +186,7 @@ async fn html_preserves_inert_link_targets_and_quotes_without_active_content() {
 async fn related_uses_its_declared_root_and_falls_back_when_the_root_is_absent() {
     let first = text_part("PLAIN", "UTF-8", "7BIT", 5, "\"<first>\"", "NIL");
     let second = text_part("PLAIN", "UTF-8", "7BIT", 6, "\"<second>\"", "NIL");
-    for (root, part, body) in [("<second>", "2", "Second"), ("<missing>", "1", "First!")] {
-        let body = if part == "1" { "First" } else { body };
+    for (root, part, body) in [("<second>", "2", "Second"), ("<missing>", "1", "First")] {
         let structure = format!("({first}{second} \"RELATED\" (\"START\" \"{root}\") NIL NIL NIL)");
         let page = read_selected(structure, Some(part), body.as_bytes().to_vec()).await;
         assert_eq!(page.text, body);

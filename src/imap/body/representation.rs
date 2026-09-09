@@ -7,7 +7,7 @@ use io_imap::types::{
     fetch::Part,
 };
 use mail_parser::{GetHeader, MessageParser, MimeHeaders};
-use std::{collections::HashMap, io::Cursor, num::NonZeroU32};
+use std::{borrow::Cow, collections::HashMap, io::Cursor, num::NonZeroU32};
 
 const HTML_TABLE_SPAN_LIMIT: usize = 8;
 const HTML_TABLE_CELL_LIMIT: usize = 128;
@@ -38,8 +38,7 @@ pub(super) fn select(
     content_ids: &HashMap<Part, String>,
 ) -> Result<Option<Selected>, Error> {
     validate_structure(structure, limits)?;
-    let mut walker = Walker::new(limits, content_ids);
-    walker.select(structure, None, 1)
+    select_part(structure, None, content_ids)
 }
 
 /// Return only the direct children whose MIME headers can establish a related root.
@@ -48,10 +47,8 @@ pub(super) fn related_multipart_headers(
     limits: &Limits,
 ) -> Result<Vec<Part>, Error> {
     validate_structure(structure, limits)?;
-    let empty_ids = HashMap::new();
-    let mut walker = Walker::new(limits, &empty_ids);
     let mut paths = Vec::new();
-    walker.related_headers(structure, None, 1, &mut paths)?;
+    related_headers(structure, None, &mut paths)?;
     Ok(paths)
 }
 
@@ -85,7 +82,8 @@ pub(super) fn validate_headers(
         .header_value(&mail_parser::HeaderName::ContentId)
         .and_then(|value| value.as_text())
         .map(normalize_content_id)
-        .transpose()?;
+        .transpose()?
+        .map(ToOwned::to_owned);
 
     if let Some(selected) = selected {
         let (media_type, charset) = headers.content_type().map_or_else(
@@ -133,7 +131,7 @@ pub(super) fn render(selected: &Selected, wire: &[u8], limits: &Limits) -> Resul
     }
     let transfer_work = wire.len().checked_mul(4).ok_or(Error::Limit)?;
     work = add_work(work, transfer_work, limits)?;
-    let (decoded, mut replacements) = decode_transfer(wire, &selected.transfer_encoding)?;
+    let (decoded, mut replacements) = decode_transfer(wire, &selected.transfer_encoding);
     if decoded.len() > limits.max_decoded_bytes {
         return Err(Error::Limit);
     }
@@ -171,12 +169,6 @@ pub(super) fn render(selected: &Selected, wire: &[u8], limits: &Limits) -> Resul
     })
 }
 
-struct Walker<'a> {
-    limits: &'a Limits,
-    content_ids: &'a HashMap<Part, String>,
-    parts: usize,
-}
-
 /// Count the complete server-provided structure before selection cuts off attached-message and
 /// attachment subtrees. Those subtrees are ineligible for rendering, but still consume the MIME
 /// structure budget.
@@ -210,135 +202,107 @@ fn validate_structure(structure: &BodyStructure<'_>, limits: &Limits) -> Result<
     visit(structure, limits, &mut parts, 1)
 }
 
-impl<'a> Walker<'a> {
-    fn new(limits: &'a Limits, content_ids: &'a HashMap<Part, String>) -> Self {
-        Self {
-            limits,
-            content_ids,
-            parts: 0,
-        }
-    }
-
-    fn visit(&mut self, depth: usize) -> Result<(), Error> {
-        self.parts = self.parts.checked_add(1).ok_or(Error::Limit)?;
-        if self.parts > self.limits.max_mime_parts || depth > self.limits.max_nesting {
-            return Err(Error::Limit);
-        }
-        Ok(())
-    }
-
-    fn select(
-        &mut self,
-        structure: &BodyStructure<'_>,
-        path: Option<&Part>,
-        depth: usize,
-    ) -> Result<Option<Selected>, Error> {
-        self.visit(depth)?;
-        match structure {
-            BodyStructure::Single {
+fn select_part(
+    structure: &BodyStructure<'_>,
+    path: Option<&Part>,
+    content_ids: &HashMap<Part, String>,
+) -> Result<Option<Selected>, Error> {
+    match structure {
+        BodyStructure::Single {
+            body,
+            extension_data,
+        } => {
+            if attachment(extension_data.as_ref().and_then(|data| data.tail.as_ref())) {
+                return Ok(None);
+            }
+            leaf(
                 body,
-                extension_data,
-            } => {
-                if attachment(extension_data.as_ref().and_then(|data| data.tail.as_ref())) {
-                    return Ok(None);
-                }
-                leaf(
-                    body,
-                    path.cloned()
-                        .unwrap_or_else(|| Part(NonZeroU32::MIN.into())),
-                )
+                path.cloned()
+                    .unwrap_or_else(|| Part(NonZeroU32::MIN.into())),
+            )
+        }
+        BodyStructure::Multi {
+            bodies,
+            subtype,
+            extension_data,
+        } => {
+            if attachment(extension_data.as_ref().and_then(|data| data.tail.as_ref())) {
+                return Ok(None);
             }
-            BodyStructure::Multi {
-                bodies,
-                subtype,
-                extension_data,
-            } => {
-                if attachment(extension_data.as_ref().and_then(|data| data.tail.as_ref())) {
-                    return Ok(None);
-                }
-                let subtype = imap_text(subtype)?.to_ascii_lowercase();
-                let children = bodies.as_ref();
-                let mut selected = Vec::with_capacity(children.len());
-                for (index, child) in children.iter().enumerate() {
-                    let child_path = child_path(path, index + 1)?;
-                    selected.push((
-                        child_path.clone(),
-                        self.select(child, Some(&child_path), depth + 1)?,
-                    ));
-                }
-                match subtype.as_str() {
-                    "alternative" => first_type(&selected, "text/plain")
-                        .or_else(|| first_type(&selected, "text/html")),
-                    "related" => {
-                        let parameters = extension_data
-                            .as_ref()
-                            .map_or(&[][..], |data| data.parameter_list.as_slice());
-                        let root = parameter(parameters, "start")?
-                            .as_deref()
-                            .map(normalize_content_id)
-                            .transpose()?;
-                        let related_root = if let Some(root) = root {
-                            let mut related_root = None;
-                            for (child, (path, candidate)) in children.iter().zip(&selected) {
-                                let content_id = self
-                                    .content_ids
-                                    .get(path)
-                                    .map(|value| normalize_content_id(value))
-                                    .transpose()?
-                                    .or(structure_content_id(child)?);
-                                if content_id.as_deref() == Some(root.as_str()) {
-                                    related_root = candidate.clone();
-                                    break;
-                                }
+            let subtype = imap_text(subtype)?.to_ascii_lowercase();
+            let children = bodies.as_ref();
+            let mut selected = Vec::with_capacity(children.len());
+            for (index, child) in children.iter().enumerate() {
+                let child_path = child_path(path, index + 1)?;
+                let candidate = select_part(child, Some(&child_path), content_ids)?;
+                selected.push((child_path, candidate));
+            }
+            Ok(match subtype.as_str() {
+                "alternative" => first_type(&mut selected, "text/plain")
+                    .or_else(|| first_type(&mut selected, "text/html")),
+                "related" => {
+                    let parameters = extension_data
+                        .as_ref()
+                        .map_or(&[][..], |data| data.parameter_list.as_slice());
+                    let root = parameter(parameters, "start")?
+                        .map(normalize_content_id)
+                        .transpose()?;
+                    let related_root = if let Some(root) = root {
+                        let mut related_root = None;
+                        for (child, (path, candidate)) in children.iter().zip(&mut selected) {
+                            let content_id = content_ids
+                                .get(path)
+                                .map(|value| normalize_content_id(value))
+                                .transpose()?
+                                .or(structure_content_id(child)?);
+                            if content_id == Some(root) {
+                                related_root = candidate.take();
+                                break;
                             }
-                            related_root
-                        } else {
-                            None
-                        };
-                        related_root.or_else(|| first(&selected))
-                    }
-                    _ => first(&selected),
+                        }
+                        related_root
+                    } else {
+                        None
+                    };
+                    related_root.or_else(|| first(&mut selected))
                 }
-                .map_or(Ok(None), |selected| Ok(Some(selected)))
-            }
+                _ => first(&mut selected),
+            })
         }
     }
+}
 
-    fn related_headers(
-        &mut self,
-        structure: &BodyStructure<'_>,
-        path: Option<&Part>,
-        depth: usize,
-        paths: &mut Vec<Part>,
-    ) -> Result<(), Error> {
-        self.visit(depth)?;
-        match structure {
-            BodyStructure::Single { .. } => Ok(()),
-            BodyStructure::Multi {
-                bodies,
-                subtype,
-                extension_data,
-            } => {
-                if attachment(extension_data.as_ref().and_then(|data| data.tail.as_ref())) {
-                    return Ok(());
-                }
-                let related = imap_text(subtype)?.eq_ignore_ascii_case("related")
-                    && parameter(
-                        extension_data
-                            .as_ref()
-                            .map_or(&[][..], |data| data.parameter_list.as_slice()),
-                        "start",
-                    )?
-                    .is_some();
-                for (index, child) in bodies.as_ref().iter().enumerate() {
-                    let child_path = child_path(path, index + 1)?;
-                    if related && matches!(child, BodyStructure::Multi { .. }) {
-                        paths.push(child_path.clone());
-                    }
-                    self.related_headers(child, Some(&child_path), depth + 1, paths)?;
-                }
-                Ok(())
+fn related_headers(
+    structure: &BodyStructure<'_>,
+    path: Option<&Part>,
+    paths: &mut Vec<Part>,
+) -> Result<(), Error> {
+    match structure {
+        BodyStructure::Single { .. } => Ok(()),
+        BodyStructure::Multi {
+            bodies,
+            subtype,
+            extension_data,
+        } => {
+            if attachment(extension_data.as_ref().and_then(|data| data.tail.as_ref())) {
+                return Ok(());
             }
+            let related = imap_text(subtype)?.eq_ignore_ascii_case("related")
+                && parameter(
+                    extension_data
+                        .as_ref()
+                        .map_or(&[][..], |data| data.parameter_list.as_slice()),
+                    "start",
+                )?
+                .is_some();
+            for (index, child) in bodies.as_ref().iter().enumerate() {
+                let child_path = child_path(path, index + 1)?;
+                if related && matches!(child, BodyStructure::Multi { .. }) {
+                    paths.push(child_path.clone());
+                }
+                related_headers(child, Some(&child_path), paths)?;
+            }
+            Ok(())
         }
     }
 }
@@ -355,13 +319,14 @@ fn leaf(body: &Body<'_>, part: Part) -> Result<Option<Selected>, Error> {
         part,
         media_type: format!("text/{subtype}"),
         charset: parameter(&body.basic.parameter_list, "charset")?
-            .unwrap_or_else(|| "us-ascii".to_owned()),
+            .unwrap_or("us-ascii")
+            .to_owned(),
         transfer_encoding: imap_text(&body.basic.content_transfer_encoding)?.to_ascii_lowercase(),
         wire_size: body.basic.size as usize,
     }))
 }
 
-fn structure_content_id(structure: &BodyStructure<'_>) -> Result<Option<String>, Error> {
+fn structure_content_id<'a>(structure: &'a BodyStructure<'_>) -> Result<Option<&'a str>, Error> {
     let BodyStructure::Single { body, .. } = structure else {
         return Ok(None);
     };
@@ -371,7 +336,6 @@ fn structure_content_id(structure: &BodyStructure<'_>) -> Result<Option<String>,
         .as_ref()
         .map(imap_text)
         .transpose()?
-        .as_deref()
         .map(normalize_content_id)
         .transpose()
 }
@@ -384,10 +348,10 @@ fn attachment(disposition: Option<&Disposition<'_>>) -> bool {
         })
 }
 
-fn parameter(
-    parameters: &[(IString<'_>, IString<'_>)],
+fn parameter<'a>(
+    parameters: &'a [(IString<'_>, IString<'_>)],
     wanted: &str,
-) -> Result<Option<String>, Error> {
+) -> Result<Option<&'a str>, Error> {
     for (name, value) in parameters {
         if imap_text(name)?.eq_ignore_ascii_case(wanted) {
             return Ok(Some(imap_text(value)?));
@@ -396,8 +360,8 @@ fn parameter(
     Ok(None)
 }
 
-fn imap_text(value: &IString<'_>) -> Result<String, Error> {
-    String::from_utf8(value.clone().into_inner().into_owned()).map_err(|_| Error::Protocol)
+fn imap_text<'a>(value: &'a IString<'_>) -> Result<&'a str, Error> {
+    std::str::from_utf8(value.as_ref()).map_err(|_| Error::Protocol)
 }
 
 fn child_path(parent: Option<&Part>, child: usize) -> Result<Part, Error> {
@@ -410,18 +374,15 @@ fn child_path(parent: Option<&Part>, child: usize) -> Result<Part, Error> {
     ))
 }
 
-fn first(candidates: &[(Part, Option<Selected>)]) -> Option<Selected> {
+fn first(candidates: &mut [(Part, Option<Selected>)]) -> Option<Selected> {
     candidates
-        .iter()
-        .find_map(|(_, candidate)| candidate.clone())
+        .iter_mut()
+        .find_map(|(_, candidate)| candidate.take())
 }
 
-fn first_type(candidates: &[(Part, Option<Selected>)], media_type: &str) -> Option<Selected> {
-    candidates.iter().find_map(|(_, candidate)| {
-        candidate
-            .as_ref()
-            .filter(|candidate| candidate.media_type == media_type)
-            .cloned()
+fn first_type(candidates: &mut [(Part, Option<Selected>)], media_type: &str) -> Option<Selected> {
+    candidates.iter_mut().find_map(|(_, candidate)| {
+        candidate.take_if(|candidate| candidate.media_type == media_type)
     })
 }
 
@@ -429,7 +390,7 @@ fn complete_headers(raw: &[u8]) -> bool {
     raw == b"\r\n" || raw.ends_with(b"\r\n\r\n") || raw.ends_with(b"\n\n")
 }
 
-fn normalize_content_id(value: &str) -> Result<String, Error> {
+fn normalize_content_id(value: &str) -> Result<&str, Error> {
     let value = value.trim();
     let value = value
         .strip_prefix('<')
@@ -438,81 +399,57 @@ fn normalize_content_id(value: &str) -> Result<String, Error> {
     if value.is_empty() || value.len() > 998 || value.bytes().any(|byte| byte.is_ascii_control()) {
         return Err(Error::Protocol);
     }
-    Ok(value.to_owned())
+    Ok(value)
 }
 
-fn decode_transfer(wire: &[u8], transfer_encoding: &str) -> Result<(Vec<u8>, bool), Error> {
-    match transfer_encoding.trim().to_ascii_lowercase().as_str() {
-        "7bit" | "8bit" | "binary" => Ok((wire.to_vec(), false)),
-        "base64" => Ok(decode_base64(wire)),
-        "quoted-printable" => Ok(decode_quoted_printable(wire)),
-        _ => Ok((wire.to_vec(), true)),
-    }
+fn decode_transfer<'a>(wire: &'a [u8], transfer_encoding: &str) -> (Cow<'a, [u8]>, bool) {
+    let (decoded, replacements) = match transfer_encoding.trim() {
+        "7bit" | "8bit" | "binary" => return (Cow::Borrowed(wire), false),
+        "base64" => decode_base64(wire),
+        "quoted-printable" => decode_quoted_printable(wire),
+        _ => return (Cow::Borrowed(wire), true),
+    };
+    (Cow::Owned(decoded), replacements)
 }
 
 fn decode_base64(wire: &[u8]) -> (Vec<u8>, bool) {
-    let malformed = !well_formed_base64(wire);
+    let (complete, well_formed) = scan_base64(wire);
     if let Some(decoded) = mail_parser::decoders::base64::base64_decode(wire) {
-        return (decoded, malformed);
+        return (decoded, !well_formed);
     }
 
     // The pinned decoder rejects an invalid byte wholesale. Keep the complete MIME quanta before
     // that byte, which are independently decodable, and make the loss visible to the caller.
-    let complete = complete_base64_quanta(wire);
     let recovered =
         mail_parser::decoders::base64::base64_decode(&wire[..complete]).unwrap_or_default();
     (recovered, true)
 }
 
-fn well_formed_base64(wire: &[u8]) -> bool {
-    let mut quartet = [0; 4];
-    let mut len = 0;
-    let mut padded = false;
-    for byte in wire.iter().copied() {
-        if byte.is_ascii_whitespace() {
-            continue;
-        }
-        if padded || !(base64_alphabet(byte) || byte == b'=') {
-            return false;
-        }
-        quartet[len] = byte;
-        len += 1;
-        if len == quartet.len() {
-            if !valid_base64_quartet(quartet) {
-                return false;
-            }
-            padded = quartet[2] == b'=' || quartet[3] == b'=';
-            len = 0;
-        }
-    }
-    len == 0
-}
-
-fn complete_base64_quanta(wire: &[u8]) -> usize {
+/// Validate the whole input and retain the end of its independently decodable prefix.
+fn scan_base64(wire: &[u8]) -> (usize, bool) {
     let mut complete = 0;
     let mut quartet = [0; 4];
     let mut len = 0;
+    let mut padded = false;
     for (index, byte) in wire.iter().copied().enumerate() {
         if byte.is_ascii_whitespace() {
             continue;
         }
-        if !(base64_alphabet(byte) || byte == b'=') {
-            break;
+        if padded || !(base64_alphabet(byte) || byte == b'=') {
+            return (complete, false);
         }
         quartet[len] = byte;
         len += 1;
         if len == quartet.len() {
             if !valid_base64_quartet(quartet) {
-                break;
+                return (complete, false);
             }
             complete = index + 1;
-            if quartet[2] == b'=' || quartet[3] == b'=' {
-                break;
-            }
+            padded = quartet[2] == b'=' || quartet[3] == b'=';
             len = 0;
         }
     }
-    complete
+    (complete, len == 0)
 }
 
 fn base64_alphabet(byte: u8) -> bool {
@@ -545,20 +482,16 @@ fn base64_value(byte: u8) -> Option<u8> {
 }
 
 fn decode_quoted_printable(wire: &[u8]) -> (Vec<u8>, bool) {
-    let malformed = !well_formed_quoted_printable(wire);
+    let prefix = quoted_printable_prefix_len(wire);
+    let malformed = prefix != wire.len();
     if let Some(decoded) = mail_parser::decoders::quoted_printable::quoted_printable_decode(wire) {
         return (decoded, malformed);
     }
 
-    let prefix = quoted_printable_prefix_len(wire);
     let recovered =
         mail_parser::decoders::quoted_printable::quoted_printable_decode(&wire[..prefix])
             .unwrap_or_default();
     (recovered, true)
-}
-
-fn well_formed_quoted_printable(wire: &[u8]) -> bool {
-    quoted_printable_prefix_len(wire) == wire.len()
 }
 
 fn quoted_printable_prefix_len(wire: &[u8]) -> usize {

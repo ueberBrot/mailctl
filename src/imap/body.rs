@@ -15,7 +15,7 @@ use io_imap::{
     },
 };
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, num::NonZeroU32};
+use std::{collections::HashMap, fmt::Write, num::NonZeroU32};
 
 /// In-memory continuation for this route proof. Public authenticated tokens belong to
 /// the application reading contract. A continuation is revalidated after each fetch.
@@ -118,7 +118,6 @@ impl ImapProbe {
                 }
             }
             let selected = representation::select(structure, &limits, &related_ids)?;
-            let mut raw = Vec::new();
             let rendered = if let Some(selected) = &selected {
                 if selected.wire_size > limits.max_body_wire_bytes {
                     return Err(Error::Limit);
@@ -127,7 +126,7 @@ impl ImapProbe {
                 if single {
                     representation::validate_headers(&root_headers, Some(selected), &limits)?;
                 }
-                if single && size as usize <= limits.max_body_wire_bytes {
+                let (raw, body_offset) = if single && size as usize <= limits.max_body_wire_bytes {
                     let whole = bytes(
                         &mut conn,
                         request.uid,
@@ -142,20 +141,25 @@ impl ImapProbe {
                     {
                         return Err(Error::Protocol);
                     }
-                    raw.extend_from_slice(&whole[root_headers.len()..]);
+                    (whole, root_headers.len())
                 } else {
-                    raw = bytes(
-                        &mut conn,
-                        request.uid,
-                        Some(Section::Part(selected.part.clone())),
-                        Some(selected.wire_size),
-                        limits.max_body_wire_bytes,
-                        &limits,
+                    (
+                        bytes(
+                            &mut conn,
+                            request.uid,
+                            Some(Section::Part(selected.part.clone())),
+                            Some(selected.wire_size),
+                            limits.max_body_wire_bytes,
+                            &limits,
+                        )
+                        .await?,
+                        0,
                     )
-                    .await?;
-                }
+                };
+                let body = &raw[body_offset..];
+                context.update(body);
                 tokio::task::yield_now().await;
-                Some(representation::render(selected, &raw, &limits)?)
+                Some(representation::render(selected, body, &limits)?)
             } else {
                 None
             };
@@ -170,13 +174,14 @@ impl ImapProbe {
                 (String::new(), false, false)
             };
             self.metrics = metrics;
-            context.update(&raw);
-            if let Some(selected) = &selected {
-                context.update(part_name(&selected.part).as_bytes());
+            let selected_part = selected.as_ref().map(|selected| {
+                let name = part_name(&selected.part);
+                context.update(name.as_bytes());
                 context.update(selected.media_type.as_bytes());
                 context.update(selected.charset.as_bytes());
                 context.update(selected.transfer_encoding.as_bytes());
-            }
+                name
+            });
             context.update(text.as_bytes());
             let fingerprint = context.finalize().into();
             let offset = match request.continuation {
@@ -199,8 +204,12 @@ impl ImapProbe {
                 offset: end,
             });
             Ok(BodyPage {
-                text: text[offset..end].to_owned(),
-                selected_part: selected.as_ref().map(|s| part_name(&s.part)),
+                text: if offset == 0 && end == text.len() {
+                    text
+                } else {
+                    text[offset..end].to_owned()
+                },
+                selected_part,
                 source_media_type: selected.map(|s| s.media_type),
                 representation_version: REPRESENTATION,
                 converted,
@@ -216,12 +225,14 @@ impl ImapProbe {
 }
 
 fn part_name(part: &Part) -> String {
-    part.0
-        .as_ref()
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(".")
+    let mut name = String::new();
+    for (index, number) in part.0.as_ref().iter().enumerate() {
+        if index != 0 {
+            name.push('.');
+        }
+        let _ = write!(name, "{number}");
+    }
+    name
 }
 
 async fn headers(

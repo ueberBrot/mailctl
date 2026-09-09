@@ -28,7 +28,7 @@ trait Stream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Stream for T {}
 
 pub(super) struct Connection<'a> {
-    stream: Option<BufReader<Box<dyn Stream>>>,
+    stream: BufReader<Box<dyn Stream>>,
     fragmentizer: Fragmentizer,
     limits: Limits,
     metrics: &'a mut Metrics,
@@ -57,7 +57,7 @@ impl<'a> Connection<'a> {
             TlsMode::StartTls => Box::new(tcp),
         };
         Ok(Self {
-            stream: Some(BufReader::with_capacity(4096, stream)),
+            stream: BufReader::with_capacity(4096, stream),
             fragmentizer: Fragmentizer::new(limits.max_response_bytes as u32),
             limits,
             metrics,
@@ -80,7 +80,7 @@ impl<'a> Connection<'a> {
             .map(NonZeroU32::get)
             .ok_or(Error::UnsafeSelection)
     }
-    pub async fn upgrade(&mut self, host: &str, tls: Arc<ClientConfig>) -> Result<(), Error> {
+    pub async fn upgrade(mut self, host: &str, tls: Arc<ClientConfig>) -> Result<Self, Error> {
         let command = Command {
             tag: TagGenerator::new().generate(),
             body: CommandBody::StartTLS,
@@ -94,7 +94,7 @@ impl<'a> Connection<'a> {
         {
             return Err(Error::Tls);
         }
-        let stream = self.stream.take().ok_or(Error::Transport)?;
+        let stream = self.stream;
         if !stream.buffer().is_empty() {
             return Err(Error::Protocol);
         }
@@ -105,9 +105,9 @@ impl<'a> Connection<'a> {
         .await
         .map_err(|_| Error::Timeout)?
         .map_err(|_| Error::Tls)?;
-        self.stream = Some(BufReader::with_capacity(4096, Box::new(tls)));
+        self.stream = BufReader::with_capacity(4096, Box::new(tls));
         self.fragmentizer = Fragmentizer::new(self.limits.max_response_bytes as u32);
-        Ok(())
+        Ok(self)
     }
     pub async fn drive<C, T, E>(&mut self, mut coroutine: C) -> Result<T, Error>
     where
@@ -143,8 +143,6 @@ impl<'a> Connection<'a> {
                         return Err(Error::UnsafeSelection);
                     }
                     self.stream
-                        .as_mut()
-                        .ok_or(Error::Transport)?
                         .write_all(&bytes)
                         .await
                         .map_err(|_| Error::Transport)?;
@@ -208,19 +206,13 @@ impl<'a> Connection<'a> {
             if self.metrics.wire_bytes >= self.limits.max_operation_bytes {
                 return Err(Error::Limit);
             }
-            let byte = self
-                .stream
-                .as_mut()
-                .ok_or(Error::Transport)?
-                .read_u8()
-                .await
-                .map_err(|e| {
-                    if e.kind() == io::ErrorKind::UnexpectedEof {
-                        Error::Eof
-                    } else {
-                        Error::Transport
-                    }
-                })?;
+            let byte = self.stream.read_u8().await.map_err(|e| {
+                if e.kind() == io::ErrorKind::UnexpectedEof {
+                    Error::Eof
+                } else {
+                    Error::Transport
+                }
+            })?;
             bytes += 1;
             self.metrics.wire_bytes += 1;
             self.metrics.max_response_bytes = self.metrics.max_response_bytes.max(bytes);
@@ -305,7 +297,7 @@ impl<'a> Connection<'a> {
                         return Err(Error::Protocol);
                     }
                     self.command.inspect(response, self.uid_validity)?;
-                    return Ok(input.to_vec());
+                    return Ok(repaired.unwrap_or_else(|| guard.message_bytes().to_vec()));
                 }
             }
         }
@@ -373,7 +365,7 @@ impl CommandState {
                     sequences: BTreeSet::new(),
                 }
             }
-            CommandBody::Fetch { .. } if body_fetch.is_some() => CommandKind::BodyFetch {
+            CommandBody::Fetch { .. } => CommandKind::BodyFetch {
                 contract: body_fetch.ok_or(Error::Unsupported)?,
                 seen: false,
             },

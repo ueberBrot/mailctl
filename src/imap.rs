@@ -422,7 +422,7 @@ impl ImapProbe {
             if !caps.contains(&Capability::StartTls) {
                 return Err(Error::Unsupported);
             }
-            conn.upgrade(&self.host, self.tls.clone()).await?;
+            conn = conn.upgrade(&self.host, self.tls.clone()).await?;
             caps = conn.drive(ImapCapabilityGet::new()).await?;
         }
         if !caps.contains(&Capability::Imap4Rev1) || caps.contains(&Capability::LoginDisabled) {
