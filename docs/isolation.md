@@ -119,7 +119,8 @@ Start the explicitly provisioned service:
 sudo deployment/macos-isolated/service.sh start
 ```
 
-The installed launchd job starts at boot and restarts after process failure.
+The installed launchd job runs in its own security audit session under the
+service identity. It starts at boot and restarts after process failure.
 Use `service.sh restart` after an administrative change and `service.sh stop`
 to stop it. A locked or unavailable Keychain produces a credential error;
 serving never prompts to unlock it.
