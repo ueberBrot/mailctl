@@ -37,7 +37,7 @@ try:
             if not prompted and any(prompt in bytes(output).lower() for prompt in (b"password:", b"credential:")):
                 prompted = True
                 if "signal" in request:
-                    os.killpg(pid, getattr(signal, request["signal"]))
+                    os.kill(pid, getattr(signal, request["signal"]))
                 elif not request.get("wait"):
                     os.write(terminal, request["secret"].encode() + b"\n")
         if status is None:
@@ -50,7 +50,7 @@ finally:
     if status is None:
         done, child_status = os.waitpid(pid, os.WNOHANG)
         if not done:
-            os.killpg(pid, signal.SIGKILL)
+            os.kill(pid, signal.SIGKILL)
             _, child_status = os.waitpid(pid, 0)
         status = child_status
     try:

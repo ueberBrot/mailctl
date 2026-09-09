@@ -59,6 +59,7 @@ pub(crate) struct Qualification {
     artifacts: PathBuf,
     users: Vec<String>,
     installed: bool,
+    trusted_certificate: Option<(PathBuf, String)>,
 }
 
 impl Qualification {
@@ -78,6 +79,7 @@ impl Qualification {
             artifacts: temporary_directory(&suffix),
             users: Vec::new(),
             installed: false,
+            trusted_certificate: None,
         };
         fixture.service_uid = fixture.create_user(&fixture.service_user.clone(), true);
         fixture.caller_uid = fixture.create_user(&fixture.caller_user.clone(), false);
@@ -192,10 +194,9 @@ impl Qualification {
             .expect("numeric service UID")
     }
 
-    pub(crate) fn create_keychain(&self, certificate: &Path) -> PathBuf {
+    pub(crate) fn create_keychain(&mut self, certificate: &Path) -> PathBuf {
         let keychain = Path::new(SERVICE_HOME).join("native-fixture.keychain-db");
         let keychain_text = keychain.to_str().expect("UTF-8 keychain path");
-        let certificate = certificate.to_str().expect("UTF-8 certificate path");
         for arguments in [
             vec![
                 "create-keychain",
@@ -212,18 +213,43 @@ impl Qualification {
             vec!["set-keychain-settings", keychain_text],
             vec!["default-keychain", "-d", "user", "-s", keychain_text],
             vec!["list-keychains", "-d", "user", "-s", keychain_text],
-            vec![
-                "add-trusted-cert",
-                "-r",
-                "trustRoot",
-                "-k",
-                keychain_text,
-                certificate,
-            ],
         ] {
             let output = bounded(self.service_command("/usr/bin/security").args(arguments));
             assert_success(&output, "provision disposable service keychain");
         }
+        let certificate_text = certificate.to_str().expect("UTF-8 certificate path");
+        let fingerprint = bounded(command("/usr/bin/openssl").args([
+            "x509",
+            "-in",
+            certificate_text,
+            "-noout",
+            "-fingerprint",
+            "-sha256",
+        ]));
+        assert_success(&fingerprint, "identify the synthetic provider certificate");
+        let fingerprint = String::from_utf8(fingerprint.stdout)
+            .expect("certificate fingerprint")
+            .split_once('=')
+            .expect("fingerprint value")
+            .1
+            .trim()
+            .replace(':', "");
+        assert!(
+            fingerprint.len() == 64 && fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit())
+        );
+        self.trusted_certificate = Some((certificate.to_owned(), fingerprint));
+        assert_success(
+            &bounded(command("/usr/bin/security").args([
+                "add-trusted-cert",
+                "-d",
+                "-r",
+                "trustRoot",
+                "-k",
+                "/Library/Keychains/System.keychain",
+                certificate_text,
+            ])),
+            "administrator trusts only the disposable synthetic provider certificate",
+        );
         keychain
     }
 
@@ -414,6 +440,19 @@ impl Qualification {
 
 impl Drop for Qualification {
     fn drop(&mut self) {
+        if let Some((certificate, fingerprint)) = self.trusted_certificate.take() {
+            cleanup_command(command("/usr/bin/security").args([
+                "remove-trusted-cert",
+                "-d",
+                certificate.to_str().expect("certificate path"),
+            ]));
+            cleanup_command(command("/usr/bin/security").args([
+                "delete-certificate",
+                "-Z",
+                &fingerprint,
+                "/Library/Keychains/System.keychain",
+            ]));
+        }
         if self.installed {
             let _ = command("/bin/launchctl")
                 .args(["bootout", "system", PLIST])
@@ -458,6 +497,13 @@ pub(crate) struct WrongPeer {
 impl Drop for WrongPeer {
     fn drop(&mut self) {
         terminate_probe(&mut self.child);
+    }
+}
+
+fn cleanup_command(command: &mut Command) {
+    command.stdout(Stdio::null()).stderr(Stdio::null());
+    if let Ok(child) = command.spawn() {
+        let _ = process::capture(child, None, OUTPUT_BYTES, DEADLINE);
     }
 }
 

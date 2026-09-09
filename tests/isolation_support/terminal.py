@@ -51,7 +51,10 @@ finally:
     if status is None:
         done, child_status = os.waitpid(pid, os.WNOHANG)
         if not done:
-            os.killpg(pid, signal.SIGKILL)
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except PermissionError:
+                os.kill(pid, signal.SIGKILL)
             _, child_status = os.waitpid(pid, 0)
         status = child_status
     if echo_enabled is None:

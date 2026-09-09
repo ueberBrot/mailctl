@@ -48,7 +48,7 @@ const WORK_SECRET: &str = "isolated-native-work-secret";
 #[ignore = "requires root and MAILCTL_DISPOSABLE_MACOS=1 on a disposable macOS runner"]
 async fn isolated_launchd_qualification_uses_disposable_identities_and_a_real_native_keychain() {
     eprintln!("native isolation: provision disposable identities and install");
-    let fixture = Qualification::begin(Path::new(ISOLATED), Path::new(CLI), Path::new(MCP));
+    let mut fixture = Qualification::begin(Path::new(ISOLATED), Path::new(CLI), Path::new(MCP));
     let mut provider = server::NativeServer::new(Path::new(SERVICE_HOME));
 
     eprintln!("native isolation: configure synthetic accounts");
