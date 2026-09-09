@@ -98,6 +98,63 @@ async fn starttls_refreshes_capabilities_before_login_and_reads_only_bounded_uid
 }
 
 #[tokio::test]
+async fn invalid_envelope_projections_dispose_the_connection() {
+    let fields = [
+        "UID 4",
+        "ENVELOPE (NIL NIL NIL NIL NIL NIL NIL NIL NIL NIL)",
+        "FLAGS ()",
+        "INTERNALDATE \"01-Sep-2026 12:00:00 +0000\"",
+        "RFC822.SIZE 412",
+    ];
+    let mut cases = Vec::new();
+    for index in 0..fields.len() {
+        let mut missing = fields.to_vec();
+        missing.remove(index);
+        cases.push((missing.join(" "), mailctl::imap::Error::Protocol));
+        let mut duplicate = fields.to_vec();
+        duplicate.push(fields[index]);
+        cases.push((duplicate.join(" "), mailctl::imap::Error::Protocol));
+    }
+    cases.push((
+        format!(
+            "{} BODYSTRUCTURE (\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" 12 1)",
+            fields.join(" ")
+        ),
+        mailctl::imap::Error::Unsupported,
+    ));
+    for (items, expected) in cases {
+        let mut fixture = fixture(TlsMode::Implicit, Limits::default(), move |mut wire| {
+            Box::pin(async move {
+                authenticate(&mut wire).await;
+                examine(&mut wire).await;
+                let tag = expect(&mut wire, "UID SEARCH UID 1:10").await;
+                write(&mut wire, &format!("* SEARCH 4\r\n{tag} OK searched\r\n")).await;
+                expect(
+                    &mut wire,
+                    "UID FETCH 4 (UID ENVELOPE FLAGS INTERNALDATE RFC822.SIZE)",
+                )
+                .await;
+                write(&mut wire, &format!("* 1 FETCH ({items})\r\n")).await;
+                dropped(&mut wire).await;
+            })
+        })
+        .await;
+        let error = fixture
+            .probe
+            .search(
+                "fixture",
+                "disposable-password",
+                "INBOX",
+                UidWindow { first: 1, last: 10 },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error, expected);
+        fixture.task.await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn certificate_hostname_verification_prevents_authentication() {
     let mut fixture = fixture_with_name(
         TlsMode::Implicit,
@@ -334,6 +391,29 @@ async fn response_and_parser_work_limits_fail_explicitly() {
         assert!(metrics.parser_steps <= ceiling.max_parser_steps);
         fixture.task.await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn parser_limit_metrics_include_the_last_consumed_byte() {
+    let limits = Limits {
+        max_parser_steps: 1,
+        ..Limits::default()
+    };
+    let mut fixture = fixture(TlsMode::Implicit, limits, |mut wire| {
+        Box::pin(async move { dropped(&mut wire).await })
+    })
+    .await;
+    let error = fixture
+        .probe
+        .discover("fixture", "disposable-password", &["INBOX".into()])
+        .await
+        .unwrap_err();
+    assert_eq!(error, mailctl::imap::Error::Limit);
+    let metrics = fixture.probe.metrics();
+    assert_eq!(metrics.wire_bytes, 1);
+    assert_eq!(metrics.max_response_bytes, 1);
+    assert_eq!(metrics.parser_steps, 1);
+    fixture.task.await.unwrap();
 }
 
 #[tokio::test]

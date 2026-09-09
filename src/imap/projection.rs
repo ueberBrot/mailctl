@@ -9,104 +9,71 @@ use io_imap::types::{
 };
 use std::num::NonZeroU32;
 
-#[derive(Clone, Copy)]
-enum Kind {
-    Uid,
-    Envelope,
-    Flags,
-    InternalDate,
-    Size,
-}
-const FIELDS: [Kind; 5] = [
-    Kind::Uid,
-    Kind::Envelope,
-    Kind::Flags,
-    Kind::InternalDate,
-    Kind::Size,
-];
-impl Kind {
-    fn request(self) -> MessageDataItemName<'static> {
-        match self {
-            Self::Uid => MessageDataItemName::Uid,
-            Self::Envelope => MessageDataItemName::Envelope,
-            Self::Flags => MessageDataItemName::Flags,
-            Self::InternalDate => MessageDataItemName::InternalDate,
-            Self::Size => MessageDataItemName::Rfc822Size,
-        }
-    }
-}
-
-enum Field<'a, 'b> {
-    Uid(NonZeroU32),
-    Envelope(&'a WireEnvelope<'b>),
-    Flags(&'a [FlagFetch<'b>]),
-    InternalDate(&'a DateTime),
-    Size(u32),
-}
-impl<'a, 'b> Field<'a, 'b> {
-    fn classify(item: &'a MessageDataItem<'b>) -> Result<(Kind, Self), Error> {
-        Ok(match item {
-            MessageDataItem::Uid(uid) => (Kind::Uid, Self::Uid(*uid)),
-            MessageDataItem::Envelope(envelope) => (Kind::Envelope, Self::Envelope(envelope)),
-            MessageDataItem::Flags(flags) => (Kind::Flags, Self::Flags(flags)),
-            MessageDataItem::InternalDate(date) => (Kind::InternalDate, Self::InternalDate(date)),
-            MessageDataItem::Rfc822Size(size) => (Kind::Size, Self::Size(*size)),
-            _ => return Err(Error::Unsupported),
-        })
-    }
-    fn project(self, result: &mut Envelope) {
-        match self {
-            Self::Uid(uid) => result.uid = uid.get(),
-            Self::Envelope(envelope) => {
-                result.subject = string(&envelope.subject);
-                result.from = addresses(&envelope.from);
-                result.to = addresses(&envelope.to);
-                result.cc = addresses(&envelope.cc);
-                result.sent_date = string(&envelope.date);
-                result.message_id = string(&envelope.message_id);
-            }
-            Self::Flags(flags) => {
-                result.flags = flags
-                    .iter()
-                    .map(|flag| match flag {
-                        FlagFetch::Flag(flag) => flag.to_string(),
-                        FlagFetch::Recent => "\\Recent".to_owned(),
-                    })
-                    .collect();
-            }
-            Self::InternalDate(date) => result.received_date = Some(date.as_ref().to_rfc3339()),
-            Self::Size(size) => result.size = Some(size),
-        }
-    }
-}
-
 pub(super) struct Projection<'a, 'b> {
-    fields: [Option<Field<'a, 'b>>; FIELDS.len()],
+    uid: NonZeroU32,
+    envelope: &'a WireEnvelope<'b>,
+    flags: &'a [FlagFetch<'b>],
+    internal_date: &'a DateTime,
+    size: u32,
 }
 impl<'a, 'b> Projection<'a, 'b> {
     pub fn request() -> MacroOrMessageDataItemNames<'static> {
-        MacroOrMessageDataItemNames::MessageDataItemNames(FIELDS.map(Kind::request).to_vec())
+        MacroOrMessageDataItemNames::MessageDataItemNames(vec![
+            MessageDataItemName::Uid,
+            MessageDataItemName::Envelope,
+            MessageDataItemName::Flags,
+            MessageDataItemName::InternalDate,
+            MessageDataItemName::Rfc822Size,
+        ])
     }
     /// Rejects unknown, duplicate, and missing fields before the backend can merge rows.
     pub fn parse(items: &'a [MessageDataItem<'b>]) -> Result<Self, Error> {
-        let mut fields = [const { None }; FIELDS.len()];
+        let mut uid = None;
+        let mut envelope = None;
+        let mut flags = None;
+        let mut internal_date = None;
+        let mut size = None;
         for item in items {
-            let (kind, field) = Field::classify(item)?;
-            if fields[kind as usize].replace(field).is_some() {
+            let duplicate = match item {
+                MessageDataItem::Uid(value) => uid.replace(*value).is_some(),
+                MessageDataItem::Envelope(value) => envelope.replace(value).is_some(),
+                MessageDataItem::Flags(value) => flags.replace(value.as_slice()).is_some(),
+                MessageDataItem::InternalDate(value) => internal_date.replace(value).is_some(),
+                MessageDataItem::Rfc822Size(value) => size.replace(*value).is_some(),
+                _ => return Err(Error::Unsupported),
+            };
+            if duplicate {
                 return Err(Error::Protocol);
             }
         }
-        if fields.iter().any(Option::is_none) {
-            return Err(Error::Protocol);
-        }
-        Ok(Self { fields })
+        Ok(Self {
+            uid: uid.ok_or(Error::Protocol)?,
+            envelope: envelope.ok_or(Error::Protocol)?,
+            flags: flags.ok_or(Error::Protocol)?,
+            internal_date: internal_date.ok_or(Error::Protocol)?,
+            size: size.ok_or(Error::Protocol)?,
+        })
     }
     pub fn normalize(self) -> Envelope {
-        let mut envelope = Envelope::default();
-        for field in self.fields.into_iter().flatten() {
-            field.project(&mut envelope);
+        Envelope {
+            uid: self.uid.get(),
+            subject: string(&self.envelope.subject),
+            from: addresses(&self.envelope.from),
+            to: addresses(&self.envelope.to),
+            cc: addresses(&self.envelope.cc),
+            received_date: Some(self.internal_date.as_ref().to_rfc3339()),
+            sent_date: string(&self.envelope.date),
+            flags: self
+                .flags
+                .iter()
+                .map(|flag| match flag {
+                    FlagFetch::Flag(flag) => flag.to_string(),
+                    FlagFetch::Recent => "\\Recent".to_owned(),
+                })
+                .collect(),
+            message_id: string(&self.envelope.message_id),
+            size: Some(self.size),
         }
-        envelope
     }
 }
 fn string(value: &NString<'_>) -> Option<String> {

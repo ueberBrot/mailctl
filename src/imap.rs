@@ -246,7 +246,7 @@ impl ImapProbe {
         }
         tokio::time::timeout(self.limits.operation_timeout, async {
             let mut conn = self.authenticate(username, password).await?;
-            let mut mailboxes = BTreeMap::new();
+            let mut mailboxes = Vec::with_capacity(names.len());
             for (expected, name) in names {
                 let pattern = name
                     .replace('&', "&-")
@@ -261,7 +261,7 @@ impl ImapProbe {
                 if rows.len() > 1 {
                     return Err(Error::Protocol);
                 }
-                for (name, _, attrs) in rows {
+                if let Some((name, _, attrs)) = rows.into_iter().next() {
                     let name = match name {
                         WireMailbox::Inbox => "INBOX".to_owned(),
                         WireMailbox::Other(n) => String::from_utf8(n.inner().as_ref().to_vec())
@@ -274,19 +274,16 @@ impl ImapProbe {
                     let selectable = !attributes
                         .iter()
                         .any(|a| a.eq_ignore_ascii_case("\\Noselect"));
-                    mailboxes.insert(
-                        expected.clone(),
-                        Mailbox {
-                            name,
-                            selectable,
-                            attributes,
-                        },
-                    );
+                    mailboxes.push(Mailbox {
+                        name,
+                        selectable,
+                        attributes,
+                    });
                 }
             }
             conn.drive(ImapLogout::new()).await?;
             Ok(Discovery {
-                mailboxes: mailboxes.into_values().collect(),
+                mailboxes,
                 metrics: conn.metrics(),
             })
         })
@@ -435,10 +432,10 @@ fn mailbox(name: &str) -> Result<(), Error> {
     }
     Ok(())
 }
-fn identity(name: &str) -> String {
+fn identity(name: &str) -> &str {
     if name.eq_ignore_ascii_case("INBOX") {
-        "INBOX".to_owned()
+        "INBOX"
     } else {
-        name.to_owned()
+        name
     }
 }

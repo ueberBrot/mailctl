@@ -78,7 +78,7 @@ async fn openssl(dir: &Path, args: &str) -> Result<()> {
     Ok(())
 }
 
-/// A bounded independent protocol observer, never a production email adapter.
+/// Bounded protocol exchanges used to seed disposable mailboxes.
 struct Wire<S> {
     stream: BufReader<S>,
 }
@@ -108,25 +108,22 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
         Ok(())
     }
 
-    async fn imap(&mut self, command: &str, accepted: bool) -> Result<Vec<String>> {
+    async fn imap(&mut self, command: &str) -> Result<()> {
         self.send(&format!("a1 {command}\r\n")).await?;
-        let mut lines = Vec::new();
         for _ in 0..100 {
             let line = self.line().await?;
             if line.starts_with("a1 ") {
                 let status = line.split_whitespace().nth(1);
-                if status != Some(if accepted { "OK" } else { "NO" }) {
+                if status != Some("OK") {
                     return Err(format!(
-                        "Independent IMAP {} returned status {:?}; expected {}",
+                        "Fixture IMAP {} returned status {:?}; expected OK",
                         command.split_whitespace().next().unwrap_or("command"),
                         status,
-                        if accepted { "OK" } else { "NO" }
                     )
                     .into());
                 }
-                return Ok(lines);
+                return Ok(());
             }
-            lines.push(line);
         }
         Err("Independent IMAP response count exceeded fixture budget".into())
     }
@@ -181,20 +178,20 @@ pub(crate) async fn seed_seen(port: u16, tls: &TlsConnector) -> Result<()> {
         .map_err(|_| "Seen-message IMAP greeting timed out")??;
     tokio::time::timeout(
         Duration::from_secs(5),
-        wire.imap(&format!("LOGIN \"{EMAIL}\" \"{PASSWORD}\""), true),
+        wire.imap(&format!("LOGIN \"{EMAIL}\" \"{PASSWORD}\"")),
     )
     .await
     .map_err(|_| "Seen-message IMAP login timed out")??;
-    tokio::time::timeout(Duration::from_secs(5), wire.imap("SELECT INBOX", true))
+    tokio::time::timeout(Duration::from_secs(5), wire.imap("SELECT INBOX"))
         .await
         .map_err(|_| "Seen-message mailbox selection timed out")??;
     tokio::time::timeout(
         Duration::from_secs(5),
-        wire.imap("UID STORE 2 +FLAGS.SILENT (\\Seen)", true),
+        wire.imap("UID STORE 2 +FLAGS.SILENT (\\Seen)"),
     )
     .await
     .map_err(|_| "Seen-message flag setup timed out")??;
-    tokio::time::timeout(Duration::from_secs(5), wire.imap("LOGOUT", true))
+    tokio::time::timeout(Duration::from_secs(5), wire.imap("LOGOUT"))
         .await
         .map_err(|_| "Seen-message IMAP logout timed out")??;
     Ok(())
@@ -216,7 +213,7 @@ async fn smtp_message<S: AsyncRead + AsyncWrite + Unpin>(
     Ok(())
 }
 
-/// Fixture setup may mutate disposable mailboxes; the independent observer above cannot.
+/// Fixture setup may mutate disposable mailboxes; the independent observer cannot.
 pub(crate) async fn seed_folder(port: u16, tls: &TlsConnector) -> Result<()> {
     tokio::time::timeout(Duration::from_secs(10), async {
         let socket = TcpStream::connect(("127.0.0.1", port)).await?;
@@ -225,9 +222,9 @@ pub(crate) async fn seed_folder(port: u16, tls: &TlsConnector) -> Result<()> {
             .await?;
         let mut wire = Wire::new(stream);
         wire.line().await?;
-        wire.imap(&format!("LOGIN \"{EMAIL}\" \"{PASSWORD}\""), true)
+        wire.imap(&format!("LOGIN \"{EMAIL}\" \"{PASSWORD}\""))
             .await?;
-        wire.imap("CREATE \"fixture folder/child\"", true).await?;
+        wire.imap("CREATE \"fixture folder/child\"").await?;
         let message = MESSAGE.replace(MESSAGE_ID, FOLDER_MESSAGE_ID);
         wire.send(&format!(
             "a1 APPEND \"fixture folder/child\" {{{}}}\r\n",
@@ -241,7 +238,7 @@ pub(crate) async fn seed_folder(port: u16, tls: &TlsConnector) -> Result<()> {
         if !wire.line().await?.starts_with("a1 OK") {
             return Err("Fixture APPEND failed".into());
         }
-        wire.imap("LOGOUT", true).await?;
+        wire.imap("LOGOUT").await?;
         Ok(())
     })
     .await

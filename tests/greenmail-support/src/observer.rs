@@ -66,7 +66,7 @@ pub async fn snapshot(port: u16, tls: &TlsConnector, password: &str) -> Result<M
         let mut messages = fetch
             .into_iter()
             .filter_map(Reply::into_message)
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Vec<_>>();
         messages.sort_by_key(|message| message.uid);
         if messages.len() != count as usize {
             return Err("Independent observer mailbox count/fetch mismatch".into());
@@ -133,20 +133,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ObserverWire<S> {
     }
 
     async fn greeting(&mut self) -> Result<()> {
-        loop {
-            if self.parser.progress().is_some() && self.parser.is_message_complete() {
-                let greeting = self
-                    .parser
-                    .decode_message(&GreetingCodec::new())
-                    .map_err(|_| "Independent observer received malformed IMAP greeting")?;
-                return match greeting.kind {
-                    GreetingKind::Ok => Ok(()),
-                    GreetingKind::PreAuth | GreetingKind::Bye => {
-                        Err("Independent observer received an unusable IMAP greeting".into())
-                    }
-                };
+        self.read_message().await?;
+        let greeting = self
+            .parser
+            .decode_message(&GreetingCodec::new())
+            .map_err(|_| "Independent observer received malformed IMAP greeting")?;
+        match greeting.kind {
+            GreetingKind::Ok => Ok(()),
+            GreetingKind::PreAuth | GreetingKind::Bye => {
+                Err("Independent observer received an unusable IMAP greeting".into())
             }
-            self.read_more().await?;
         }
     }
 
@@ -219,13 +215,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ObserverWire<S> {
     }
 
     async fn response(&mut self) -> Result<Reply> {
+        self.read_message().await?;
+        let response = self
+            .parser
+            .decode_message(&ResponseCodec::new())
+            .map_err(|_| "Independent observer received malformed IMAP response")?;
+        Reply::from_response(response)
+    }
+
+    async fn read_message(&mut self) -> Result<()> {
         loop {
-            if self.parser.progress().is_some() && self.parser.is_message_complete() {
-                let response = self
-                    .parser
-                    .decode_message(&ResponseCodec::new())
-                    .map_err(|_| "Independent observer received malformed IMAP response")?;
-                return Reply::from_response(response);
+            while self.parser.progress().is_some() {
+                if self.parser.is_message_complete() {
+                    return Ok(());
+                }
             }
             self.read_more().await?;
         }
@@ -296,9 +299,9 @@ impl Reply {
         }
     }
 
-    fn into_message(self) -> Option<Result<MessageSnapshot>> {
+    fn into_message(self) -> Option<MessageSnapshot> {
         match self {
-            Self::Fetch(message) => Some(Ok(message)),
+            Self::Fetch(message) => Some(message),
             _ => None,
         }
     }
@@ -344,4 +347,29 @@ fn nstring(value: io_imap::types::core::NString<'_>, field: &str) -> Result<Stri
         .ok_or_else(|| format!("Independent observer envelope omitted {field}"))?;
     String::from_utf8(value.into_owned())
         .map_err(|_| format!("Independent observer envelope {field} was not UTF-8").into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn command_consumes_buffered_literals_before_reading_again() {
+        let (client, mut server) = tokio::io::duplex(4096);
+        // Keep the socket open after sending all fragments and the completion together.
+        server.write_all(b"* 1 FETCH (UID 4 FLAGS () ENVELOPE (NIL {7}\r\nSubject NIL NIL NIL NIL NIL NIL NIL \"<four@example.test>\"))\r\no1 OK fetched\r\n").await.unwrap();
+        let mut wire = ObserverWire::new(client);
+        let replies = tokio::time::timeout(
+            Duration::from_secs(1),
+            wire.ok("FETCH 1:* (UID FLAGS ENVELOPE)"),
+        )
+        .await
+        .expect("buffered response must not wait for more socket data")
+        .unwrap();
+        let message = replies.into_iter().find_map(Reply::into_message).unwrap();
+        assert_eq!(message.uid, 4);
+        assert_eq!(message.subject, "Subject");
+        assert_eq!(message.message_id, "<four@example.test>");
+        assert!(!message.seen);
+    }
 }

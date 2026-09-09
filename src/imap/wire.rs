@@ -130,29 +130,26 @@ impl<'a> Connection<'a> {
                         return Err(Error::Protocol);
                     }
                     self.command = CommandState::new(command)?;
-                    let result = self
-                        .stream
+                    self.stream
                         .as_mut()
                         .ok_or(Error::Transport)?
                         .write_all(&bytes)
-                        .await;
-                    result.map_err(|_| Error::Transport)?;
+                        .await
+                        .map_err(|_| Error::Transport)?;
                 }
                 ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
                     let mut received = self.frame().await?;
-                    if self.command.needs_logout_completion() {
-                        while self.command.needs_logout_completion() {
-                            let next = self.frame().await?;
-                            if next.len()
-                                > self
-                                    .limits
-                                    .max_response_bytes
-                                    .saturating_sub(received.len())
-                            {
-                                return Err(Error::Limit);
-                            }
-                            received.extend(next);
+                    while self.command.needs_logout_completion() {
+                        let next = self.frame().await?;
+                        if next.len()
+                            > self
+                                .limits
+                                .max_response_bytes
+                                .saturating_sub(received.len())
+                        {
+                            return Err(Error::Limit);
                         }
+                        received.extend(next);
                     }
                     frame = Some(received);
                 }
@@ -213,9 +210,9 @@ impl<'a> Connection<'a> {
                     }
                 })?;
             bytes += 1;
-            self.step(1)?;
             self.metrics.wire_bytes += 1;
             self.metrics.max_response_bytes = self.metrics.max_response_bytes.max(bytes);
+            self.step(1)?;
             guard.enqueue_bytes(&[byte]);
             while let Some(info) = guard.progress() {
                 if let FragmentInfo::Line {
