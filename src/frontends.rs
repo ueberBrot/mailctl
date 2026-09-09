@@ -1,6 +1,7 @@
 //! Executable lifecycle and presentation around the embedded application contract.
 mod arguments;
 mod configuration;
+mod credentials;
 mod diagnostics;
 #[cfg(feature = "mcp")]
 mod mcp;
@@ -47,9 +48,12 @@ pub fn run(executable: Executable) -> ExitCode {
         .as_ref()
         .and_then(|matches| Options::from_arg_matches(matches).ok())
         .unwrap_or_default();
-    let administration = preliminary
-        .as_ref()
-        .is_some_and(|matches| matches!(matches.subcommand_name(), Some("setup" | "credential")));
+    let administration = preliminary.as_ref().is_some_and(|matches| {
+        matches!(
+            matches.subcommand_name(),
+            Some("setup" | "credential" | "doctor")
+        )
+    });
     let serving = executable.is_mcp() && !administration;
     let json = !serving
         && preliminary
@@ -110,9 +114,6 @@ pub fn run(executable: Executable) -> ExitCode {
 
 async fn execute(invocation: Invocation) -> Result<u8, Error> {
     let Invocation { options, action } = invocation;
-    if matches!(action, Action::Credential) {
-        return Err(Error::new(ErrorCode::UnsupportedCapability));
-    }
     if let Action::Setup(args) = action {
         let json = options.json;
         let color = options.diagnostics.color;
@@ -124,8 +125,8 @@ async fn execute(invocation: Invocation) -> Result<u8, Error> {
         return Ok(report(json, color, Ok(OperationResult::Setup(setup)), None, 30).await);
     }
     let config = configuration::load(&options.config)?;
-    #[cfg(feature = "cli")]
     let deadline = config.limits.operation_seconds;
+    let accounts = options.accounts.clone();
     let selected = options
         .grant
         .as_deref()
@@ -154,8 +155,41 @@ async fn execute(invocation: Invocation) -> Result<u8, Error> {
         _ = &mut shutdown => return Err(Error::new(ErrorCode::Cancelled)),
         result = initialization => result.map_err(|_| Error::new(ErrorCode::InternalError))??,
     };
+    if let Action::Credential(command) = action {
+        let work = credentials::execute(service, accounts, command, options.json);
+        tokio::pin!(work);
+        let result = tokio::select! {
+            _ = &mut shutdown => return Err(Error::new(ErrorCode::Cancelled)),
+            result = tokio::time::timeout(Duration::from_secs(deadline as u64), &mut work) =>
+                result.map_err(|_| Error::new(ErrorCode::Timeout))?,
+        };
+        let (status, service) = result?;
+        return Ok(report(
+            options.json,
+            options.diagnostics.color,
+            Ok(OperationResult::Credential(status)),
+            Some(service),
+            deadline,
+        )
+        .await);
+    }
     let context = service.context(&selected, &narrowing)?;
     match action {
+        Action::Doctor { check_account } => {
+            let result = tokio::select! {
+                _ = &mut shutdown => Err(Error::new(ErrorCode::Cancelled)),
+                result = tokio::time::timeout(Duration::from_secs(deadline as u64), service.doctor(&context, check_account)) =>
+                    result.map_err(|_| Error::new(ErrorCode::Timeout)).and_then(|result| result),
+            };
+            Ok(report(
+                options.json,
+                options.diagnostics.color,
+                result.map(OperationResult::Doctor),
+                Some(service),
+                deadline,
+            )
+            .await)
+        }
         #[cfg(feature = "mcp")]
         Action::Mcp { .. } => {
             tokio::select! {
@@ -175,7 +209,7 @@ async fn execute(invocation: Invocation) -> Result<u8, Error> {
             )
             .await)
         }
-        Action::Setup(_) | Action::Credential => unreachable!(),
+        Action::Setup(_) | Action::Credential(_) => unreachable!(),
     }
 }
 
@@ -207,8 +241,17 @@ async fn report(
     seconds: usize,
 ) -> u8 {
     let envelope = Envelope::from_result(uuid::Uuid::new_v4().to_string(), result);
-    diagnostics::result(envelope.request_id(), envelope.error());
-    let code = envelope.error().map_or(0, Error::exit_code);
+    let error = envelope.error().or_else(|| match envelope.result() {
+        Some(OperationResult::Doctor(doctor)) => doctor.accounts.iter().find_map(|account| {
+            match &account.authentication.as_ref()?.outcome {
+                crate::domain::AuthenticationOutcome::Authenticated => None,
+                crate::domain::AuthenticationOutcome::Failed { error } => Some(error),
+            }
+        }),
+        _ => None,
+    });
+    diagnostics::result(envelope.request_id(), error);
+    let code = error.map_or(0, Error::exit_code);
     let output = if json {
         serde_json::to_string(&envelope)
     } else {

@@ -43,7 +43,36 @@ pub(super) struct Connection<'a> {
     command: CommandState,
     uid_validity: Option<NonZeroU32>,
 }
+/// Transport state kept between completed operations, without borrowed metrics.
+pub(super) struct Session {
+    stream: BufReader<Box<dyn Stream>>,
+    fragmentizer: Fragmentizer,
+    limits: Limits,
+    command: CommandState,
+    uid_validity: Option<NonZeroU32>,
+}
+impl Session {
+    pub(super) fn resume(self, metrics: &mut Metrics) -> Connection<'_> {
+        Connection {
+            stream: self.stream,
+            fragmentizer: self.fragmentizer,
+            limits: self.limits,
+            metrics,
+            command: self.command,
+            uid_validity: self.uid_validity,
+        }
+    }
+}
 impl<'a> Connection<'a> {
+    pub(super) fn into_session(self) -> Session {
+        Session {
+            stream: self.stream,
+            fragmentizer: self.fragmentizer,
+            limits: self.limits,
+            command: self.command,
+            uid_validity: self.uid_validity,
+        }
+    }
     pub async fn connect(
         host: &str,
         port: u16,

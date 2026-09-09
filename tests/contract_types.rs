@@ -34,4 +34,11 @@ const _: fn(OperationResult) = |result| match result {
     OperationResult::Cancelled(cancellation) => {
         let _: bool = cancellation.cancelled;
     }
+    OperationResult::Credential(status) => {
+        let _: String = status.account_id;
+        let _: mailctl::domain::SourceAvailability = status.availability;
+    }
+    OperationResult::Doctor(doctor) => {
+        let _: Vec<mailctl::domain::DoctorAccount> = doctor.accounts;
+    }
 };

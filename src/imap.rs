@@ -33,6 +33,18 @@ use std::{collections::BTreeMap, fmt, sync::Arc, time::Duration};
 use tokio_rustls::rustls::{self, RootCertStore};
 use wire::Connection;
 
+/// An authenticated connection with no selected mailbox or retained credential.
+pub(crate) struct AuthenticatedConnection(wire::Session);
+impl AuthenticatedConnection {
+    pub(crate) async fn disconnect(self, deadline: Duration) -> Result<(), Error> {
+        let mut metrics = Metrics::default();
+        let mut connection = self.0.resume(&mut metrics);
+        tokio::time::timeout(deadline, connection.drive(ImapLogout::new()))
+            .await
+            .map_err(|_| Error::Timeout)?
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     InvalidInput,
@@ -260,6 +272,20 @@ pub struct ImapProbe {
     transfers: attachment::TransferStore,
 }
 impl ImapProbe {
+    pub(crate) async fn connect_authenticated(
+        &mut self,
+        username: &str,
+        password: &str,
+    ) -> Result<AuthenticatedConnection, Error> {
+        credentials(username, password)?;
+        tokio::time::timeout(self.limits.operation_timeout, async {
+            self.authenticate(username, password)
+                .await
+                .map(|connection| AuthenticatedConnection(connection.into_session()))
+        })
+        .await
+        .map_err(|_| Error::Timeout)?
+    }
     pub fn new(
         host: String,
         port: u16,

@@ -97,6 +97,7 @@ limits! {
     buffered_bytes: 64 * 1024 * 1024 => 256 * 1024 * 1024,
     credential_workers: 2 => 8,
     queued_credentials: 8 => 32,
+    doctor_checks_per_minute: 2 => 12,
     connection_lifetime_seconds: 300 => 900,
 }
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

@@ -42,6 +42,8 @@ pub struct Error {
     pub code: ErrorCode,
     pub message: String,
     pub retryable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_failure: Option<CredentialFailure>,
 }
 impl Error {
     pub fn setup_required() -> Self {
@@ -51,6 +53,7 @@ impl Error {
                 "Configuration is unavailable or invalid; run this executable's setup subcommand"
                     .into(),
             retryable: false,
+            credential_failure: None,
         }
     }
     pub fn obsolete_runtime_capacity() -> Self {
@@ -58,6 +61,7 @@ impl Error {
             code: ErrorCode::InvalidRequest,
             message: "Configuration uses removed shared runtime capacity settings; remove runtimes, runtime_slots, and shared permit settings. Limits now apply per process; run this executable's setup subcommand to migrate".into(),
             retryable: false,
+            credential_failure: None,
         }
     }
     pub fn new(code: ErrorCode) -> Self {
@@ -90,6 +94,7 @@ impl Error {
                     | ErrorCode::RateLimited
                     | ErrorCode::Timeout
             ),
+            credential_failure: None,
         }
     }
     pub fn exit_code(&self) -> u8 {
@@ -303,6 +308,85 @@ pub enum OperationResult {
     Health(Health),
     Cancelled(Cancellation),
     Setup(Setup),
+    Credential(CredentialStatus),
+    Doctor(Doctor),
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialFailure {
+    Missing,
+    Locked,
+    AccessDenied,
+    Unavailable,
+    InvalidSecret,
+    InteractionRequired,
+    Internal,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceAvailability {
+    Available,
+    Missing,
+    Locked,
+    AccessDenied,
+    Unavailable,
+    Configured,
+    InteractionRequired,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialStatus {
+    pub account_id: String,
+    pub availability: SourceAvailability,
+    pub provisioning: Provisioning,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Provisioning {
+    Operator,
+    External,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Doctor {
+    pub status: String,
+    pub topology: String,
+    pub installation_id: String,
+    pub configuration_revision: String,
+    pub grant: String,
+    pub prerequisites: Vec<String>,
+    pub accounts: Vec<DoctorAccount>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DoctorAccount {
+    pub account_id: String,
+    pub generation: u64,
+    pub source: SourceAvailability,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authentication: Option<AuthenticationCheck>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AuthenticationCheck {
+    /// Seconds since the Unix epoch when the check completed.
+    pub checked_at: u64,
+    pub outcome: AuthenticationOutcome,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AuthenticationOutcome {
+    Authenticated,
+    Failed { error: Error },
 }
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]

@@ -49,6 +49,85 @@ mailboxes = ["INBOX"]
     )
 }
 
+#[tokio::test]
+async fn doctor_separates_safe_source_status_from_explicit_rate_limited_authentication() {
+    use mailctl::domain::{
+        AuthenticationOutcome, CredentialFailure, ErrorCode, SourceAvailability,
+    };
+    let config =
+        Config::parse(&configuration().replace("source = \"native\"", "source = \"session\""))
+            .unwrap();
+    let service = Service::in_memory(config).unwrap();
+    let context = service.context("reader", &Narrowing::default()).unwrap();
+    let local = service.doctor(&context, false).await.unwrap();
+    assert_eq!(local.status, "ready");
+    assert_eq!(local.topology, "native");
+    assert_eq!(local.accounts.len(), 1);
+    assert_eq!(
+        local.accounts[0].source,
+        SourceAvailability::InteractionRequired
+    );
+    assert!(local.accounts[0].authentication.is_none());
+
+    let checked = service.doctor(&context, true).await.unwrap();
+    assert_eq!(checked.status, "degraded");
+    let check = checked.accounts[0].authentication.as_ref().unwrap();
+    assert!(check.checked_at > 1_700_000_000);
+    let AuthenticationOutcome::Failed { error } = &check.outcome else {
+        panic!("session prompting must not authenticate");
+    };
+    assert_eq!(error.code, ErrorCode::CredentialUnavailable);
+    assert_eq!(
+        error.credential_failure,
+        Some(CredentialFailure::InteractionRequired)
+    );
+
+    let repeated = service.doctor(&context, true).await.unwrap();
+    let AuthenticationOutcome::Failed { error } = &repeated.accounts[0]
+        .authentication
+        .as_ref()
+        .unwrap()
+        .outcome
+    else {
+        panic!("repeated check must be rate limited");
+    };
+    assert_eq!(error.code, ErrorCode::RateLimited);
+}
+
+#[tokio::test]
+async fn doctor_rejects_foreign_contexts_and_denied_accounts_before_source_or_provider_work() {
+    use mailctl::domain::ErrorCode;
+    let config = Config::parse(&configuration()).unwrap();
+    let service = Service::in_memory(config.clone()).unwrap();
+    let other = Service::in_memory(config).unwrap();
+    let foreign = other.context("reader", &Narrowing::default()).unwrap();
+    assert_eq!(
+        service.doctor(&foreign, true).await.unwrap_err().code,
+        ErrorCode::PermissionDenied
+    );
+    let denied = service
+        .context(
+            "reader",
+            &Narrowing {
+                accounts: Some(vec!["personal".into()]),
+                read_only: false,
+            },
+        )
+        .unwrap();
+    assert!(
+        service
+            .doctor(&denied, false)
+            .await
+            .unwrap()
+            .accounts
+            .is_empty()
+    );
+    assert_eq!(
+        service.doctor(&denied, true).await.unwrap_err().code,
+        ErrorCode::AccountNotAllowed
+    );
+}
+
 #[test]
 fn discovery_filters_email_accounts_and_reports_completion() {
     let service = Service::in_memory(Config::parse(&configuration()).unwrap()).unwrap();
@@ -378,6 +457,7 @@ fn configuration_checks_every_resource_maximum() {
         ("buffered_bytes", 268435456),
         ("credential_workers", 8),
         ("queued_credentials", 32),
+        ("doctor_checks_per_minute", 12),
         ("connection_lifetime_seconds", 900),
     ];
     let limits: String = maxima

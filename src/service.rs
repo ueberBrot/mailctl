@@ -1,4 +1,6 @@
 //! Account discovery and access-grant authorization through one application interface.
+mod credentials;
+pub(crate) use credentials::{credential_error, source_availability};
 mod state;
 use crate::encoding::{OutputBudget, serialized_size};
 use crate::{
@@ -16,6 +18,7 @@ pub struct Service {
     config: Config,
     registry: AccountRegistry,
     context_id: Uuid,
+    authentication: tokio::sync::OnceCell<crate::authentication::Runtime>,
 }
 impl Service {
     pub fn open(config: Config) -> Result<Self, Error> {
@@ -58,6 +61,7 @@ impl Service {
             config,
             registry,
             context_id: Uuid::new_v4(),
+            authentication: tokio::sync::OnceCell::new(),
         }
     }
     pub fn context(

@@ -1,7 +1,7 @@
 # mailctl
 
-Email tools for the command line and MCP. Currently supports configured account
-discovery, capability reporting, and local health checks.
+Email tools for the command line and MCP. It supports configured account discovery,
+capability reporting, macOS credential provisioning, and authentication diagnostics.
 
 Build both executables:
 
@@ -19,5 +19,7 @@ Configure an account and list it:
 Run `./target/debug/mailctl-mcp` to serve MCP over STDIO using the same configuration.
 Use `--grant` to select an access grant, `--account` to narrow accounts, or `--help`
 for available commands.
+
+[Configure credentials, check authentication, and rotate passwords](docs/credentials.md).
 
 [ISC License](LICENSE).

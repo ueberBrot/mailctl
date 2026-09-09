@@ -26,6 +26,11 @@ enum Administration {
     Setup(Setup),
     #[command(subcommand)]
     Credential(Credential),
+    /// Inspect local readiness; authenticate only with --check-account.
+    Doctor {
+        #[arg(long)]
+        check_account: bool,
+    },
 }
 #[derive(Args, Default)]
 pub(super) struct Setup {
@@ -37,7 +42,7 @@ pub(super) struct Setup {
     pub username: Option<String>,
 }
 #[derive(Subcommand)]
-enum Credential {
+pub(super) enum Credential {
     Set,
     Delete,
     Status,
@@ -63,7 +68,6 @@ enum Email {
     Account(Account),
     #[command(subcommand)]
     Capability(Capability),
-    Doctor,
     #[command(flatten)]
     Administration(Administration),
 }
@@ -109,13 +113,17 @@ pub(super) enum Action {
         use_configured_grant: bool,
     },
     Setup(Setup),
-    Credential,
+    Credential(Credential),
+    Doctor {
+        check_account: bool,
+    },
 }
 impl From<Administration> for Action {
     fn from(value: Administration) -> Self {
         match value {
             Administration::Setup(args) => Self::Setup(args),
-            Administration::Credential(_) => Self::Credential,
+            Administration::Credential(command) => Self::Credential(command),
+            Administration::Doctor { check_account } => Self::Doctor { check_account },
         }
     }
 }
@@ -143,7 +151,6 @@ impl Invocation {
                         }))
                     }
                     Email::Capability(Capability::Show) => Action::Email(Operation::Capabilities),
-                    Email::Doctor => Action::Email(Operation::Health),
                     Email::Administration(admin) => admin.into(),
                 };
                 Ok(Self {

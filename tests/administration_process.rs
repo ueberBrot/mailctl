@@ -93,17 +93,107 @@ fn each_component_sets_up_and_updates_accounts_without_replacing_other_identitie
 }
 
 #[test]
-fn each_component_keeps_credential_commands_explicitly_unsupported() {
+fn credential_commands_require_an_unambiguous_account_and_machine_set_never_prompts() {
     for executable in executables() {
         let installation = Installation::two_accounts();
+        assert_success(&run_bounded({
+            let mut command = installation.command(executable);
+            command.args(["--json", "setup"]);
+            command
+        }));
         for command_name in ["set", "delete", "status"] {
             let output = run_bounded({
                 let mut command = installation.command(executable);
                 command.args(["--json", "credential", command_name]);
                 command
             });
-            assert_eq!(output.status.code(), Some(8));
-            assert_eq!(envelope(&output)["error"]["code"], "unsupported_capability");
+            assert_eq!(output.status.code(), Some(2));
+            assert_eq!(envelope(&output)["error"]["code"], "invalid_request");
+            assert!(
+                envelope(&output)["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("--account")
+            );
+        }
+        let output = run_bounded({
+            let mut command = installation.command(executable);
+            command.args(["--json", "--account", "work", "credential", "set"]);
+            command
+        });
+        assert_eq!(output.status.code(), Some(4));
+        assert_eq!(
+            envelope(&output)["error"]["credential_failure"],
+            "interaction_required"
+        );
+    }
+}
+
+#[test]
+fn both_components_inspect_external_sources_and_require_an_authorized_explicit_check() {
+    for executable in executables() {
+        let installation = Installation::two_accounts();
+        let text = std::fs::read_to_string(installation.config()).unwrap();
+        std::fs::write(
+            installation.config(),
+            text.replace("source = \"native\"", "source = \"session\""),
+        )
+        .unwrap();
+        assert_success(&run_bounded({
+            let mut command = installation.command(executable);
+            command.args(["--json", "setup"]);
+            command
+        }));
+        let status = run_bounded({
+            let mut command = installation.command(executable);
+            command.args(["--json", "--account", "work", "credential", "status"]);
+            command
+        });
+        assert_success(&status);
+        assert_eq!(
+            envelope(&status)["result"]["availability"],
+            "interaction_required"
+        );
+        assert_eq!(envelope(&status)["result"]["provisioning"], "external");
+        let local = run_bounded({
+            let mut command = installation.command(executable);
+            command.args(["--json", "doctor"]);
+            command
+        });
+        assert_success(&local);
+        let local = envelope(&local);
+        let accounts = local["result"]["accounts"].as_array().unwrap();
+        assert_eq!(accounts.len(), 1);
+        assert!(accounts[0].get("authentication").is_none());
+
+        let checked = run_bounded({
+            let mut command = installation.command(executable);
+            command.args(["--json", "--account", "work", "doctor", "--check-account"]);
+            command
+        });
+        assert_eq!(checked.status.code(), Some(4));
+        let checked = envelope(&checked);
+        let authentication = &checked["result"]["accounts"][0]["authentication"];
+        assert_eq!(authentication["outcome"]["status"], "failed");
+        assert_eq!(
+            authentication["outcome"]["error"]["credential_failure"],
+            "interaction_required"
+        );
+        assert!(authentication["checked_at"].as_u64().unwrap() > 1_700_000_000);
+        for (grant, account, expected) in [
+            ("default", "personal", "account_not_allowed"),
+            ("all", "", "invalid_request"),
+        ] {
+            let denied = run_bounded({
+                let mut command = installation.command(executable);
+                command.args(["--json", "--grant", grant]);
+                if !account.is_empty() {
+                    command.args(["--account", account]);
+                }
+                command.args(["doctor", "--check-account"]);
+                command
+            });
+            assert_eq!(envelope(&denied)["error"]["code"], expected);
         }
     }
 }
