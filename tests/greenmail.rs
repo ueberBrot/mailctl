@@ -26,7 +26,7 @@ fn imap_discovery_and_search_preserve_mailbox_content_identity_and_flags() {
         assert!(snapshot_before.messages.iter().any(|message| message.seen));
         assert!(snapshot_before.messages.iter().any(|message| !message.seen));
 
-        let probe = ImapProbe::new(
+        let mut probe = ImapProbe::new(
             "localhost".to_owned(),
             fixture.imaps_port(),
             TlsMode::Implicit,

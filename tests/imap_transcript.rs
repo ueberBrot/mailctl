@@ -5,7 +5,7 @@ use mailctl::imap::{Limits, TlsMode, UidWindow};
 
 #[tokio::test]
 async fn exact_discovery_authenticates_over_verified_tls_and_logs_out_safely() {
-    let fixture = fixture(TlsMode::Implicit, Limits::default(), |mut wire| {
+    let mut fixture = fixture(TlsMode::Implicit, Limits::default(), |mut wire| {
         Box::pin(async move {
             authenticate(&mut wire).await;
             let tag = expect(&mut wire, "LIST \"\" INBOX").await;
@@ -31,11 +31,23 @@ async fn exact_discovery_authenticates_over_verified_tls_and_logs_out_safely() {
     assert_eq!(result.mailboxes[0].name, "INBOX");
     assert!(result.mailboxes[0].selectable);
     fixture.task.await.unwrap();
+    assert_eq!(
+        fixture
+            .probe
+            .discover("", "disposable-password", &["INBOX".into()])
+            .await
+            .unwrap_err(),
+        mailctl::imap::Error::InvalidInput
+    );
+    let metrics = fixture.probe.metrics();
+    assert_eq!(metrics.wire_bytes, 0);
+    assert_eq!(metrics.responses, 0);
+    assert_eq!(metrics.parser_steps, 0);
 }
 
 #[tokio::test]
 async fn starttls_refreshes_capabilities_before_login_and_reads_only_bounded_uid_envelopes() {
-    let fixture = fixture(TlsMode::StartTls, Limits::default(), |mut wire| Box::pin(async move {
+    let mut fixture = fixture(TlsMode::StartTls, Limits::default(), |mut wire| Box::pin(async move {
         authenticate(&mut wire).await;
         examine(&mut wire).await;
         let tag = expect(&mut wire, "UID SEARCH UID 1:10").await;
@@ -81,13 +93,13 @@ async fn starttls_refreshes_capabilities_before_login_and_reads_only_bounded_uid
         Some("<four@example.invalid>")
     );
     assert!(result.metrics.wire_bytes < 4096);
-    assert!(result.metrics.max_buffered_bytes <= Limits::default().max_response_bytes * 2);
+    assert!(result.metrics.max_response_bytes <= Limits::default().max_response_bytes);
     fixture.task.await.unwrap();
 }
 
 #[tokio::test]
 async fn certificate_hostname_verification_prevents_authentication() {
-    let fixture = fixture_with_name(
+    let mut fixture = fixture_with_name(
         TlsMode::Implicit,
         Limits::default(),
         "wrong.invalid",
@@ -110,7 +122,7 @@ async fn unsafe_selection_never_reaches_search() {
         "{tag} OK [READ-ONLY] selected\r\n",
         "* OK [UIDVALIDITY 77] identity\r\n{tag} OK selected\r\n",
     ] {
-        let fixture = fixture(TlsMode::Implicit, Limits::default(), move |mut wire| {
+        let mut fixture = fixture(TlsMode::Implicit, Limits::default(), move |mut wire| {
             Box::pin(async move {
                 authenticate(&mut wire).await;
                 let tag = expect(&mut wire, "EXAMINE INBOX").await;
@@ -148,7 +160,7 @@ async fn malformed_referral_and_mismatched_completion_dispose_the_connection() {
             mailctl::imap::Error::Protocol,
         ),
     ] {
-        let fixture = fixture(TlsMode::Implicit, Limits::default(), move |mut wire| {
+        let mut fixture = fixture(TlsMode::Implicit, Limits::default(), move |mut wire| {
             Box::pin(async move {
                 authenticate(&mut wire).await;
                 let tag = expect(&mut wire, "LIST \"\" INBOX").await;
@@ -170,7 +182,7 @@ async fn malformed_referral_and_mismatched_completion_dispose_the_connection() {
 #[tokio::test]
 async fn starttls_is_required_and_rejection_disposes_the_plaintext_connection() {
     for advertised in [false, true] {
-        let fixture = plaintext_fixture(Limits::default(), move |mut wire| {
+        let mut fixture = plaintext_fixture(Limits::default(), move |mut wire| {
             Box::pin(async move {
                 write(&mut wire, "* OK synthetic server ready\r\n").await;
                 capability(
@@ -210,7 +222,7 @@ async fn operation_timeout_disposes_the_connection() {
         operation_timeout: std::time::Duration::from_secs(1),
         ..Limits::default()
     };
-    let fixture = fixture(TlsMode::Implicit, limits, |mut wire| {
+    let mut fixture = fixture(TlsMode::Implicit, limits, |mut wire| {
         Box::pin(async move {
             authenticate(&mut wire).await;
             expect(&mut wire, "LIST \"\" INBOX").await;
@@ -229,7 +241,7 @@ async fn operation_timeout_disposes_the_connection() {
 #[tokio::test]
 async fn cancellation_completion_is_observed_by_the_server() {
     let (ready_send, ready_receive) = tokio::sync::oneshot::channel();
-    let fixture = fixture(TlsMode::Implicit, Limits::default(), move |mut wire| {
+    let mut fixture = fixture(TlsMode::Implicit, Limits::default(), move |mut wire| {
         Box::pin(async move {
             authenticate(&mut wire).await;
             expect(&mut wire, "LIST \"\" INBOX").await;
@@ -252,7 +264,7 @@ async fn cancellation_completion_is_observed_by_the_server() {
 
 #[tokio::test]
 async fn eof_during_a_response_disposes_the_operation() {
-    let fixture = fixture(TlsMode::Implicit, Limits::default(), |mut wire| {
+    let mut fixture = fixture(TlsMode::Implicit, Limits::default(), |mut wire| {
         Box::pin(async move {
             authenticate(&mut wire).await;
             expect(&mut wire, "LIST \"\" INBOX").await;
@@ -301,7 +313,7 @@ async fn response_and_parser_work_limits_fail_explicitly() {
         } else {
             "* OK unsolicited progress\r\n".repeat(24)
         };
-        let fixture = fixture(TlsMode::Implicit, limits, move |mut wire| {
+        let mut fixture = fixture(TlsMode::Implicit, limits, move |mut wire| {
             Box::pin(async move {
                 authenticate(&mut wire).await;
                 expect(&mut wire, "LIST \"\" INBOX").await;
@@ -331,7 +343,7 @@ async fn missing_or_duplicate_search_data_cannot_claim_an_empty_result() {
         "* SEARCH 4\r\n* SEARCH\r\n{tag} OK searched\r\n",
         "* SEARCH 11\r\n{tag} OK searched\r\n",
     ] {
-        let fixture = fixture(TlsMode::Implicit, Limits::default(), move |mut wire| {
+        let mut fixture = fixture(TlsMode::Implicit, Limits::default(), move |mut wire| {
             Box::pin(async move {
                 authenticate(&mut wire).await;
                 examine(&mut wire).await;
@@ -358,7 +370,7 @@ async fn missing_or_duplicate_search_data_cannot_claim_an_empty_result() {
 
 #[tokio::test]
 async fn unsolicited_uid_ranges_are_rejected_before_backend_expansion() {
-    let fixture = fixture(TlsMode::Implicit, Limits::default(), |mut wire| {
+    let mut fixture = fixture(TlsMode::Implicit, Limits::default(), |mut wire| {
         Box::pin(async move {
             authenticate(&mut wire).await;
             expect(&mut wire, "EXAMINE INBOX").await;
@@ -395,7 +407,7 @@ fn client_allocations_remain_bounded_for_discovery_envelopes_and_oversized_liter
         "starttls",
         "oversized-literal",
     ] {
-        let (probe, server) = dedicated_fixture(
+        let (mut probe, server) = dedicated_fixture(
             if route == "starttls" {
                 TlsMode::StartTls
             } else {
@@ -474,14 +486,14 @@ fn client_allocations_remain_bounded_for_discovery_envelopes_and_oversized_liter
         server.join().unwrap();
         let metrics = probe.metrics();
         eprintln!(
-            "{route}: allocation_peak={} allocation_total={} allocations={} wire_bytes={} parser_steps={} responses={} estimated_buffered_peak={}",
+            "{route}: allocation_peak={} allocation_total={} allocations={} wire_bytes={} parser_steps={} responses={} largest_response_frame={}",
             allocations.bytes_max,
             allocations.bytes_total,
             allocations.count_total,
             metrics.wire_bytes,
             metrics.parser_steps,
             metrics.responses,
-            metrics.max_buffered_bytes
+            metrics.max_response_bytes
         );
         assert!(
             allocations.bytes_max < 2 * 1024 * 1024,
@@ -505,7 +517,7 @@ fn client_allocations_remain_bounded_for_discovery_envelopes_and_oversized_liter
 
 #[tokio::test]
 async fn exact_discovery_preserves_spaces_ampersands_and_fragmented_responses() {
-    let fixture = fixture(TlsMode::Implicit, Limits::default(), |mut wire| {
+    let mut fixture = fixture(TlsMode::Implicit, Limits::default(), |mut wire| {
         Box::pin(async move {
             authenticate(&mut wire).await;
             let tag = expect(&mut wire, "LIST \"\" \"A&-B Box\"").await;
@@ -541,7 +553,7 @@ async fn excessive_nesting_and_invalid_literal_declarations_dispose_connections(
             mailctl::imap::Error::Protocol,
         ),
     ] {
-        let fixture = fixture(TlsMode::Implicit, Limits::default(), move |mut wire| {
+        let mut fixture = fixture(TlsMode::Implicit, Limits::default(), move |mut wire| {
             Box::pin(async move {
                 authenticate(&mut wire).await;
                 expect(&mut wire, "LIST \"\" INBOX").await;
@@ -564,7 +576,7 @@ async fn excessive_nesting_and_invalid_literal_declarations_dispose_connections(
 async fn discovery_and_search_inputs_are_bounded_before_connecting() {
     use mailctl::imap::{Error, ImapProbe};
     use tokio_rustls::rustls::RootCertStore;
-    let probe = ImapProbe::new(
+    let mut probe = ImapProbe::new(
         "localhost".into(),
         9,
         TlsMode::Implicit,

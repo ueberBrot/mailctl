@@ -67,7 +67,13 @@ can be inspected with `cargo tree --locked -e features -i imap-codec`.
 
 Each `ImapProbe` operation opens its own connection, authenticates, performs one
 bounded discovery or UID-window search, and logs out. It returns owned results;
-no connection returns to a pool. Dropping the operation future drops its socket,
+no connection returns to a pool. Operations require an exclusive mutable borrow
+of their probe, so one operation cannot reset another operation's resource
+counters. Independent probes can run concurrently. Counters reset before input
+validation and remain inspectable after the future is dropped. A compile-time
+fixture verifies that operation futures cannot overlap on one probe.
+
+Dropping the operation future drops its socket,
 including on timeout, EOF, malformed responses, or failed selection.
 
 | Step | Direct io-imap route | Application check |
@@ -138,11 +144,11 @@ variation between runs is expected from generated command tags and TLS state.
 
 | Reference route | Peak live allocated bytes | Cumulative allocated bytes |
 | --- | ---: | ---: |
-| Exact discovery | 20,601 | 39,324 |
-| UID search and envelope | 24,289 | 57,779 |
-| Envelope with a 60 KiB subject literal | 330,171 | 741,459 |
-| STARTTLS search and envelope | 24,407 | 64,755 |
-| Refused 32 MiB literal declaration | 19,699 | 40,938 |
+| Exact discovery | 20,515 | 39,044 |
+| UID search and envelope | 23,950 | 57,871 |
+| Envelope with a 60 KiB subject literal | 329,784 | 741,553 |
+| STARTTLS search and envelope | 24,068 | 64,848 |
+| Refused 32 MiB literal declaration | 19,440 | 41,090 |
 
 The 60 KiB subject case consumed 61,923 IMAP bytes and 185,799 parser-work units.
 Its subject was returned intact. The oversized case admitted zero literal bytes.

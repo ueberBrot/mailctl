@@ -1,4 +1,4 @@
-use super::{Error, Limits, Metrics, TlsMode};
+use super::{Error, Limits, Metrics, TlsMode, projection::Projection};
 use io_imap::{
     codec::{
         CommandCodec, ResponseCodec,
@@ -6,6 +6,7 @@ use io_imap::{
         fragmentizer::{FragmentInfo, Fragmentizer, LineEnding},
     },
     coroutine::{ImapCoroutine, ImapCoroutineState, ImapYield},
+    rfc3501::examine::ImapMailboxExamine,
     send::ImapSend,
     types::{
         command::{Command, CommandBody},
@@ -13,10 +14,7 @@ use io_imap::{
         response::{Code, Data, Response, Status, StatusKind},
     },
 };
-use std::{
-    io,
-    sync::{Arc, Mutex},
-};
+use std::{collections::BTreeSet, io, num::NonZeroU32, sync::Arc};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     net::TcpStream,
@@ -29,31 +27,22 @@ use zeroize::Zeroizing;
 trait Stream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Stream for T {}
 
-pub(super) struct Connection {
+pub(super) struct Connection<'a> {
     stream: Option<BufReader<Box<dyn Stream>>>,
     fragmentizer: Fragmentizer,
     limits: Limits,
-    metrics: Arc<Mutex<Metrics>>,
-    pub examining: bool,
-    pub read_only: bool,
-    pub authenticating: bool,
-    tag: Option<String>,
-    logging_out: bool,
-    logout_bye: bool,
-    logout_tagged: bool,
-    searching: bool,
-    search_responses: usize,
-    fetch_sequences: std::collections::BTreeSet<u32>,
-    uid_validity: Option<u32>,
+    metrics: &'a mut Metrics,
+    command: CommandState,
+    uid_validity: Option<NonZeroU32>,
 }
-impl Connection {
+impl<'a> Connection<'a> {
     pub async fn connect(
         host: &str,
         port: u16,
         mode: TlsMode,
         tls: Arc<ClientConfig>,
         limits: Limits,
-        metrics: Arc<Mutex<Metrics>>,
+        metrics: &'a mut Metrics,
     ) -> Result<Self, Error> {
         let tcp = TcpStream::connect((host, port))
             .await
@@ -72,18 +61,24 @@ impl Connection {
             fragmentizer: Fragmentizer::new(limits.max_response_bytes as u32),
             limits,
             metrics,
-            examining: false,
-            read_only: false,
-            authenticating: false,
-            tag: None,
-            logging_out: false,
-            logout_bye: false,
-            logout_tagged: false,
-            searching: false,
-            search_responses: 0,
-            fetch_sequences: Default::default(),
+            command: CommandState::greeting(),
             uid_validity: None,
         })
+    }
+    pub fn metrics(&self) -> Metrics {
+        *self.metrics
+    }
+    pub async fn examine(&mut self, name: &str) -> Result<u32, Error> {
+        self.drive(ImapMailboxExamine::new(
+            name.to_owned()
+                .try_into()
+                .map_err(|_| Error::InvalidInput)?,
+            Default::default(),
+        ))
+        .await?;
+        self.uid_validity
+            .map(NonZeroU32::get)
+            .ok_or(Error::UnsafeSelection)
     }
     pub async fn upgrade(&mut self, host: &str, tls: Arc<ClientConfig>) -> Result<(), Error> {
         let command = Command {
@@ -128,16 +123,13 @@ impl Connection {
                     let bytes = Zeroizing::new(bytes);
                     // LOGIN is restricted to a single frame so the complete command can
                     // be validated and its transient encoded bytes cleared after writing.
-                    let (_, command) = CommandCodec::new()
+                    let (remaining, command) = CommandCodec::new()
                         .decode(&bytes)
                         .map_err(|_| Error::Protocol)?;
-                    self.tag = Some(command.tag.as_ref().to_owned());
-                    self.logging_out = matches!(command.body, CommandBody::Logout);
-                    self.logout_bye = false;
-                    self.logout_tagged = false;
-                    self.searching = matches!(command.body, CommandBody::Search { .. });
-                    self.search_responses = 0;
-                    self.fetch_sequences.clear();
+                    if !remaining.is_empty() {
+                        return Err(Error::Protocol);
+                    }
+                    self.command = CommandState::new(command)?;
                     let result = self
                         .stream
                         .as_mut()
@@ -148,8 +140,8 @@ impl Connection {
                 }
                 ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
                     let mut received = self.frame().await?;
-                    if self.logging_out && self.logout_bye {
-                        while !self.logout_tagged {
+                    if self.command.needs_logout_completion() {
+                        while self.command.needs_logout_completion() {
                             let next = self.frame().await?;
                             if next.len()
                                 > self
@@ -160,23 +152,18 @@ impl Connection {
                                 return Err(Error::Limit);
                             }
                             received.extend(next);
-                            let mut metrics =
-                                self.metrics.lock().unwrap_or_else(|e| e.into_inner());
-                            metrics.max_buffered_bytes =
-                                metrics.max_buffered_bytes.max(received.len() * 2 + 4096);
                         }
                     }
                     frame = Some(received);
                 }
                 ImapCoroutineState::Complete(Ok(value)) => {
-                    if self.searching && self.search_responses != 1 {
-                        return Err(Error::Protocol);
+                    if let Some(uid_validity) = self.command.finish()? {
+                        self.uid_validity = Some(uid_validity);
                     }
-                    self.tag = None;
                     return Ok(value);
                 }
                 ImapCoroutineState::Complete(Err(_)) => {
-                    return Err(if self.authenticating {
+                    return Err(if matches!(self.command.kind, CommandKind::Login) {
                         Error::Authentication
                     } else {
                         Error::Protocol
@@ -185,34 +172,32 @@ impl Connection {
             }
         }
     }
-    fn step(&self, count: usize) -> Result<(), Error> {
-        let mut m = self.metrics.lock().unwrap_or_else(|e| e.into_inner());
-        if count > self.limits.max_parser_steps.saturating_sub(m.parser_steps) {
+    fn step(&mut self, count: usize) -> Result<(), Error> {
+        if count
+            > self
+                .limits
+                .max_parser_steps
+                .saturating_sub(self.metrics.parser_steps)
+        {
             return Err(Error::Limit);
         }
-        m.parser_steps += count;
+        self.metrics.parser_steps += count;
         Ok(())
     }
     async fn frame(&mut self) -> Result<Vec<u8>, Error> {
         let mut guard = Fragmentizer::new(self.limits.max_response_bytes as u32);
         let mut bytes = 0usize;
         let mut nesting = 0usize;
-        {
-            let mut m = self.metrics.lock().unwrap_or_else(|e| e.into_inner());
-            if m.responses >= self.limits.max_responses {
-                return Err(Error::Limit);
-            }
-            m.responses += 1;
+        if self.metrics.responses >= self.limits.max_responses {
+            return Err(Error::Limit);
         }
+        self.metrics.responses += 1;
         loop {
             if bytes >= self.limits.max_response_bytes {
                 return Err(Error::Limit);
             }
-            {
-                let m = self.metrics.lock().unwrap_or_else(|e| e.into_inner());
-                if m.wire_bytes >= self.limits.max_operation_bytes {
-                    return Err(Error::Limit);
-                }
+            if self.metrics.wire_bytes >= self.limits.max_operation_bytes {
+                return Err(Error::Limit);
             }
             let byte = self
                 .stream
@@ -229,12 +214,8 @@ impl Connection {
                 })?;
             bytes += 1;
             self.step(1)?;
-            {
-                let mut m = self.metrics.lock().unwrap_or_else(|e| e.into_inner());
-                m.wire_bytes += 1;
-                m.max_response_bytes = m.max_response_bytes.max(bytes);
-                m.max_buffered_bytes = m.max_buffered_bytes.max(bytes * 2 + 4096);
-            }
+            self.metrics.wire_bytes += 1;
+            self.metrics.max_response_bytes = self.metrics.max_response_bytes.max(bytes);
             guard.enqueue_bytes(&[byte]);
             while let Some(info) = guard.progress() {
                 if let FragmentInfo::Line {
@@ -280,17 +261,14 @@ impl Connection {
                         if length > self.limits.max_literal_bytes
                             || length > self.limits.max_response_bytes.saturating_sub(bytes)
                             || length
-                                > self.limits.max_operation_bytes.saturating_sub(
-                                    self.metrics
-                                        .lock()
-                                        .unwrap_or_else(|e| e.into_inner())
-                                        .wire_bytes,
-                                )
+                                > self
+                                    .limits
+                                    .max_operation_bytes
+                                    .saturating_sub(self.metrics.wire_bytes)
                         {
                             return Err(Error::Limit);
                         }
-                        let mut m = self.metrics.lock().unwrap_or_else(|e| e.into_inner());
-                        m.max_literal_bytes = m.max_literal_bytes.max(length);
+                        self.metrics.max_literal_bytes = self.metrics.max_literal_bytes.max(length);
                     }
                 }
                 if guard.is_message_complete() {
@@ -298,13 +276,109 @@ impl Connection {
                     let response = guard
                         .decode_message(&ResponseCodec::new())
                         .map_err(|_| Error::Protocol)?;
-                    self.inspect(response)?;
+                    self.command.inspect(response, self.uid_validity)?;
                     return Ok(guard.message_bytes().to_vec());
                 }
             }
         }
     }
-    fn inspect(&mut self, response: Response<'_>) -> Result<(), Error> {
+}
+
+/// A command owns the response requirements implied by its typed request.
+struct CommandState {
+    tag: Option<String>,
+    kind: CommandKind,
+}
+enum CommandKind {
+    Greeting,
+    Capability,
+    Login,
+    StartTls,
+    List,
+    Examine {
+        uid_validity: Option<NonZeroU32>,
+        read_only: bool,
+    },
+    Search {
+        seen: bool,
+    },
+    Fetch {
+        sequences: BTreeSet<u32>,
+    },
+    Logout {
+        bye: bool,
+        tagged: bool,
+    },
+}
+impl CommandState {
+    fn greeting() -> Self {
+        Self {
+            tag: None,
+            kind: CommandKind::Greeting,
+        }
+    }
+    fn new(command: Command<'_>) -> Result<Self, Error> {
+        let kind = match command.body {
+            CommandBody::Capability => CommandKind::Capability,
+            CommandBody::Login { .. } => CommandKind::Login,
+            CommandBody::StartTLS => CommandKind::StartTls,
+            CommandBody::List { .. } => CommandKind::List,
+            CommandBody::Examine { parameters, .. } if parameters.is_empty() => {
+                CommandKind::Examine {
+                    uid_validity: None,
+                    read_only: false,
+                }
+            }
+            CommandBody::Search { uid: true, .. } => CommandKind::Search { seen: false },
+            CommandBody::Fetch {
+                uid: true,
+                macro_or_item_names,
+                modifiers,
+                ..
+            } if modifiers.is_empty() && macro_or_item_names == Projection::request() => {
+                CommandKind::Fetch {
+                    sequences: BTreeSet::new(),
+                }
+            }
+            CommandBody::Logout => CommandKind::Logout {
+                bye: false,
+                tagged: false,
+            },
+            _ => return Err(Error::Unsupported),
+        };
+        Ok(Self {
+            tag: Some(command.tag.as_ref().to_owned()),
+            kind,
+        })
+    }
+    fn needs_logout_completion(&self) -> bool {
+        matches!(
+            self.kind,
+            CommandKind::Logout {
+                bye: true,
+                tagged: false
+            }
+        )
+    }
+    fn finish(&self) -> Result<Option<NonZeroU32>, Error> {
+        match self.kind {
+            CommandKind::Examine {
+                uid_validity: Some(uid_validity),
+                read_only: true,
+            } => Ok(Some(uid_validity)),
+            CommandKind::Examine { .. } => Err(Error::UnsafeSelection),
+            CommandKind::Search { seen: false } => Err(Error::Protocol),
+            CommandKind::Logout { bye: false, .. } | CommandKind::Logout { tagged: false, .. } => {
+                Err(Error::Protocol)
+            }
+            _ => Ok(None),
+        }
+    }
+    fn inspect(
+        &mut self,
+        response: Response<'_>,
+        selected: Option<NonZeroU32>,
+    ) -> Result<(), Error> {
         match response {
             Response::Status(status) => {
                 let (body, tagged) = match &status {
@@ -312,75 +386,65 @@ impl Connection {
                         if self.tag.as_deref() != Some(tagged.tag.as_ref()) {
                             return Err(Error::Protocol);
                         }
-                        self.logout_tagged = true;
+                        if let CommandKind::Logout { tagged, .. } = &mut self.kind {
+                            *tagged = true;
+                        }
                         (&tagged.body, true)
                     }
                     Status::Untagged(body) => (body, false),
                     Status::Bye(bye) => {
                         check_code(bye.code.as_ref())?;
-                        if self.logout_bye {
+                        let CommandKind::Logout { bye, .. } = &mut self.kind else {
+                            return Err(Error::Eof);
+                        };
+                        if *bye {
                             return Err(Error::Protocol);
                         }
-                        self.logout_bye = true;
-                        return if self.logging_out {
-                            Ok(())
-                        } else {
-                            Err(Error::Eof)
-                        };
+                        *bye = true;
+                        return Ok(());
                     }
                 };
                 check_code(body.code.as_ref())?;
                 if let Some(Code::UidValidity(value)) = body.code {
-                    if self.examining {
-                        if self.uid_validity.replace(value.get()).is_some() {
+                    if let CommandKind::Examine { uid_validity, .. } = &mut self.kind {
+                        if body.kind != StatusKind::Ok || uid_validity.replace(value).is_some() {
                             return Err(Error::Protocol);
                         }
-                    } else if self
-                        .uid_validity
-                        .is_some_and(|expected| expected != value.get())
-                    {
+                    } else if selected.is_some_and(|expected| expected != value) {
                         return Err(Error::UnsafeSelection);
                     }
                 }
-                if self.examining && tagged {
+                if let CommandKind::Examine { read_only, .. } = &mut self.kind
+                    && tagged
+                {
                     if body.kind != StatusKind::Ok || body.code != Some(Code::ReadOnly) {
                         return Err(Error::UnsafeSelection);
                     }
-                    self.read_only = true;
+                    *read_only = true;
                 }
             }
             Response::Data(data) => match data {
                 Data::Capability(_)
-                | Data::List { .. }
-                | Data::Flags(_)
-                | Data::Exists(_)
-                | Data::Recent(_)
-                | Data::Expunge(_) => {}
+                    if matches!(self.kind, CommandKind::Capability | CommandKind::Login) => {}
+                Data::List { .. } if matches!(self.kind, CommandKind::List) => {}
+                Data::Flags(_) | Data::Exists(_) | Data::Recent(_) | Data::Expunge(_) => {}
                 Data::Search(..) => {
-                    if !self.searching || self.search_responses != 0 {
+                    let CommandKind::Search { seen } = &mut self.kind else {
+                        return Err(Error::Protocol);
+                    };
+                    if *seen {
                         return Err(Error::Protocol);
                     }
-                    self.search_responses += 1;
+                    *seen = true;
                 }
                 Data::Fetch { seq, items } => {
-                    if !self.fetch_sequences.insert(seq.get()) {
+                    let CommandKind::Fetch { sequences } = &mut self.kind else {
+                        return Err(Error::Protocol);
+                    };
+                    if !sequences.insert(seq.get()) {
                         return Err(Error::Protocol);
                     }
-                    if self.examining {
-                        return Err(Error::Protocol);
-                    }
-                    if items.as_ref().iter().any(|item| {
-                        !matches!(
-                            item,
-                            io_imap::types::fetch::MessageDataItem::Uid(_)
-                                | io_imap::types::fetch::MessageDataItem::Envelope(_)
-                                | io_imap::types::fetch::MessageDataItem::Flags(_)
-                                | io_imap::types::fetch::MessageDataItem::InternalDate(_)
-                                | io_imap::types::fetch::MessageDataItem::Rfc822Size(_)
-                        )
-                    }) {
-                        return Err(Error::Unsupported);
-                    }
+                    Projection::parse(items.as_ref())?;
                 }
                 // VANISHED sequence ranges can expand into billions of UIDs in the
                 // backend's EXAMINE coroutine. No extensions are enabled in this proof.
@@ -391,6 +455,7 @@ impl Connection {
         Ok(())
     }
 }
+
 fn server_name(host: &str) -> Result<ServerName<'static>, Error> {
     ServerName::try_from(host.to_owned()).map_err(|_| Error::InvalidInput)
 }
