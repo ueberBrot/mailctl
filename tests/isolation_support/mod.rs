@@ -196,6 +196,30 @@ impl Qualification {
             .expect("numeric service UID")
     }
 
+    /// Unlock the disposable fixture keychain in the broker's launchd session.
+    pub(crate) fn unlock_broker_keychain(&self, keychain: &Path) {
+        let broker_pid = self.launchd_pid().to_string();
+        let keychain = keychain.to_str().expect("UTF-8 fixture keychain path");
+        let output = bounded(command("/bin/launchctl").args([
+            "bsexec",
+            &broker_pid,
+            "/usr/bin/sudo",
+            "-H",
+            "-u",
+            &self.service_user,
+            "--",
+            "/usr/bin/security",
+            "unlock-keychain",
+            "-p",
+            "mailctl-isolated-fixture",
+            keychain,
+        ]));
+        assert_success(
+            &output,
+            "unlock disposable keychain in the broker launchd session",
+        );
+    }
+
     pub(crate) fn create_keychain(&mut self, certificate: &Path) -> PathBuf {
         let keychain = Path::new(SERVICE_HOME).join("native-fixture.keychain-db");
         let keychain_text = keychain.to_str().expect("UTF-8 keychain path");
