@@ -34,6 +34,7 @@ pub struct MessageSnapshot {
     pub message_id: String,
     pub subject: String,
     pub seen: bool,
+    pub draft: bool,
 }
 
 /// Observe the synthetic INBOX through a new verified TLS connection.
@@ -42,6 +43,22 @@ pub struct MessageSnapshot {
 /// server response with io-imap's re-exported codec, separately from the
 /// production adapter.
 pub async fn snapshot(port: u16, tls: &TlsConnector, password: &str) -> Result<MailboxSnapshot> {
+    snapshot_mailbox(port, tls, password, "INBOX").await
+}
+
+pub async fn snapshot_mailbox(
+    port: u16,
+    tls: &TlsConnector,
+    password: &str,
+    mailbox: &str,
+) -> Result<MailboxSnapshot> {
+    if mailbox.is_empty()
+        || mailbox.len() > 4096
+        || !mailbox.bytes().all(|byte| (32..=126).contains(&byte))
+    {
+        return Err("Invalid observer mailbox".into());
+    }
+    let mailbox = mailbox.replace('\\', "\\\\").replace('"', "\\\"");
     tokio::time::timeout(Duration::from_secs(10), async {
         let socket = TcpStream::connect(("127.0.0.1", port)).await?;
         let stream = tls
@@ -52,7 +69,7 @@ pub async fn snapshot(port: u16, tls: &TlsConnector, password: &str) -> Result<M
         wire.ok(&format!("LOGIN \"{EMAIL}\" \"{password}\""))
             .await?;
 
-        let examine = wire.ok("EXAMINE INBOX").await?;
+        let examine = wire.ok(&format!("EXAMINE \"{mailbox}\"")).await?;
         let uid_validity = examine
             .iter()
             .find_map(Reply::uid_validity)
@@ -317,6 +334,7 @@ fn uid_validity(code: Option<&Code<'_>>) -> Option<u32> {
 fn message<'a>(items: impl IntoIterator<Item = MessageDataItem<'a>>) -> Result<MessageSnapshot> {
     let mut uid = None;
     let mut seen = None;
+    let mut draft = None;
     let mut envelope = None;
     for item in items {
         match item {
@@ -324,8 +342,13 @@ fn message<'a>(items: impl IntoIterator<Item = MessageDataItem<'a>>) -> Result<M
             MessageDataItem::Flags(flags) => {
                 seen = Some(
                     flags
-                        .into_iter()
+                        .iter()
                         .any(|flag| matches!(flag, FlagFetch::Flag(Flag::Seen))),
+                );
+                draft = Some(
+                    flags
+                        .iter()
+                        .any(|flag| matches!(flag, FlagFetch::Flag(Flag::Draft))),
                 );
             }
             MessageDataItem::Envelope(value) => envelope = Some(value),
@@ -338,6 +361,7 @@ fn message<'a>(items: impl IntoIterator<Item = MessageDataItem<'a>>) -> Result<M
         message_id: nstring(envelope.message_id, "message ID")?,
         subject: nstring(envelope.subject, "subject")?,
         seen: seen.ok_or("Independent observer FETCH omitted FLAGS")?,
+        draft: draft.ok_or("Independent observer FETCH omitted FLAGS")?,
     })
 }
 

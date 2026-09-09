@@ -107,11 +107,29 @@ fn check_dependencies(
         {
             return Err("Use pinned tokio-rustls 0.26.5 with only ring and tls12".into());
         }
+        if name == "mail-builder"
+            && (package.version.to_string() != "0.5.0" || !node.features.is_empty())
+        {
+            return Err("Use pinned mail-builder 0.5.0 without hostname discovery".into());
+        }
+        if name == "rusqlite"
+            && (package.version.to_string() != "0.40.2"
+                || node
+                    .features
+                    .iter()
+                    .map(|feature| feature.as_str())
+                    .collect::<HashSet<_>>()
+                    != HashSet::from(["bundled", "modern_sqlite"]))
+        {
+            return Err("Use pinned rusqlite 0.40.2 with bundled SQLite".into());
+        }
         if name == "mailctl" {
             for (dependency_name, version) in [
                 ("io-imap", "=0.6.0"),
                 ("tokio", "=1.53.1"),
                 ("tokio-rustls", "=0.26.5"),
+                ("mail-builder", "=0.5.0"),
+                ("rusqlite", "=0.40.2"),
             ] {
                 if !dependencies.iter().any(|dependency| {
                     dependency.name == dependency_name && dependency.req.to_string() == version

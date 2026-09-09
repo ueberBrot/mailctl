@@ -1,4 +1,7 @@
-use super::{Error, Limits, Metrics, TlsMode, fetch::Fetch as BodyFetch, projection::Projection};
+use super::{
+    AppendOutcome, AppendUid, Error, Limits, Metrics, TlsMode, fetch::Fetch as BodyFetch,
+    projection::Projection,
+};
 use io_imap::{
     codec::{
         CommandCodec, ResponseCodec,
@@ -6,11 +9,16 @@ use io_imap::{
         fragmentizer::{FragmentInfo, Fragmentizer, LineEnding},
     },
     coroutine::{ImapCoroutine, ImapCoroutineState, ImapYield},
-    rfc3501::examine::ImapMailboxExamine,
+    rfc3501::{
+        append::ImapMessageAppendOptions,
+        append_stream::{ImapMessageAppendStream, ImapMessageAppendStreamYield},
+        examine::ImapMailboxExamine,
+    },
     send::ImapSend,
     types::{
         command::{Command, CommandBody},
         core::TagGenerator,
+        flag::Flag,
         response::{Code, Data, Response, Status, StatusKind},
     },
 };
@@ -112,6 +120,101 @@ impl<'a> Connection<'a> {
         self.fragmentizer = Fragmentizer::new(self.limits.max_response_bytes as u32);
         Ok(self)
     }
+    /// The streaming coroutine keeps the frozen MIME out of backend command buffers.
+    pub async fn append(&mut self, target: &str, mime: &[u8]) -> Result<(), Error> {
+        let mut coroutine = ImapMessageAppendStream::new(
+            target
+                .to_owned()
+                .try_into()
+                .map_err(|_| Error::InvalidInput)?,
+            u32::try_from(mime.len()).map_err(|_| Error::Limit)?,
+            ImapMessageAppendOptions {
+                flags: vec![Flag::Draft],
+                ..Default::default()
+            },
+        );
+        let mut frame = None;
+        let mut header = true;
+        loop {
+            self.step(1)?;
+            let state = coroutine.resume(&mut self.fragmentizer, frame.as_deref());
+            frame = None;
+            match state {
+                ImapCoroutineState::Yielded(ImapMessageAppendStreamYield::WantsWrite(bytes)) => {
+                    if header {
+                        let suffix = format!("{{{}}}\r\n", mime.len());
+                        let prefix = bytes
+                            .strip_suffix(suffix.as_bytes())
+                            .ok_or(Error::Protocol)?;
+                        let mut empty = prefix.to_vec();
+                        empty.extend_from_slice(b"{0}\r\n\r\n");
+                        let (remaining, command) = CommandCodec::new()
+                            .decode(&empty)
+                            .map_err(|_| Error::Protocol)?;
+                        if !remaining.is_empty() {
+                            return Err(Error::Protocol);
+                        }
+                        self.command = CommandState::append(command, target)?;
+                        self.metrics.append_outcome = Some(AppendOutcome::Unknown);
+                        header = false;
+                    } else if bytes != b"\r\n"
+                        || !matches!(
+                            self.command.kind,
+                            CommandKind::Append { streamed: true, .. }
+                        )
+                    {
+                        return Err(Error::Protocol);
+                    }
+                    self.append_write(&bytes).await?;
+                }
+                ImapCoroutineState::Yielded(ImapMessageAppendStreamYield::WantsStream) => {
+                    let CommandKind::Append {
+                        continuation: true,
+                        streamed,
+                        ..
+                    } = &mut self.command.kind
+                    else {
+                        return Err(Error::Protocol);
+                    };
+                    if *streamed {
+                        return Err(Error::Protocol);
+                    }
+                    *streamed = true;
+                    self.append_write(mime).await?;
+                }
+                ImapCoroutineState::Yielded(ImapMessageAppendStreamYield::WantsRead) => {
+                    frame = Some(self.frame().await?);
+                    if matches!(
+                        self.metrics.append_outcome,
+                        Some(AppendOutcome::Created { .. } | AppendOutcome::Rejected)
+                    ) {
+                        // The guarded response is authoritative before any further coroutine
+                        // work, cleanup, or optional reference lookup can fail.
+                        self.step(1)?;
+                        let _ = coroutine.resume(&mut self.fragmentizer, frame.as_deref());
+                        return Ok(());
+                    }
+                }
+                ImapCoroutineState::Complete(_) => return Err(Error::Protocol),
+            }
+        }
+    }
+    async fn append_write(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        if bytes.len()
+            > self
+                .limits
+                .max_operation_bytes
+                .saturating_sub(self.metrics.wire_bytes)
+                .saturating_sub(self.metrics.append_wire_bytes)
+        {
+            return Err(Error::Limit);
+        }
+        self.metrics.append_wire_bytes += bytes.len();
+        self.stream
+            .write_all(bytes)
+            .await
+            .map_err(|_| Error::Transport)
+    }
     pub async fn drive<C, T, E>(&mut self, mut coroutine: C) -> Result<T, Error>
     where
         C: ImapCoroutine<Yield = ImapYield, Return = Result<T, E>>,
@@ -206,7 +309,12 @@ impl<'a> Connection<'a> {
             if bytes >= self.limits.max_response_bytes {
                 return Err(Error::Limit);
             }
-            if self.metrics.wire_bytes >= self.limits.max_operation_bytes {
+            if self
+                .metrics
+                .wire_bytes
+                .saturating_add(self.metrics.append_wire_bytes)
+                >= self.limits.max_operation_bytes
+            {
                 return Err(Error::Limit);
             }
             let byte = self.stream.read_u8().await.map_err(|e| {
@@ -300,6 +408,9 @@ impl<'a> Connection<'a> {
                         return Err(Error::Protocol);
                     }
                     self.command.inspect(response, self.uid_validity)?;
+                    if let CommandKind::Append { outcome, .. } = self.command.kind {
+                        self.metrics.append_outcome = Some(outcome);
+                    }
                     return Ok(repaired.unwrap_or_else(|| guard.message_bytes().to_vec()));
                 }
             }
@@ -313,6 +424,11 @@ struct CommandState {
     kind: CommandKind,
 }
 enum CommandKind {
+    Append {
+        continuation: bool,
+        streamed: bool,
+        outcome: AppendOutcome,
+    },
     Greeting,
     Capability,
     Login,
@@ -343,6 +459,32 @@ impl CommandState {
             tag: None,
             kind: CommandKind::Greeting,
         }
+    }
+    fn append(command: Command<'_>, target: &str) -> Result<Self, Error> {
+        let CommandBody::Append {
+            mailbox,
+            flags,
+            date: None,
+            ..
+        } = &command.body
+        else {
+            return Err(Error::Unsupported);
+        };
+        let expected: io_imap::types::mailbox::Mailbox<'_> = target
+            .replace('&', "&-")
+            .try_into()
+            .map_err(|_| Error::InvalidInput)?;
+        if mailbox != &expected || flags != &[Flag::Draft] {
+            return Err(Error::Unsupported);
+        }
+        Ok(Self {
+            tag: Some(command.tag.as_ref().to_owned()),
+            kind: CommandKind::Append {
+                continuation: false,
+                streamed: false,
+                outcome: AppendOutcome::Unknown,
+            },
+        })
     }
     fn new(command: Command<'_>) -> Result<Self, Error> {
         let body_fetch = BodyFetch::from_command(&command.body);
@@ -428,6 +570,27 @@ impl CommandState {
                         if let CommandKind::Logout { tagged, .. } = &mut self.kind {
                             *tagged = true;
                         }
+                        if let CommandKind::Append {
+                            streamed, outcome, ..
+                        } = &mut self.kind
+                        {
+                            *outcome = match tagged.body.kind {
+                                StatusKind::Ok if *streamed => AppendOutcome::Created {
+                                    uid: match tagged.body.code {
+                                        Some(Code::AppendUid { uid_validity, uid }) => {
+                                            Some(AppendUid {
+                                                uid_validity: uid_validity.get(),
+                                                uid: uid.get(),
+                                            })
+                                        }
+                                        _ => None,
+                                    },
+                                },
+                                StatusKind::No | StatusKind::Bad => AppendOutcome::Rejected,
+                                _ => return Err(Error::Protocol),
+                            };
+                            return Ok(());
+                        }
                         (&tagged.body, true)
                     }
                     Status::Untagged(body) => (body, false),
@@ -496,7 +659,20 @@ impl CommandState {
                 // backend's EXAMINE coroutine. No extensions are enabled in this proof.
                 _ => return Err(Error::Unsupported),
             },
-            Response::CommandContinuationRequest(_) => return Err(Error::Protocol),
+            Response::CommandContinuationRequest(_) => {
+                let CommandKind::Append {
+                    continuation,
+                    streamed: false,
+                    ..
+                } = &mut self.kind
+                else {
+                    return Err(Error::Protocol);
+                };
+                if *continuation {
+                    return Err(Error::Protocol);
+                }
+                *continuation = true;
+            }
         }
         Ok(())
     }

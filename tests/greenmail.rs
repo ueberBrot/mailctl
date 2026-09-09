@@ -369,3 +369,89 @@ fn imap_attachment_listing_and_chunks_preserve_exact_base64_decoded_data() {
         Ok(())
     });
 }
+
+#[test]
+fn imap_append_creates_exact_draft_in_existing_target_without_changing_inbox() {
+    greenmail_support::run(async {
+        use mailctl::imap::{AppendOutcome, DraftInput, ImapProbe, Limits, PreparedDraft, TlsMode};
+
+        const TARGET: &str = "fixture folder/child";
+        const ID: &str = "append-proof@example.test";
+        let fixture = greenmail_support::Fixture::start().await?;
+        fixture.verify_folder_path_encoding().await?;
+        let inbox = fixture.snapshot().await?;
+        let inbox_contents = fixture.contents().await?;
+        let target = fixture.snapshot_mailbox(TARGET).await?;
+        let target_contents = fixture.contents_mailbox(TARGET).await?;
+        let draft = PreparedDraft::compose(
+            DraftInput {
+                from: "sender@example.test".into(),
+                to: vec!["recipient@example.test".into()],
+                cc: vec!["copy@example.test".into()],
+                bcc: vec!["private@example.test".into()],
+                subject: "Unsent draft proof".into(),
+                body: "Synthetic unsent draft.\nSecond line.".into(),
+                message_id: ID.into(),
+                date_unix: 1_700_000_000,
+                ..DraftInput::default()
+            },
+            64 * 1024,
+        )?;
+        let mut probe = ImapProbe::new(
+            "localhost".into(),
+            fixture.imaps_port(),
+            TlsMode::Implicit,
+            fixture.tls_roots(),
+            Limits::default(),
+        )?;
+        let result = probe
+            .append_draft(
+                "fixture+smoke@example.test",
+                "disposable-fixture-password",
+                TARGET,
+                &draft,
+            )
+            .await?;
+        let AppendOutcome::Created { uid } = result.outcome else {
+            panic!("APPEND was not acknowledged: {:?}", result.outcome);
+        };
+        let after = fixture.snapshot_mailbox(TARGET).await?;
+        assert_eq!(after.uid_validity, target.uid_validity);
+        assert_eq!(after.messages.len(), target.messages.len() + 1);
+        let observed = after
+            .messages
+            .iter()
+            .find(|message| message.message_id == format!("<{ID}>"))
+            .unwrap();
+        assert!(observed.draft);
+        assert!(!observed.seen);
+        if let Some(uid) = uid {
+            assert_eq!(uid.uid_validity, after.uid_validity);
+            assert_eq!(uid.uid, observed.uid);
+        }
+        for original in &target.messages {
+            assert!(after.messages.contains(original));
+        }
+        let contents = fixture.contents_mailbox(TARGET).await?;
+        assert_eq!(contents.len(), target_contents.len() + 1);
+        for original in &target_contents {
+            assert!(contents.contains(original));
+        }
+        let stored = contents
+            .iter()
+            .find(|message| message.message_id == format!("<{ID}>"))
+            .unwrap();
+        assert_eq!(stored.mime_message.as_bytes(), draft.bytes());
+        let parsed = mail_parser::MessageParser::default()
+            .parse(stored.mime_message.as_bytes())
+            .unwrap();
+        assert_eq!(
+            parsed.bcc().unwrap().first().unwrap().address.as_deref(),
+            Some("private@example.test")
+        );
+        assert_eq!(fixture.snapshot().await?, inbox);
+        assert_eq!(fixture.contents().await?, inbox_contents);
+        fixture.shutdown().await?;
+        Ok(())
+    });
+}

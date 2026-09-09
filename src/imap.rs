@@ -1,10 +1,13 @@
-//! Bounded, read-only IMAP route proof. Each operation owns and disposes its connection.
+//! Bounded IMAP route proofs. Each operation owns and disposes its connection.
+mod append;
 mod attachment;
 mod body;
 mod fetch;
 mod mime;
 mod projection;
 mod wire;
+
+pub use append::{AppendOutcome, AppendResult, AppendUid, DraftInput, PreparedDraft};
 
 pub use attachment::{
     AttachmentChunk, AttachmentIntegrity, AttachmentList, AttachmentListRequest,
@@ -181,6 +184,9 @@ impl Limits {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Metrics {
+    pub append_outcome: Option<AppendOutcome>,
+    pub append_wire_bytes: usize,
+    pub mime_bytes: usize,
     pub wire_bytes: usize,
     pub responses: usize,
     pub parser_steps: usize,

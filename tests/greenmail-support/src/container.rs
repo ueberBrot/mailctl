@@ -195,11 +195,19 @@ impl Fixture {
         observer::snapshot(self.imaps, &self.tls, PASSWORD).await
     }
 
+    pub async fn snapshot_mailbox(&self, mailbox: &str) -> Result<MailboxSnapshot> {
+        observer::snapshot_mailbox(self.imaps, &self.tls, PASSWORD, mailbox).await
+    }
+
     /// Returns the typed administrative view used to check exact synthetic content.
     pub async fn contents(&self) -> Result<Vec<AdministrativeMessage>> {
+        self.contents_mailbox("INBOX").await
+    }
+
+    pub async fn contents_mailbox(&self, mailbox: &str) -> Result<Vec<AdministrativeMessage>> {
         let mut messages = self
             .api
-            .messages(EMAIL, "INBOX")
+            .messages(EMAIL, mailbox)
             .await?
             .into_iter()
             .map(|message| AdministrativeMessage {
