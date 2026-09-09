@@ -40,6 +40,29 @@ pub async fn fixture_with_name(
     certificate_name: &str,
     script: impl FnOnce(Wire) -> Script + Send + 'static,
 ) -> Fixture {
+    let mut script = Some(script);
+    fixture_sessions(mode, limits, certificate_name, 1, move |wire| {
+        script.take().unwrap()(wire)
+    })
+    .await
+}
+
+/// Keep the same verified endpoint across operations and continuation requests.
+pub async fn repeating_fixture(
+    limits: Limits,
+    sessions: usize,
+    script: impl FnMut(Wire) -> Script + Send + 'static,
+) -> Fixture {
+    fixture_sessions(TlsMode::Implicit, limits, "127.0.0.1", sessions, script).await
+}
+
+async fn fixture_sessions(
+    mode: TlsMode,
+    limits: Limits,
+    certificate_name: &str,
+    sessions: usize,
+    mut script: impl FnMut(Wire) -> Script + Send + 'static,
+) -> Fixture {
     let wrong_hostname = certificate_name != "127.0.0.1";
     let cert = rcgen::generate_simple_self_signed(vec![certificate_name.into()]).unwrap();
     let mut roots = RootCertStore::empty();
@@ -58,25 +81,27 @@ pub async fn fixture_with_name(
     // while localhost first attempts an unavailable IPv6 address on Windows.
     let probe = ImapProbe::new("127.0.0.1".into(), port, mode, roots, limits).unwrap();
     let task = tokio::spawn(async move {
-        let (mut socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
-            .await
-            .expect("fixture connection deadline")
-            .unwrap();
-        if matches!(mode, TlsMode::StartTls) {
-            write(&mut socket, "* OK synthetic server ready\r\n").await;
-            capability(&mut socket, "IMAP4rev1 STARTTLS LOGINDISABLED").await;
-            let tag = expect(&mut socket, "STARTTLS").await;
-            write(&mut socket, &format!("{tag} OK begin TLS\r\n")).await;
-        }
-        match acceptor.accept(socket).await {
-            Ok(mut socket) => {
-                if matches!(mode, TlsMode::Implicit) {
-                    write(&mut socket, "* OK synthetic server ready\r\n").await;
-                }
-                script(Box::new(socket)).await;
+        for _ in 0..sessions {
+            let (mut socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .expect("fixture connection deadline")
+                .unwrap();
+            if matches!(mode, TlsMode::StartTls) {
+                write(&mut socket, "* OK synthetic server ready\r\n").await;
+                capability(&mut socket, "IMAP4rev1 STARTTLS LOGINDISABLED").await;
+                let tag = expect(&mut socket, "STARTTLS").await;
+                write(&mut socket, &format!("{tag} OK begin TLS\r\n")).await;
             }
-            Err(_) if wrong_hostname => {}
-            Err(error) => panic!("fixture TLS handshake failed: {error}"),
+            match acceptor.accept(socket).await {
+                Ok(mut socket) => {
+                    if matches!(mode, TlsMode::Implicit) {
+                        write(&mut socket, "* OK synthetic server ready\r\n").await;
+                    }
+                    script(Box::new(socket)).await;
+                }
+                Err(_) if wrong_hostname => {}
+                Err(error) => panic!("fixture TLS handshake failed: {error}"),
+            }
         }
     });
     Fixture { probe, task }

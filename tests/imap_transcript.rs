@@ -1,3 +1,4 @@
+#[allow(dead_code)]
 mod imap_support;
 
 use imap_support::*;

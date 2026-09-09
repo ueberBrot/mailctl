@@ -1,4 +1,4 @@
-use super::{Error, Limits, Metrics, TlsMode, projection::Projection};
+use super::{Error, Limits, Metrics, TlsMode, body::Fetch as BodyFetch, projection::Projection};
 use io_imap::{
     codec::{
         CommandCodec, ResponseCodec,
@@ -130,6 +130,18 @@ impl<'a> Connection<'a> {
                         return Err(Error::Protocol);
                     }
                     self.command = CommandState::new(command)?;
+                    if self
+                        .command
+                        .literal_limit()
+                        .is_some_and(|count| count > self.limits.max_literal_bytes)
+                    {
+                        return Err(Error::Limit);
+                    }
+                    if matches!(self.command.kind, CommandKind::BodyFetch { .. })
+                        && self.uid_validity.is_none()
+                    {
+                        return Err(Error::UnsafeSelection);
+                    }
                     self.stream
                         .as_mut()
                         .ok_or(Error::Transport)?
@@ -256,6 +268,10 @@ impl<'a> Connection<'a> {
                     if let Some(a) = announcement {
                         let length = a.length as usize;
                         if length > self.limits.max_literal_bytes
+                            || self
+                                .command
+                                .literal_limit()
+                                .is_some_and(|count| length > count)
                             || length > self.limits.max_response_bytes.saturating_sub(bytes)
                             || length
                                 > self
@@ -270,11 +286,26 @@ impl<'a> Connection<'a> {
                 }
                 if guard.is_message_complete() {
                     self.step(bytes * 2)?;
-                    let response = guard
-                        .decode_message(&ResponseCodec::new())
+                    let repaired = match &self.command.kind {
+                        CommandKind::BodyFetch { contract, .. } => contract
+                            .repair_partial_separator(
+                                guard.message_bytes(),
+                                self.limits.max_response_bytes,
+                            )?,
+                        _ => None,
+                    };
+                    if repaired.is_some() {
+                        self.step(bytes + 1)?;
+                    }
+                    let input = repaired.as_deref().unwrap_or_else(|| guard.message_bytes());
+                    let (remaining, response) = ResponseCodec::new()
+                        .decode(input)
                         .map_err(|_| Error::Protocol)?;
+                    if !remaining.is_empty() {
+                        return Err(Error::Protocol);
+                    }
                     self.command.inspect(response, self.uid_validity)?;
-                    return Ok(guard.message_bytes().to_vec());
+                    return Ok(input.to_vec());
                 }
             }
         }
@@ -302,6 +333,10 @@ enum CommandKind {
     Fetch {
         sequences: BTreeSet<u32>,
     },
+    BodyFetch {
+        contract: BodyFetch,
+        seen: bool,
+    },
     Logout {
         bye: bool,
         tagged: bool,
@@ -315,6 +350,7 @@ impl CommandState {
         }
     }
     fn new(command: Command<'_>) -> Result<Self, Error> {
+        let body_fetch = BodyFetch::from_command(&command.body);
         let kind = match command.body {
             CommandBody::Capability => CommandKind::Capability,
             CommandBody::Login { .. } => CommandKind::Login,
@@ -337,6 +373,10 @@ impl CommandState {
                     sequences: BTreeSet::new(),
                 }
             }
+            CommandBody::Fetch { .. } if body_fetch.is_some() => CommandKind::BodyFetch {
+                contract: body_fetch.ok_or(Error::Unsupported)?,
+                seen: false,
+            },
             CommandBody::Logout => CommandKind::Logout {
                 bye: false,
                 tagged: false,
@@ -357,6 +397,12 @@ impl CommandState {
             }
         )
     }
+    fn literal_limit(&self) -> Option<usize> {
+        match &self.kind {
+            CommandKind::BodyFetch { contract, .. } => contract.literal_limit(),
+            _ => None,
+        }
+    }
     fn finish(&self) -> Result<Option<NonZeroU32>, Error> {
         match self.kind {
             CommandKind::Examine {
@@ -365,6 +411,7 @@ impl CommandState {
             } => Ok(Some(uid_validity)),
             CommandKind::Examine { .. } => Err(Error::UnsafeSelection),
             CommandKind::Search { seen: false } => Err(Error::Protocol),
+            CommandKind::BodyFetch { seen: false, .. } => Err(Error::Protocol),
             CommandKind::Logout { bye: false, .. } | CommandKind::Logout { tagged: false, .. } => {
                 Err(Error::Protocol)
             }
@@ -434,15 +481,22 @@ impl CommandState {
                     }
                     *seen = true;
                 }
-                Data::Fetch { seq, items } => {
-                    let CommandKind::Fetch { sequences } = &mut self.kind else {
-                        return Err(Error::Protocol);
-                    };
-                    if !sequences.insert(seq.get()) {
-                        return Err(Error::Protocol);
+                Data::Fetch { seq, items } => match &mut self.kind {
+                    CommandKind::Fetch { sequences } => {
+                        if !sequences.insert(seq.get()) {
+                            return Err(Error::Protocol);
+                        }
+                        Projection::parse(items.as_ref())?;
                     }
-                    Projection::parse(items.as_ref())?;
-                }
+                    CommandKind::BodyFetch { contract, seen } => {
+                        if *seen {
+                            return Err(Error::Protocol);
+                        }
+                        contract.validate(items.as_ref())?;
+                        *seen = true;
+                    }
+                    _ => return Err(Error::Protocol),
+                },
                 // VANISHED sequence ranges can expand into billions of UIDs in the
                 // backend's EXAMINE coroutine. No extensions are enabled in this proof.
                 _ => return Err(Error::Unsupported),

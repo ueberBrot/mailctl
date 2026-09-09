@@ -155,6 +155,11 @@ impl Fixture {
         Ok(())
     }
 
+    /// Add an opt-in multipart body fixture with an attachment above 2 MiB.
+    pub async fn seed_multipart_with_large_attachment(&self) -> Result<()> {
+        fixtures::seed_multipart_with_large_attachment(self.smtp).await
+    }
+
     pub async fn verify_empty(&self) -> Result<()> {
         if !self.contents().await?.is_empty() {
             return Err("GreenMail purge retained messages".into());

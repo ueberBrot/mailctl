@@ -18,6 +18,9 @@ pub(crate) const PASSWORD: &str = "disposable-fixture-password";
 pub(crate) const MESSAGE_ID: &str = "<bootstrap-smoke@example.test>";
 pub(crate) const FOLDER_MESSAGE_ID: &str = "<nested-folder@example.test>";
 pub(crate) const SEEN_MESSAGE_ID: &str = "<observed-seen@example.test>";
+pub(crate) const MULTIPART_MESSAGE_ID: &str = "<large-attachment-body@example.test>";
+pub(crate) const MULTIPART_SUBJECT: &str = "Large attachment body route";
+pub(crate) const MULTIPART_BODY: &str = "Synthetic multipart body.\r\n";
 pub(crate) const BODY: &str = "Synthetic bootstrap message.";
 pub(crate) const SEEN_BODY: &str = "Synthetic seen message.";
 pub(crate) const MESSAGE: &str = "From: sender@example.test\r\nTo: fixture+smoke@example.test\r\nMessage-ID: <bootstrap-smoke@example.test>\r\nSubject: Bootstrap smoke\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nSynthetic bootstrap message.\r\n";
@@ -156,6 +159,58 @@ pub(crate) async fn seed(port: u16) -> Result<()> {
     })
     .await
     .map_err(|_| "SMTP fixture seeding timed out")?
+}
+
+/// Seed one multipart message whose attachment exceeds the whole-message route budget.
+///
+/// This is deliberately opt-in: the default fixture mailbox remains small for suites
+/// that only exercise discovery and search.
+pub(crate) async fn seed_multipart_with_large_attachment(port: u16) -> Result<()> {
+    const ATTACHMENT_BYTES: usize = 2 * 1024 * 1024 + 1;
+    const BOUNDARY: &str = "mailctl-large-attachment-boundary";
+
+    let attachment = "A".repeat(76).to_owned() + "\r\n";
+    let attachment = attachment.repeat(ATTACHMENT_BYTES.div_ceil(76));
+    let message = format!(
+        "From: sender@example.test\r\n\
+To: {EMAIL}\r\n\
+Message-ID: {MULTIPART_MESSAGE_ID}\r\n\
+Subject: {MULTIPART_SUBJECT}\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"{BOUNDARY}\"\r\n\
+\r\n\
+--{BOUNDARY}\r\n\
+Content-Type: multipart/alternative; boundary=\"{BOUNDARY}-alternative\"\r\n\
+\r\n\
+--{BOUNDARY}-alternative\r\n\
+Content-Type: text/plain; charset=utf-8\r\n\
+\r\n\
+{MULTIPART_BODY}\
+--{BOUNDARY}-alternative\r\n\
+Content-Type: text/html; charset=utf-8\r\n\
+\r\n\
+<p>Synthetic <strong>HTML</strong> alternative.</p>\r\n\
+--{BOUNDARY}-alternative--\r\n\
+--{BOUNDARY}\r\n\
+Content-Type: application/octet-stream; name=\"large.bin\"\r\n\
+Content-Disposition: attachment; filename=\"large.bin\"\r\n\
+Content-Transfer-Encoding: 8bit\r\n\
+\r\n\
+{attachment}\r\n\
+--{BOUNDARY}--\r\n"
+    );
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let mut wire = Wire::new(TcpStream::connect(("127.0.0.1", port)).await?);
+        wire.smtp_reply("220").await?;
+        wire.send("EHLO localhost\r\n").await?;
+        wire.smtp_reply("250").await?;
+        smtp_message(&mut wire, &message).await?;
+        wire.send("QUIT\r\n").await?;
+        wire.smtp_reply("221").await?;
+        Ok(())
+    })
+    .await
+    .map_err(|_| "Large multipart SMTP fixture seeding timed out")?
 }
 
 /// Fixture setup marks one synthetic message as seen to prove readers preserve both states.

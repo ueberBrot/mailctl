@@ -82,7 +82,8 @@ impl Api {
         }
         let mut bytes = Vec::new();
         while let Some(chunk) = response.chunk().await? {
-            if bytes.len() + chunk.len() > 1024 * 1024 {
+            // The independent observer includes the synthetic >2 MiB attachment.
+            if bytes.len() + chunk.len() > 8 * 1024 * 1024 {
                 return Err("GreenMail API response exceeded fixture budget".into());
             }
             bytes.extend_from_slice(&chunk);

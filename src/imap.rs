@@ -1,6 +1,9 @@
 //! Bounded, read-only IMAP route proof. Each operation owns and disposes its connection.
+mod body;
 mod projection;
 mod wire;
+
+pub use body::{BodyCursor, BodyPage, BodyRequest};
 
 use io_imap::{
     rfc3501::{
@@ -31,6 +34,7 @@ pub enum Error {
     Limit,
     Authentication,
     UnsafeSelection,
+    StaleCursor,
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -45,6 +49,7 @@ impl fmt::Display for Error {
             Self::Limit => "IMAP resource limit exceeded",
             Self::Authentication => "IMAP authentication failed",
             Self::UnsafeSelection => "IMAP read-only selection was not established",
+            Self::StaleCursor => "message body continuation is stale",
         })
     }
 }
@@ -68,6 +73,12 @@ pub struct Limits {
     pub max_mailboxes: usize,
     pub max_uid_window: usize,
     pub max_messages: usize,
+    pub max_header_bytes: usize,
+    pub max_mime_parts: usize,
+    pub max_body_wire_bytes: usize,
+    pub max_decoded_bytes: usize,
+    pub max_text_bytes: usize,
+    pub max_decode_steps: usize,
     pub operation_timeout: Duration,
     pub connect_timeout: Duration,
 }
@@ -75,7 +86,7 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             max_response_bytes: 64 * 1024,
-            max_operation_bytes: 2 * 1024 * 1024,
+            max_operation_bytes: 4 * 1024 * 1024,
             max_literal_bytes: 64 * 1024,
             max_responses: 4096,
             max_parser_steps: 8 * 1024 * 1024,
@@ -83,6 +94,12 @@ impl Default for Limits {
             max_mailboxes: 1000,
             max_uid_window: 1000,
             max_messages: 50,
+            max_header_bytes: 64 * 1024,
+            max_mime_parts: 200,
+            max_body_wire_bytes: 2 * 1024 * 1024,
+            max_decoded_bytes: 8 * 1024 * 1024,
+            max_text_bytes: 256 * 1024,
+            max_decode_steps: 32 * 1024 * 1024,
             operation_timeout: Duration::from_secs(30),
             connect_timeout: Duration::from_secs(10),
         }
@@ -93,7 +110,7 @@ impl Limits {
         if self.max_response_bytes == 0
             || self.max_response_bytes > 256 * 1024
             || self.max_operation_bytes < self.max_response_bytes
-            || self.max_operation_bytes > 8 * 1024 * 1024
+            || self.max_operation_bytes > 16 * 1024 * 1024
             || self.max_literal_bytes == 0
             || self.max_literal_bytes > self.max_response_bytes
             || self.max_responses == 0
@@ -108,6 +125,18 @@ impl Limits {
             || self.max_uid_window > 10000
             || self.max_messages == 0
             || self.max_messages > 200
+            || self.max_header_bytes == 0
+            || self.max_header_bytes > 256 * 1024
+            || self.max_mime_parts == 0
+            || self.max_mime_parts > 1000
+            || self.max_body_wire_bytes == 0
+            || self.max_body_wire_bytes > 8 * 1024 * 1024
+            || self.max_decoded_bytes == 0
+            || self.max_decoded_bytes > 32 * 1024 * 1024
+            || self.max_text_bytes < 4
+            || self.max_text_bytes > 2 * 1024 * 1024
+            || self.max_decode_steps == 0
+            || self.max_decode_steps > 128 * 1024 * 1024
             || self.operation_timeout.is_zero()
             || self.operation_timeout > Duration::from_secs(120)
             || self.connect_timeout.is_zero()
@@ -127,6 +156,8 @@ pub struct Metrics {
     pub parser_steps: usize,
     pub max_response_bytes: usize,
     pub max_literal_bytes: usize,
+    pub decode_steps: usize,
+    pub decoded_bytes: usize,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Mailbox {
