@@ -5,8 +5,10 @@
 mod api;
 mod container;
 mod fixtures;
+mod observer;
 
-pub use container::Fixture;
+pub use container::{AdministrativeMessage, Fixture};
+pub use observer::{MailboxSnapshot, MessageSnapshot};
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 /// Run an integration suite with a finite deadline and actionable prerequisite errors.

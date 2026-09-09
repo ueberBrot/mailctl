@@ -17,12 +17,16 @@ pub(crate) const EMAIL: &str = "fixture+smoke@example.test";
 pub(crate) const PASSWORD: &str = "disposable-fixture-password";
 pub(crate) const MESSAGE_ID: &str = "<bootstrap-smoke@example.test>";
 pub(crate) const FOLDER_MESSAGE_ID: &str = "<nested-folder@example.test>";
+pub(crate) const SEEN_MESSAGE_ID: &str = "<observed-seen@example.test>";
 pub(crate) const BODY: &str = "Synthetic bootstrap message.";
+pub(crate) const SEEN_BODY: &str = "Synthetic seen message.";
 pub(crate) const MESSAGE: &str = "From: sender@example.test\r\nTo: fixture+smoke@example.test\r\nMessage-ID: <bootstrap-smoke@example.test>\r\nSubject: Bootstrap smoke\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nSynthetic bootstrap message.\r\n";
+pub(crate) const SEEN_MESSAGE: &str = "From: sender@example.test\r\nTo: fixture+smoke@example.test\r\nMessage-ID: <observed-seen@example.test>\r\nSubject: Observed seen\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nSynthetic seen message.\r\n";
 
 pub(crate) struct TlsInputs {
     pub keystore: Vec<u8>,
     pub connector: TlsConnector,
+    pub roots: RootCertStore,
 }
 
 impl TlsInputs {
@@ -46,11 +50,12 @@ impl TlsInputs {
         let mut roots = RootCertStore::empty();
         roots.add(CertificateDer::from(std::fs::read(dir.join("ca.der"))?))?;
         let config = ClientConfig::builder()
-            .with_root_certificates(roots)
+            .with_root_certificates(roots.clone())
             .with_no_client_auth();
         Ok(Self {
             keystore: std::fs::read(dir.join("server.p12"))?,
             connector: TlsConnector::from(Arc::new(config)),
+            roots,
         })
     }
 }
@@ -73,7 +78,7 @@ async fn openssl(dir: &Path, args: &str) -> Result<()> {
     Ok(())
 }
 
-/// A bounded independent protocol observer, never a production email adapter.
+/// Bounded protocol exchanges used to seed disposable mailboxes.
 struct Wire<S> {
     stream: BufReader<S>,
 }
@@ -103,25 +108,22 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
         Ok(())
     }
 
-    async fn imap(&mut self, command: &str, accepted: bool) -> Result<Vec<String>> {
+    async fn imap(&mut self, command: &str) -> Result<()> {
         self.send(&format!("a1 {command}\r\n")).await?;
-        let mut lines = Vec::new();
         for _ in 0..100 {
             let line = self.line().await?;
             if line.starts_with("a1 ") {
                 let status = line.split_whitespace().nth(1);
-                if status != Some(if accepted { "OK" } else { "NO" }) {
+                if status != Some("OK") {
                     return Err(format!(
-                        "Independent IMAP {} returned status {:?}; expected {}",
+                        "Fixture IMAP {} returned status {:?}; expected OK",
                         command.split_whitespace().next().unwrap_or("command"),
                         status,
-                        if accepted { "OK" } else { "NO" }
                     )
                     .into());
                 }
-                return Ok(lines);
+                return Ok(());
             }
-            lines.push(line);
         }
         Err("Independent IMAP response count exceeded fixture budget".into())
     }
@@ -140,73 +142,78 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Wire<S> {
     }
 }
 
-pub(crate) async fn observe(
-    port: u16,
-    tls: &TlsConnector,
-    password: &str,
-    expected_login: bool,
-    expected_messages: Option<usize>,
-) -> Result<()> {
-    tokio::time::timeout(Duration::from_secs(10), async {
-        let socket = TcpStream::connect(("127.0.0.1", port)).await?;
-        let stream = tls
-            .connect(ServerName::try_from("localhost")?, socket)
-            .await?;
-        let mut wire = Wire::new(stream);
-        if !wire.line().await?.starts_with("* OK") {
-            return Err("IMAP greeting missing".into());
-        }
-        wire.imap(&format!("LOGIN \"{EMAIL}\" \"{password}\""), expected_login)
-            .await?;
-        if let Some(count) = expected_messages {
-            let lines = wire.imap("EXAMINE INBOX", true).await?;
-            if !lines
-                .iter()
-                .any(|line| line.trim() == format!("* {count} EXISTS"))
-                || !lines.iter().any(|line| line.contains("[UIDVALIDITY "))
-            {
-                return Err("Independent IMAP mailbox count/identity mismatch".into());
-            }
-            if count > 0 {
-                let lines = wire.imap("FETCH 1:* (UID FLAGS)", true).await?;
-                if !lines
-                    .iter()
-                    .any(|line| line.contains("UID ") && line.contains("FLAGS ("))
-                    || lines.iter().any(|line| line.contains("\\Seen"))
-                {
-                    return Err("Synthetic message UID/unseen flag mismatch".into());
-                }
-            }
-        }
-        wire.imap("LOGOUT", true).await?;
-        Ok(())
-    })
-    .await
-    .map_err(|_| "Independent IMAP/TLS readiness timed out")?
-}
-
 pub(crate) async fn seed(port: u16) -> Result<()> {
     tokio::time::timeout(Duration::from_secs(10), async {
         let mut wire = Wire::new(TcpStream::connect(("127.0.0.1", port)).await?);
         wire.smtp_reply("220").await?;
-        for (command, code) in [
-            ("EHLO localhost\r\n".to_owned(), "250"),
-            ("MAIL FROM:<sender@example.test>\r\n".to_owned(), "250"),
-            (format!("RCPT TO:<{EMAIL}>\r\n"), "250"),
-            ("DATA\r\n".to_owned(), "354"),
-            (format!("{MESSAGE}.\r\n"), "250"),
-            ("QUIT\r\n".to_owned(), "221"),
-        ] {
-            wire.send(&command).await?;
-            wire.smtp_reply(code).await?;
-        }
+        wire.send("EHLO localhost\r\n").await?;
+        wire.smtp_reply("250").await?;
+        smtp_message(&mut wire, MESSAGE).await?;
+        smtp_message(&mut wire, SEEN_MESSAGE).await?;
+        wire.send("QUIT\r\n").await?;
+        wire.smtp_reply("221").await?;
         Ok(())
     })
     .await
     .map_err(|_| "SMTP fixture seeding timed out")?
 }
 
-/// Fixture setup may mutate disposable mailboxes; the independent observer above cannot.
+/// Fixture setup marks one synthetic message as seen to prove readers preserve both states.
+pub(crate) async fn seed_seen(port: u16, tls: &TlsConnector) -> Result<()> {
+    let socket = tokio::time::timeout(
+        Duration::from_secs(5),
+        TcpStream::connect(("127.0.0.1", port)),
+    )
+    .await
+    .map_err(|_| "Seen-message IMAP connection timed out")??;
+    let stream = tokio::time::timeout(
+        Duration::from_secs(5),
+        tls.connect(ServerName::try_from("localhost")?, socket),
+    )
+    .await
+    .map_err(|_| "Seen-message IMAP TLS handshake timed out")??;
+    let mut wire = Wire::new(stream);
+    tokio::time::timeout(Duration::from_secs(5), wire.line())
+        .await
+        .map_err(|_| "Seen-message IMAP greeting timed out")??;
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        wire.imap(&format!("LOGIN \"{EMAIL}\" \"{PASSWORD}\"")),
+    )
+    .await
+    .map_err(|_| "Seen-message IMAP login timed out")??;
+    tokio::time::timeout(Duration::from_secs(5), wire.imap("SELECT INBOX"))
+        .await
+        .map_err(|_| "Seen-message mailbox selection timed out")??;
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        wire.imap("UID STORE 2 +FLAGS.SILENT (\\Seen)"),
+    )
+    .await
+    .map_err(|_| "Seen-message flag setup timed out")??;
+    tokio::time::timeout(Duration::from_secs(5), wire.imap("LOGOUT"))
+        .await
+        .map_err(|_| "Seen-message IMAP logout timed out")??;
+    Ok(())
+}
+
+async fn smtp_message<S: AsyncRead + AsyncWrite + Unpin>(
+    wire: &mut Wire<S>,
+    message: &str,
+) -> Result<()> {
+    for (command, code) in [
+        ("MAIL FROM:<sender@example.test>\r\n".to_owned(), "250"),
+        (format!("RCPT TO:<{EMAIL}>\r\n"), "250"),
+        ("DATA\r\n".to_owned(), "354"),
+        (format!("{message}.\r\n"), "250"),
+    ] {
+        wire.send(&command).await?;
+        wire.smtp_reply(code).await?;
+    }
+    Ok(())
+}
+
+/// Fixture setup may mutate disposable mailboxes; the independent observer cannot.
 pub(crate) async fn seed_folder(port: u16, tls: &TlsConnector) -> Result<()> {
     tokio::time::timeout(Duration::from_secs(10), async {
         let socket = TcpStream::connect(("127.0.0.1", port)).await?;
@@ -215,9 +222,9 @@ pub(crate) async fn seed_folder(port: u16, tls: &TlsConnector) -> Result<()> {
             .await?;
         let mut wire = Wire::new(stream);
         wire.line().await?;
-        wire.imap(&format!("LOGIN \"{EMAIL}\" \"{PASSWORD}\""), true)
+        wire.imap(&format!("LOGIN \"{EMAIL}\" \"{PASSWORD}\""))
             .await?;
-        wire.imap("CREATE \"fixture folder/child\"", true).await?;
+        wire.imap("CREATE \"fixture folder/child\"").await?;
         let message = MESSAGE.replace(MESSAGE_ID, FOLDER_MESSAGE_ID);
         wire.send(&format!(
             "a1 APPEND \"fixture folder/child\" {{{}}}\r\n",
@@ -231,7 +238,7 @@ pub(crate) async fn seed_folder(port: u16, tls: &TlsConnector) -> Result<()> {
         if !wire.line().await?.starts_with("a1 OK") {
             return Err("Fixture APPEND failed".into());
         }
-        wire.imap("LOGOUT", true).await?;
+        wire.imap("LOGOUT").await?;
         Ok(())
     })
     .await

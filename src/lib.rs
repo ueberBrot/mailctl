@@ -5,5 +5,6 @@ mod encoding;
 mod file_storage;
 #[cfg(any(feature = "cli", feature = "mcp"))]
 pub mod frontends;
+pub mod imap;
 pub mod policy;
 pub mod service;

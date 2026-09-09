@@ -1,7 +1,8 @@
 use crate::{
     Result,
     api::Api,
-    fixtures::{self, BODY, EMAIL, FOLDER_MESSAGE_ID, MESSAGE_ID, PASSWORD, TlsInputs},
+    fixtures::{self, BODY, EMAIL, FOLDER_MESSAGE_ID, MESSAGE_ID, PASSWORD, SEEN_BODY, TlsInputs},
+    observer::{self, MailboxSnapshot},
 };
 use std::time::Duration;
 use testcontainers::{
@@ -17,8 +18,18 @@ pub struct Fixture {
     container: ContainerAsync<GenericImage>,
     api: Api,
     tls: tokio_rustls::TlsConnector,
+    roots: tokio_rustls::rustls::RootCertStore,
     imaps: u16,
     smtp: u16,
+}
+
+/// Synthetic mailbox content returned by GreenMail's typed administrative API.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdministrativeMessage {
+    pub uid: String,
+    pub message_id: String,
+    pub subject: String,
+    pub mime_message: String,
 }
 
 impl Fixture {
@@ -57,6 +68,7 @@ impl Fixture {
             container,
             api,
             tls: tls.connector,
+            roots: tls.roots,
             imaps,
             smtp,
         };
@@ -102,27 +114,36 @@ impl Fixture {
         if user.email != EMAIL || user.login != EMAIL || self.api.users().await?.len() != 1 {
             return Err("GreenMail user DTO or exclusive account setup mismatch".into());
         }
-        fixtures::observe(self.imaps, &self.tls, PASSWORD, true, Some(0)).await?;
-        fixtures::observe(self.imaps, &self.tls, "wrong-password", false, None).await?;
+        observer::authenticate(self.imaps, &self.tls, PASSWORD, true).await?;
+        observer::authenticate(self.imaps, &self.tls, "wrong-password", false).await?;
         fixtures::seed(self.smtp).await?;
+        fixtures::seed_seen(self.imaps, &self.tls).await?;
         self.verify_seed().await
     }
 
     async fn verify_seed(&self) -> Result<()> {
-        let messages = self.api.messages(EMAIL, "INBOX").await?;
-        if messages.len() != 1
-            || messages[0]
-                .uid
-                .parse::<u64>()
-                .ok()
-                .is_none_or(|uid| uid == 0)
-            || messages[0].message_id != MESSAGE_ID
-            || messages[0].subject != "Bootstrap smoke"
-            || !messages[0].mime_message.contains(BODY)
+        let messages = self.contents().await?;
+        let bootstrap = messages
+            .iter()
+            .find(|message| message.message_id == MESSAGE_ID);
+        let seen = messages
+            .iter()
+            .find(|message| message.message_id == fixtures::SEEN_MESSAGE_ID);
+        if messages.len() != 2
+            || bootstrap.is_none_or(|message| {
+                message.uid.parse::<u64>().ok().is_none_or(|uid| uid == 0)
+                    || message.subject != "Bootstrap smoke"
+                    || !message.mime_message.contains(BODY)
+            })
+            || seen.is_none_or(|message| {
+                message.uid.parse::<u64>().ok().is_none_or(|uid| uid == 0)
+                    || message.subject != "Observed seen"
+                    || !message.mime_message.contains(SEEN_BODY)
+            })
         {
             return Err("GreenMail synthetic message content/identity mismatch".into());
         }
-        fixtures::observe(self.imaps, &self.tls, PASSWORD, true, Some(1)).await
+        self.verify_snapshot(&self.snapshot().await?)
     }
 
     pub async fn verify_folder_path_encoding(&self) -> Result<()> {
@@ -135,10 +156,14 @@ impl Fixture {
     }
 
     pub async fn verify_empty(&self) -> Result<()> {
-        if !self.api.messages(EMAIL, "INBOX").await?.is_empty() {
+        if !self.contents().await?.is_empty() {
             return Err("GreenMail purge retained messages".into());
         }
-        fixtures::observe(self.imaps, &self.tls, PASSWORD, true, Some(0)).await
+        let snapshot = self.snapshot().await?;
+        if !snapshot.messages.is_empty() {
+            return Err("Independent observer saw messages after GreenMail purge".into());
+        }
+        Ok(())
     }
 
     /// All scoped SMTP and observer connections have closed before this call.
@@ -156,6 +181,57 @@ impl Fixture {
         self.api.delete_user(EMAIL).await?;
         if !self.api.users().await?.is_empty() {
             return Err("GreenMail user cleanup failed".into());
+        }
+        Ok(())
+    }
+
+    /// Returns a non-mutating typed IMAP snapshot through a separate connection.
+    pub async fn snapshot(&self) -> Result<MailboxSnapshot> {
+        observer::snapshot(self.imaps, &self.tls, PASSWORD).await
+    }
+
+    /// Returns the typed administrative view used to check exact synthetic content.
+    pub async fn contents(&self) -> Result<Vec<AdministrativeMessage>> {
+        let mut messages = self
+            .api
+            .messages(EMAIL, "INBOX")
+            .await?
+            .into_iter()
+            .map(|message| AdministrativeMessage {
+                uid: message.uid,
+                message_id: message.message_id,
+                subject: message.subject,
+                mime_message: message.mime_message,
+            })
+            .collect::<Vec<_>>();
+        messages.sort_by(|left, right| left.uid.cmp(&right.uid));
+        Ok(messages)
+    }
+
+    pub fn imaps_port(&self) -> u16 {
+        self.imaps
+    }
+
+    pub fn tls_roots(&self) -> tokio_rustls::rustls::RootCertStore {
+        self.roots.clone()
+    }
+
+    fn verify_snapshot(&self, snapshot: &MailboxSnapshot) -> Result<()> {
+        if snapshot.uid_validity == 0
+            || snapshot.messages.len() != 2
+            || snapshot.messages.iter().any(|message| message.uid == 0)
+            || !snapshot.messages.iter().any(|message| {
+                message.message_id == MESSAGE_ID
+                    && message.subject == "Bootstrap smoke"
+                    && !message.seen
+            })
+            || !snapshot.messages.iter().any(|message| {
+                message.message_id == fixtures::SEEN_MESSAGE_ID
+                    && message.subject == "Observed seen"
+                    && message.seen
+            })
+        {
+            return Err("Independent observer synthetic mailbox snapshot mismatch".into());
         }
         Ok(())
     }

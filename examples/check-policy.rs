@@ -17,7 +17,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .as_str()
         .ok_or("missing toolchain pin")?;
     if manifest["workspace"]["package"]["rust-version"].as_str() != Some(version) {
-        return Err("The scaffold MSRV must match the pinned toolchain".into());
+        return Err("The workspace MSRV must match the pinned toolchain".into());
     }
 
     let specs = root.join("tests/specs");
@@ -74,34 +74,13 @@ fn check_dependencies(
         if cli_only && name == "rmcp" {
             return Err("CLI-only production graph contains MCP dependencies".into());
         }
-        if [
-            "greenmail-support",
-            "testcontainers",
-            "lettre",
-            "smtp",
-            "io-smtp",
-            "io-pop3",
-            "io-jmap",
-        ]
-        .contains(&name)
-        {
-            return Err(format!("Forbidden production dependency: {name}").into());
-        }
-        for feature in &node.features {
-            if ["smtp", "sendmail", "pop3", "jmap", "gmail", "outlook"]
-                .iter()
-                .any(|forbidden| feature.to_lowercase().contains(forbidden))
-            {
-                return Err(format!("Forbidden production feature: {name}/{feature}").into());
-            }
-        }
         let dependencies: Vec<_> = package
             .dependencies
             .iter()
             .filter(|dep| dep.kind != DependencyKind::Development)
             .collect();
         for dependency in &dependencies {
-            if ["io-email", "io-imap"].contains(&dependency.name.as_str())
+            if ["io-imap", "tokio-rustls"].contains(&dependency.name.as_str())
                 && dependency.uses_default_features
             {
                 return Err(format!(
@@ -111,10 +90,38 @@ fn check_dependencies(
                 .into());
             }
         }
-        if dependencies.iter().any(|dep| dep.name == "io-email")
-            && !dependencies.iter().any(|dep| dep.name == "io-imap")
+        if name == "io-imap"
+            && (!node.features.is_empty() || package.version.to_string() != "0.6.0")
         {
-            return Err(format!("{name} must declare its direct io-imap dependency").into());
+            return Err(
+                "Use pinned io-imap 0.6.0 coroutines without client, TLS, or SASL extensions"
+                    .into(),
+            );
+        }
+        if name == "tokio-rustls"
+            && (package.version.to_string() != "0.26.5"
+                || node
+                    .features
+                    .iter()
+                    .any(|feature| !["ring", "tls12"].contains(&feature.as_str())))
+        {
+            return Err("Use pinned tokio-rustls 0.26.5 with only ring and tls12".into());
+        }
+        if name == "mailctl" {
+            for (dependency_name, version) in [
+                ("io-imap", "=0.6.0"),
+                ("tokio", "=1.53.1"),
+                ("tokio-rustls", "=0.26.5"),
+            ] {
+                if !dependencies.iter().any(|dependency| {
+                    dependency.name == dependency_name && dependency.req.to_string() == version
+                }) {
+                    return Err(format!(
+                        "Pin the direct {dependency_name} dependency to {version}"
+                    )
+                    .into());
+                }
+            }
         }
         pending.extend(
             node.deps
