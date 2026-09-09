@@ -372,6 +372,23 @@ fn invalid_persisted_uid_identity_is_refused() {
 }
 
 #[test]
+fn writer_lock_contention_fails_with_the_finite_busy_timeout() {
+    let temporary = TemporaryJournal::new();
+    let mut journal = DraftJournal::open(&temporary.path).unwrap();
+    let connection = Connection::open(&temporary.path).unwrap();
+    connection.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+
+    let started = Instant::now();
+    let result = journal.prepare(operation(Uuid::new_v4(), 1, Uuid::new_v4(), 14));
+    let elapsed = started.elapsed();
+    connection.execute_batch("ROLLBACK;").unwrap();
+
+    assert!(matches!(result, Err(DraftJournalError::Unavailable)));
+    assert!(elapsed >= Duration::from_secs(4));
+    assert!(elapsed < Duration::from_secs(7));
+}
+
+#[test]
 fn subprocess_death_preserves_committed_journal_state() {
     if let Ok(path) = env::var("MAILCTL_DRAFT_JOURNAL_CHILD_PATH") {
         let mut journal = DraftJournal::open(path).unwrap();
