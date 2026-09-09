@@ -7,6 +7,10 @@ use std::path::PathBuf;
 
 #[derive(Args)]
 pub(super) struct Options {
+    /// Use the separately provisioned local service and its operator-assigned access grant.
+    #[cfg(target_os = "macos")]
+    #[arg(long, global = true, conflicts_with_all = ["config", "grant"])]
+    pub isolated: bool,
     #[arg(long, global = true, default_value_os_t = super::configuration::default_path())]
     pub config: PathBuf,
     #[arg(long, global = true)]

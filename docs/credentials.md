@@ -1,6 +1,6 @@
 # Configure macOS credentials
 
-Both executables use the current macOS login identity's Apple Keychain. Set up
+Both executables use the Apple Keychain of the macOS account running them. Set up
 each email account, then provision its credential through either executable:
 
 ```sh
@@ -128,6 +128,6 @@ Windows executables.
 Access grants govern mailctl requests. They are not an ACL for the login's
 Keychain: other applications running as the same macOS login can read entries
 provisioned by mailctl while that Keychain is unlocked. A deployment that isolates
-credentials
-from callers requires separate qualification; this embedded setup makes no such
-isolation guarantee.
+credentials from callers uses the separately provisioned
+[optional isolated mode](isolation.md). Standard credential setup does not install
+or start that mode.

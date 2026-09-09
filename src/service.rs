@@ -193,6 +193,7 @@ impl Service {
     }
     fn capacity(limits: &crate::config::Limits) -> Capacity {
         Capacity {
+            isolation: None,
             per_process: ProcessCapacity {
                 active_requests: limits.active_requests as u64,
                 queued_requests: limits.queued_requests as u64,

@@ -1,11 +1,8 @@
 //! MCP tools share normalized envelopes with the CLI.
+use super::application::Application;
 use super::mcp_transport::{BoundedStdio, Bounds};
-use crate::{
-    domain::{
-        AccountDiscovery, Capabilities, Envelope, Error, ErrorCode, ListAccountsInput, Operation,
-    },
-    policy::RequestContext as ApplicationContext,
-    service::Service,
+use crate::domain::{
+    AccountDiscovery, Capabilities, Envelope, Error, ErrorCode, ListAccountsInput, Operation,
 };
 use rmcp::model::ErrorData as McpError;
 use rmcp::{RoleServer, ServerHandler, ServiceExt, model::*, service::RequestContext};
@@ -15,8 +12,7 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 struct EmailTools {
-    service: Service,
-    context: ApplicationContext,
+    application: Application,
     active: Semaphore,
     envelope_limit: usize,
     deadline: Duration,
@@ -109,9 +105,16 @@ impl ServerHandler for EmailTools {
                 ));
             }
         };
-        // Discovery is bounded, synchronous in-memory work. Future provider
-        // operations must propagate this request's deadline/cancellation.
-        let result = operation.and_then(|operation| self.service.execute(&self.context, operation));
+        let result = match operation {
+            Err(error) => Err(error),
+            Ok(operation) => tokio::select! {
+                biased;
+                _ = context.ct.cancelled() => Err(Error::new(ErrorCode::Cancelled)),
+                _ = self.shutdown.cancelled() => Err(Error::new(ErrorCode::Cancelled)),
+                result = tokio::time::timeout(self.deadline, self.application.execute(operation)) =>
+                    result.map_err(|_| Error::new(ErrorCode::Timeout)).flatten(),
+            },
+        };
         if result
             .as_ref()
             .is_err_and(|error| error.code == ErrorCode::OperationConflict)
@@ -137,9 +140,9 @@ impl ServerHandler for EmailTools {
     }
 }
 
-pub(super) async fn run(service: Service, context: ApplicationContext) -> Result<(), Error> {
-    let limits = service.limits(&context)?;
-    let bounds = Bounds::new(limits, service.response_bound(&context)?)?;
+pub(super) async fn run(application: Application) -> Result<(), Error> {
+    let limits = application.limits()?;
+    let bounds = Bounds::new(limits, application.response_bound()?)?;
     let expires = tokio::time::Instant::now()
         + Duration::from_secs(limits.connection_lifetime_seconds as u64);
     let initialization_expires = expires.min(
@@ -151,8 +154,7 @@ pub(super) async fn run(service: Service, context: ApplicationContext) -> Result
         active: Semaphore::new(limits.active_requests),
         envelope_limit: bounds.envelope,
         deadline: Duration::from_secs(limits.operation_seconds as u64),
-        service,
-        context: context.with_response_limit(bounds.envelope),
+        application: application.with_response_limit(bounds.envelope),
         shutdown: shutdown.clone(),
     };
     let service = tokio::time::timeout_at(
