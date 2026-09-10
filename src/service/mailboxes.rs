@@ -268,6 +268,7 @@ impl Service {
         if names.len() > limits.mailbox_inventory {
             return Err(Error::new(ErrorCode::ResponseTooLarge));
         }
+        // Preserve canonical identity order for provider-row membership checks.
         let names = names.into_values().cloned().collect::<Vec<_>>();
         let rows = if names.is_empty() {
             Vec::new()
@@ -303,17 +304,17 @@ impl Service {
         }
         let mut inventory = BTreeMap::new();
         for mut row in rows {
+            let identity = mailbox_identity(&row.name);
             if row.name.is_empty()
                 || row.name.len() > 1024
-                || !names
-                    .iter()
-                    .any(|name| mailbox_identity(name) == mailbox_identity(&row.name))
+                || names
+                    .binary_search_by(|name| mailbox_identity(name).cmp(identity))
+                    .is_err()
                 || row.special_use.len() > 16
                 || row.special_use.iter().any(|flag| flag.len() > 64)
             {
                 return Err(Error::new(ErrorCode::ProviderUnavailable));
             }
-            let identity = mailbox_identity(&row.name);
             if identity != row.name {
                 row.name = identity.to_owned();
             }
@@ -395,12 +396,12 @@ impl Service {
 
     fn encode(&self, kind: &str, value: &impl Serialize, maximum: usize) -> Result<String, Error> {
         let payload = crate::encoding::serialize_bounded(value, maximum)?;
-        let signed = format!("{kind}.{}", URL_SAFE_NO_PAD.encode(payload));
+        let mut token = format!("{kind}.");
+        URL_SAFE_NO_PAD.encode_string(payload, &mut token);
         let key = hmac::Key::new(hmac::HMAC_SHA256, self.registry.reference_key());
-        let token = format!(
-            "{signed}.{}",
-            URL_SAFE_NO_PAD.encode(hmac::sign(&key, signed.as_bytes()).as_ref())
-        );
+        let tag = hmac::sign(&key, token.as_bytes());
+        token.push('.');
+        URL_SAFE_NO_PAD.encode_string(tag.as_ref(), &mut token);
         if token.len() > maximum {
             return Err(Error::new(ErrorCode::ResponseTooLarge));
         }
