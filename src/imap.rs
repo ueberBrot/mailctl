@@ -46,7 +46,7 @@ impl AuthenticatedConnection {
         let mut connection = self.0.resume(&mut metrics);
         let names = allowlist
             .iter()
-            .map(|name| (mailbox_identity(name), name))
+            .map(|name| (mailbox_identity(name), name.as_str()))
             .collect();
         let result = connection.discover_names(names, maximum).await?;
         connection.drive(ImapLogout::new()).await?;
@@ -360,7 +360,7 @@ impl ImapProbe {
         let mut names = BTreeMap::new();
         for name in allowlist {
             mailbox(name)?;
-            names.insert(mailbox_identity(name), name);
+            names.insert(mailbox_identity(name), name.as_str());
         }
         tokio::time::timeout(self.limits.operation_timeout, async {
             let maximum = self.limits.max_mailboxes;
@@ -438,7 +438,9 @@ impl ImapProbe {
                     .await?;
                 for items in fetched.into_values() {
                     let envelope = Projection::parse(items.as_ref())?.normalize();
-                    if !uids.iter().any(|u| u.get() == envelope.uid)
+                    if uids
+                        .binary_search_by_key(&envelope.uid, |uid| uid.get())
+                        .is_err()
                         || envelopes.insert(envelope.uid, envelope).is_some()
                     {
                         return Err(Error::Protocol);
@@ -520,16 +522,15 @@ pub(crate) fn mailbox(name: &str) -> Result<(), Error> {
 impl Connection<'_> {
     async fn discover_names(
         &mut self,
-        names: BTreeMap<&str, &String>,
+        names: BTreeMap<&str, &str>,
         maximum: usize,
     ) -> Result<Vec<Mailbox>, Error> {
         let mut mailboxes = Vec::with_capacity(names.len());
         let mut row_count = 0usize;
         for (expected, name) in names {
             // The coroutine decodes response names; its LIST pattern needs wire encoding.
-            let wire_name = name.replace('&', "&-");
-            let pattern = wire_name
-                .clone()
+            let pattern = name
+                .replace('&', "&-")
                 .try_into()
                 .map_err(|_| Error::InvalidInput)?;
             let rows = self
@@ -544,12 +545,13 @@ impl Connection<'_> {
             }
             let mut found = None;
             for (returned, _, attrs) in rows {
-                let returned = match returned {
-                    WireMailbox::Inbox => "INBOX".to_owned(),
-                    WireMailbox::Other(name) => String::from_utf8(name.inner().as_ref().to_vec())
-                        .map_err(|_| Error::Protocol)?,
+                let returned = match &returned {
+                    WireMailbox::Inbox => "INBOX",
+                    WireMailbox::Other(name) => {
+                        std::str::from_utf8(name.inner().as_ref()).map_err(|_| Error::Protocol)?
+                    }
                 };
-                if mailbox_identity(&returned) != expected {
+                if mailbox_identity(returned) != expected {
                     return Err(Error::Protocol);
                 }
                 let mut attributes: Vec<_> = attrs.iter().map(ToString::to_string).collect();

@@ -11,7 +11,8 @@ use ring::hmac;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, btree_map::Entry},
+    fmt::Write,
     future::Future,
     pin::Pin,
     sync::{Arc, RwLock},
@@ -262,13 +263,12 @@ impl Service {
                     .iter()
                     .any(|allowed| mailbox_identity(allowed) == mailbox_identity(name))
             })
-            .map(|name| (mailbox_identity(name).to_owned(), name.clone()))
-            .collect::<BTreeMap<_, _>>()
-            .into_values()
-            .collect::<Vec<_>>();
+            .map(|name| (mailbox_identity(name), name))
+            .collect::<BTreeMap<_, _>>();
         if names.len() > limits.mailbox_inventory {
             return Err(Error::new(ErrorCode::ResponseTooLarge));
         }
+        let names = names.into_values().cloned().collect::<Vec<_>>();
         let rows = if names.is_empty() {
             Vec::new()
         } else {
@@ -313,13 +313,20 @@ impl Service {
             {
                 return Err(Error::new(ErrorCode::ProviderUnavailable));
             }
-            row.name = mailbox_identity(&row.name).to_owned();
+            let identity = mailbox_identity(&row.name);
+            if identity != row.name {
+                row.name = identity.to_owned();
+            }
             row.special_use.sort();
             row.special_use.dedup();
-            if let Some(previous) = inventory.insert(row.name.clone(), row.clone())
-                && previous != row
-            {
-                return Err(Error::new(ErrorCode::ProviderUnavailable));
+            match inventory.entry(row.name.clone()) {
+                Entry::Vacant(entry) => {
+                    entry.insert(row);
+                }
+                Entry::Occupied(entry) if entry.get() != &row => {
+                    return Err(Error::new(ErrorCode::ProviderUnavailable));
+                }
+                Entry::Occupied(_) => {}
             }
         }
         if reference.is_some() && inventory.is_empty() {
@@ -424,8 +431,9 @@ impl Service {
 }
 fn fingerprint(value: &impl Serialize) -> Result<String, Error> {
     let bytes = crate::encoding::serialize_bounded(value, 4 * 1024 * 1024)?;
-    Ok(Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect())
+    let mut fingerprint = String::with_capacity(64);
+    for byte in Sha256::digest(bytes) {
+        let _ = write!(fingerprint, "{byte:02x}");
+    }
+    Ok(fingerprint)
 }
