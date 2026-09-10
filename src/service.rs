@@ -2,6 +2,7 @@
 mod credentials;
 #[cfg(any(feature = "cli", feature = "mcp"))]
 pub(crate) use credentials::credential_error;
+mod mailboxes;
 mod state;
 use crate::encoding::{OutputBudget, serialized_size};
 use crate::{
@@ -12,6 +13,7 @@ use crate::{
     },
     policy::{Narrowing, RequestContext},
 };
+pub use mailboxes::{ImapMailboxes, MailboxBackend, MailboxTarget, MemoryMailboxes};
 use state::AccountRegistry;
 use uuid::Uuid;
 
@@ -19,7 +21,8 @@ pub struct Service {
     config: Config,
     registry: AccountRegistry,
     context_id: Uuid,
-    authentication: tokio::sync::OnceCell<crate::authentication::Runtime>,
+    mailbox_backend: Option<std::sync::Arc<dyn MailboxBackend>>,
+    authentication: tokio::sync::OnceCell<std::sync::Arc<crate::authentication::Runtime>>,
 }
 impl Service {
     pub fn open(config: Config) -> Result<Self, Error> {
@@ -62,6 +65,7 @@ impl Service {
             config,
             registry,
             context_id: Uuid::new_v4(),
+            mailbox_backend: None,
             authentication: tokio::sync::OnceCell::new(),
         }
     }
@@ -128,9 +132,37 @@ impl Service {
             };
             size += identities;
         }
+        if context
+            .permissions()
+            .contains(&crate::policy::Permission::ListMailboxes)
+        {
+            let grant = self.grant(context)?;
+            for account in self.visible_accounts(context) {
+                let mut entries = account
+                    .mailboxes
+                    .iter()
+                    .filter(|name| {
+                        grant.mailboxes.iter().any(|allowed| {
+                            mailboxes::identity(name) == mailboxes::identity(allowed)
+                        })
+                    })
+                    .map(|name| {
+                        2048usize
+                            .saturating_add(grant.limits.token_bytes)
+                            .saturating_add(12 * name.len())
+                    })
+                    .collect::<Vec<_>>();
+                entries.sort_unstable_by(|a, b| b.cmp(a));
+                let mailbox_size = entries
+                    .into_iter()
+                    .take(grant.limits.mailbox_page)
+                    .fold(2048usize + grant.limits.token_bytes, usize::saturating_add);
+                size = size.max(mailbox_size.min(maximum));
+            }
+        }
         Ok(size)
     }
-    pub fn execute(
+    pub async fn execute(
         &self,
         context: &RequestContext,
         operation: Operation,
@@ -138,13 +170,23 @@ impl Service {
         let grant = self.grant(context)?;
         self.registry.check_revision()?;
         let operations = || {
-            vec![
+            let mut operations = vec![
                 "list_accounts".to_string(),
                 "capabilities".to_string(),
                 "health".to_string(),
-            ]
+            ];
+            if context
+                .permissions()
+                .contains(&crate::policy::Permission::ListMailboxes)
+            {
+                operations.push("list_mailboxes".into());
+            }
+            operations
         };
         let result = match operation {
+            Operation::ListMailboxes(input) => {
+                OperationResult::Mailboxes(self.list_mailboxes(context, input).await?)
+            }
             Operation::ListAccounts(input) => {
                 let limit = input.limit.unwrap_or(grant.limits.accounts);
                 if limit == 0 || limit > grant.limits.accounts {

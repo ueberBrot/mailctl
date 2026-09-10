@@ -143,7 +143,7 @@ impl Service {
         Ok(result)
     }
 
-    async fn authentication(&self) -> Result<&Runtime, Error> {
+    pub(super) async fn authentication(&self) -> Result<&std::sync::Arc<Runtime>, Error> {
         self.authentication
             .get_or_try_init(|| async {
                 let roots = tokio::task::spawn_blocking(|| -> Result<_, Error> {
@@ -154,7 +154,9 @@ impl Service {
                 })
                 .await
                 .map_err(|_| Error::new(ErrorCode::InternalError))??;
-                Runtime::new(self.config.limits.clone(), roots).map_err(authentication_error)
+                Runtime::new(self.config.limits.clone(), roots)
+                    .map(std::sync::Arc::new)
+                    .map_err(authentication_error)
             })
             .await
     }
@@ -218,7 +220,7 @@ pub(crate) fn credential_error(failure: credentials::SourceError) -> Error {
     }
 }
 
-fn authentication_error(error: authentication::Error) -> Error {
+pub(super) fn authentication_error(error: authentication::Error) -> Error {
     match error {
         authentication::Error::Source(error) => credential_error(error),
         authentication::Error::RateLimited => Error::new(ErrorCode::RateLimited),

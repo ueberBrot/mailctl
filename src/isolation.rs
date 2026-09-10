@@ -409,7 +409,7 @@ async fn serve_session(
             let result = timeout(operation_deadline, async {
                 match request {
                     ClientFrame::Operation { operation, .. } => {
-                        service.execute(&narrowed, operation)
+                        service.execute(&narrowed, operation).await
                     }
                     ClientFrame::Doctor { check_account, .. } => service
                         .doctor(&narrowed, check_account)

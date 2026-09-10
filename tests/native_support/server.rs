@@ -17,10 +17,16 @@ use tokio_rustls::{
     rustls::{ServerConfig, pki_types::PrivatePkcs8KeyDer},
 };
 
+struct Expected {
+    username: &'static str,
+    password: &'static str,
+    mailboxes: Vec<&'static str>,
+}
+
 pub struct NativeServer {
     pub port: u16,
     pub certificate: PathBuf,
-    expected: Arc<Mutex<VecDeque<(&'static str, &'static str)>>>,
+    expected: Arc<Mutex<VecDeque<Expected>>>,
     accepted: Arc<AtomicUsize>,
     stop: watch::Sender<bool>,
     task: Option<thread::JoinHandle<()>>,
@@ -45,7 +51,7 @@ impl NativeServer {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port();
-        let expected = Arc::new(Mutex::new(VecDeque::<(&'static str, &'static str)>::new()));
+        let expected = Arc::new(Mutex::new(VecDeque::<Expected>::new()));
         let accepted = Arc::new(AtomicUsize::new(0));
         let (stop, mut stopping) = watch::channel(false);
         let queue = expected.clone();
@@ -60,7 +66,7 @@ impl NativeServer {
                         connection = listener.accept() => connection.unwrap().0,
                     };
                     count.fetch_add(1, Ordering::SeqCst);
-                    let (username, password) = queue.lock().unwrap().pop_front().expect("unexpected provider connection");
+                    let Expected { username, password, mailboxes } = queue.lock().unwrap().pop_front().expect("unexpected provider connection");
                     tokio::select! {
                         _ = stopping.changed() => return,
                         result = tokio::time::timeout(Duration::from_secs(10), async {
@@ -70,6 +76,11 @@ impl NativeServer {
                             let tag = imap_support::expect(&mut wire, &format!("LOGIN \"{username}\" \"{password}\"")).await;
                             imap_support::write(&mut wire, &format!("{tag} OK authenticated\r\n")).await;
                             imap_support::capability(&mut wire, "IMAP4rev1").await;
+                            for name in mailboxes {
+                                let tag = imap_support::expect(&mut wire, &format!("LIST \"\" {name}")).await;
+                                let attributes = if name == "Archive" { "\\Archive" } else { "" };
+                                imap_support::write(&mut wire, &format!("* LIST ({attributes}) \"/\" {name}\r\n{tag} OK listed\r\n")).await;
+                            }
                             imap_support::logout(&mut wire).await;
                         }) => result.expect("native authentication transcript deadline"),
                     }
@@ -87,10 +98,24 @@ impl NativeServer {
     }
 
     pub fn expect(&self, username: &'static str, password: &'static str) {
-        self.expected
-            .lock()
-            .unwrap()
-            .push_back((username, password));
+        self.expected.lock().unwrap().push_back(Expected {
+            username,
+            password,
+            mailboxes: Vec::new(),
+        });
+    }
+
+    pub fn expect_mailboxes(
+        &self,
+        username: &'static str,
+        password: &'static str,
+        mailboxes: &[&'static str],
+    ) {
+        self.expected.lock().unwrap().push_back(Expected {
+            username,
+            password,
+            mailboxes: mailboxes.to_vec(),
+        });
     }
 
     pub fn accepted(&self) -> usize {

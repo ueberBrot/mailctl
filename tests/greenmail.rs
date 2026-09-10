@@ -455,3 +455,92 @@ fn imap_append_creates_exact_draft_in_existing_target_without_changing_inbox() {
         Ok(())
     });
 }
+
+#[test]
+fn application_mailbox_discovery_and_reference_reuse_preserve_independently_observed_mail() {
+    greenmail_support::run(async {
+        use mailctl::{
+            authentication::Runtime,
+            config::Config,
+            credentials::{Availability, Secret, SecretSource, SourceError},
+            domain::{ListMailboxesInput, Operation, OperationResult},
+            policy::Narrowing,
+            service::{ImapMailboxes, Service},
+        };
+        use std::{collections::BTreeMap, sync::Arc};
+        struct Source;
+        impl SecretSource for Source {
+            fn availability(&self, _: uuid::Uuid) -> Availability {
+                Availability::Available
+            }
+            fn resolve(&self, _: uuid::Uuid) -> Result<Secret, SourceError> {
+                Secret::new(b"disposable-fixture-password".to_vec())
+            }
+        }
+        let fixture = greenmail_support::Fixture::start().await?;
+        let contents = fixture.contents().await?;
+        let snapshot = fixture.snapshot().await?;
+        let config = Config::parse(&format!(
+            r#"version = 1
+default_grant = "reader"
+state_dir = {state}
+[[accounts]]
+key = "fixture"
+alias = "fixture"
+server = "localhost"
+port = {port}
+username = "fixture+smoke@example.test"
+mailboxes = ["INBOX"]
+from_identities = ["fixture"]
+[accounts.credential]
+source = "session"
+[[grants]]
+name = "reader"
+accounts = ["fixture"]
+mailboxes = ["INBOX"]
+"#,
+            state =
+                serde_json::to_string(&std::env::temp_dir().join("mailctl-greenmail-application"))?,
+            port = fixture.imaps_port()
+        ))?;
+        let runtime = Arc::new(Runtime::new(config.limits.clone(), fixture.tls_roots()).unwrap());
+        let backend = ImapMailboxes::new(
+            runtime,
+            BTreeMap::from([("fixture".into(), Arc::new(Source) as Arc<dyn SecretSource>)]),
+        );
+        let service = Service::in_memory(config)?.with_mailbox_backend(Arc::new(backend));
+        let context = service.context("reader", &Narrowing::default())?;
+        let OperationResult::Mailboxes(first) = service
+            .execute(
+                &context,
+                Operation::ListMailboxes(ListMailboxesInput::default()),
+            )
+            .await?
+        else {
+            panic!("mailboxes")
+        };
+        assert!(first.complete);
+        assert_eq!(first.mailboxes.len(), 1);
+        assert_eq!(first.mailboxes[0].metadata.name, "INBOX");
+        let OperationResult::Mailboxes(resolved) = service
+            .execute(
+                &context,
+                Operation::ListMailboxes(ListMailboxesInput {
+                    reference: Some(first.mailboxes[0].reference.clone()),
+                    ..Default::default()
+                }),
+            )
+            .await?
+        else {
+            panic!("mailboxes")
+        };
+        assert_eq!(
+            resolved.mailboxes[0].reference,
+            first.mailboxes[0].reference
+        );
+        assert_eq!(fixture.snapshot().await?, snapshot);
+        assert_eq!(fixture.contents().await?, contents);
+        fixture.shutdown().await?;
+        Ok(())
+    });
+}

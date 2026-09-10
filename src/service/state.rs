@@ -310,6 +310,9 @@ impl AccountRegistry {
         let account = &self.registry.accounts[key];
         (&account.account_id, account.generations.len() as u64)
     }
+    pub(super) fn reference_key(&self) -> &[u8; 32] {
+        &self.registry.installation_key
+    }
     pub(super) fn installation(&self) -> &str {
         &self.registry.installation
     }

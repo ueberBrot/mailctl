@@ -145,45 +145,92 @@ pub struct ListAccountsInput {
 )]
 pub enum Operation {
     ListAccounts(ListAccountsInput),
+    ListMailboxes(ListMailboxesInput),
     Capabilities,
     Health,
 }
 
 impl<'de> Deserialize<'de> for Operation {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(rename_all = "snake_case")]
-        enum Name {
-            ListAccounts,
-            Capabilities,
-            Health,
-        }
         #[derive(Default)]
         enum Input {
             #[default]
             Absent,
-            Present(ListAccountsInput),
+            Present(serde_json::Value),
         }
         impl<'de> Deserialize<'de> for Input {
             fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-                ListAccountsInput::deserialize(deserializer).map(Self::Present)
+                serde_json::Value::deserialize(deserializer).map(Self::Present)
             }
         }
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Wire {
-            operation: Name,
+            operation: String,
             #[serde(default)]
             input: Input,
         }
         let wire = Wire::deserialize(deserializer)?;
-        match (wire.operation, wire.input) {
-            (Name::ListAccounts, Input::Present(input)) => Ok(Self::ListAccounts(input)),
-            (Name::Capabilities, Input::Absent) => Ok(Self::Capabilities),
-            (Name::Health, Input::Absent) => Ok(Self::Health),
-            _ => Err(serde::de::Error::custom("invalid operation input")),
+        let invalid = || serde::de::Error::custom("invalid operation input");
+        match (wire.operation.as_str(), wire.input) {
+            ("list_accounts", Input::Present(input)) => serde_json::from_value(input)
+                .map(Self::ListAccounts)
+                .map_err(|_| invalid()),
+            ("list_mailboxes", Input::Present(input)) => serde_json::from_value(input)
+                .map(Self::ListMailboxes)
+                .map_err(|_| invalid()),
+            ("capabilities", Input::Absent) => Ok(Self::Capabilities),
+            ("health", Input::Absent) => Ok(Self::Health),
+            _ => Err(invalid()),
         }
     }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ListMailboxesInput {
+    /// Select one authorized account alias; omission requires an unambiguous scope.
+    #[serde(default, deserialize_with = "bounded_optional_string::<_, 1024>")]
+    #[schemars(length(min = 1, max = 1024), extend("x-maxUtf8Bytes" = 1024))]
+    pub account: Option<String>,
+    /// Resolve one mailbox reference under the current access grant.
+    #[serde(default, deserialize_with = "bounded_optional_string::<_, 8192>")]
+    #[schemars(length(min = 1, max = 8192), extend("x-maxUtf8Bytes" = 8192))]
+    pub reference: Option<String>,
+    #[serde(default, deserialize_with = "mailbox_limit")]
+    #[schemars(range(min = 1, max = 1000))]
+    pub limit: Option<usize>,
+    #[serde(default, deserialize_with = "bounded_optional_string::<_, 8192>")]
+    #[schemars(length(min = 1, max = 8192), extend("x-maxUtf8Bytes" = 8192))]
+    pub cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MailboxMetadata {
+    pub name: String,
+    pub selectable: bool,
+    pub special_use: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Mailbox {
+    pub reference: String,
+    pub account_id: String,
+    pub generation: u64,
+    pub display_label: String,
+    pub metadata: MailboxMetadata,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct MailboxDiscovery {
+    pub account_id: String,
+    pub generation: u64,
+    pub mailboxes: Vec<Mailbox>,
+    pub complete: bool,
+    pub next_cursor: Option<String>,
 }
 
 /// A result envelope has exactly one success result or one failure error.
@@ -304,6 +351,7 @@ fn account_limit<'de, D: serde::Deserializer<'de>>(
 #[serde(untagged)]
 pub enum OperationResult {
     Accounts(AccountDiscovery),
+    Mailboxes(MailboxDiscovery),
     Capabilities(Capabilities),
     Health(Health),
     Cancelled(Cancellation),
@@ -469,4 +517,38 @@ pub struct ProcessCapacity {
     pub active_requests: u64,
     pub queued_requests: u64,
     pub buffered_bytes: u64,
+}
+
+fn mailbox_limit<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<usize>, D::Error> {
+    let limit = Option::<usize>::deserialize(deserializer)?;
+    if limit.is_some_and(|limit| !(1..=1000).contains(&limit)) {
+        return Err(serde::de::Error::custom("invalid mailbox limit"));
+    }
+    Ok(limit)
+}
+fn bounded_optional_string<'de, D: serde::Deserializer<'de>, const MAX: usize>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    struct Bounded<const MAX: usize>(String);
+    impl<'de, const MAX: usize> Deserialize<'de> for Bounded<MAX> {
+        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            struct Visitor<const MAX: usize>;
+            impl<const MAX: usize> serde::de::Visitor<'_> for Visitor<MAX> {
+                type Value = Bounded<MAX>;
+                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    write!(f, "a nonempty string of at most {MAX} UTF-8 bytes")
+                }
+                fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                    if value.is_empty() || value.len() > MAX {
+                        return Err(E::custom("string exceeds its bound"));
+                    }
+                    Ok(Bounded(value.into()))
+                }
+            }
+            deserializer.deserialize_str(Visitor::<MAX>)
+        }
+    }
+    Option::<Bounded<MAX>>::deserialize(deserializer).map(|value| value.map(|value| value.0))
 }

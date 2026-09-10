@@ -1,7 +1,7 @@
 //! Independent command trees sharing startup and operator arguments.
 use super::{Executable, diagnostics};
 #[cfg(feature = "cli")]
-use crate::domain::{ListAccountsInput, Operation};
+use crate::domain::{ListAccountsInput, ListMailboxesInput, Operation};
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -69,6 +69,8 @@ struct Mailctl {
 #[derive(Subcommand)]
 enum Email {
     #[command(subcommand)]
+    Mailbox(Mailbox),
+    #[command(subcommand)]
     Account(Account),
     #[command(subcommand)]
     Capability(Capability),
@@ -83,6 +85,20 @@ enum Account {
         limit: Option<u16>,
     },
 }
+#[cfg(feature = "cli")]
+#[derive(Subcommand)]
+enum Mailbox {
+    /// List approved mailboxes, or resolve a previously returned reference.
+    List {
+        #[arg(long, value_parser = clap::value_parser!(u16).range(1..=1000))]
+        limit: Option<u16>,
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long)]
+        reference: Option<String>,
+    },
+}
+
 #[cfg(feature = "cli")]
 #[derive(Subcommand)]
 enum Capability {
@@ -149,6 +165,16 @@ impl Invocation {
             Executable::Cli => {
                 let parsed = Mailctl::from_arg_matches(matches)?;
                 let action = match parsed.command {
+                    Email::Mailbox(Mailbox::List {
+                        limit,
+                        cursor,
+                        reference,
+                    }) => Action::Email(Operation::ListMailboxes(ListMailboxesInput {
+                        account: None,
+                        limit: limit.map(usize::from),
+                        cursor,
+                        reference,
+                    })),
                     Email::Account(Account::List { limit }) => {
                         Action::Email(Operation::ListAccounts(ListAccountsInput {
                             limit: limit.map(usize::from),

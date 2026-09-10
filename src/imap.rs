@@ -36,6 +36,21 @@ use wire::Connection;
 /// An authenticated connection with no selected mailbox or retained credential.
 pub(crate) struct AuthenticatedConnection(wire::Session);
 impl AuthenticatedConnection {
+    pub(crate) async fn discover(
+        self,
+        allowlist: &[String],
+        maximum: usize,
+    ) -> Result<Vec<Mailbox>, Error> {
+        let mut metrics = Metrics::default();
+        let mut connection = self.0.resume(&mut metrics);
+        let names = allowlist
+            .iter()
+            .map(|name| (identity(name), name))
+            .collect();
+        let result = connection.discover_names(names, maximum).await?;
+        connection.drive(ImapLogout::new()).await?;
+        Ok(result)
+    }
     pub(crate) async fn disconnect(self) -> Result<(), Error> {
         let mut metrics = Metrics::default();
         let mut connection = self.0.resume(&mut metrics);
@@ -347,42 +362,9 @@ impl ImapProbe {
             names.insert(identity(name), name);
         }
         tokio::time::timeout(self.limits.operation_timeout, async {
+            let maximum = self.limits.max_mailboxes;
             let mut conn = self.authenticate(username, password).await?;
-            let mut mailboxes = Vec::with_capacity(names.len());
-            for (expected, name) in names {
-                let pattern = name
-                    .replace('&', "&-")
-                    .try_into()
-                    .map_err(|_| Error::InvalidInput)?;
-                let rows = conn
-                    .drive(ImapMailboxList::new(
-                        "".try_into().map_err(|_| Error::InvalidInput)?,
-                        pattern,
-                    ))
-                    .await?;
-                if rows.len() > 1 {
-                    return Err(Error::Protocol);
-                }
-                if let Some((name, _, attrs)) = rows.into_iter().next() {
-                    let name = match name {
-                        WireMailbox::Inbox => "INBOX".to_owned(),
-                        WireMailbox::Other(n) => String::from_utf8(n.inner().as_ref().to_vec())
-                            .map_err(|_| Error::Protocol)?,
-                    };
-                    if identity(&name) != expected {
-                        return Err(Error::Protocol);
-                    }
-                    let attributes: Vec<_> = attrs.iter().map(ToString::to_string).collect();
-                    let selectable = !attributes
-                        .iter()
-                        .any(|a| a.eq_ignore_ascii_case("\\Noselect"));
-                    mailboxes.push(Mailbox {
-                        name,
-                        selectable,
-                        attributes,
-                    });
-                }
-            }
+            let mailboxes = conn.discover_names(names, maximum).await?;
             conn.drive(ImapLogout::new()).await?;
             Ok(Discovery {
                 mailboxes,
@@ -521,7 +503,7 @@ fn credentials(user: &str, password: &str) -> Result<(), Error> {
     }
     Ok(())
 }
-fn mailbox(name: &str) -> Result<(), Error> {
+pub(crate) fn mailbox(name: &str) -> Result<(), Error> {
     if name.is_empty() || name.len() > 4096 {
         return Err(Error::InvalidInput);
     }
@@ -538,5 +520,63 @@ fn identity(name: &str) -> &str {
         "INBOX"
     } else {
         name
+    }
+}
+
+impl Connection<'_> {
+    async fn discover_names(
+        &mut self,
+        names: BTreeMap<&str, &String>,
+        maximum: usize,
+    ) -> Result<Vec<Mailbox>, Error> {
+        let mut mailboxes = Vec::with_capacity(names.len());
+        let mut row_count = 0usize;
+        for (expected, name) in names {
+            let wire_name = name.replace('&', "&-");
+            let pattern = wire_name
+                .clone()
+                .try_into()
+                .map_err(|_| Error::InvalidInput)?;
+            let rows = self
+                .drive(ImapMailboxList::new(
+                    "".try_into().map_err(|_| Error::InvalidInput)?,
+                    pattern,
+                ))
+                .await?;
+            row_count = row_count.saturating_add(rows.len());
+            if row_count > maximum {
+                return Err(Error::Limit);
+            }
+            let mut found = None;
+            for (returned, _, attrs) in rows {
+                let returned = match returned {
+                    WireMailbox::Inbox => "INBOX".to_owned(),
+                    WireMailbox::Other(name) => String::from_utf8(name.inner().as_ref().to_vec())
+                        .map_err(|_| Error::Protocol)?,
+                };
+                if identity(&returned) != expected {
+                    return Err(Error::Protocol);
+                }
+                let mut attributes: Vec<_> = attrs.iter().map(ToString::to_string).collect();
+                attributes.sort();
+                attributes.dedup();
+                let selectable = !attributes
+                    .iter()
+                    .any(|a| a.eq_ignore_ascii_case("\\Noselect"));
+                let mailbox = Mailbox {
+                    name: expected.into(),
+                    selectable,
+                    attributes,
+                };
+                if found.as_ref().is_some_and(|previous| previous != &mailbox) {
+                    return Err(Error::Protocol);
+                }
+                found = Some(mailbox);
+            }
+            if let Some(mailbox) = found {
+                mailboxes.push(mailbox);
+            }
+        }
+        Ok(mailboxes)
     }
 }

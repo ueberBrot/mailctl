@@ -309,6 +309,39 @@ impl Runtime {
         .map_err(|_| Error::Timeout)?
     }
 
+    /// Discover exact approved names on one admitted connection, then log out.
+    pub async fn discover(
+        &self,
+        account: &Account,
+        names: &[String],
+        limits: &Limits,
+    ) -> Result<Vec<imap::Mailbox>, Error> {
+        self.validate_limits(limits)?;
+        if names.len() > limits.mailbox_inventory {
+            return Err(Error::Imap(imap::Error::Limit));
+        }
+        for name in names {
+            imap::mailbox(name).map_err(Error::Imap)?;
+        }
+        let pool = self.pool(account.id, account.generation)?;
+        tokio::time::timeout(
+            Duration::from_secs(limits.operation_seconds as u64),
+            async {
+                let Lease {
+                    idle,
+                    admission: _admission,
+                    ..
+                } = self.acquire_inner(account, limits, pool, true).await?;
+                idle.connection
+                    .discover(names, limits.mailbox_inventory)
+                    .await
+                    .map_err(Error::Imap)
+            },
+        )
+        .await
+        .map_err(|_| Error::Timeout)?
+    }
+
     pub async fn acquire(&self, account: &Account, limits: &Limits) -> Result<Lease, Error> {
         self.validate_limits(limits)?;
         let pool = self.pool(account.id, account.generation)?;

@@ -36,6 +36,8 @@ tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["std", "registry", "fmt", "json", "ansi"] }
 anstream = "1.0.0"
 sha2 = "0.11.0"
+ring = "=0.17.14"
+base64 = "=0.22.1"
 getrandom = "0.4.3"
 etcetera = "0.11.0"
 mail-parser = { version = "=0.11.8", default-features = false, features = ["full_encoding"] }

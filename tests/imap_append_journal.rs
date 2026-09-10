@@ -37,7 +37,9 @@ async fn acknowledged_creation_is_durable_before_optional_reference_lookup_fails
     let lookup_identity = operation.identity.clone();
     let lookup_path = path.clone();
     let mut session = 0;
-    let Fixture { mut probe, task } = repeating_fixture(Limits::default(), 2, move |mut wire| {
+    let Fixture {
+        mut probe, task, ..
+    } = repeating_fixture(Limits::default(), 2, move |mut wire| {
         session += 1;
         let first = session == 1;
         let expected = expected.clone();
@@ -120,15 +122,16 @@ async fn lost_acknowledgement_persists_uncertainty_and_refuses_redispatch() {
     let mime = draft();
     let expected = mime.bytes().to_vec();
     let operation = operation(&mime);
-    let Fixture { mut probe, task } =
-        fixture(TlsMode::Implicit, Limits::default(), move |mut wire| {
-            Box::pin(async move {
-                authenticate(&mut wire).await;
-                receive(&mut wire, "Drafts", &expected).await;
-                // The server has the complete message; close before acknowledging it.
-            })
+    let Fixture {
+        mut probe, task, ..
+    } = fixture(TlsMode::Implicit, Limits::default(), move |mut wire| {
+        Box::pin(async move {
+            authenticate(&mut wire).await;
+            receive(&mut wire, "Drafts", &expected).await;
+            // The server has the complete message; close before acknowledging it.
         })
-        .await;
+    })
+    .await;
     let mut journal = DraftJournal::open(&path).unwrap();
     journal.prepare(operation.clone()).unwrap();
     journal.begin_dispatch(&operation).unwrap();
@@ -165,16 +168,17 @@ async fn cancellation_closes_transport_and_leaves_durable_in_flight_state() {
     let expected = mime.bytes().to_vec();
     let operation = operation(&mime);
     let (accepted, received) = tokio::sync::oneshot::channel();
-    let Fixture { mut probe, task } =
-        fixture(TlsMode::Implicit, Limits::default(), move |mut wire| {
-            Box::pin(async move {
-                authenticate(&mut wire).await;
-                receive(&mut wire, "Drafts", &expected).await;
-                accepted.send(()).unwrap();
-                dropped(&mut wire).await;
-            })
+    let Fixture {
+        mut probe, task, ..
+    } = fixture(TlsMode::Implicit, Limits::default(), move |mut wire| {
+        Box::pin(async move {
+            authenticate(&mut wire).await;
+            receive(&mut wire, "Drafts", &expected).await;
+            accepted.send(()).unwrap();
+            dropped(&mut wire).await;
         })
-        .await;
+    })
+    .await;
     let mut journal = DraftJournal::open(&path).unwrap();
     journal.prepare(operation.clone()).unwrap();
     journal.begin_dispatch(&operation).unwrap();

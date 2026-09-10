@@ -4,13 +4,20 @@ use mailctl::{
     service::Service,
 };
 
-const _: fn(&Service, &RequestContext, Operation) -> Result<OperationResult, Error> =
-    Service::execute;
+const _: fn(&Service, &RequestContext, Operation) = |service, context, operation| {
+    fn require_send(_: impl std::future::Future<Output = Result<OperationResult, Error>> + Send) {}
+    require_send(service.execute(context, operation));
+};
 const _: for<'a> fn(&'a Service, &RequestContext) -> Result<&'a mailctl::config::Limits, Error> =
     Service::limits;
 const _: fn(Envelope<AccountDiscovery>) -> Result<AccountDiscovery, Error> = Envelope::into_result;
 const _: fn(Envelope<Capabilities>) -> Result<Capabilities, Error> = Envelope::into_result;
 const _: fn(OperationResult) = |result| match result {
+    OperationResult::Mailboxes(discovery) => {
+        let _: Vec<mailctl::domain::Mailbox> = discovery.mailboxes;
+        let _: bool = discovery.complete;
+        let _: Option<String> = discovery.next_cursor;
+    }
     OperationResult::Accounts(discovery) => {
         let _: Vec<String> = discovery
             .accounts

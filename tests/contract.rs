@@ -10,8 +10,11 @@ fn execute(
     context: &RequestContext,
     operation: Operation,
 ) -> Result<serde_json::Value, Error> {
-    service
-        .execute(context, operation)
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(service.execute(context, operation))
         .map(|result| serde_json::to_value(result).unwrap())
 }
 
@@ -503,8 +506,7 @@ fn private_account_history_fails_closed_on_corruption() {
     let context = foreign.context("reader", &Narrowing::default()).unwrap();
     std::fs::write(directory.join("accounts.json"), b"{corrupt").unwrap();
     assert_eq!(
-        service
-            .execute(&context, Operation::Health)
+        execute(&service, &context, Operation::Health)
             .unwrap_err()
             .code,
         mailctl::domain::ErrorCode::PermissionDenied
@@ -897,7 +899,7 @@ fn response_narrowing_rejects_large_results_and_cannot_be_widened() {
         Operation::Health,
     ] {
         assert_eq!(
-            service.execute(&context, operation).unwrap_err().code,
+            execute(&service, &context, operation).unwrap_err().code,
             mailctl::domain::ErrorCode::ResponseTooLarge
         );
     }

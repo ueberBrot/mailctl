@@ -2,7 +2,8 @@
 use super::application::Application;
 use super::mcp_transport::{BoundedStdio, Bounds};
 use crate::domain::{
-    AccountDiscovery, Capabilities, Envelope, Error, ErrorCode, ListAccountsInput, Operation,
+    AccountDiscovery, Capabilities, Envelope, Error, ErrorCode, ListAccountsInput,
+    ListMailboxesInput, MailboxDiscovery, Operation, OperationResult,
 };
 use rmcp::model::ErrorData as McpError;
 use rmcp::{RoleServer, ServerHandler, ServiceExt, model::*, service::RequestContext};
@@ -12,6 +13,7 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 struct EmailTools {
+    mailboxes: bool,
     application: Application,
     active: Semaphore,
     envelope_limit: usize,
@@ -19,9 +21,9 @@ struct EmailTools {
     shutdown: CancellationToken,
 }
 
-fn definitions() -> Vec<Tool> {
+fn definitions(mailboxes: bool) -> Vec<Tool> {
     let empty = json!({"type":"object","properties":{},"additionalProperties":false});
-    vec![
+    let mut tools = vec![
         Tool::new(
             "email_list_accounts",
             "List authorized email accounts with explicit completion.",
@@ -35,7 +37,19 @@ fn definitions() -> Vec<Tool> {
             empty.as_object().unwrap().clone(),
         )
         .with_output_schema::<Envelope<Capabilities>>(),
-    ]
+    ];
+    if mailboxes {
+        tools.push(
+            Tool::new(
+                "email_list_mailboxes",
+                "List approved mailboxes or resolve a reusable mailbox reference.",
+                serde_json::Map::new(),
+            )
+            .with_input_schema::<ListMailboxesInput>()
+            .with_output_schema::<Envelope<MailboxDiscovery>>(),
+        );
+    }
+    tools
 }
 
 impl ServerHandler for EmailTools {
@@ -66,7 +80,7 @@ impl ServerHandler for EmailTools {
                     .map_err(|_| McpError::internal_error("Service unavailable", None))?,
         };
         Ok(ListToolsResult {
-            tools: definitions(),
+            tools: definitions(self.mailboxes),
             ..Default::default()
         })
     }
@@ -87,6 +101,11 @@ impl ServerHandler for EmailTools {
         let input = request.arguments.unwrap_or_default();
         let operation = match (admitted.as_ref(), request.name.as_ref()) {
             (Err(error), _) => Err(error.clone()),
+            (_, "email_list_mailboxes") if self.mailboxes => {
+                serde_json::from_value(Value::Object(input))
+                    .map(Operation::ListMailboxes)
+                    .map_err(|_| Error::new(ErrorCode::InvalidRequest))
+            }
             (_, "email_list_accounts") => serde_json::from_value(Value::Object(input))
                 .map(Operation::ListAccounts)
                 .map_err(|_| Error::new(ErrorCode::InvalidRequest)),
@@ -141,6 +160,15 @@ impl ServerHandler for EmailTools {
 }
 
 pub(super) async fn run(application: Application) -> Result<(), Error> {
+    let OperationResult::Capabilities(capabilities) =
+        application.execute(Operation::Capabilities).await?
+    else {
+        return Err(Error::new(ErrorCode::InternalError));
+    };
+    let mailboxes = capabilities
+        .operations
+        .iter()
+        .any(|operation| operation == "list_mailboxes");
     let limits = application.limits()?;
     let bounds = Bounds::new(limits, application.response_bound()?)?;
     let expires = tokio::time::Instant::now()
@@ -151,6 +179,7 @@ pub(super) async fn run(application: Application) -> Result<(), Error> {
     let shutdown = CancellationToken::new();
     let _cancel_on_exit = shutdown.clone().drop_guard();
     let handler = EmailTools {
+        mailboxes,
         active: Semaphore::new(limits.active_requests),
         envelope_limit: bounds.envelope,
         deadline: Duration::from_secs(limits.operation_seconds as u64),

@@ -1,7 +1,8 @@
 # mailctl
 
-Email tools for the command line and MCP. It supports configured account discovery,
-capability reporting, macOS credential provisioning, and authentication diagnostics.
+Email tools for the command line and MCP. It supports account and mailbox
+discovery, reusable mailbox references, capability reporting, macOS credential
+provisioning, and authentication diagnostics.
 
 Build both executables:
 
@@ -21,6 +22,7 @@ Use `--grant` to select an access grant, `--account` to narrow accounts, or `--h
 for available commands.
 
 [Configure credentials, check authentication, and rotate passwords](docs/credentials.md).
+[Discover approved mailboxes and reuse their references](docs/mailboxes.md).
 
 Standard operation needs no service. Operators who want a separate protected
 credential identity can explicitly [set up native macOS isolation](docs/isolation.md).

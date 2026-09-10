@@ -265,11 +265,14 @@ fn accounts(installation: &Installation) -> serde_json::Value {
     let service = Service::open(config).unwrap();
     let context = service.context(&grant, &Narrowing::default()).unwrap();
     serde_json::to_value(
-        service
-            .execute(
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(service.execute(
                 &context,
                 Operation::ListAccounts(ListAccountsInput::default()),
-            )
+            ))
             .unwrap(),
     )
     .unwrap()

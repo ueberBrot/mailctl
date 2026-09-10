@@ -35,7 +35,7 @@ impl Application {
 
     pub async fn execute(&self, operation: Operation) -> Result<OperationResult, Error> {
         match self {
-            Self::Embedded { service, context } => service.execute(context, operation),
+            Self::Embedded { service, context } => service.execute(context, operation).await,
             #[cfg(target_os = "macos")]
             Self::Isolated(client) => client.execute(operation).await,
         }

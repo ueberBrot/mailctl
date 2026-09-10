@@ -31,6 +31,8 @@ pub type Wire = Box<dyn Stream>;
 pub type Script = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 pub struct Fixture {
+    pub port: u16,
+    pub roots: RootCertStore,
     pub probe: ImapProbe,
     pub task: JoinHandle<()>,
 }
@@ -88,7 +90,7 @@ async fn fixture_sessions(
     let port = listener.local_addr().unwrap().port();
     // Match the IPv4 listener directly so the operation deadline cannot expire
     // while localhost first attempts an unavailable IPv6 address on Windows.
-    let probe = ImapProbe::new("127.0.0.1".into(), port, mode, roots, limits).unwrap();
+    let probe = ImapProbe::new("127.0.0.1".into(), port, mode, roots.clone(), limits).unwrap();
     let task = tokio::spawn(async move {
         for _ in 0..sessions {
             let (mut socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
@@ -113,7 +115,12 @@ async fn fixture_sessions(
             }
         }
     });
-    Fixture { probe, task }
+    Fixture {
+        probe,
+        task,
+        port,
+        roots,
+    }
 }
 
 pub async fn write<S: AsyncWrite + Unpin + ?Sized>(wire: &mut S, response: &str) {
@@ -250,7 +257,7 @@ pub fn dedicated_sessions(
             .build()
             .unwrap();
         runtime.block_on(async {
-            let Fixture { probe, task } =
+            let Fixture { probe, task, .. } =
                 fixture_sessions(mode, limits, "127.0.0.1", sessions, script).await;
             send.send(probe).unwrap();
             task.await.unwrap();
@@ -264,9 +271,10 @@ pub async fn plaintext_fixture(
     script: impl FnOnce(Wire) -> Script + Send + 'static,
 ) -> Fixture {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
     let probe = ImapProbe::new(
         "127.0.0.1".into(),
-        listener.local_addr().unwrap().port(),
+        port,
         TlsMode::StartTls,
         RootCertStore::empty(),
         limits,
@@ -279,7 +287,12 @@ pub async fn plaintext_fixture(
             .unwrap();
         script(Box::new(socket)).await;
     });
-    Fixture { probe, task }
+    Fixture {
+        probe,
+        task,
+        port,
+        roots: RootCertStore::empty(),
+    }
 }
 
 fn normalized(mut body: CommandBody<'_>) -> CommandBody<'_> {

@@ -93,12 +93,21 @@ fn concurrent_first_setup_preserves_one_shared_account_identity() {
         thread::spawn(move || run_bounded(command))
     };
     let second = {
+        #[cfg(feature = "mcp")]
+        let mut command = installation.mcp();
+        #[cfg(not(feature = "mcp"))]
         let mut command = installation.cli();
         command.args(["--json", "setup"]);
         thread::spawn(move || run_bounded(command))
     };
-    assert_success(&first.join().unwrap());
-    assert_success(&second.join().unwrap());
+    let first = first.join().unwrap();
+    let second = second.join().unwrap();
+    assert_success(&first);
+    assert_success(&second);
+    assert_eq!(
+        envelope(&first)["result"]["installation_id"],
+        envelope(&second)["result"]["installation_id"]
+    );
 
     let result = accounts(
         &installation,

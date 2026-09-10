@@ -1,6 +1,9 @@
 //! Print the versioned discovery contract for consuming applications.
 use mailctl::{
-    domain::{AccountDiscovery, Capabilities, Envelope, Health, ListAccountsInput, Operation},
+    domain::{
+        AccountDiscovery, Capabilities, Envelope, Health, ListAccountsInput, ListMailboxesInput,
+        MailboxDiscovery, Operation,
+    },
     policy::Narrowing,
 };
 use schemars::schema_for;
@@ -13,6 +16,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "operation": schema_for!(Operation),
         "narrowing": schema_for!(Narrowing),
         "list_accounts_input": schema_for!(ListAccountsInput),
+        "list_mailboxes_input": schema_for!(ListMailboxesInput),
+        "mailbox_discovery_envelope": schema_for!(Envelope<MailboxDiscovery>),
         "account_discovery": schema_for!(AccountDiscovery),
         "capabilities": schema_for!(Capabilities),
         "health": schema_for!(Health),

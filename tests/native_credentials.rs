@@ -37,7 +37,17 @@ fn native_credentials_cross_components_rotate_and_clean_up() {
     let mcp = frozen_mcp.to_str().unwrap();
     let mut keychain = NativeKeychain::new(installation.config().parent().unwrap());
     let mut server = server::NativeServer::new(installation.config().parent().unwrap());
-    let configuration = fs::read_to_string(installation.config()).unwrap();
+    let configuration = fs::read_to_string(installation.config())
+        .unwrap()
+        .replace(
+            "mailboxes = [\"INBOX\", \"Drafts\"]",
+            "mailboxes = [\"INBOX\", \"Drafts\", \"Archive\"]",
+        )
+        .replace(
+            "mailboxes = [\"INBOX\"]",
+            "mailboxes = [\"INBOX\", \"Archive\"]",
+        )
+        + "\n[[grants]]\nname = \"restricted\"\naccounts = [\"work\"]\nmailboxes = [\"INBOX\"]\n";
     fs::write(
         installation.config(),
         configuration.replace(
@@ -131,6 +141,8 @@ fn native_credentials_cross_components_rotate_and_clean_up() {
         "personal@example.test",
         SECOND,
     );
+
+    mailbox_handoffs(&installation, &server, cli, mcp);
 
     let mut rename = installation.command(cli);
     rename.args(["--json", "--account", "work", "setup", "--alias", "renamed"]);
@@ -540,4 +552,121 @@ fn read_preference(command: &str) -> Result<Vec<String>, ()> {
             Ok(result)
         })
         .collect()
+}
+
+fn mailbox_handoffs(
+    installation: &Installation,
+    server: &server::NativeServer,
+    cli: &str,
+    mcp: &str,
+) {
+    use rmcp::{ServiceExt, model::CallToolRequestParams, transport::TokioChildProcess};
+    use serde_json::{Value, json};
+    server.expect_mailboxes("work@example.test", FIRST, &["Archive", "INBOX"]);
+    let mut command = installation.command(cli);
+    command
+        .env("SSL_CERT_FILE", &server.certificate)
+        .args(["--json", "mailbox", "list", "--limit", "1"]);
+    let output = run_bounded(command);
+    assert_success(&output);
+    let first = envelope(&output)["result"].clone();
+    assert_eq!(first["mailboxes"][0]["metadata"]["name"], "Archive");
+    assert_eq!(first["complete"], false);
+    let reference = first["mailboxes"][0]["reference"].as_str().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let connect = |grant: &str| {
+            let mut command = tokio::process::Command::new(mcp);
+            command
+                .arg("--config")
+                .arg(installation.config())
+                .args(["--grant", grant, "--account", "work"])
+                .env("SSL_CERT_FILE", &server.certificate);
+            TokioChildProcess::new(command).unwrap()
+        };
+        let reader = ().serve(connect("default")).await.unwrap();
+        server.expect_mailboxes("work@example.test", FIRST, &["Archive", "INBOX"]);
+        let response = reader
+            .call_tool(
+                CallToolRequestParams::new("email_list_mailboxes").with_arguments(
+                    json!({"limit":1,"cursor":first["next_cursor"]})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.is_error, Some(false));
+        let last = response.structured_content.unwrap();
+        assert_eq!(last["result"]["mailboxes"][0]["metadata"]["name"], "INBOX");
+        assert_eq!(last["result"]["complete"], true);
+        let inbox = last["result"]["mailboxes"][0]["reference"]
+            .as_str()
+            .unwrap();
+        server.expect_mailboxes("work@example.test", FIRST, &["INBOX"]);
+        let mut command = installation.command(cli);
+        command.env("SSL_CERT_FILE", &server.certificate).args([
+            "--json",
+            "mailbox",
+            "list",
+            "--reference",
+            inbox,
+        ]);
+        let output = run_bounded(command);
+        assert_success(&output);
+        assert_eq!(
+            envelope(&output)["result"]["mailboxes"][0],
+            last["result"]["mailboxes"][0]
+        );
+        reader.cancel().await.unwrap();
+        for grant in ["default", "all", "restricted"] {
+            let reader = ().serve(connect(grant)).await.unwrap();
+            let before = server.accepted();
+            if grant != "restricted" {
+                server.expect_mailboxes("work@example.test", FIRST, &["Archive"]);
+            }
+            let response = reader
+                .call_tool(
+                    CallToolRequestParams::new("email_list_mailboxes").with_arguments(
+                        json!({"reference":reference}).as_object().unwrap().clone(),
+                    ),
+                )
+                .await
+                .unwrap();
+            let structured = response.structured_content.unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(&response.content[0].as_text().unwrap().text)
+                    .unwrap(),
+                structured
+            );
+            if grant == "restricted" {
+                assert_eq!(response.is_error, Some(true));
+                assert_eq!(structured["error"]["code"], "mailbox_not_allowed");
+                assert_eq!(server.accepted(), before);
+            } else {
+                assert_eq!(response.is_error, Some(false));
+                assert_eq!(structured["result"]["mailboxes"][0], first["mailboxes"][0]);
+            }
+            reader.cancel().await.unwrap();
+        }
+        let before = server.accepted();
+        let mut command = installation.command(cli);
+        command.args([
+            "--json",
+            "--grant",
+            "restricted",
+            "mailbox",
+            "list",
+            "--reference",
+            reference,
+        ]);
+        let output = run_bounded(command);
+        assert_eq!(output.status.code(), Some(3));
+        assert_eq!(envelope(&output)["error"]["code"], "mailbox_not_allowed");
+        assert_eq!(server.accepted(), before);
+    });
 }

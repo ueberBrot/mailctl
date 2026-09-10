@@ -151,7 +151,7 @@ async fn mcp_serves_with_a_small_valid_byte_budget() {
     assert_eq!(envelope["result"]["accounts"][0]["alias"], "work");
     tokio::time::timeout(Duration::from_secs(30), async {
         for _ in 0..128 {
-            assert_eq!(client.list_all_tools().await.unwrap().len(), 2);
+            assert_eq!(client.list_all_tools().await.unwrap().len(), 3);
             let response = client
                 .call_tool(CallToolRequestParams::new("email_list_accounts"))
                 .await
@@ -196,7 +196,11 @@ async fn standalone_mcp_negotiates_schemas_and_applies_configured_grant_scope() 
             .iter()
             .map(|tool| tool.name.as_ref())
             .collect::<Vec<_>>(),
-        ["email_list_accounts", "email_capabilities"]
+        [
+            "email_list_accounts",
+            "email_capabilities",
+            "email_list_mailboxes"
+        ]
     );
     let discovery = &tools[0];
     assert!(discovery.input_schema.contains_key("properties"));
@@ -406,4 +410,69 @@ async fn cli_runs_and_exits_while_a_standalone_mcp_session_owns_its_own_lease() 
         1
     );
     client.cancel().await.expect("close MCP session");
+}
+
+#[cfg(feature = "cli")]
+#[tokio::test]
+async fn mailbox_discovery_has_cli_mcp_parity_and_is_hidden_from_drafts_only_grants() {
+    let installation = Installation::two_accounts();
+    let text = std::fs::read_to_string(installation.config()).unwrap();
+    std::fs::write(
+        installation.config(),
+        text.replace(
+            "mailboxes = [\"INBOX\"]",
+            "mailboxes = [\"OutsideAccountScope\"]",
+        ),
+    )
+    .unwrap();
+    setup(&installation);
+    let output = run_bounded({
+        let mut command = installation.cli();
+        command.args(["--json", "mailbox", "list"]);
+        command
+    });
+    assert_success(&output);
+    let cli = envelope(&output);
+    assert_eq!(cli["result"]["mailboxes"], json!([]));
+    assert_eq!(cli["result"]["complete"], true);
+    let reader = client(&installation, &[]).await;
+    assert!(
+        reader
+            .list_all_tools()
+            .await
+            .unwrap()
+            .iter()
+            .any(|tool| tool.name == "email_list_mailboxes")
+    );
+    let response = reader
+        .call_tool(CallToolRequestParams::new("email_list_mailboxes"))
+        .await
+        .unwrap();
+    let structured = response.structured_content.unwrap();
+    assert_eq!(structured["result"], cli["result"]);
+    assert_eq!(
+        serde_json::from_str::<Value>(&response.content[0].as_text().unwrap().text).unwrap(),
+        structured
+    );
+    reader.cancel().await.unwrap();
+    let writer = client(
+        &installation,
+        &["--grant", "writer", "--use-configured-grant"],
+    )
+    .await;
+    assert!(
+        !writer
+            .list_all_tools()
+            .await
+            .unwrap()
+            .iter()
+            .any(|tool| tool.name == "email_list_mailboxes")
+    );
+    assert!(
+        writer
+            .call_tool(CallToolRequestParams::new("email_list_mailboxes"))
+            .await
+            .is_err()
+    );
+    writer.cancel().await.unwrap();
 }
