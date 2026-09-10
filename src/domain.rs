@@ -1,6 +1,8 @@
 //! Domain inputs, discovery results, and safe errors shared by every frontend.
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+mod search;
+pub use search::*;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -146,6 +148,7 @@ pub struct ListAccountsInput {
 pub enum Operation {
     ListAccounts(ListAccountsInput),
     ListMailboxes(ListMailboxesInput),
+    SearchMessages(SearchMessagesInput),
     Capabilities,
     Health,
 }
@@ -178,6 +181,9 @@ impl<'de> Deserialize<'de> for Operation {
                 .map_err(|_| invalid()),
             ("list_mailboxes", Input::Present(input)) => serde_json::from_value(input)
                 .map(Self::ListMailboxes)
+                .map_err(|_| invalid()),
+            ("search_messages", Input::Present(input)) => serde_json::from_value(input)
+                .map(Self::SearchMessages)
                 .map_err(|_| invalid()),
             ("capabilities", Input::Absent) => Ok(Self::Capabilities),
             ("health", Input::Absent) => Ok(Self::Health),
@@ -352,6 +358,7 @@ fn account_limit<'de, D: serde::Deserializer<'de>>(
 pub enum OperationResult {
     Accounts(AccountDiscovery),
     Mailboxes(MailboxDiscovery),
+    Messages(MessageSearch),
     Capabilities(Capabilities),
     Health(Health),
     Cancelled(Cancellation),

@@ -1,7 +1,9 @@
 //! Independent command trees sharing startup and operator arguments.
 use super::{Executable, diagnostics};
 #[cfg(feature = "cli")]
-use crate::domain::{ListAccountsInput, ListMailboxesInput, Operation};
+use crate::domain::{
+    ListAccountsInput, ListMailboxesInput, Operation, SearchCriteria, SearchMessagesInput,
+};
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -69,6 +71,8 @@ struct Mailctl {
 #[derive(Subcommand)]
 enum Email {
     #[command(subcommand)]
+    Message(Message),
+    #[command(subcommand)]
     Mailbox(Mailbox),
     #[command(subcommand)]
     Account(Account),
@@ -76,6 +80,31 @@ enum Email {
     Capability(Capability),
     #[command(flatten)]
     Administration(Administration),
+}
+#[cfg(feature = "cli")]
+#[derive(Subcommand)]
+enum Message {
+    /// Search a mailbox with AND-only criteria and descending-UID continuation.
+    Search {
+        #[arg(long)]
+        mailbox: String,
+        /// JSON array of typed predicates; repeated fields remain AND terms.
+        #[arg(long, default_value = "[]", value_parser = search_criteria)]
+        criteria: SearchCriteria,
+        #[arg(long, value_parser = clap::value_parser!(u16).range(1..=200))]
+        limit: Option<u16>,
+        #[arg(long)]
+        cursor: Option<String>,
+    },
+}
+#[cfg(feature = "cli")]
+fn search_criteria(value: &str) -> Result<SearchCriteria, &'static str> {
+    if value.len() > 1024 * 1024 {
+        return Err("Search criteria exceed the input limit");
+    }
+    crate::encoding::validate_json_depth(value.as_bytes(), 32)
+        .map_err(|_| "Invalid search criteria")?;
+    serde_json::from_str(value).map_err(|_| "Invalid search criteria")
 }
 #[cfg(feature = "cli")]
 #[derive(Subcommand)]
@@ -165,6 +194,17 @@ impl Invocation {
             Executable::Cli => {
                 let parsed = Mailctl::from_arg_matches(matches)?;
                 let action = match parsed.command {
+                    Email::Message(Message::Search {
+                        mailbox,
+                        criteria,
+                        limit,
+                        cursor,
+                    }) => Action::Email(Operation::SearchMessages(SearchMessagesInput {
+                        mailbox,
+                        criteria,
+                        limit: limit.map(usize::from),
+                        cursor,
+                    })),
                     Email::Mailbox(Mailbox::List {
                         limit,
                         cursor,

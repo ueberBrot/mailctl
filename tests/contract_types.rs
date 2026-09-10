@@ -13,6 +13,12 @@ const _: for<'a> fn(&'a Service, &RequestContext) -> Result<&'a mailctl::config:
 const _: fn(Envelope<AccountDiscovery>) -> Result<AccountDiscovery, Error> = Envelope::into_result;
 const _: fn(Envelope<Capabilities>) -> Result<Capabilities, Error> = Envelope::into_result;
 const _: fn(OperationResult) = |result| match result {
+    OperationResult::Messages(search) => {
+        let _: Vec<mailctl::domain::MessageEnvelope> = search.messages;
+        let _: mailctl::domain::SearchCriteria = search.criteria;
+        let _: bool = search.complete;
+        let _: Option<String> = search.next_cursor;
+    }
     OperationResult::Mailboxes(discovery) => {
         let _: Vec<mailctl::domain::Mailbox> = discovery.mailboxes;
         let _: bool = discovery.complete;

@@ -3,7 +3,8 @@ use super::application::Application;
 use super::mcp_transport::{BoundedStdio, Bounds};
 use crate::domain::{
     AccountDiscovery, Capabilities, Envelope, Error, ErrorCode, ListAccountsInput,
-    ListMailboxesInput, MailboxDiscovery, Operation, OperationResult,
+    ListMailboxesInput, MailboxDiscovery, MessageSearch, Operation, OperationResult,
+    SearchMessagesInput,
 };
 use rmcp::model::ErrorData as McpError;
 use rmcp::{RoleServer, ServerHandler, ServiceExt, model::*, service::RequestContext};
@@ -14,6 +15,7 @@ use tokio_util::sync::CancellationToken;
 
 struct EmailTools {
     mailboxes: bool,
+    search: bool,
     application: Application,
     active: Semaphore,
     envelope_limit: usize,
@@ -21,7 +23,7 @@ struct EmailTools {
     shutdown: CancellationToken,
 }
 
-fn definitions(mailboxes: bool) -> Vec<Tool> {
+fn definitions(mailboxes: bool, search: bool) -> Vec<Tool> {
     let empty = json!({"type":"object","properties":{},"additionalProperties":false});
     let mut tools = vec![
         Tool::new(
@@ -47,6 +49,17 @@ fn definitions(mailboxes: bool) -> Vec<Tool> {
             )
             .with_input_schema::<ListMailboxesInput>()
             .with_output_schema::<Envelope<MailboxDiscovery>>(),
+        );
+    }
+    if search {
+        tools.push(
+            Tool::new(
+                "email_search_messages",
+                "Search one approved mailbox with AND predicates and bounded descending-UID pages.",
+                serde_json::Map::new(),
+            )
+            .with_input_schema::<SearchMessagesInput>()
+            .with_output_schema::<Envelope<MessageSearch>>(),
         );
     }
     tools
@@ -80,7 +93,7 @@ impl ServerHandler for EmailTools {
                     .map_err(|_| McpError::internal_error("Service unavailable", None))?,
         };
         Ok(ListToolsResult {
-            tools: definitions(self.mailboxes),
+            tools: definitions(self.mailboxes, self.search),
             ..Default::default()
         })
     }
@@ -101,6 +114,11 @@ impl ServerHandler for EmailTools {
         let input = request.arguments.unwrap_or_default();
         let operation = match (admitted.as_ref(), request.name.as_ref()) {
             (Err(error), _) => Err(error.clone()),
+            (_, "email_search_messages") if self.search => {
+                serde_json::from_value(Value::Object(input))
+                    .map(Operation::SearchMessages)
+                    .map_err(|_| Error::new(ErrorCode::InvalidRequest))
+            }
             (_, "email_list_mailboxes") if self.mailboxes => {
                 serde_json::from_value(Value::Object(input))
                     .map(Operation::ListMailboxes)
@@ -169,6 +187,10 @@ pub(super) async fn run(application: Application) -> Result<(), Error> {
         .operations
         .iter()
         .any(|operation| operation == "list_mailboxes");
+    let search = capabilities
+        .operations
+        .iter()
+        .any(|operation| operation == "search_messages");
     let limits = application.limits()?;
     let bounds = Bounds::new(limits, application.response_bound()?)?;
     let expires = tokio::time::Instant::now()
@@ -179,6 +201,7 @@ pub(super) async fn run(application: Application) -> Result<(), Error> {
     let shutdown = CancellationToken::new();
     let _cancel_on_exit = shutdown.clone().drop_guard();
     let handler = EmailTools {
+        search,
         mailboxes,
         active: Semaphore::new(limits.active_requests),
         envelope_limit: bounds.envelope,

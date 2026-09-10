@@ -143,6 +143,7 @@ fn native_credentials_cross_components_rotate_and_clean_up() {
     );
 
     mailbox_handoffs(&installation, &server, cli, mcp);
+    search_handoffs(&installation, &server, cli, mcp);
 
     let mut rename = installation.command(cli);
     rename.args(["--json", "--account", "work", "setup", "--alias", "renamed"]);
@@ -552,6 +553,144 @@ fn read_preference(command: &str) -> Result<Vec<String>, ()> {
             Ok(result)
         })
         .collect()
+}
+
+fn search_handoffs(
+    installation: &Installation,
+    server: &server::NativeServer,
+    cli: &str,
+    mcp: &str,
+) {
+    use rmcp::{ServiceExt, model::CallToolRequestParams, transport::TokioChildProcess};
+    use serde_json::{Value, json};
+    server.expect_mailboxes("work@example.test", FIRST, &["Archive", "INBOX"]);
+    let mut command = installation.command(cli);
+    command
+        .env("SSL_CERT_FILE", &server.certificate)
+        .args(["--json", "mailbox", "list", "--limit", "1"]);
+    let output = run_bounded(command);
+    assert_success(&output);
+    let reference = envelope(&output)["result"]["mailboxes"][0]["reference"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    server.expect_search("work@example.test", FIRST, "Archive", None);
+    let mut command = installation.command(cli);
+    command.env("SSL_CERT_FILE", &server.certificate).args([
+        "--json",
+        "message",
+        "search",
+        "--mailbox",
+        &reference,
+        "--limit",
+        "1",
+    ]);
+    let output = run_bounded(command);
+    assert_success(&output);
+    let first = envelope(&output)["result"].clone();
+    assert_eq!(
+        first["messages"][0]["message_id"]["value"],
+        "<search-3@example.test>"
+    );
+    assert_eq!(first["complete"], false);
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let connect = |grant: &str| {
+                let mut command = tokio::process::Command::new(mcp);
+                command
+                    .arg("--config")
+                    .arg(installation.config())
+                    .args(["--grant", grant, "--account", "work"])
+                    .env("SSL_CERT_FILE", &server.certificate);
+                TokioChildProcess::new(command).unwrap()
+            };
+            let reader = ().serve(connect("default")).await.unwrap();
+            server.expect_search("work@example.test", FIRST, "Archive", None);
+            let response = reader
+                .call_tool(
+                    CallToolRequestParams::new("email_search_messages").with_arguments(
+                        json!({"mailbox":reference,"limit":1})
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.is_error, Some(false));
+            let structured = response.structured_content.unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(&response.content[0].as_text().unwrap().text)
+                    .unwrap(),
+                structured
+            );
+            assert_eq!(structured["result"], first);
+            server.expect_search("work@example.test", FIRST, "Archive", Some(2));
+            let response = reader
+                .call_tool(
+                    CallToolRequestParams::new("email_search_messages").with_arguments(
+                        json!({"mailbox":reference,"limit":1,"cursor":first["next_cursor"]})
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ),
+                )
+                .await
+                .unwrap();
+            let second = response.structured_content.unwrap()["result"].clone();
+            assert_eq!(
+                second["messages"][0]["message_id"]["value"],
+                "<search-2@example.test>"
+            );
+            server.expect_search("work@example.test", FIRST, "Archive", Some(1));
+            let mut command = installation.command(cli);
+            command.env("SSL_CERT_FILE", &server.certificate).args([
+                "--json",
+                "message",
+                "search",
+                "--mailbox",
+                &reference,
+                "--limit",
+                "1",
+                "--cursor",
+                second["next_cursor"].as_str().unwrap(),
+            ]);
+            let output = run_bounded(command);
+            assert_success(&output);
+            let last = envelope(&output)["result"].clone();
+            assert_eq!(
+                last["messages"][0]["message_id"]["value"],
+                "<search-1@example.test>"
+            );
+            assert_eq!(last["complete"], true);
+            assert!(last["next_cursor"].is_null());
+            reader.cancel().await.unwrap();
+            for (grant, error) in [
+                ("restricted", "mailbox_not_allowed"),
+                ("all", "stale_cursor"),
+            ] {
+                let reader = ().serve(connect(grant)).await.unwrap();
+                let before = server.accepted();
+                let response = reader
+                    .call_tool(
+                        CallToolRequestParams::new("email_search_messages").with_arguments(
+                            json!({"mailbox":reference,"limit":1,"cursor":first["next_cursor"]})
+                                .as_object()
+                                .unwrap()
+                                .clone(),
+                        ),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.is_error, Some(true));
+                assert_eq!(response.structured_content.unwrap()["error"]["code"], error);
+                assert_eq!(server.accepted(), before);
+                reader.cancel().await.unwrap();
+            }
+        });
 }
 
 fn mailbox_handoffs(

@@ -21,6 +21,7 @@ struct Expected {
     username: &'static str,
     password: &'static str,
     mailboxes: Vec<&'static str>,
+    search: Option<(&'static str, Option<u32>)>,
 }
 
 pub struct NativeServer {
@@ -66,7 +67,7 @@ impl NativeServer {
                         connection = listener.accept() => connection.unwrap().0,
                     };
                     count.fetch_add(1, Ordering::SeqCst);
-                    let Expected { username, password, mailboxes } = queue.lock().unwrap().pop_front().expect("unexpected provider connection");
+                    let Expected { username, password, mailboxes, search } = queue.lock().unwrap().pop_front().expect("unexpected provider connection");
                     tokio::select! {
                         _ = stopping.changed() => return,
                         result = tokio::time::timeout(Duration::from_secs(10), async {
@@ -80,6 +81,9 @@ impl NativeServer {
                                 let tag = imap_support::expect(&mut wire, &format!("LIST \"\" {name}")).await;
                                 let attributes = if name == "Archive" { "\\Archive" } else { "" };
                                 imap_support::write(&mut wire, &format!("* LIST ({attributes}) \"/\" {name}\r\n{tag} OK listed\r\n")).await;
+                            }
+                            if let Some((mailbox, position)) = search {
+                                search_page(&mut wire, mailbox, position).await;
                             }
                             imap_support::logout(&mut wire).await;
                         }) => result.expect("native authentication transcript deadline"),
@@ -102,6 +106,7 @@ impl NativeServer {
             username,
             password,
             mailboxes: Vec::new(),
+            search: None,
         });
     }
 
@@ -115,6 +120,22 @@ impl NativeServer {
             username,
             password,
             mailboxes: mailboxes.to_vec(),
+            search: None,
+        });
+    }
+
+    pub fn expect_search(
+        &self,
+        username: &'static str,
+        password: &'static str,
+        mailbox: &'static str,
+        position: Option<u32>,
+    ) {
+        self.expected.lock().unwrap().push_back(Expected {
+            username,
+            password,
+            mailboxes: vec![],
+            search: Some((mailbox, position)),
         });
     }
 
@@ -134,6 +155,39 @@ impl NativeServer {
             "every expected authentication occurred"
         );
     }
+}
+
+async fn search_page(wire: &mut imap_support::Wire, mailbox: &str, position: Option<u32>) {
+    use imap_support::{expect, write};
+    let tag = expect(wire, &format!("EXAMINE {mailbox}")).await;
+    write(
+        wire,
+        &format!("* 3 EXISTS\r\n* OK [UIDVALIDITY 77] stable\r\n{tag} OK [READ-ONLY] selected\r\n"),
+    )
+    .await;
+    if position.is_none() {
+        let tag = expect(wire, "UID SEARCH UID *").await;
+        write(wire, &format!("* SEARCH 3\r\n{tag} OK boundary\r\n")).await;
+    }
+    let uid = position.unwrap_or(3);
+    let tag = expect(wire, &format!("UID SEARCH UID 1:{uid}")).await;
+    let matches = (1..=uid)
+        .map(|uid| uid.to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    write(
+        wire,
+        &format!("* SEARCH {matches}\r\n{tag} OK searched\r\n"),
+    )
+    .await;
+    let tag = expect(
+        wire,
+        &format!("UID FETCH {uid} (UID ENVELOPE FLAGS INTERNALDATE RFC822.SIZE)"),
+    )
+    .await;
+    let flags = if uid == 1 { "" } else { "\\Seen" };
+    let subject = format!("Search fixture {uid} {}", "x".repeat(12000));
+    write(wire, &format!("* {uid} FETCH (UID {uid} ENVELOPE (NIL \"{subject}\" NIL NIL NIL NIL NIL NIL NIL \"<search-{uid}@example.test>\") FLAGS ({flags}) INTERNALDATE \"01-Sep-2026 12:00:00 +0000\" RFC822.SIZE 13000)\r\n{tag} OK fetched\r\n")).await;
 }
 
 impl Drop for NativeServer {

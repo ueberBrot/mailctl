@@ -138,10 +138,10 @@ impl MailboxBackend for ImapMailboxes {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Reference {
-    account: String,
-    generation: u64,
-    mailbox: String,
+pub(super) struct Reference {
+    pub(super) account: String,
+    pub(super) generation: u64,
+    pub(super) mailbox: String,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -394,7 +394,12 @@ impl Service {
         })
     }
 
-    fn encode(&self, kind: &str, value: &impl Serialize, maximum: usize) -> Result<String, Error> {
+    pub(super) fn encode(
+        &self,
+        kind: &str,
+        value: &impl Serialize,
+        maximum: usize,
+    ) -> Result<String, Error> {
         let payload = crate::encoding::serialize_bounded(value, maximum)?;
         let mut token = format!("{kind}.");
         URL_SAFE_NO_PAD.encode_string(payload, &mut token);
@@ -407,7 +412,7 @@ impl Service {
         }
         Ok(token)
     }
-    fn decode<T: DeserializeOwned>(
+    pub(super) fn decode<T: DeserializeOwned>(
         &self,
         kind: &str,
         token: &str,
@@ -430,7 +435,7 @@ impl Service {
         serde_json::from_slice(&payload).map_err(|_| invalid())
     }
 }
-fn fingerprint(value: &impl Serialize) -> Result<String, Error> {
+pub(super) fn fingerprint(value: &impl Serialize) -> Result<String, Error> {
     let bytes = crate::encoding::serialize_bounded(value, 4 * 1024 * 1024)?;
     let mut fingerprint = String::with_capacity(64);
     for byte in Sha256::digest(bytes) {

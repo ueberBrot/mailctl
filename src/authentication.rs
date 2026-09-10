@@ -152,6 +152,18 @@ pub struct Lease {
     capacity: usize,
 }
 impl Lease {
+    pub(crate) async fn search(
+        self,
+        request: crate::service::SearchRequest<'_>,
+        limits: &Limits,
+    ) -> Result<crate::service::SearchBatch, crate::domain::Error> {
+        let Self {
+            idle,
+            admission: _admission,
+            ..
+        } = self;
+        idle.connection.search(request, limits).await
+    }
     pub fn release(self) {
         let mut state = self.pool.state.lock().unwrap();
         if state.generation == self.generation
@@ -356,6 +368,9 @@ impl Runtime {
     fn validate_limits(&self, limits: &Limits) -> Result<(), Error> {
         limits.validate().map_err(|_| Error::InvalidInput)?;
         if limits.mailbox_inventory > self.limits.mailbox_inventory
+            || limits.search_page > self.limits.search_page
+            || limits.search_uid_window > self.limits.search_uid_window
+            || limits.search_windows > self.limits.search_windows
             || limits.account_connections > self.limits.account_connections
             || limits.account_pending_requests > self.limits.account_pending_requests
             || limits.secret_bytes > self.limits.secret_bytes

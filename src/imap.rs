@@ -6,6 +6,7 @@ mod body;
 mod fetch;
 mod mime;
 mod projection;
+mod search;
 mod wire;
 
 pub use append::{AppendOutcome, AppendResult, AppendUid, DraftInput, PreparedDraft};
