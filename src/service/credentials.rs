@@ -226,14 +226,6 @@ pub(super) fn authentication_error(error: authentication::Error) -> Error {
         authentication::Error::RateLimited => Error::new(ErrorCode::RateLimited),
         authentication::Error::Timeout => Error::new(ErrorCode::Timeout),
         authentication::Error::InvalidInput => Error::new(ErrorCode::InvalidRequest),
-        authentication::Error::Imap(error) => Error::new(match error {
-            crate::imap::Error::Authentication => ErrorCode::AuthenticationFailed,
-            crate::imap::Error::Tls => ErrorCode::TlsFailed,
-            crate::imap::Error::Timeout => ErrorCode::Timeout,
-            crate::imap::Error::Unsupported => ErrorCode::UnsupportedCapability,
-            crate::imap::Error::Limit => ErrorCode::ResponseTooLarge,
-            crate::imap::Error::InvalidInput => ErrorCode::InvalidRequest,
-            _ => ErrorCode::ProviderUnavailable,
-        }),
+        authentication::Error::Imap(error) => error.into(),
     }
 }

@@ -3,8 +3,11 @@ mod credentials;
 #[cfg(any(feature = "cli", feature = "mcp"))]
 pub(crate) use credentials::credential_error;
 mod mailboxes;
+mod search;
 mod state;
+mod tokens;
 use crate::encoding::{OutputBudget, serialized_size};
+pub use crate::search::{LocatedMessage, SearchBatch, SearchPosition, SearchRequest};
 use crate::{
     config::{AccountConfig, Config},
     domain::{
@@ -14,6 +17,7 @@ use crate::{
     policy::{Narrowing, RequestContext},
 };
 pub use mailboxes::{ImapMailboxes, MailboxBackend, MailboxTarget, MemoryMailboxes};
+pub use search::{ImapMessages, MemoryMessage, MemoryMessages, SearchBackend};
 use state::AccountRegistry;
 use uuid::Uuid;
 
@@ -22,6 +26,7 @@ pub struct Service {
     registry: AccountRegistry,
     context_id: Uuid,
     mailbox_backend: Option<std::sync::Arc<dyn MailboxBackend>>,
+    search_backend: Option<std::sync::Arc<dyn SearchBackend>>,
     authentication: tokio::sync::OnceCell<std::sync::Arc<crate::authentication::Runtime>>,
 }
 impl Service {
@@ -66,6 +71,7 @@ impl Service {
             registry,
             context_id: Uuid::new_v4(),
             mailbox_backend: None,
+            search_backend: None,
             authentication: tokio::sync::OnceCell::new(),
         }
     }
@@ -118,6 +124,12 @@ impl Service {
             .limits(context)?
             .envelope_bytes
             .min(context.response_limit());
+        if context
+            .permissions()
+            .contains(&crate::policy::Permission::SearchMessages)
+        {
+            return Ok(maximum);
+        }
         let mut size = 2048usize.min(maximum);
         for account in self.visible_accounts(context) {
             // Covers account identity, generation, operation names and envelope
@@ -182,9 +194,18 @@ impl Service {
             {
                 operations.push("list_mailboxes".into());
             }
+            if context
+                .permissions()
+                .contains(&crate::policy::Permission::SearchMessages)
+            {
+                operations.push("search_messages".into());
+            }
             operations
         };
         let result = match operation {
+            Operation::SearchMessages(input) => {
+                OperationResult::Messages(self.search_messages(context, input).await?)
+            }
             Operation::ListMailboxes(input) => {
                 OperationResult::Mailboxes(self.list_mailboxes(context, input).await?)
             }

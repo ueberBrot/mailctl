@@ -57,7 +57,7 @@ pub(crate) fn serialize_bounded<T: Serialize>(value: &T, maximum: usize) -> Resu
 }
 
 /// Check nesting before the JSON decoder allocates nested values.
-#[cfg(any(feature = "mcp", target_os = "macos"))]
+#[cfg(any(feature = "cli", feature = "mcp", target_os = "macos"))]
 pub(crate) fn validate_json_depth(bytes: &[u8], maximum_depth: usize) -> Result<(), Error> {
     let mut depth = 0usize;
     let mut quoted = false;

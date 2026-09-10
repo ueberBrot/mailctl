@@ -6,6 +6,7 @@ use io_imap::{
     codec::{
         CommandCodec, ResponseCodec,
         decode::Decoder,
+        encode::{Encoder, Fragment},
         fragmentizer::{FragmentInfo, Fragmentizer, LineEnding},
     },
     coroutine::{ImapCoroutine, ImapCoroutineState, ImapYield},
@@ -17,10 +18,11 @@ use io_imap::{
     send::ImapSend,
     types::{
         command::{Command, CommandBody},
-        core::TagGenerator,
+        core::{LiteralMode, TagGenerator},
         fetch::MacroOrMessageDataItemNames,
         flag::Flag,
         response::{Code, Data, Response, Status, StatusKind},
+        search::SearchKey,
     },
 };
 use std::{collections::BTreeSet, io, num::NonZeroU32, sync::Arc};
@@ -95,17 +97,40 @@ impl<'a> Connection<'a> {
     pub fn metrics(&self) -> Metrics {
         *self.metrics
     }
+    pub(super) fn limit_search(&mut self, limits: &crate::config::Limits) {
+        self.session.limits.max_literal_bytes = limits.header_bytes;
+        self.session.limits.max_response_bytes = limits
+            .header_bytes
+            .saturating_mul(2)
+            .saturating_add(16 * 1024)
+            .max(120_000)
+            .min(limits.wire_fetch_bytes);
+        self.session.limits.max_operation_bytes = limits.wire_fetch_bytes;
+        // Authentication completed at a clean command boundary. Both parsers
+        // must apply the selected operation's frame ceiling.
+        self.session.fragmentizer =
+            Fragmentizer::new(self.session.limits.max_response_bytes as u32);
+    }
     pub async fn examine(&mut self, name: &str) -> Result<u32, Error> {
-        self.drive(ImapMailboxExamine::new(
-            name.to_owned()
-                .try_into()
-                .map_err(|_| Error::InvalidInput)?,
-            Default::default(),
-        ))
-        .await?;
+        self.examine_selection(name)
+            .await
+            .map(|(validity, _)| validity)
+    }
+    pub(super) async fn examine_selection(
+        &mut self,
+        name: &str,
+    ) -> Result<(u32, Option<u32>), Error> {
+        let selection = self
+            .drive(ImapMailboxExamine::new(
+                name.to_owned()
+                    .try_into()
+                    .map_err(|_| Error::InvalidInput)?,
+                Default::default(),
+            ))
+            .await?;
         self.session
             .uid_validity
-            .map(NonZeroU32::get)
+            .map(|validity| (validity.get(), selection.uid_next.map(NonZeroU32::get)))
             .ok_or(Error::UnsafeSelection)
     }
     pub async fn upgrade(mut self, host: &str, tls: Arc<ClientConfig>) -> Result<Self, Error> {
@@ -242,7 +267,83 @@ impl<'a> Connection<'a> {
             .await
             .map_err(|_| Error::Transport)
     }
-    pub async fn drive<C, T, E>(&mut self, mut coroutine: C) -> Result<T, Error>
+    pub async fn drive<C, T, E>(&mut self, coroutine: C) -> Result<T, Error>
+    where
+        C: ImapCoroutine<Yield = ImapYield, Return = Result<T, E>>,
+    {
+        self.drive_inner(coroutine, false).await
+    }
+    /// The typed SEARCH command also authenticates fragmented literal writes.
+    pub(super) async fn search(
+        &mut self,
+        criteria: Vec<SearchKey<'static>>,
+        utf8: bool,
+    ) -> Result<Vec<NonZeroU32>, Error> {
+        if self.session.uid_validity.is_none() {
+            return Err(Error::UnsafeSelection);
+        }
+        let command = Command {
+            tag: TagGenerator::new().generate(),
+            body: CommandBody::Search {
+                charset: if utf8 {
+                    Some("UTF-8".try_into().map_err(|_| Error::InvalidInput)?)
+                } else {
+                    None
+                },
+                criteria: criteria.try_into().map_err(|_| Error::InvalidInput)?,
+                uid: true,
+            },
+        };
+        let mut literals = 0;
+        let mut bytes = 0usize;
+        for fragment in CommandCodec::new().encode(&command) {
+            match fragment {
+                Fragment::Line { data } => bytes += data.len(),
+                Fragment::Literal {
+                    data,
+                    mode: LiteralMode::Sync,
+                } => {
+                    literals += 1;
+                    bytes += data.len();
+                }
+                Fragment::Literal { .. } => return Err(Error::Unsupported),
+            }
+        }
+        if literals > 32 || bytes > 32 * 8192 + 2048 {
+            return Err(Error::Limit);
+        }
+        self.step(bytes)?;
+        self.session.command = CommandState::new(&command)?;
+        let CommandKind::Search {
+            remaining_literals, ..
+        } = &mut self.session.command.kind
+        else {
+            unreachable!()
+        };
+        *remaining_literals = literals;
+        let output = self
+            .drive_inner(ImapSend::new(CommandCodec::new(), command), true)
+            .await?;
+        if !output
+            .tagged
+            .is_some_and(|tagged| tagged.body.kind == StatusKind::Ok)
+        {
+            return Err(Error::Protocol);
+        }
+        output
+            .data
+            .into_iter()
+            .find_map(|data| match data {
+                Data::Search(uids, _) => Some(uids),
+                _ => None,
+            })
+            .ok_or(Error::Protocol)
+    }
+    async fn drive_inner<C, T, E>(
+        &mut self,
+        mut coroutine: C,
+        prepared_search: bool,
+    ) -> Result<T, Error>
     where
         C: ImapCoroutine<Yield = ImapYield, Return = Result<T, E>>,
     {
@@ -254,15 +355,26 @@ impl<'a> Connection<'a> {
             match state {
                 ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
                     let bytes = Zeroizing::new(bytes);
-                    // LOGIN is restricted to a single frame so the complete command can
-                    // be validated and its transient encoded bytes cleared after writing.
-                    let (remaining, command) = CommandCodec::new()
-                        .decode(&bytes)
-                        .map_err(|_| Error::Protocol)?;
-                    if !remaining.is_empty() {
-                        return Err(Error::Protocol);
+                    if prepared_search {
+                        let CommandKind::Search {
+                            remaining_literals,
+                            waiting_for_literal,
+                            ..
+                        } = &mut self.session.command.kind
+                        else {
+                            return Err(Error::Protocol);
+                        };
+                        *waiting_for_literal = *remaining_literals > 0;
+                    } else {
+                        // Other routes still validate one complete command before writing.
+                        let (remaining, command) = CommandCodec::new()
+                            .decode(&bytes)
+                            .map_err(|_| Error::Protocol)?;
+                        if !remaining.is_empty() {
+                            return Err(Error::Protocol);
+                        }
+                        self.session.command = CommandState::new(&command)?;
                     }
-                    self.session.command = CommandState::new(command)?;
                     if self
                         .session
                         .command
@@ -476,6 +588,8 @@ enum CommandKind {
     },
     Search {
         seen: bool,
+        remaining_literals: usize,
+        waiting_for_literal: bool,
     },
     Fetch {
         sequences: BTreeSet<u32>,
@@ -522,9 +636,9 @@ impl CommandState {
             },
         })
     }
-    fn new(command: Command<'_>) -> Result<Self, Error> {
+    fn new(command: &Command<'_>) -> Result<Self, Error> {
         let body_fetch = BodyFetch::from_command(&command.body);
-        let kind = match command.body {
+        let kind = match &command.body {
             CommandBody::Capability => CommandKind::Capability,
             CommandBody::Login { .. } => CommandKind::Login,
             CommandBody::StartTLS => CommandKind::StartTls,
@@ -535,7 +649,11 @@ impl CommandState {
                     read_only: false,
                 }
             }
-            CommandBody::Search { uid: true, .. } => CommandKind::Search { seen: false },
+            CommandBody::Search { uid: true, .. } => CommandKind::Search {
+                seen: false,
+                remaining_literals: 0,
+                waiting_for_literal: false,
+            },
             CommandBody::Fetch {
                 uid: true,
                 macro_or_item_names: MacroOrMessageDataItemNames::MessageDataItemNames(names),
@@ -583,7 +701,14 @@ impl CommandState {
                 read_only: true,
             } => Ok(Some(uid_validity)),
             CommandKind::Examine { .. } => Err(Error::UnsafeSelection),
-            CommandKind::Search { seen: false } => Err(Error::Protocol),
+            CommandKind::Search { seen: false, .. }
+            | CommandKind::Search {
+                waiting_for_literal: true,
+                ..
+            } => Err(Error::Protocol),
+            CommandKind::Search {
+                remaining_literals, ..
+            } if remaining_literals != 0 => Err(Error::Protocol),
             CommandKind::BodyFetch { seen: false, .. } => Err(Error::Protocol),
             CommandKind::Logout { bye: false, .. } | CommandKind::Logout { tagged: false, .. } => {
                 Err(Error::Protocol)
@@ -667,7 +792,12 @@ impl CommandState {
                 Data::List { .. } if matches!(self.kind, CommandKind::List) => {}
                 Data::Flags(_) | Data::Exists(_) | Data::Recent(_) | Data::Expunge(_) => {}
                 Data::Search(..) => {
-                    let CommandKind::Search { seen } = &mut self.kind else {
+                    let CommandKind::Search {
+                        seen,
+                        remaining_literals: 0,
+                        waiting_for_literal: false,
+                    } = &mut self.kind
+                    else {
                         return Err(Error::Protocol);
                     };
                     if *seen {
@@ -696,6 +826,19 @@ impl CommandState {
                 _ => return Err(Error::Unsupported),
             },
             Response::CommandContinuationRequest(_) => {
+                if let CommandKind::Search {
+                    remaining_literals,
+                    waiting_for_literal,
+                    ..
+                } = &mut self.kind
+                {
+                    if !*waiting_for_literal || *remaining_literals == 0 {
+                        return Err(Error::Protocol);
+                    }
+                    *remaining_literals -= 1;
+                    *waiting_for_literal = false;
+                    return Ok(());
+                }
                 let CommandKind::Append {
                     continuation,
                     streamed: false,

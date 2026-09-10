@@ -151,7 +151,7 @@ async fn mcp_serves_with_a_small_valid_byte_budget() {
     assert_eq!(envelope["result"]["accounts"][0]["alias"], "work");
     tokio::time::timeout(Duration::from_secs(30), async {
         for _ in 0..128 {
-            assert_eq!(client.list_all_tools().await.unwrap().len(), 3);
+            assert_eq!(client.list_all_tools().await.unwrap().len(), 4);
             let response = client
                 .call_tool(CallToolRequestParams::new("email_list_accounts"))
                 .await
@@ -199,7 +199,8 @@ async fn standalone_mcp_negotiates_schemas_and_applies_configured_grant_scope() 
         [
             "email_list_accounts",
             "email_capabilities",
-            "email_list_mailboxes"
+            "email_list_mailboxes",
+            "email_search_messages"
         ]
     );
     let discovery = &tools[0];
@@ -316,6 +317,7 @@ fn malformed_stdio_frames_are_not_parsed_or_kept_alive() {
     setup(&installation);
     for frame in [
         vec![0xff, b'\n'],
+        format!("[{}]\n", vec!["0"; 4097].join(",")).into_bytes(),
         format!("{}0{}\n", "[".repeat(65), "]".repeat(65)).into_bytes(),
         vec![b'x'; 65 * 1024],
     ] {

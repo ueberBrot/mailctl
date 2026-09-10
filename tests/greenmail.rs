@@ -93,6 +93,165 @@ fn imap_discovery_and_search_preserve_mailbox_content_identity_and_flags() {
 }
 
 #[test]
+fn application_search_pages_and_predicates_preserve_independently_observed_mailbox_state() {
+    greenmail_support::run(async {
+        use mailctl::{
+            authentication::Runtime,
+            config::Config,
+            credentials::{Availability, Secret, SecretSource, SourceError},
+            domain::{ListMailboxesInput, Operation, OperationResult, SearchMessagesInput},
+            service::{ImapMailboxes, ImapMessages, Service},
+        };
+        use std::{collections::BTreeMap, sync::Arc};
+        struct FixtureSecret;
+        impl SecretSource for FixtureSecret {
+            fn availability(&self, _: uuid::Uuid) -> Availability {
+                Availability::Available
+            }
+            fn resolve(&self, _: uuid::Uuid) -> Result<Secret, SourceError> {
+                Secret::new(b"disposable-fixture-password".to_vec())
+            }
+        }
+        let mut fixture = greenmail_support::Fixture::start().await?;
+        let before = fixture.snapshot().await?;
+        let contents = fixture.contents().await?;
+        let configuration = Config::parse(&format!(
+            r#"
+version = 1
+default_grant = "reader"
+state_dir = {state}
+[[accounts]]
+key = "fixture"
+alias = "fixture"
+server = "localhost"
+port = {port}
+username = "fixture+smoke@example.test"
+mailboxes = ["INBOX"]
+from_identities = ["fixture"]
+[accounts.credential]
+source = "session"
+[[grants]]
+name = "reader"
+accounts = ["fixture"]
+mailboxes = ["INBOX"]
+"#,
+            state = serde_json::to_string(&std::env::temp_dir().join("mailctl-greenmail-search"))?,
+            port = fixture.imaps_port()
+        ))?;
+        let runtime =
+            Arc::new(Runtime::new(configuration.limits.clone(), fixture.tls_roots()).unwrap());
+        let sources = BTreeMap::from([(
+            "fixture".into(),
+            Arc::new(FixtureSecret) as Arc<dyn SecretSource>,
+        )]);
+        let service = Service::in_memory(configuration)?
+            .with_mailbox_backend(Arc::new(ImapMailboxes::new(
+                runtime.clone(),
+                sources.clone(),
+            )))
+            .with_search_backend(Arc::new(ImapMessages::new(runtime, sources)));
+        let context = service.context("reader", &Default::default())?;
+        let OperationResult::Mailboxes(discovery) = service
+            .execute(
+                &context,
+                Operation::ListMailboxes(ListMailboxesInput::default()),
+            )
+            .await?
+        else {
+            panic!("mailbox discovery")
+        };
+        let mailbox = discovery.mailboxes[0].reference.clone();
+        let mut cursor = None;
+        let mut identifiers = Vec::new();
+        loop {
+            let OperationResult::Messages(page) = service
+                .execute(
+                    &context,
+                    Operation::SearchMessages(SearchMessagesInput {
+                        mailbox: mailbox.clone(),
+                        criteria: Default::default(),
+                        limit: Some(1),
+                        cursor,
+                    }),
+                )
+                .await?
+            else {
+                panic!("search")
+            };
+            assert_eq!(
+                page.messages.len(),
+                1,
+                "page={page:?}, before={before:?}, returned={identifiers:?}"
+            );
+            let metadata = &page.messages[0].metadata;
+            let id = metadata.message_id.value().unwrap();
+            let observed = before
+                .messages
+                .iter()
+                .find(|message| &message.message_id == id)
+                .unwrap();
+            assert_eq!(metadata.subject.value(), Some(&observed.subject));
+            assert_eq!(
+                metadata.flags.iter().any(|flag| flag == "\\Seen"),
+                observed.seen
+            );
+            identifiers.push(id.clone());
+            if page.complete {
+                assert!(page.next_cursor.is_none());
+                break;
+            }
+            cursor = Some(page.next_cursor.expect("incomplete page keeps its cursor"));
+        }
+        assert_eq!(
+            identifiers,
+            before
+                .messages
+                .iter()
+                .rev()
+                .map(|message| message.message_id.clone())
+                .collect::<Vec<_>>()
+        );
+        for (field, flag, expected) in [
+            ("required_flag", "seen", "<observed-seen@example.test>"),
+            ("forbidden_flag", "seen", "<bootstrap-smoke@example.test>"),
+        ] {
+            let criteria = serde_json::from_value(serde_json::json!([
+                {"field":field,"flag":flag}, {"field":"from","value":"sender@example.test"},
+                {"field":"text","value":"Synthetic"}, {"field":"received_after","date":"2000-01-01"}
+            ]))?;
+            let OperationResult::Messages(page) = service
+                .execute(
+                    &context,
+                    Operation::SearchMessages(SearchMessagesInput {
+                        mailbox: mailbox.clone(),
+                        criteria,
+                        limit: None,
+                        cursor: None,
+                    }),
+                )
+                .await?
+            else {
+                panic!("search")
+            };
+            assert_eq!(page.messages.len(), 1);
+            assert_eq!(
+                page.messages[0]
+                    .metadata
+                    .message_id
+                    .value()
+                    .map(String::as_str),
+                Some(expected)
+            );
+        }
+        assert_eq!(fixture.snapshot().await?, before);
+        assert_eq!(fixture.contents().await?, contents);
+        fixture.delete_user().await?;
+        fixture.shutdown().await?;
+        Ok(())
+    });
+}
+
+#[test]
 fn imap_body_reads_selected_text_without_downloading_a_large_attachment() {
     greenmail_support::run(async {
         use mailctl::imap::{BodyRequest, ImapProbe, Limits, TlsMode};

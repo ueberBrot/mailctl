@@ -46,14 +46,23 @@ impl Bounds {
             let (_, control, request) = Self::reservations(input, envelope, limits.accounts);
             control + request <= available
         };
-        // Preserve the complete application allowance whenever a reservation
-        // fits. A large response takes precedence over a larger input frame;
-        // only the configured memory ceiling may narrow the response budget.
+        // A full search can contain 32 four-KiB strings, each JSON-escaped to six
+        // bytes per source byte. Reserve its frame before sizing the response.
+        let mut input = 1024;
+        let mut upper = limits.envelope_bytes.min(1024 * 1024);
+        while input < upper {
+            let candidate = input + (upper - input).div_ceil(2);
+            if fits(candidate, 1024) {
+                input = candidate;
+            } else {
+                upper = candidate - 1;
+            }
+        }
         let mut envelope = 0;
         let mut upper = response_bound.min(limits.envelope_bytes);
         while envelope < upper {
             let candidate = envelope + (upper - envelope).div_ceil(2);
-            if fits(1024, candidate) {
+            if fits(input, candidate) {
                 envelope = candidate;
             } else {
                 upper = candidate - 1;
@@ -61,16 +70,6 @@ impl Bounds {
         }
         if envelope < 1024 {
             return Err(Error::setup_required());
-        }
-        let mut input = 1024;
-        let mut upper = limits.envelope_bytes.min(64 * 1024);
-        while input < upper {
-            let candidate = input + (upper - input).div_ceil(2);
-            if fits(candidate, envelope) {
-                input = candidate;
-            } else {
-                upper = candidate - 1;
-            }
         }
         let (output, control, request) = Self::reservations(input, envelope, limits.accounts);
         let requests = (available - control) / request;
@@ -97,16 +96,22 @@ impl Bounds {
         // MCP contains the envelope once as a Value and once as JSON text.
         // Escaping that already serialized text adds at most one byte per byte.
         // Account for the caller's JSON-RPC id and fixed protocol/tool schemas.
-        let output = (3 * envelope + input + 1024).max(16 * 1024);
+        let output = (3 * envelope + input + 1024).max(32 * 1024);
         // The permanent control allocation covers one decoder, retained client
         // initialization data and ingress scratch. SDK/Tokio encoder capacities
         // remain allocated after a response: each can grow to twice its payload;
         // Tokio's pinned STDIO implementation copies at most 2 MiB per write.
-        let control = 272 * input + 2 * output + 2 * output.min(2 * 1024 * 1024);
+        // The ingress guard caps JSON keys/values at 4096 before SDK decoding.
+        // Large frames therefore reserve bounded node overhead instead of
+        // treating every string byte as another tiny JSON value. Retain the
+        // tighter generic estimate for small frames.
+        let control_input = (272 * input).min(12 * input + 4 * 1024 * 1024);
+        let request_input = (128 * input).min(4 * input + 2 * 1024 * 1024);
+        let control = control_input + 2 * output + 2 * output.min(2 * 1024 * 1024);
         // The input/metadata survives to output completion. Domain-to-Value
         // conversion holds at most two copies of field bytes; Value plus text
         // holds at most three, including String capacity growth.
-        let request = 128 * input + 3 * envelope + structure;
+        let request = request_input + 3 * envelope + structure;
         (output, control, request)
     }
 }
@@ -137,7 +142,7 @@ impl BoundedStdio {
                 let Ok(Some(Ok(line))) = timeout(bounds.deadline, lines.next()).await else {
                     break;
                 };
-                if crate::encoding::validate_json_depth(line.as_bytes(), bounds.nesting).is_err() {
+                if validate_frame(line.as_bytes(), bounds.nesting).is_err() {
                     break;
                 }
                 let write = async {
@@ -162,6 +167,36 @@ impl BoundedStdio {
             staged: None,
         }
     }
+}
+
+fn validate_frame(bytes: &[u8], nesting: usize) -> Result<(), Error> {
+    crate::encoding::validate_json_depth(bytes, nesting)?;
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut nodes = 1usize;
+    for byte in bytes {
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if *byte == b'\\' {
+                escaped = true;
+            } else if *byte == b'"' {
+                quoted = false;
+            }
+        } else {
+            match byte {
+                b'"' => quoted = true,
+                b'{' | b'[' | b',' | b':' => {
+                    nodes += 1;
+                    if nodes > 4096 {
+                        return Err(Error::new(crate::domain::ErrorCode::InvalidRequest));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
 }
 impl Drop for BoundedStdio {
     fn drop(&mut self) {
@@ -253,5 +288,36 @@ impl Transport<RoleServer> for BoundedStdio {
     async fn close(&mut self) -> io::Result<()> {
         self.ingress.abort();
         self.sdk.close().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn bounded_sdk_decoding_fits_the_input_reservation_for_large_strings_and_many_nodes() {
+        for arguments in [
+            json!({"mailbox":"mb1.synthetic","criteria":vec![json!({"field":"text","value":"\u{1}".repeat(4096)});32]}),
+            json!({"values":vec![json!({"a":0,"b":1});500]}),
+        ] {
+            let frame = serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"email_search_messages","arguments":arguments}})).unwrap();
+            validate_frame(&frame, 32).unwrap();
+            let measured = allocation_counter::measure(|| {
+                let decoded: RxJsonRpcMessage<RoleServer> = serde_json::from_slice(&frame).unwrap();
+                let retained = decoded.clone();
+                std::hint::black_box((decoded, retained));
+            });
+            let reservation = (128 * frame.len()).min(4 * frame.len() + 2 * 1024 * 1024);
+            assert!(measured.bytes_max as usize <= reservation, "{measured:?}");
+            eprintln!(
+                "MCP input bytes={} peak={} reservation={reservation}",
+                frame.len(),
+                measured.bytes_max
+            );
+        }
+        let excessive = serde_json::to_vec(&vec![0; 4097]).unwrap();
+        assert!(validate_frame(&excessive, 32).is_err());
     }
 }
