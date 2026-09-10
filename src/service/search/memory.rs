@@ -25,7 +25,7 @@ struct MemoryMailbox {
     messages: BTreeMap<u32, MemoryMessage>,
 }
 #[derive(Default)]
-pub struct MemoryMessages(RwLock<BTreeMap<(String, String), Arc<MemoryMailbox>>>);
+pub struct MemoryMessages(RwLock<BTreeMap<String, BTreeMap<String, Arc<MemoryMailbox>>>>);
 impl MemoryMessages {
     pub fn set(
         &self,
@@ -34,16 +34,21 @@ impl MemoryMessages {
         uid_validity: u32,
         messages: Vec<MemoryMessage>,
     ) {
-        self.0.write().unwrap().insert(
-            (account_key.into(), mailbox_identity(mailbox).into()),
-            Arc::new(MemoryMailbox {
-                validity: uid_validity,
-                messages: messages
-                    .into_iter()
-                    .map(|message| (message.uid, message))
-                    .collect(),
-            }),
-        );
+        self.0
+            .write()
+            .unwrap()
+            .entry(account_key.into())
+            .or_default()
+            .insert(
+                mailbox_identity(mailbox).into(),
+                Arc::new(MemoryMailbox {
+                    validity: uid_validity,
+                    messages: messages
+                        .into_iter()
+                        .map(|message| (message.uid, message))
+                        .collect(),
+                }),
+            );
     }
 }
 impl SearchBackend for MemoryMessages {
@@ -58,10 +63,8 @@ impl SearchBackend for MemoryMessages {
                 .0
                 .read()
                 .unwrap()
-                .get(&(
-                    target.config.key.clone(),
-                    mailbox_identity(request.mailbox).into(),
-                ))
+                .get(&target.config.key)
+                .and_then(|mailboxes| mailboxes.get(mailbox_identity(request.mailbox)))
                 .cloned()
                 .ok_or_else(|| Error::new(ErrorCode::StaleReference))?;
             page(&mut MemorySelection(mailbox), &request, limits).await

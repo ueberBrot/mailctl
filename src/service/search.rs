@@ -118,11 +118,13 @@ impl Service {
             limits.token_bytes,
             ErrorCode::StaleReference,
         )?;
-        let account = self
+        let (account, id, generation) = self
             .visible_accounts(context)
-            .find(|account| self.registry.identity(&account.key).0 == reference.account)
+            .find_map(|account| {
+                let (id, generation) = self.registry.identity(&account.key);
+                (id == reference.account).then_some((account, id, generation))
+            })
             .ok_or_else(|| Error::new(ErrorCode::AccountNotAllowed))?;
-        let (id, generation) = self.registry.identity(&account.key);
         if generation != reference.generation {
             return Err(Error::new(ErrorCode::StaleReference));
         }

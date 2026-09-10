@@ -313,7 +313,7 @@ impl<'a> Connection<'a> {
             return Err(Error::Limit);
         }
         self.step(bytes)?;
-        self.session.command = CommandState::new(command.clone())?;
+        self.session.command = CommandState::new(&command)?;
         let CommandKind::Search {
             remaining_literals, ..
         } = &mut self.session.command.kind
@@ -373,7 +373,7 @@ impl<'a> Connection<'a> {
                         if !remaining.is_empty() {
                             return Err(Error::Protocol);
                         }
-                        self.session.command = CommandState::new(command)?;
+                        self.session.command = CommandState::new(&command)?;
                     }
                     if self
                         .session
@@ -636,9 +636,9 @@ impl CommandState {
             },
         })
     }
-    fn new(command: Command<'_>) -> Result<Self, Error> {
+    fn new(command: &Command<'_>) -> Result<Self, Error> {
         let body_fetch = BodyFetch::from_command(&command.body);
-        let kind = match command.body {
+        let kind = match &command.body {
             CommandBody::Capability => CommandKind::Capability,
             CommandBody::Login { .. } => CommandKind::Login,
             CommandBody::StartTLS => CommandKind::StartTls,
