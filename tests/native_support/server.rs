@@ -170,7 +170,12 @@ async fn search_page(wire: &mut imap_support::Wire, mailbox: &str, position: Opt
         write(wire, &format!("* SEARCH 3\r\n{tag} OK boundary\r\n")).await;
     }
     let uid = position.unwrap_or(3);
-    let tag = expect(wire, &format!("UID SEARCH UID 1:{uid}")).await;
+    let range = if uid == 1 {
+        "1".to_owned()
+    } else {
+        format!("1:{uid}")
+    };
+    let tag = expect(wire, &format!("UID SEARCH UID {range}")).await;
     let matches = (1..=uid)
         .map(|uid| uid.to_string())
         .collect::<Vec<_>>()

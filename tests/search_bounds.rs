@@ -314,3 +314,48 @@ fn maximum_window_budget_retains_continuation_after_empty_live_queries() {
     assert!(probe.metrics().parser_steps < 64 * 1024);
     server.join().unwrap();
 }
+
+#[test]
+fn valid_subject_text_can_contain_an_encoded_word_marker() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (mut probe, server) =
+        dedicated_fixture(TlsMode::Implicit, Limits::default(), |mut wire| {
+            Box::pin(async move {
+                authenticate(&mut wire).await;
+                select(&mut wire, 2).await;
+                let tag = expect(&mut wire, "UID SEARCH UID 1:2").await;
+                write(&mut wire, &format!("* SEARCH 1 2\r\n{tag} OK searched\r\n")).await;
+                let tag = expect(
+                    &mut wire,
+                    "UID FETCH 1:2 (UID ENVELOPE FLAGS INTERNALDATE RFC822.SIZE)",
+                )
+                .await;
+                row(&mut wire, 1, "How =? works").await;
+                row(&mut wire, 2, "=?UTF-8?Q?How_=3D=3F_works?=").await;
+                write(&mut wire, &format!("{tag} OK fetched\r\n")).await;
+                logout(&mut wire).await;
+            })
+        });
+    let criteria = SearchCriteria::default();
+    let batch = runtime
+        .block_on(probe.search_messages(
+            "fixture",
+            "disposable-password",
+            SearchRequest {
+                mailbox: "INBOX",
+                criteria: &criteria,
+                position: None,
+                limit: 2,
+                response_bytes: 1024 * 1024,
+            },
+            &config::Limits::default(),
+        ))
+        .unwrap();
+    assert!(batch.messages.iter().all(
+        |message| message.metadata.subject.value().map(String::as_str) == Some("How =? works")
+    ));
+    server.join().unwrap();
+}

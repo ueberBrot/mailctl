@@ -168,7 +168,7 @@ fn header_text(bytes: &[u8]) -> Option<String> {
     line.extend_from_slice(b"\r\n");
     let parsed = mail_parser::parsers::MessageStream::new(&line).parse_unstructured();
     match parsed {
-        mail_parser::HeaderValue::Text(value) if !value.contains("=?") => Some(value.into_owned()),
+        mail_parser::HeaderValue::Text(value) => Some(value.into_owned()),
         mail_parser::HeaderValue::Empty if bytes.iter().all(u8::is_ascii_whitespace) => {
             Some(String::new())
         }

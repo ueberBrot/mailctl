@@ -1,8 +1,11 @@
 #![cfg(any(feature = "cli", feature = "mcp"))]
 mod support;
 
+#[cfg(feature = "mcp")]
 use serde_json::json;
-use support::{Installation, envelope, run_bounded};
+#[cfg(feature = "cli")]
+use support::envelope;
+use support::{Installation, run_bounded};
 
 fn setup(installation: &Installation) {
     #[cfg(feature = "cli")]
