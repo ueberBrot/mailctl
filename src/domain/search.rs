@@ -161,7 +161,7 @@ impl TryFrom<Vec<SearchPredicate>> for SearchCriteria {
                 | Bcc { value }
                 | Subject { value }
                 | Text { value } => {
-                    if value.len() > 4096 || value.contains('\0') {
+                    if !valid_search_text(value) {
                         return Err(invalid());
                     }
                 }
@@ -231,6 +231,9 @@ fn page_limit<'de, D: serde::Deserializer<'de>>(
     }
     Ok(limit)
 }
+fn valid_search_text(value: &str) -> bool {
+    value.len() <= 4096 && !value.contains('\0')
+}
 fn search_text<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
     struct Visitor;
     impl serde::de::Visitor<'_> for Visitor {
@@ -239,7 +242,7 @@ fn search_text<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Stri
             f.write_str("at most 4096 UTF-8 bytes without NUL")
         }
         fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<String, E> {
-            if value.len() > 4096 || value.contains('\0') {
+            if !valid_search_text(value) {
                 return Err(E::custom("invalid search text"));
             }
             Ok(value.to_owned())

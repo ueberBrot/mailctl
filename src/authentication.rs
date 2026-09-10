@@ -154,9 +154,9 @@ pub struct Lease {
 impl Lease {
     pub(crate) async fn search(
         self,
-        request: crate::service::SearchRequest<'_>,
+        request: crate::search::SearchRequest<'_>,
         limits: &Limits,
-    ) -> Result<crate::service::SearchBatch, crate::domain::Error> {
+    ) -> Result<crate::search::SearchBatch, crate::domain::Error> {
         let Self {
             idle,
             admission: _admission,
@@ -371,6 +371,8 @@ impl Runtime {
             || limits.search_page > self.limits.search_page
             || limits.search_uid_window > self.limits.search_uid_window
             || limits.search_windows > self.limits.search_windows
+            || limits.header_bytes > self.limits.header_bytes
+            || limits.wire_fetch_bytes > self.limits.wire_fetch_bytes
             || limits.account_connections > self.limits.account_connections
             || limits.account_pending_requests > self.limits.account_pending_requests
             || limits.secret_bytes > self.limits.secret_bytes

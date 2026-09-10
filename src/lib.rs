@@ -12,4 +12,5 @@ pub mod imap;
 #[cfg(target_os = "macos")]
 pub mod isolation;
 pub mod policy;
+mod search;
 pub mod service;

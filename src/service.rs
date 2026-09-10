@@ -3,9 +3,11 @@ mod credentials;
 #[cfg(any(feature = "cli", feature = "mcp"))]
 pub(crate) use credentials::credential_error;
 mod mailboxes;
-pub(crate) mod search;
+mod search;
 mod state;
+mod tokens;
 use crate::encoding::{OutputBudget, serialized_size};
+pub use crate::search::{LocatedMessage, SearchBatch, SearchPosition, SearchRequest};
 use crate::{
     config::{AccountConfig, Config},
     domain::{
@@ -15,10 +17,7 @@ use crate::{
     policy::{Narrowing, RequestContext},
 };
 pub use mailboxes::{ImapMailboxes, MailboxBackend, MailboxTarget, MemoryMailboxes};
-pub use search::{
-    ImapMessages, LocatedMessage, MemoryMessage, MemoryMessages, SearchBackend, SearchBatch,
-    SearchPosition, SearchRequest,
-};
+pub use search::{ImapMessages, MemoryMessage, MemoryMessages, SearchBackend};
 use state::AccountRegistry;
 use uuid::Uuid;
 

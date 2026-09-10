@@ -290,3 +290,34 @@ impl Transport<RoleServer> for BoundedStdio {
         self.sdk.close().await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn bounded_sdk_decoding_fits_the_input_reservation_for_large_strings_and_many_nodes() {
+        for arguments in [
+            json!({"mailbox":"mb1.synthetic","criteria":vec![json!({"field":"text","value":"\u{1}".repeat(4096)});32]}),
+            json!({"values":vec![json!({"a":0,"b":1});500]}),
+        ] {
+            let frame = serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"email_search_messages","arguments":arguments}})).unwrap();
+            validate_frame(&frame, 32).unwrap();
+            let measured = allocation_counter::measure(|| {
+                let decoded: RxJsonRpcMessage<RoleServer> = serde_json::from_slice(&frame).unwrap();
+                let retained = decoded.clone();
+                std::hint::black_box((decoded, retained));
+            });
+            let reservation = (128 * frame.len()).min(4 * frame.len() + 2 * 1024 * 1024);
+            assert!(measured.bytes_max as usize <= reservation, "{measured:?}");
+            eprintln!(
+                "MCP input bytes={} peak={} reservation={reservation}",
+                frame.len(),
+                measured.bytes_max
+            );
+        }
+        let excessive = serde_json::to_vec(&vec![0; 4097]).unwrap();
+        assert!(validate_frame(&excessive, 32).is_err());
+    }
+}

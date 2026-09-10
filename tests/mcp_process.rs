@@ -317,6 +317,7 @@ fn malformed_stdio_frames_are_not_parsed_or_kept_alive() {
     setup(&installation);
     for frame in [
         vec![0xff, b'\n'],
+        format!("[{}]\n", vec!["0"; 4097].join(",")).into_bytes(),
         format!("{}0{}\n", "[".repeat(65), "]".repeat(65)).into_bytes(),
         vec![b'x'; 65 * 1024],
     ] {

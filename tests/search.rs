@@ -371,12 +371,17 @@ impl mailctl::credentials::SecretSource for SyntheticSource {
     }
 }
 async fn imap_service(fixture: &imap_support::Fixture) -> (mailctl::service::Service, String) {
+    imap_service_with_config(fixture, config()).await
+}
+async fn imap_service_with_config(
+    fixture: &imap_support::Fixture,
+    mut configuration: mailctl::config::Config,
+) -> (mailctl::service::Service, String) {
     use mailctl::{
         authentication::Runtime,
         domain::MailboxMetadata,
         service::{ImapMessages, MemoryMailboxes, Service},
     };
-    let mut configuration = config();
     configuration.accounts[0].server = "127.0.0.1".into();
     configuration.accounts[0].port = fixture.port;
     configuration.accounts[0].username = "fixture".into();
@@ -702,7 +707,6 @@ async fn search_rejects_duplicate_out_of_window_and_multiple_search_responses() 
     }
 }
 
-#[allow(dead_code)]
 mod support;
 
 #[tokio::test]
@@ -806,4 +810,110 @@ async fn persistent_search_cursors_resume_and_reauthorize_after_configuration_ch
             .code,
         ErrorCode::StaleReference
     );
+}
+
+#[tokio::test]
+async fn deletion_between_search_and_fetch_does_not_lose_unreturned_matches() {
+    use imap_support::*;
+    let mut number = 0;
+    let fixture = repeating_fixture(mailctl::imap::Limits::default(), 2, move |mut wire| {
+        number += 1;
+        let first = number == 1;
+        Box::pin(async move {
+            authenticate(&mut wire).await;
+            examine(&mut wire).await;
+            if first {
+                let tag = expect(&mut wire, "UID SEARCH UID *").await;
+                write(&mut wire, &format!("* SEARCH 3\r\n{tag} OK boundary\r\n")).await;
+            }
+            let tag = expect(
+                &mut wire,
+                if first {
+                    "UID SEARCH UID 1:3"
+                } else {
+                    "UID SEARCH UID 1"
+                },
+            )
+            .await;
+            write(
+                &mut wire,
+                &format!(
+                    "* SEARCH {}\r\n{tag} OK searched\r\n",
+                    if first { "1 2 3" } else { "1" }
+                ),
+            )
+            .await;
+            let tag = expect(
+                &mut wire,
+                if first {
+                    "UID FETCH 2:3 (UID ENVELOPE FLAGS INTERNALDATE RFC822.SIZE)"
+                } else {
+                    "UID FETCH 1 (UID ENVELOPE FLAGS INTERNALDATE RFC822.SIZE)"
+                },
+            )
+            .await;
+            if first {
+                write(&mut wire, "* 3 EXPUNGE\r\n").await;
+            }
+            fetched(&mut wire, if first { 2 } else { 1 }).await;
+            write(&mut wire, &format!("{tag} OK fetched\r\n")).await;
+            logout(&mut wire).await;
+        })
+    })
+    .await;
+    let mut configuration = config();
+    configuration.grants[0].limits.search_windows = 1;
+    let (service, reference) = imap_service_with_config(&fixture, configuration).await;
+    let first = search(&service, json!({"mailbox":reference,"limit":2})).await;
+    assert_eq!(first["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(first["complete"], false);
+    let second = search(
+        &service,
+        json!({"mailbox":reference,"limit":2,"cursor":first["next_cursor"]}),
+    )
+    .await;
+    assert_eq!(second["messages"][0]["subject"]["value"], "message 1");
+    assert_eq!(second["complete"], true);
+    fixture.task.await.unwrap();
+}
+
+#[tokio::test]
+async fn cancelling_a_search_disposes_its_lease_and_allows_another_request() {
+    use imap_support::*;
+    let started = Arc::new(tokio::sync::Notify::new());
+    let observed = started.clone();
+    let mut number = 0;
+    let fixture = repeating_fixture(mailctl::imap::Limits::default(), 2, move |mut wire| {
+        let started = started.clone();
+        number += 1;
+        let first = number == 1;
+        Box::pin(async move {
+            authenticate(&mut wire).await;
+            examine(&mut wire).await;
+            let tag = expect(&mut wire, "UID SEARCH UID *").await;
+            if first {
+                started.notify_one();
+                dropped(&mut wire).await;
+            } else {
+                write(&mut wire, &format!("* SEARCH\r\n{tag} OK empty\r\n")).await;
+                logout(&mut wire).await;
+            }
+        })
+    })
+    .await;
+    let mut configuration = config();
+    configuration.limits.account_connections = 1;
+    configuration.grants[0].limits.account_connections = 1;
+    let (service, reference) = imap_service_with_config(&fixture, configuration).await;
+    let mut request = Box::pin(search(&service, json!({"mailbox":reference})));
+    tokio::select! {
+        _ = observed.notified() => {},
+        _ = &mut request => panic!("stalled search returned before cancellation"),
+    }
+    drop(request);
+    assert_eq!(
+        search(&service, json!({"mailbox":reference})).await["complete"],
+        true
+    );
+    fixture.task.await.unwrap();
 }

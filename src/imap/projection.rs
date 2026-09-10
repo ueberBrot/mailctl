@@ -73,7 +73,39 @@ impl<'a, 'b> Projection<'a, 'b> {
             size: Some(self.size),
         }
     }
-    pub(super) fn message(self) -> crate::service::LocatedMessage {
+    /// Bound source field octets before malformed/encoded metadata can shrink or grow.
+    pub(super) fn check_header_bytes(&self, maximum: usize) -> Result<(), Error> {
+        let mut remaining = maximum;
+        let mut count = |value: &NString<'_>| {
+            let length = value.0.as_ref().map_or(0, |value| value.as_ref().len());
+            remaining = remaining.checked_sub(length).ok_or(Error::Limit)?;
+            Ok::<_, Error>(())
+        };
+        for value in [
+            &self.envelope.date,
+            &self.envelope.subject,
+            &self.envelope.in_reply_to,
+            &self.envelope.message_id,
+        ] {
+            count(value)?;
+        }
+        for addresses in [
+            &self.envelope.from,
+            &self.envelope.sender,
+            &self.envelope.reply_to,
+            &self.envelope.to,
+            &self.envelope.cc,
+            &self.envelope.bcc,
+        ] {
+            for address in addresses {
+                for value in [&address.name, &address.adl, &address.mailbox, &address.host] {
+                    count(value)?;
+                }
+            }
+        }
+        Ok(())
+    }
+    pub(super) fn message(self) -> crate::search::LocatedMessage {
         use crate::domain::MessageMetadata;
         let mut flags = self
             .flags
@@ -85,7 +117,7 @@ impl<'a, 'b> Projection<'a, 'b> {
             .collect::<Vec<_>>();
         flags.sort();
         flags.dedup();
-        crate::service::LocatedMessage {
+        crate::search::LocatedMessage {
             uid: self.uid.get(),
             metadata: MessageMetadata {
                 subject: metadata(&self.envelope.subject, header_text),

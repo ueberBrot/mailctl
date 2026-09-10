@@ -2,10 +2,7 @@
 use super::{AuthenticatedConnection, Metrics, Projection, wire::Connection};
 use crate::{
     domain::{Error, ErrorCode, SearchCriteria},
-    service::{
-        LocatedMessage, SearchBatch, SearchRequest,
-        search::{SelectedMailbox, imap_error, page},
-    },
+    search::{LocatedMessage, SearchBatch, SearchRequest, SelectedMailbox, page},
 };
 use io_imap::{
     rfc3501::{
@@ -23,17 +20,59 @@ impl AuthenticatedConnection {
         request: SearchRequest<'_>,
         limits: &crate::config::Limits,
     ) -> Result<SearchBatch, Error> {
-        super::mailbox(request.mailbox).map_err(imap_error)?;
         let mut metrics = Metrics::default();
-        let mut connection = self.0.resume(&mut metrics);
-        connection.limit_search(limits);
-        let (validity, uid_next) = connection
+        self.0
+            .resume(&mut metrics)
+            .search_messages(request, limits)
+            .await
+    }
+}
+impl super::ImapProbe {
+    /// Typed traversal through the same selected-mailbox routine used by the application.
+    /// `metrics()` retains progress after success, failure, or cancellation.
+    pub async fn search_messages(
+        &mut self,
+        username: &str,
+        password: &str,
+        request: SearchRequest<'_>,
+        limits: &crate::config::Limits,
+    ) -> Result<SearchBatch, Error> {
+        self.metrics = Metrics::default();
+        limits.validate()?;
+        super::credentials(username, password).map_err(Error::from)?;
+        let deadline = self
+            .limits
+            .operation_timeout
+            .min(std::time::Duration::from_secs(
+                limits.operation_seconds as u64,
+            ));
+        tokio::time::timeout(deadline, async {
+            let mut connection = self
+                .authenticate(username, password)
+                .await
+                .map_err(Error::from)?;
+            connection.search_messages(request, limits).await
+        })
+        .await
+        .map_err(|_| Error::new(ErrorCode::Timeout))?
+    }
+}
+impl Connection<'_> {
+    async fn search_messages(
+        &mut self,
+        request: SearchRequest<'_>,
+        limits: &crate::config::Limits,
+    ) -> Result<SearchBatch, Error> {
+        super::mailbox(request.mailbox).map_err(Error::from)?;
+        limits.validate()?;
+        self.limit_search(limits);
+        let (validity, uid_next) = self
             .examine_selection(request.mailbox)
             .await
-            .map_err(imap_error)?;
+            .map_err(Error::from)?;
         let result = page(
             &mut Selection {
-                connection: &mut connection,
+                connection: self,
                 validity,
                 uid_next,
                 header_bytes: limits.header_bytes,
@@ -42,13 +81,11 @@ impl AuthenticatedConnection {
             limits,
         )
         .await?;
-        connection
-            .drive(ImapLogout::new())
-            .await
-            .map_err(imap_error)?;
+        self.drive(ImapLogout::new()).await.map_err(Error::from)?;
         Ok(result)
     }
 }
+
 struct Selection<'a, 'b> {
     connection: &'a mut Connection<'b>,
     validity: u32,
@@ -72,7 +109,7 @@ impl SelectedMailbox for Selection<'_, '_> {
                 ImapMessageSearchOptions { uid: true },
             ))
             .await
-            .map_err(imap_error)?;
+            .map_err(Error::from)?;
         if uids.len() > 1 {
             return Err(Error::new(ErrorCode::ProviderUnavailable));
         }
@@ -96,7 +133,7 @@ impl SelectedMailbox for Selection<'_, '_> {
             .connection
             .search(keys, utf8)
             .await
-            .map_err(imap_error)?;
+            .map_err(Error::from)?;
         Ok(uids.into_iter().map(NonZeroU32::get).collect())
     }
     async fn fetch(&mut self, uids: &[u32]) -> Result<Vec<LocatedMessage>, Error> {
@@ -116,14 +153,14 @@ impl SelectedMailbox for Selection<'_, '_> {
                 },
             ))
             .await
-            .map_err(imap_error)?;
+            .map_err(Error::from)?;
         rows.into_values()
             .map(|items| {
-                let message = Projection::parse(items.as_ref())
-                    .map_err(imap_error)?
-                    .message();
-                crate::encoding::OutputBudget::new(self.header_bytes).count(&message.metadata)?;
-                Ok(message)
+                let projection = Projection::parse(items.as_ref()).map_err(Error::from)?;
+                projection
+                    .check_header_bytes(self.header_bytes)
+                    .map_err(Error::from)?;
+                Ok(projection.message())
             })
             .collect()
     }

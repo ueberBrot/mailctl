@@ -578,3 +578,18 @@ impl Connection<'_> {
         Ok(mailboxes)
     }
 }
+
+impl From<Error> for crate::domain::Error {
+    fn from(error: Error) -> Self {
+        use crate::domain::ErrorCode;
+        Self::new(match error {
+            Error::Authentication => ErrorCode::AuthenticationFailed,
+            Error::Tls => ErrorCode::TlsFailed,
+            Error::Timeout => ErrorCode::Timeout,
+            Error::Unsupported => ErrorCode::UnsupportedCapability,
+            Error::Limit => ErrorCode::ResponseTooLarge,
+            Error::InvalidInput => ErrorCode::InvalidRequest,
+            _ => ErrorCode::ProviderUnavailable,
+        })
+    }
+}

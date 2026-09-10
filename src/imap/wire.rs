@@ -101,12 +101,15 @@ impl<'a> Connection<'a> {
         self.session.limits.max_literal_bytes = limits.header_bytes;
         self.session.limits.max_response_bytes = limits
             .header_bytes
-            .saturating_add(2048)
+            .saturating_mul(2)
+            .saturating_add(16 * 1024)
             .max(120_000)
-            .min(256 * 1024);
-        self.session.limits.max_operation_bytes = limits
-            .wire_fetch_bytes
-            .max(self.session.limits.max_response_bytes);
+            .min(limits.wire_fetch_bytes);
+        self.session.limits.max_operation_bytes = limits.wire_fetch_bytes;
+        // Authentication completed at a clean command boundary. Both parsers
+        // must apply the selected operation's frame ceiling.
+        self.session.fragmentizer =
+            Fragmentizer::new(self.session.limits.max_response_bytes as u32);
     }
     pub async fn examine(&mut self, name: &str) -> Result<u32, Error> {
         self.examine_selection(name)
