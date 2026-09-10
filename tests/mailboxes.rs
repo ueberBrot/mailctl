@@ -189,6 +189,25 @@ impl mailctl::credentials::SecretSource for SyntheticSource {
     }
 }
 
+fn imap_service(mut configuration: Config, fixture: &imap_support::Fixture) -> Service {
+    configuration.accounts[0].server = "127.0.0.1".into();
+    configuration.accounts[0].port = fixture.port;
+    configuration.accounts[0].username = "fixture".into();
+    let runtime = Arc::new(
+        mailctl::authentication::Runtime::new(configuration.limits.clone(), fixture.roots.clone())
+            .unwrap(),
+    );
+    let sources = std::collections::BTreeMap::from([(
+        "work".into(),
+        Arc::new(SyntheticSource) as Arc<dyn mailctl::credentials::SecretSource>,
+    )]);
+    Service::in_memory(configuration)
+        .unwrap()
+        .with_mailbox_backend(Arc::new(mailctl::service::ImapMailboxes::new(
+            runtime, sources,
+        )))
+}
+
 #[tokio::test]
 async fn imap_runs_the_same_application_discovery_contract_with_exact_non_mutating_commands() {
     use imap_support::*;
@@ -215,25 +234,7 @@ async fn imap_runs_the_same_application_discovery_contract_with_exact_non_mutati
         })
     })
     .await;
-    let mut configuration = config();
-    configuration.accounts[0].server = "127.0.0.1".into();
-    configuration.accounts[0].port = fixture.port;
-    configuration.accounts[0].username = "fixture".into();
-    let runtime = Arc::new(
-        mailctl::authentication::Runtime::new(configuration.limits.clone(), fixture.roots.clone())
-            .unwrap(),
-    );
-    let sources = std::collections::BTreeMap::from([(
-        "work".into(),
-        Arc::new(SyntheticSource) as Arc<dyn mailctl::credentials::SecretSource>,
-    )]);
-    let backend = mailctl::service::ImapMailboxes::new(runtime, sources);
-    discovery_contract(
-        Service::in_memory(configuration)
-            .unwrap()
-            .with_mailbox_backend(Arc::new(backend)),
-    )
-    .await;
+    discovery_contract(imap_service(config(), &fixture)).await;
     fixture.task.await.unwrap();
 }
 
@@ -247,25 +248,9 @@ async fn imap_preserves_ampersands_and_deduplicates_exact_server_identities() {
         logout(&mut wire).await;
     })).await;
     let mut configuration = config();
-    configuration.accounts[0].server = "127.0.0.1".into();
-    configuration.accounts[0].port = fixture.port;
-    configuration.accounts[0].username = "fixture".into();
     configuration.accounts[0].mailboxes = vec!["Projects & notes".into()];
     configuration.grants[0].mailboxes = vec!["Projects & notes".into()];
-    let runtime = Arc::new(
-        mailctl::authentication::Runtime::new(configuration.limits.clone(), fixture.roots.clone())
-            .unwrap(),
-    );
-    let backend = mailctl::service::ImapMailboxes::new(
-        runtime,
-        std::collections::BTreeMap::from([(
-            "work".into(),
-            Arc::new(SyntheticSource) as Arc<dyn mailctl::credentials::SecretSource>,
-        )]),
-    );
-    let service = Service::in_memory(configuration)
-        .unwrap()
-        .with_mailbox_backend(Arc::new(backend));
+    let service = imap_service(configuration, &fixture);
     let context = service.context("reader", &Narrowing::default()).unwrap();
     let OperationResult::Mailboxes(page) = service
         .execute(
@@ -668,27 +653,8 @@ async fn imap_fails_explicitly_on_malformed_unrequested_conflicting_and_oversize
         })
         .await;
         let mut configuration = config();
-        configuration.accounts[0].server = "127.0.0.1".into();
-        configuration.accounts[0].port = fixture.port;
-        configuration.accounts[0].username = "fixture".into();
         configuration.accounts[0].mailboxes = vec!["INBOX".into()];
-        let runtime = Arc::new(
-            mailctl::authentication::Runtime::new(
-                configuration.limits.clone(),
-                fixture.roots.clone(),
-            )
-            .unwrap(),
-        );
-        let backend = mailctl::service::ImapMailboxes::new(
-            runtime,
-            std::collections::BTreeMap::from([(
-                "work".into(),
-                Arc::new(SyntheticSource) as Arc<dyn mailctl::credentials::SecretSource>,
-            )]),
-        );
-        let service = Service::in_memory(configuration)
-            .unwrap()
-            .with_mailbox_backend(Arc::new(backend));
+        let service = imap_service(configuration, &fixture);
         assert_eq!(
             list(&service, "reader", ListMailboxesInput::default())
                 .await
@@ -734,4 +700,165 @@ async fn configured_inventory_ceiling_returns_all_thousand_mailboxes_without_fal
             .collect::<Vec<_>>(),
         names
     );
+}
+
+#[test]
+fn a_small_response_budget_stops_large_page_assembly() {
+    let memory = Arc::new(MemoryMailboxes::default());
+    let names = (0..1000)
+        .map(|index| format!("Mailbox{index:04}{}", "x".repeat(750)))
+        .collect::<Vec<_>>();
+    memory.set("work", names.iter().map(|name| metadata(name)).collect());
+    let mut configuration = config();
+    configuration.accounts[0].mailboxes = names.clone();
+    configuration.grants[0].mailboxes = names;
+    configuration.limits.mailbox_page = 1000;
+    configuration.grants[0].limits.mailbox_page = 1000;
+    let service = Service::in_memory(configuration)
+        .unwrap()
+        .with_mailbox_backend(memory);
+    let context = service.context("reader", &Narrowing::default()).unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let small = context.clone().with_response_limit(600);
+    let restricted = allocation_counter::measure(|| {
+        assert_eq!(
+            runtime
+                .block_on(service.execute(
+                    &small,
+                    Operation::ListMailboxes(ListMailboxesInput::default())
+                ))
+                .unwrap_err()
+                .code,
+            mailctl::domain::ErrorCode::ResponseTooLarge
+        );
+    });
+    let complete = allocation_counter::measure(|| {
+        assert!(
+            runtime
+                .block_on(service.execute(
+                    &context,
+                    Operation::ListMailboxes(ListMailboxesInput::default())
+                ))
+                .is_ok()
+        );
+    });
+    assert!(
+        restricted.bytes_total + 1024 * 1024 < complete.bytes_total,
+        "a refused page must avoid allocating its mailbox references and labels: restricted={restricted:?}, complete={complete:?}"
+    );
+}
+
+#[tokio::test]
+async fn imap_runtime_inventory_ceiling_is_enforced_before_credential_work() {
+    use mailctl::{
+        authentication::Runtime,
+        credentials::{Availability, Secret, SecretSource, SourceError},
+        domain::ErrorCode,
+    };
+    struct Missing(std::sync::atomic::AtomicUsize);
+    impl SecretSource for Missing {
+        fn availability(&self, _: uuid::Uuid) -> Availability {
+            Availability::Missing
+        }
+        fn resolve(&self, _: uuid::Uuid) -> Result<Secret, SourceError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(SourceError::Missing)
+        }
+    }
+    let configuration = config();
+    let mut runtime_limits = configuration.limits.clone();
+    runtime_limits.mailbox_page = 1;
+    runtime_limits.mailbox_inventory = 1;
+    let runtime = Arc::new(
+        Runtime::new(runtime_limits, tokio_rustls::rustls::RootCertStore::empty()).unwrap(),
+    );
+    let missing = Arc::new(Missing(std::sync::atomic::AtomicUsize::new(0)));
+    let backend = mailctl::service::ImapMailboxes::new(
+        runtime,
+        std::collections::BTreeMap::from([(
+            "work".into(),
+            missing.clone() as Arc<dyn SecretSource>,
+        )]),
+    );
+    let service = Service::in_memory(configuration)
+        .unwrap()
+        .with_mailbox_backend(Arc::new(backend));
+    assert_eq!(
+        list(&service, "reader", ListMailboxesInput::default())
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::InvalidRequest
+    );
+    assert_eq!(missing.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn cancelled_and_timed_out_discovery_release_the_connection_and_admission() {
+    use imap_support::*;
+    for cancel in [true, false] {
+        let ready = Arc::new(tokio::sync::Notify::new());
+        let mut first = true;
+        let notify = ready.clone();
+        let fixture = repeating_fixture(mailctl::imap::Limits::default(), 2, move |mut wire| {
+            let stalled = first;
+            first = false;
+            let ready = notify.clone();
+            Box::pin(async move {
+                authenticate(&mut wire).await;
+                let tag = expect(&mut wire, "LIST \"\" INBOX").await;
+                if stalled {
+                    ready.notify_one();
+                    dropped(&mut wire).await;
+                } else {
+                    write(
+                        &mut wire,
+                        &format!("* LIST () \"/\" INBOX\r\n{tag} OK listed\r\n"),
+                    )
+                    .await;
+                    logout(&mut wire).await;
+                }
+            })
+        })
+        .await;
+        let mut configuration = config();
+        configuration.accounts[0].mailboxes = vec!["INBOX".into()];
+        for limits in [
+            &mut configuration.limits,
+            &mut configuration.grants[0].limits,
+        ] {
+            limits.operation_seconds = 1;
+            limits.connection_seconds = 1;
+            limits.initialization_seconds = 1;
+            limits.account_connections = 1;
+        }
+        let service = Arc::new(imap_service(configuration, &fixture));
+        let running = service.clone();
+        let task =
+            tokio::spawn(
+                async move { list(&running, "reader", ListMailboxesInput::default()).await },
+            );
+        tokio::time::timeout(std::time::Duration::from_secs(3), ready.notified())
+            .await
+            .unwrap();
+        if cancel {
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        } else {
+            assert_eq!(
+                task.await.unwrap().unwrap_err().code,
+                mailctl::domain::ErrorCode::Timeout
+            );
+        }
+        assert!(
+            list(&service, "reader", ListMailboxesInput::default())
+                .await
+                .unwrap()
+                .complete
+        );
+        fixture.task.await.unwrap();
+    }
 }

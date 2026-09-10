@@ -552,3 +552,12 @@ fn bounded_optional_string<'de, D: serde::Deserializer<'de>, const MAX: usize>(
     }
     Option::<Bounded<MAX>>::deserialize(deserializer).map(|value| value.map(|value| value.0))
 }
+
+/// IMAP reserves case-insensitive INBOX; every other mailbox keeps its exact identity.
+pub(crate) fn mailbox_identity(name: &str) -> &str {
+    if name.eq_ignore_ascii_case("INBOX") {
+        "INBOX"
+    } else {
+        name
+    }
+}

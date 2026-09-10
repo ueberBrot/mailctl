@@ -355,7 +355,8 @@ impl Runtime {
 
     fn validate_limits(&self, limits: &Limits) -> Result<(), Error> {
         limits.validate().map_err(|_| Error::InvalidInput)?;
-        if limits.account_connections > self.limits.account_connections
+        if limits.mailbox_inventory > self.limits.mailbox_inventory
+            || limits.account_connections > self.limits.account_connections
             || limits.account_pending_requests > self.limits.account_pending_requests
             || limits.secret_bytes > self.limits.secret_bytes
             || limits.operation_seconds > self.limits.operation_seconds

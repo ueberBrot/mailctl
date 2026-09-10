@@ -143,7 +143,8 @@ impl Service {
                     .iter()
                     .filter(|name| {
                         grant.mailboxes.iter().any(|allowed| {
-                            mailboxes::identity(name) == mailboxes::identity(allowed)
+                            crate::domain::mailbox_identity(name)
+                                == crate::domain::mailbox_identity(allowed)
                         })
                     })
                     .map(|name| {

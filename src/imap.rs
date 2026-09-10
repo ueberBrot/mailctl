@@ -1,4 +1,5 @@
 //! Bounded IMAP route proofs. Each operation owns and disposes its connection.
+use crate::domain::mailbox_identity;
 mod append;
 mod attachment;
 mod body;
@@ -45,7 +46,7 @@ impl AuthenticatedConnection {
         let mut connection = self.0.resume(&mut metrics);
         let names = allowlist
             .iter()
-            .map(|name| (identity(name), name))
+            .map(|name| (mailbox_identity(name), name))
             .collect();
         let result = connection.discover_names(names, maximum).await?;
         connection.drive(ImapLogout::new()).await?;
@@ -359,7 +360,7 @@ impl ImapProbe {
         let mut names = BTreeMap::new();
         for name in allowlist {
             mailbox(name)?;
-            names.insert(identity(name), name);
+            names.insert(mailbox_identity(name), name);
         }
         tokio::time::timeout(self.limits.operation_timeout, async {
             let maximum = self.limits.max_mailboxes;
@@ -515,13 +516,6 @@ pub(crate) fn mailbox(name: &str) -> Result<(), Error> {
     }
     Ok(())
 }
-fn identity(name: &str) -> &str {
-    if name.eq_ignore_ascii_case("INBOX") {
-        "INBOX"
-    } else {
-        name
-    }
-}
 
 impl Connection<'_> {
     async fn discover_names(
@@ -532,6 +526,7 @@ impl Connection<'_> {
         let mut mailboxes = Vec::with_capacity(names.len());
         let mut row_count = 0usize;
         for (expected, name) in names {
+            // The coroutine decodes response names; its LIST pattern needs wire encoding.
             let wire_name = name.replace('&', "&-");
             let pattern = wire_name
                 .clone()
@@ -554,7 +549,7 @@ impl Connection<'_> {
                     WireMailbox::Other(name) => String::from_utf8(name.inner().as_ref().to_vec())
                         .map_err(|_| Error::Protocol)?,
                 };
-                if identity(&returned) != expected {
+                if mailbox_identity(&returned) != expected {
                     return Err(Error::Protocol);
                 }
                 let mut attributes: Vec<_> = attrs.iter().map(ToString::to_string).collect();

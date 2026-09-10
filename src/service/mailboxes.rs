@@ -1,5 +1,6 @@
 //! Authorized mailbox inventories and installation-scoped references.
 use super::Service;
+use crate::domain::mailbox_identity;
 use crate::{
     config::{AccountConfig, Limits},
     domain::{Error, ErrorCode, ListMailboxesInput, Mailbox, MailboxDiscovery, MailboxMetadata},
@@ -60,7 +61,7 @@ impl MailboxBackend for MemoryMailboxes {
                 .filter(|mailbox| {
                     names
                         .iter()
-                        .any(|name| identity(name) == identity(&mailbox.name))
+                        .any(|name| mailbox_identity(name) == mailbox_identity(&mailbox.name))
                 })
                 .cloned()
                 .collect())
@@ -163,6 +164,17 @@ impl Service {
         context: &RequestContext,
         input: ListMailboxesInput,
     ) -> Result<MailboxDiscovery, Error> {
+        let deadline = Duration::from_secs(self.grant(context)?.limits.operation_seconds as u64);
+        tokio::time::timeout(deadline, self.list_mailboxes_inner(context, input))
+            .await
+            .map_err(|_| Error::new(ErrorCode::Timeout))?
+    }
+
+    async fn list_mailboxes_inner(
+        &self,
+        context: &RequestContext,
+        input: ListMailboxesInput,
+    ) -> Result<MailboxDiscovery, Error> {
         let grant = self.grant(context)?;
         if !context.permissions().contains(&Permission::ListMailboxes) {
             return Err(super::denied());
@@ -210,11 +222,11 @@ impl Service {
             if !account
                 .mailboxes
                 .iter()
-                .any(|name| identity(name) == identity(&reference.mailbox))
+                .any(|name| mailbox_identity(name) == mailbox_identity(&reference.mailbox))
                 || !grant
                     .mailboxes
                     .iter()
-                    .any(|name| identity(name) == identity(&reference.mailbox))
+                    .any(|name| mailbox_identity(name) == mailbox_identity(&reference.mailbox))
             {
                 return Err(Error::new(ErrorCode::MailboxNotAllowed));
             }
@@ -240,17 +252,17 @@ impl Service {
             .mailboxes
             .iter()
             .filter(|name| {
-                reference
-                    .as_ref()
-                    .is_none_or(|reference| identity(name) == identity(&reference.mailbox))
+                reference.as_ref().is_none_or(|reference| {
+                    mailbox_identity(name) == mailbox_identity(&reference.mailbox)
+                })
             })
             .filter(|name| {
                 grant
                     .mailboxes
                     .iter()
-                    .any(|allowed| identity(allowed) == identity(name))
+                    .any(|allowed| mailbox_identity(allowed) == mailbox_identity(name))
             })
-            .map(|name| (identity(name).to_owned(), name.clone()))
+            .map(|name| (mailbox_identity(name).to_owned(), name.clone()))
             .collect::<BTreeMap<_, _>>()
             .into_values()
             .collect::<Vec<_>>();
@@ -266,23 +278,16 @@ impl Service {
                 None => {
                     live = ImapMailboxes::new(
                         self.authentication().await?.clone(),
-                        self.config
-                            .accounts
-                            .iter()
-                            .map(|account| {
-                                (
-                                    account.key.clone(),
-                                    crate::credentials::source_for(&account.credential),
-                                )
-                            })
-                            .collect(),
+                        BTreeMap::from([(
+                            account.key.clone(),
+                            crate::credentials::source_for(&account.credential),
+                        )]),
                     );
                     &live
                 }
             };
-            tokio::time::timeout(
-                Duration::from_secs(limits.operation_seconds as u64),
-                backend.discover(
+            backend
+                .discover(
                     MailboxTarget {
                         account_id: id,
                         generation,
@@ -290,10 +295,8 @@ impl Service {
                     },
                     &names,
                     limits,
-                ),
-            )
-            .await
-            .map_err(|_| Error::new(ErrorCode::Timeout))??
+                )
+                .await?
         };
         if rows.len() > limits.mailbox_inventory {
             return Err(Error::new(ErrorCode::ResponseTooLarge));
@@ -304,13 +307,13 @@ impl Service {
                 || row.name.len() > 1024
                 || !names
                     .iter()
-                    .any(|name| identity(name) == identity(&row.name))
+                    .any(|name| mailbox_identity(name) == mailbox_identity(&row.name))
                 || row.special_use.len() > 16
                 || row.special_use.iter().any(|flag| flag.len() > 64)
             {
                 return Err(Error::new(ErrorCode::ProviderUnavailable));
             }
-            row.name = identity(&row.name).to_owned();
+            row.name = mailbox_identity(&row.name).to_owned();
             row.special_use.sort();
             row.special_use.dedup();
             if let Some(previous) = inventory.insert(row.name.clone(), row.clone())
@@ -347,8 +350,15 @@ impl Service {
                 limits.token_bytes,
             )?)
         };
+        let mut budget =
+            crate::encoding::OutputBudget::new(context.response_limit().saturating_sub(512));
+        budget.reserve(256)?;
+        budget.count(&next_cursor)?;
         let mut mailboxes = Vec::new();
         for metadata in inventory.into_values().skip(position).take(limit) {
+            budget.reserve(256)?;
+            budget.count(&metadata)?;
+            budget.count(&metadata.name)?;
             let reference = self.encode(
                 "mb1",
                 &Reference {
@@ -358,6 +368,7 @@ impl Service {
                 },
                 limits.token_bytes,
             )?;
+            budget.count(&reference)?;
             mailboxes.push(Mailbox {
                 reference,
                 account_id: id.into(),
@@ -417,11 +428,4 @@ fn fingerprint(value: &impl Serialize) -> Result<String, Error> {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect())
-}
-pub(crate) fn identity(name: &str) -> &str {
-    if name.eq_ignore_ascii_case("INBOX") {
-        "INBOX"
-    } else {
-        name
-    }
 }
