@@ -1,5 +1,6 @@
 //! Account discovery and access-grant authorization through one application interface.
 mod credentials;
+#[cfg(any(feature = "cli", feature = "mcp"))]
 pub(crate) use credentials::credential_error;
 mod state;
 use crate::encoding::{OutputBudget, serialized_size};
@@ -193,6 +194,7 @@ impl Service {
     }
     fn capacity(limits: &crate::config::Limits) -> Capacity {
         Capacity {
+            isolation: None,
             per_process: ProcessCapacity {
                 active_requests: limits.active_requests as u64,
                 queued_requests: limits.queued_requests as u64,
@@ -224,7 +226,7 @@ impl Service {
     fn visible_accounts<'a>(
         &'a self,
         context: &'a RequestContext,
-    ) -> impl Iterator<Item = &'a AccountConfig> {
+    ) -> impl ExactSizeIterator<Item = &'a AccountConfig> {
         context
             .account_indices()
             .iter()

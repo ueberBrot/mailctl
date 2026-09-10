@@ -9,5 +9,7 @@ mod file_storage;
 #[cfg(any(feature = "cli", feature = "mcp"))]
 pub mod frontends;
 pub mod imap;
+#[cfg(target_os = "macos")]
+pub mod isolation;
 pub mod policy;
 pub mod service;

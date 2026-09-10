@@ -40,3 +40,24 @@ fn cli_setup_initializes_an_explicit_disposable_installation() {
     assert_eq!(result["grants"], 3);
     assert!(result["installation_id"].is_string());
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn isolated_invocation_is_explicit_and_cannot_run_operator_setup() {
+    let help = Command::new(MAILCTL).arg("--help").output().unwrap();
+    assert!(
+        String::from_utf8(help.stdout)
+            .unwrap()
+            .contains("--isolated")
+    );
+
+    let installation = Installation::empty();
+    let output = run_bounded({
+        let mut command = installation.cli();
+        command.args(["--isolated", "--json", "setup"]);
+        command
+    });
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(envelope(&output)["error"]["code"], "invalid_request");
+    assert!(!installation.config().exists());
+}

@@ -452,6 +452,16 @@ pub struct Setup {
 #[serde(deny_unknown_fields)]
 pub struct Capacity {
     pub per_process: ProcessCapacity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isolation: Option<IsolationCapacity>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct IsolationCapacity {
+    pub sessions: u64,
+    pub active_requests_per_session: u64,
+    pub request_bytes: u64,
+    pub session_seconds: u64,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]

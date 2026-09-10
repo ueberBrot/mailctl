@@ -1,4 +1,5 @@
 //! Executable lifecycle and presentation around the embedded application contract.
+mod application;
 mod arguments;
 mod configuration;
 mod credentials;
@@ -11,8 +12,8 @@ mod mcp_transport;
 use crate::{
     domain::{Envelope, Error, ErrorCode, OperationResult},
     policy::Narrowing,
-    service::Service,
 };
+use application::Application;
 use arguments::{Action, Invocation};
 use clap::FromArgMatches;
 use diagnostics::{Color, LogFormat, Options};
@@ -104,7 +105,7 @@ pub fn run(executable: Executable) -> ExitCode {
         };
         match result {
             Ok(code) => code,
-            Err(error) => report(json, options.color, Err(error), None, 30).await,
+            Err(error) => report(json, options.color, Err(error), (), 30).await,
         }
     });
     // STDIO workers may remain blocked after cancellation; process exit releases their leases.
@@ -113,7 +114,14 @@ pub fn run(executable: Executable) -> ExitCode {
 }
 
 async fn execute(invocation: Invocation) -> Result<u8, Error> {
-    let Invocation { options, action } = invocation;
+    let Invocation {
+        mut options,
+        action,
+    } = invocation;
+    #[cfg(target_os = "macos")]
+    if options.isolated {
+        return execute_isolated(options, action).await;
+    }
     if let Action::Setup(args) = action {
         let json = options.json;
         let color = options.diagnostics.color;
@@ -122,34 +130,20 @@ async fn execute(invocation: Invocation) -> Result<u8, Error> {
         })
         .await
         .map_err(|_| Error::new(ErrorCode::InternalError))??;
-        return Ok(report(json, color, Ok(OperationResult::Setup(setup)), None, 30).await);
+        return Ok(report(json, color, Ok(OperationResult::Setup(setup)), (), 30).await);
     }
     let config = configuration::load(&options.config)?;
     let deadline = config.limits.operation_seconds;
     let selected = options
         .grant
-        .as_deref()
-        .unwrap_or(&config.default_grant)
-        .to_owned();
-    #[allow(unused_mut)]
-    let mut narrowing = Narrowing {
-        read_only: options.read_only,
-        accounts: (!options.accounts.is_empty()).then_some(options.accounts),
-    };
-    #[cfg(feature = "mcp")]
-    if let Action::Mcp {
-        use_configured_grant,
-    } = action
-    {
-        if options.json {
-            return Err(Error::new(ErrorCode::InvalidRequest));
-        }
-        narrowing.read_only |= !use_configured_grant;
-    }
+        .take()
+        .unwrap_or_else(|| config.default_grant.clone());
+    let narrowing = invocation_narrowing(&mut options, &action)?;
     let shutdown = termination_signal()?;
     tokio::pin!(shutdown);
+    let config_path = options.config.clone();
     let initialization =
-        tokio::task::spawn_blocking(move || configuration::open(&options.config, config));
+        tokio::task::spawn_blocking(move || configuration::open(&config_path, config));
     let service = tokio::select! {
         _ = &mut shutdown => return Err(Error::new(ErrorCode::Cancelled)),
         result = initialization => result.map_err(|_| Error::new(ErrorCode::InternalError))??,
@@ -177,43 +171,92 @@ async fn execute(invocation: Invocation) -> Result<u8, Error> {
         .await);
     }
     let context = service.context(&selected, &narrowing)?;
-    match action {
-        Action::Doctor { check_account } => {
-            let result = tokio::select! {
-                _ = &mut shutdown => Err(Error::new(ErrorCode::Cancelled)),
-                result = tokio::time::timeout(Duration::from_secs(deadline as u64), service.doctor(&context, check_account)) =>
-                    result.map_err(|_| Error::new(ErrorCode::Timeout)).flatten(),
-            };
-            Ok(report(
-                options.json,
-                options.diagnostics.color,
-                result.map(OperationResult::Doctor),
-                Some(service),
-                deadline,
-            )
-            .await)
-        }
-        #[cfg(feature = "mcp")]
-        Action::Mcp { .. } => {
-            tokio::select! {
-                _ = &mut shutdown => Err(Error::new(ErrorCode::Cancelled)),
-                result = mcp::run(service, context) => result.map(|()| 0),
-            }
-        }
-        #[cfg(feature = "cli")]
-        Action::Email(operation) => {
-            let result = service.execute(&context, operation);
-            Ok(report(
-                options.json,
-                options.diagnostics.color,
-                result,
-                Some(service),
-                deadline,
-            )
-            .await)
-        }
-        Action::Setup(_) | Action::Credential(_) => unreachable!(),
+    execute_application(
+        options,
+        action,
+        Application::Embedded {
+            service: Box::new(service),
+            context,
+        },
+    )
+    .await
+}
+
+#[cfg(target_os = "macos")]
+async fn execute_isolated(mut options: arguments::Options, action: Action) -> Result<u8, Error> {
+    if matches!(action, Action::Setup(_) | Action::Credential(_)) {
+        return Err(Error::new(ErrorCode::InvalidRequest));
     }
+    let narrowing = invocation_narrowing(&mut options, &action)?;
+    let shutdown = termination_signal()?;
+    tokio::pin!(shutdown);
+    let client = tokio::select! {
+        _ = &mut shutdown => return Err(Error::new(ErrorCode::Cancelled)),
+        result = crate::isolation::Client::connect(narrowing) => result?,
+    };
+    execute_application(options, action, Application::Isolated(Box::new(client))).await
+}
+
+fn invocation_narrowing(
+    options: &mut arguments::Options,
+    _action: &Action,
+) -> Result<Narrowing, Error> {
+    #[allow(unused_mut)]
+    let mut narrowing = Narrowing {
+        read_only: options.read_only,
+        accounts: (!options.accounts.is_empty()).then(|| std::mem::take(&mut options.accounts)),
+    };
+    #[cfg(feature = "mcp")]
+    if let Action::Mcp {
+        use_configured_grant,
+    } = _action
+    {
+        if options.json {
+            return Err(Error::new(ErrorCode::InvalidRequest));
+        }
+        narrowing.read_only |= !*use_configured_grant;
+    }
+    Ok(narrowing)
+}
+
+async fn execute_application(
+    options: arguments::Options,
+    action: Action,
+    application: Application,
+) -> Result<u8, Error> {
+    let deadline = application.limits()?.operation_seconds;
+    let shutdown = termination_signal()?;
+    tokio::pin!(shutdown);
+    #[cfg(feature = "mcp")]
+    if matches!(action, Action::Mcp { .. }) {
+        return tokio::select! {
+            _ = &mut shutdown => Err(Error::new(ErrorCode::Cancelled)),
+            result = mcp::run(application) => result.map(|()| 0),
+        };
+    }
+    let operation = async {
+        match action {
+            Action::Doctor { check_account } => application.doctor(check_account).await,
+            #[cfg(feature = "cli")]
+            Action::Email(operation) => application.execute(operation).await,
+            #[cfg(feature = "mcp")]
+            Action::Mcp { .. } => unreachable!(),
+            Action::Setup(_) | Action::Credential(_) => unreachable!(),
+        }
+    };
+    let result = tokio::select! {
+        _ = &mut shutdown => Err(Error::new(ErrorCode::Cancelled)),
+        result = tokio::time::timeout(Duration::from_secs(deadline as u64), operation) =>
+            result.map_err(|_| Error::new(ErrorCode::Timeout)).flatten(),
+    };
+    Ok(report(
+        options.json,
+        options.diagnostics.color,
+        result,
+        application,
+        deadline,
+    )
+    .await)
 }
 
 fn termination_signal() -> Result<impl Future<Output = ()>, Error> {
@@ -236,11 +279,11 @@ fn termination_signal() -> Result<impl Future<Output = ()>, Error> {
     }
 }
 
-async fn report(
+async fn report<O: Send + 'static>(
     json: bool,
     color: Color,
     result: Result<OperationResult, Error>,
-    owner: Option<Service>,
+    owner: O,
     seconds: usize,
 ) -> u8 {
     let envelope = Envelope::from_result(uuid::Uuid::new_v4().to_string(), result);
