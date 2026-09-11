@@ -1,5 +1,7 @@
 ## Agent skills
 
+Follow [commit conventions](README.md#commit-conventions) for PR titles and commits made directly to `main`.
+
 ### Issue tracker
 
 Issues and specs live in GitHub Issues for `ueberBrot/mailctl`. Before tracker operations, read `docs/agents/issue-tracker.md`.
