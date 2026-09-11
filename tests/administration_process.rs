@@ -218,6 +218,66 @@ fn setup_guidance_is_actionable_without_a_sibling_executable() {
 }
 
 #[test]
+fn unsupported_configuration_and_state_versions_preserve_established_identities() {
+    for executable in executables() {
+        let installation = Installation::two_accounts();
+        assert_success(&run_bounded({
+            let mut command = installation.command(executable);
+            command.args(["--json", "setup"]);
+            command
+        }));
+        let original = std::fs::read_to_string(installation.config()).unwrap();
+        let state_path = installation
+            .config()
+            .parent()
+            .unwrap()
+            .join("state/accounts.json");
+        let state = std::fs::read(&state_path).unwrap();
+        let unsupported = original.replacen("version = 1", "version = 999", 1);
+        std::fs::write(installation.config(), &unsupported).unwrap();
+        let output = run_bounded({
+            let mut command = installation.command(executable);
+            command.args(["--json", "setup", "--alias", "work"]);
+            command
+        });
+        assert_eq!(output.status.code(), Some(2));
+        assert!(
+            envelope(&output)["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("compatible")
+        );
+        assert_eq!(std::fs::read(&state_path).unwrap(), state);
+        assert_eq!(
+            std::fs::read_to_string(installation.config()).unwrap(),
+            unsupported
+        );
+        std::fs::write(installation.config(), &original).unwrap();
+        let mut future_state: serde_json::Value = serde_json::from_slice(&state).unwrap();
+        future_state["version"] = serde_json::json!(999);
+        let future_state = serde_json::to_vec(&future_state).unwrap();
+        std::fs::write(&state_path, &future_state).unwrap();
+        let output = run_bounded({
+            let mut command = installation.command(executable);
+            command.args(["--json", "setup", "--alias", "work"]);
+            command
+        });
+        assert_eq!(output.status.code(), Some(2));
+        assert!(
+            envelope(&output)["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("compatible")
+        );
+        assert_eq!(std::fs::read(&state_path).unwrap(), future_state);
+        assert_eq!(
+            std::fs::read_to_string(installation.config()).unwrap(),
+            original
+        );
+    }
+}
+
+#[test]
 fn setup_rejects_an_oversized_replacement_without_changing_configuration() {
     for executable in executables() {
         let installation = Installation::two_accounts();

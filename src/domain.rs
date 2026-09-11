@@ -50,6 +50,14 @@ pub struct Error {
     pub credential_failure: Option<CredentialFailure>,
 }
 impl Error {
+    pub fn incompatible_schema() -> Self {
+        Self {
+            code: ErrorCode::InvalidRequest,
+            message: "Unsupported configuration or state schema; install compatible CLI/MCP versions and restart active processes. Preserve existing configuration and history".into(),
+            retryable: false,
+            credential_failure: None,
+        }
+    }
     pub fn setup_required() -> Self {
         Self {
             code: ErrorCode::InvalidRequest,

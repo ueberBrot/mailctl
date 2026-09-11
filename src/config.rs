@@ -236,9 +236,11 @@ impl Config {
         Ok(config)
     }
     pub fn validate(&self) -> Result<(), Error> {
+        if self.version != 1 {
+            return Err(Error::incompatible_schema());
+        }
         self.limits.validate()?;
-        if self.version != 1
-            || !safe_path(&self.state_dir)
+        if !safe_path(&self.state_dir)
             || self.accounts.len() > self.limits.accounts
             || self.grants.is_empty()
             || self.grants.len() > self.limits.grants

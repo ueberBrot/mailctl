@@ -71,8 +71,10 @@ impl Registry {
         })
     }
     fn validate(&self) -> Result<(), Error> {
-        if self.version != 1
-            || Uuid::parse_str(&self.installation).is_err()
+        if self.version != 1 {
+            return Err(Error::incompatible_schema());
+        }
+        if Uuid::parse_str(&self.installation).is_err()
             || self.installation_key == [0; 32]
             || self.configuration_revision.len() != 64
             || !self
