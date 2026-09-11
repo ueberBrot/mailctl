@@ -56,7 +56,9 @@ pub(super) fn imap_text<'a>(value: &'a IString<'_>) -> Result<&'a str, Error> {
 pub(super) fn child_path(parent: Option<&Part>, child: usize) -> Result<Part, Error> {
     let child =
         NonZeroU32::new(u32::try_from(child).map_err(|_| Error::Limit)?).ok_or(Error::Limit)?;
-    let mut parts = parent.map_or_else(Vec::new, |parent| parent.0.as_ref().to_vec());
+    let parent = parent.map_or(&[][..], |parent| parent.0.as_ref());
+    let mut parts = Vec::with_capacity(parent.len() + 1);
+    parts.extend_from_slice(parent);
     parts.push(child);
     Ok(Part(
         parts.try_into().expect("child makes the path nonempty"),

@@ -164,6 +164,22 @@ impl Lease {
         } = self;
         idle.connection.search(request, limits).await
     }
+    pub(crate) async fn read_body(
+        self,
+        mailbox: &str,
+        request: imap::BodyRequest,
+        limits: &Limits,
+    ) -> Result<imap::BodyPage, crate::domain::Error> {
+        let Self {
+            idle,
+            admission: _admission,
+            ..
+        } = self;
+        idle.connection
+            .read_body(mailbox, request, limits)
+            .await
+            .map_err(Into::into)
+    }
     pub fn release(self) {
         let mut state = self.pool.state.lock().unwrap();
         if state.generation == self.generation
@@ -367,7 +383,10 @@ impl Runtime {
 
     fn validate_limits(&self, limits: &Limits) -> Result<(), Error> {
         limits.validate().map_err(|_| Error::InvalidInput)?;
-        if limits.mailbox_inventory > self.limits.mailbox_inventory
+        if limits.text_page_bytes > self.limits.text_page_bytes
+            || limits.mime_depth > self.limits.mime_depth
+            || limits.mime_parts > self.limits.mime_parts
+            || limits.mailbox_inventory > self.limits.mailbox_inventory
             || limits.search_page > self.limits.search_page
             || limits.search_uid_window > self.limits.search_uid_window
             || limits.search_windows > self.limits.search_windows

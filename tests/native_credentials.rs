@@ -593,6 +593,20 @@ fn search_handoffs(
         "<search-3@example.test>"
     );
     assert_eq!(first["complete"], false);
+    let message_reference = first["messages"][0]["reference"].as_str().unwrap();
+    server.expect_body("work@example.test", FIRST, "Archive");
+    let mut command = installation.command(cli);
+    command.env("SSL_CERT_FILE", &server.certificate).args([
+        "--json",
+        "message",
+        "get",
+        "--message",
+        message_reference,
+    ]);
+    let output = run_bounded(command);
+    assert_success(&output);
+    let body = envelope(&output)["result"].clone();
+    assert_eq!(body["body"]["text"], "Short body.\r\n");
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -608,6 +622,26 @@ fn search_handoffs(
                 TokioChildProcess::new(command).unwrap()
             };
             let reader = ().serve(connect("default")).await.unwrap();
+            server.expect_body("work@example.test", FIRST, "Archive");
+            let response = reader
+                .call_tool(
+                    CallToolRequestParams::new("email_get_message").with_arguments(
+                        json!({"message": message_reference})
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.is_error, Some(false));
+            let structured = response.structured_content.unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(&response.content[0].as_text().unwrap().text)
+                    .unwrap(),
+                structured
+            );
+            assert_eq!(structured["result"], body);
             server.expect_search("work@example.test", FIRST, "Archive", None);
             let response = reader
                 .call_tool(
@@ -673,6 +707,25 @@ fn search_handoffs(
                 ("all", "stale_cursor"),
             ] {
                 let reader = ().serve(connect(grant)).await.unwrap();
+                if grant == "restricted" {
+                    let before = server.accepted();
+                    let response = reader
+                        .call_tool(
+                            CallToolRequestParams::new("email_get_message").with_arguments(
+                                json!({"message": message_reference})
+                                    .as_object()
+                                    .unwrap()
+                                    .clone(),
+                            ),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        response.structured_content.unwrap()["error"]["code"],
+                        "mailbox_not_allowed"
+                    );
+                    assert_eq!(server.accepted(), before);
+                }
                 let before = server.accepted();
                 let response = reader
                     .call_tool(

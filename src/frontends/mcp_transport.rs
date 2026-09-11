@@ -142,7 +142,9 @@ impl BoundedStdio {
                 let Ok(Some(Ok(line))) = timeout(bounds.deadline, lines.next()).await else {
                     break;
                 };
-                if validate_frame(line.as_bytes(), bounds.nesting).is_err() {
+                if crate::encoding::validate_json_bounds(line.as_bytes(), bounds.nesting, 4096)
+                    .is_err()
+                {
                     break;
                 }
                 let write = async {
@@ -169,35 +171,6 @@ impl BoundedStdio {
     }
 }
 
-fn validate_frame(bytes: &[u8], nesting: usize) -> Result<(), Error> {
-    crate::encoding::validate_json_depth(bytes, nesting)?;
-    let mut quoted = false;
-    let mut escaped = false;
-    let mut nodes = 1usize;
-    for byte in bytes {
-        if quoted {
-            if escaped {
-                escaped = false;
-            } else if *byte == b'\\' {
-                escaped = true;
-            } else if *byte == b'"' {
-                quoted = false;
-            }
-        } else {
-            match byte {
-                b'"' => quoted = true,
-                b'{' | b'[' | b',' | b':' => {
-                    nodes += 1;
-                    if nodes > 4096 {
-                        return Err(Error::new(crate::domain::ErrorCode::InvalidRequest));
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    Ok(())
-}
 impl Drop for BoundedStdio {
     fn drop(&mut self) {
         self.ingress.abort();
@@ -303,7 +276,7 @@ mod tests {
             json!({"values":vec![json!({"a":0,"b":1});500]}),
         ] {
             let frame = serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"email_search_messages","arguments":arguments}})).unwrap();
-            validate_frame(&frame, 32).unwrap();
+            crate::encoding::validate_json_bounds(&frame, 32, 4096).unwrap();
             let measured = allocation_counter::measure(|| {
                 let decoded: RxJsonRpcMessage<RoleServer> = serde_json::from_slice(&frame).unwrap();
                 let retained = decoded.clone();
@@ -318,6 +291,6 @@ mod tests {
             );
         }
         let excessive = serde_json::to_vec(&vec![0; 4097]).unwrap();
-        assert!(validate_frame(&excessive, 32).is_err());
+        assert!(crate::encoding::validate_json_bounds(&excessive, 32, 4096).is_err());
     }
 }

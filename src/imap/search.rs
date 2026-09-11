@@ -145,7 +145,7 @@ impl SelectedMailbox for Selection<'_, '_> {
         let rows = self
             .connection
             .drive(ImapMessageFetch::new(
-                uids.as_slice().try_into().unwrap(),
+                uids.try_into().unwrap(),
                 Projection::FIELDS.to_vec().into(),
                 ImapMessageFetchOptions {
                     uid: true,

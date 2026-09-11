@@ -1,5 +1,9 @@
 //! Authorized search and exact descending-UID continuation.
-use super::{MailboxTarget, Service, mailboxes::Reference, tokens::fingerprint};
+use super::{
+    MailboxTarget, Service,
+    mailboxes::Reference,
+    tokens::{MessageReference, fingerprint},
+};
 use crate::search::{SearchBatch, SearchPosition, SearchRequest};
 use crate::{
     config::Limits,
@@ -12,7 +16,7 @@ use crate::{
 mod memory;
 pub use memory::{MemoryMessage, MemoryMessages};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 
 pub trait SearchBackend: Send + Sync {
     fn search<'a>(
@@ -23,47 +27,6 @@ pub trait SearchBackend: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<SearchBatch, Error>> + Send + 'a>>;
 }
 
-pub struct ImapMessages {
-    runtime: Arc<crate::authentication::Runtime>,
-    sources: BTreeMap<String, Arc<dyn crate::credentials::SecretSource>>,
-}
-impl ImapMessages {
-    pub fn new(
-        runtime: Arc<crate::authentication::Runtime>,
-        sources: BTreeMap<String, Arc<dyn crate::credentials::SecretSource>>,
-    ) -> Self {
-        Self { runtime, sources }
-    }
-}
-impl SearchBackend for ImapMessages {
-    fn search<'a>(
-        &'a self,
-        target: MailboxTarget<'a>,
-        request: SearchRequest<'a>,
-        limits: &'a Limits,
-    ) -> Pin<Box<dyn Future<Output = Result<SearchBatch, Error>> + Send + 'a>> {
-        Box::pin(async move {
-            let source = self
-                .sources
-                .get(&target.config.key)
-                .cloned()
-                .ok_or_else(|| Error::new(ErrorCode::CredentialUnavailable))?;
-            let account = crate::authentication::Account {
-                id: uuid::Uuid::parse_str(target.account_id)
-                    .map_err(|_| Error::new(ErrorCode::InternalError))?,
-                generation: target.generation,
-                config: target.config.clone(),
-                source,
-            };
-            let lease = self
-                .runtime
-                .acquire(&account, limits)
-                .await
-                .map_err(super::credentials::authentication_error)?;
-            lease.search(request, limits).await
-        })
-    }
-}
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Cursor {
@@ -73,14 +36,6 @@ struct Cursor {
     scope: String,
     query: String,
     position: SearchPosition,
-}
-#[derive(Serialize)]
-struct MessageReference<'a> {
-    account: &'a str,
-    generation: u64,
-    mailbox: &'a str,
-    uid_validity: u32,
-    uid: u32,
 }
 
 impl Service {
@@ -118,28 +73,13 @@ impl Service {
             limits.token_bytes,
             ErrorCode::StaleReference,
         )?;
-        let (account, id, generation) = self
-            .visible_accounts(context)
-            .find_map(|account| {
-                let (id, generation) = self.registry.identity(&account.key);
-                (id == reference.account).then_some((account, id, generation))
-            })
-            .ok_or_else(|| Error::new(ErrorCode::AccountNotAllowed))?;
-        if generation != reference.generation {
-            return Err(Error::new(ErrorCode::StaleReference));
-        }
         let name = mailbox_identity(&reference.mailbox);
-        if !account
-            .mailboxes
-            .iter()
-            .any(|allowed| mailbox_identity(allowed) == name)
-            || !grant
-                .mailboxes
-                .iter()
-                .any(|allowed| mailbox_identity(allowed) == name)
-        {
-            return Err(Error::new(ErrorCode::MailboxNotAllowed));
-        }
+        let target @ MailboxTarget {
+            config: account,
+            account_id: id,
+            generation,
+        } = self.authorize_mailbox(context, &reference.account, reference.generation, name)?;
+
         let scope = fingerprint(&(
             self.registry.revision(),
             context.grant_name(),
@@ -167,23 +107,13 @@ impl Service {
         let backend: &dyn SearchBackend = match &self.search_backend {
             Some(backend) => backend.as_ref(),
             None => {
-                live = ImapMessages::new(
-                    self.authentication().await?.clone(),
-                    BTreeMap::from([(
-                        account.key.clone(),
-                        crate::credentials::source_for(&account.credential),
-                    )]),
-                );
+                live = self.imap_backend(account).await?;
                 &live
             }
         };
         let batch = backend
             .search(
-                MailboxTarget {
-                    account_id: id,
-                    generation,
-                    config: account,
-                },
+                target,
                 SearchRequest {
                     mailbox: name,
                     criteria: &input.criteria,

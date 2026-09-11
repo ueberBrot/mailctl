@@ -5,7 +5,6 @@ use crate::{
     domain::{Error, ErrorCode},
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::{
     borrow::Cow,
     collections::{BTreeMap, HashSet},
@@ -322,14 +321,7 @@ impl AccountRegistry {
 }
 
 fn fingerprint(config: &Config) -> Result<String, Error> {
-    let bytes =
-        crate::encoding::serialize_bounded(config, storage::MAX_BYTES).map_err(|_| invalid())?;
-    use std::fmt::Write;
-    let mut revision = String::with_capacity(64);
-    for byte in Sha256::digest(bytes) {
-        let _ = write!(revision, "{byte:02x}");
-    }
-    Ok(revision)
+    super::tokens::fingerprint(config).map_err(|_| invalid())
 }
 
 fn load(directory: &Path) -> Result<Option<Registry>, Error> {

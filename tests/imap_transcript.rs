@@ -665,7 +665,13 @@ async fn discovery_and_search_inputs_are_bounded_before_connecting() {
         Limits::default(),
     )
     .unwrap();
-    for mailbox in ["*", "Approved/%", "non-ASCII-é"] {
+    for mailbox in [
+        "*",
+        "Approved/%",
+        "bad\r\nname",
+        "bad\u{7f}name",
+        "bad\u{85}name",
+    ] {
         assert_eq!(
             probe
                 .discover("fixture", "disposable-password", &[mailbox.into()])

@@ -93,5 +93,8 @@ required-features = ["docker-tests"]
 [workspace.lints.rust]
 unsafe_code = "forbid"
 
+[workspace.lints.clippy]
+redundant_clone = "warn"
+
 [lints]
 workspace = true

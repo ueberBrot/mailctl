@@ -2,7 +2,7 @@
 use crate::{
     config::Limits,
     domain::{Envelope, Error, ErrorCode, Operation, OperationResult},
-    encoding::{serialize_bounded, validate_json_depth},
+    encoding::{serialize_bounded, validate_json_bounds},
     policy::Narrowing,
 };
 #[cfg(feature = "isolated")]
@@ -523,7 +523,7 @@ async fn read_frame<T: for<'de> Deserialize<'de>>(
         .read_exact(&mut bytes)
         .await
         .map_err(|_| Error::new(ErrorCode::BrokerUnavailable))?;
-    validate_json_depth(&bytes, nesting)?;
+    validate_json_bounds(&bytes, nesting, usize::MAX)?;
     serde_json::from_slice(&bytes).map_err(|_| Error::new(ErrorCode::InvalidRequest))
 }
 

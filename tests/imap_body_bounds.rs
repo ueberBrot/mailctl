@@ -68,7 +68,7 @@ async fn body_read_rejects_uidvalidity_before_any_fetch() {
         )
         .await
         .unwrap_err();
-    assert_eq!(error, Error::UnsafeSelection);
+    assert_eq!(error, Error::StaleReference);
     validity_fixture.task.await.unwrap();
 }
 

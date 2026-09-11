@@ -80,143 +80,181 @@ impl ImapProbe {
         context.update(format!("{limits:?}").as_bytes());
         tokio::time::timeout(limits.operation_timeout, async {
             let mut conn = self.authenticate(username, password).await?;
-            if conn.examine(name).await? != request.uid_validity {
-                return Err(Error::UnsafeSelection);
-            }
-            let metadata = Fetch::Metadata { uid: request.uid };
-            let fields = metadata.execute(&mut conn).await?;
-            let (size, structure) = metadata.metadata(&fields)?;
-            // Validate every MIME node, including excluded attachment subtrees.
-            let mut related_ids = HashMap::new();
-            let needed_headers = representation::related_multipart_headers(structure, &limits)?;
-            let mut header_bytes = 0;
-            let root_headers = headers(
-                &mut conn,
-                request.uid,
-                Section::Header(None),
-                &limits,
-                &mut header_bytes,
-            )
-            .await?;
-            representation::validate_headers(&root_headers, None, &limits)?;
-            for path in needed_headers {
-                let raw = headers(
-                    &mut conn,
-                    request.uid,
-                    Section::Mime(path.clone()),
-                    &limits,
-                    &mut header_bytes,
-                )
-                .await?;
-                if let Some(id) = representation::validate_headers(&raw, None, &limits)? {
-                    related_ids.insert(path, id);
-                }
-            }
-            let selected = representation::select(structure, &limits, &related_ids)?;
-            let rendered = if let Some(selected) = &selected {
-                if selected.wire_size > limits.max_body_wire_bytes {
-                    return Err(Error::Limit);
-                }
-                let single = matches!(structure, BodyStructure::Single { .. });
-                if single {
-                    representation::validate_headers(&root_headers, Some(selected), &limits)?;
-                }
-                let (raw, body_offset) = if single && size as usize <= limits.max_body_wire_bytes {
-                    let whole = bytes(
-                        &mut conn,
-                        request.uid,
-                        None,
-                        Some(size as usize),
-                        limits.max_body_wire_bytes,
-                        &limits,
-                    )
-                    .await?;
-                    if !whole.starts_with(&root_headers)
-                        || whole.len() - root_headers.len() > selected.wire_size
-                    {
-                        return Err(Error::Protocol);
-                    }
-                    (whole, root_headers.len())
-                } else {
-                    (
-                        bytes(
-                            &mut conn,
-                            request.uid,
-                            Some(Section::Part(selected.part.clone())),
-                            Some(selected.wire_size),
-                            limits.max_body_wire_bytes,
-                            &limits,
-                        )
-                        .await?,
-                        0,
-                    )
-                };
-                let body = &raw[body_offset..];
-                context.update(body);
-                tokio::task::yield_now().await;
-                Some(representation::render(selected, body, &limits)?)
-            } else {
-                None
-            };
-            conn.drive(ImapLogout::new()).await?;
-            let mut metrics = conn.metrics();
+            let page = read_selected(&mut conn, name, request, &limits, context).await?;
             drop(conn);
-            let (text, converted, replacements) = if let Some(rendered) = rendered {
-                metrics.decode_steps = rendered.work;
-                metrics.decoded_bytes = rendered.text.len();
-                (rendered.text, rendered.converted, rendered.replacements)
-            } else {
-                (String::new(), false, false)
-            };
-            self.metrics = metrics;
-            let selected_part = selected.as_ref().map(|selected| {
-                let name = part_name(&selected.part);
-                context.update(name.as_bytes());
-                context.update(selected.media_type.as_bytes());
-                context.update(selected.charset.as_bytes());
-                context.update(selected.transfer_encoding.as_bytes());
-                name
-            });
-            context.update(text.as_bytes());
-            let fingerprint = context.finalize().into();
-            let offset = match request.continuation {
-                Some(cursor)
-                    if cursor.fingerprint == fingerprint
-                        && text.is_char_boundary(cursor.offset)
-                        && cursor.offset < text.len() =>
-                {
-                    cursor.offset
-                }
-                Some(_) => return Err(Error::StaleCursor),
-                None => 0,
-            };
-            let mut end = text.len().min(offset + limits.max_text_bytes);
-            while !text.is_char_boundary(end) {
-                end -= 1;
-            }
-            let continuation = (end < text.len()).then_some(BodyCursor {
-                fingerprint,
-                offset: end,
-            });
-            Ok(BodyPage {
-                text: if offset == 0 && end == text.len() {
-                    text
-                } else {
-                    text[offset..end].to_owned()
-                },
-                selected_part,
-                source_media_type: selected.map(|s| s.media_type),
-                representation_version: REPRESENTATION,
-                converted,
-                replacements,
-                truncated: continuation.is_some(),
-                continuation,
-                metrics,
-            })
+            self.metrics = page.metrics;
+            Ok(page)
         })
         .await
         .map_err(|_| Error::Timeout)?
     }
+}
+
+impl super::AuthenticatedConnection {
+    pub(crate) async fn read_body(
+        self,
+        name: &str,
+        request: BodyRequest,
+        limits: &crate::config::Limits,
+    ) -> Result<BodyPage, Error> {
+        let limits = Limits {
+            max_body_wire_bytes: limits.wire_fetch_bytes,
+            max_header_bytes: limits.header_bytes,
+            max_nesting: limits.mime_depth,
+            max_mime_parts: limits.mime_parts,
+            max_text_bytes: limits.text_page_bytes,
+            max_operation_bytes: 16 * 1024 * 1024,
+            max_response_bytes: 256 * 1024,
+            max_literal_bytes: 64 * 1024,
+            ..Limits::default()
+        };
+        limits.validate()?;
+        let mut metrics = Metrics::default();
+        let mut conn = self.0.resume(&mut metrics);
+        conn.limit_body(&limits);
+        read_selected(&mut conn, name, request, &limits, Sha256::new()).await
+    }
+}
+
+async fn read_selected(
+    conn: &mut Connection<'_>,
+    name: &str,
+    request: BodyRequest,
+    limits: &Limits,
+    mut context: Sha256,
+) -> Result<BodyPage, Error> {
+    mailbox(name)?;
+    if request.uid == 0 || request.uid_validity == 0 {
+        return Err(Error::InvalidInput);
+    }
+    if conn.examine(name).await? != request.uid_validity {
+        return Err(Error::StaleReference);
+    }
+    let metadata = Fetch::Metadata { uid: request.uid };
+    let fields = metadata.execute(conn).await?;
+    let (size, structure) = metadata.metadata(&fields)?;
+    // Validate every MIME node, including excluded attachment subtrees.
+    let mut related_ids = HashMap::new();
+    let needed_headers = representation::related_multipart_headers(structure, limits)?;
+    let mut header_bytes = 0;
+    let root_headers = headers(
+        conn,
+        request.uid,
+        Section::Header(None),
+        limits,
+        &mut header_bytes,
+    )
+    .await?;
+    representation::validate_headers(&root_headers, None, limits)?;
+    for path in needed_headers {
+        let raw = headers(
+            conn,
+            request.uid,
+            Section::Mime(path.clone()),
+            limits,
+            &mut header_bytes,
+        )
+        .await?;
+        if let Some(id) = representation::validate_headers(&raw, None, limits)? {
+            related_ids.insert(path, id);
+        }
+    }
+    let selected = representation::select(structure, limits, &related_ids)?;
+    let rendered = if let Some(selected) = &selected {
+        if selected.wire_size > limits.max_body_wire_bytes {
+            return Err(Error::Limit);
+        }
+        let single = matches!(structure, BodyStructure::Single { .. });
+        if single {
+            representation::validate_headers(&root_headers, Some(selected), limits)?;
+        }
+        let (raw, body_offset) = if single && size as usize <= limits.max_body_wire_bytes {
+            let whole = bytes(
+                conn,
+                request.uid,
+                None,
+                Some(size as usize),
+                limits.max_body_wire_bytes,
+                limits,
+            )
+            .await?;
+            if !whole.starts_with(&root_headers)
+                || whole.len() - root_headers.len() > selected.wire_size
+            {
+                return Err(Error::Protocol);
+            }
+            (whole, root_headers.len())
+        } else {
+            (
+                bytes(
+                    conn,
+                    request.uid,
+                    Some(Section::Part(selected.part.clone())),
+                    Some(selected.wire_size),
+                    limits.max_body_wire_bytes,
+                    limits,
+                )
+                .await?,
+                0,
+            )
+        };
+        let body = &raw[body_offset..];
+        context.update(body);
+        tokio::task::yield_now().await;
+        Some(representation::render(selected, body, limits)?)
+    } else {
+        None
+    };
+    conn.drive(ImapLogout::new()).await?;
+    let mut metrics = conn.metrics();
+    let (text, converted, replacements) = if let Some(rendered) = rendered {
+        metrics.decode_steps = rendered.work;
+        metrics.decoded_bytes = rendered.text.len();
+        (rendered.text, rendered.converted, rendered.replacements)
+    } else {
+        (String::new(), false, false)
+    };
+    let selected_part = selected.as_ref().map(|selected| {
+        let name = part_name(&selected.part);
+        context.update(name.as_bytes());
+        context.update(selected.media_type.as_bytes());
+        context.update(selected.charset.as_bytes());
+        context.update(selected.transfer_encoding.as_bytes());
+        name
+    });
+    context.update(text.as_bytes());
+    let fingerprint = context.finalize().into();
+    let offset = match request.continuation {
+        Some(cursor)
+            if cursor.fingerprint == fingerprint
+                && text.is_char_boundary(cursor.offset)
+                && cursor.offset < text.len() =>
+        {
+            cursor.offset
+        }
+        Some(_) => return Err(Error::StaleCursor),
+        None => 0,
+    };
+    let end = text.floor_char_boundary(offset + limits.max_text_bytes);
+    let continuation = (end < text.len()).then_some(BodyCursor {
+        fingerprint,
+        offset: end,
+    });
+    Ok(BodyPage {
+        text: if offset == 0 && end == text.len() {
+            text
+        } else {
+            text[offset..end].to_owned()
+        },
+        selected_part,
+        source_media_type: selected.map(|s| s.media_type),
+        representation_version: REPRESENTATION,
+        converted,
+        replacements,
+        truncated: continuation.is_some(),
+        continuation,
+        metrics,
+    })
 }
 
 async fn headers(

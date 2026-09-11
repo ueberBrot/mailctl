@@ -46,9 +46,11 @@ MCP uses the same `reference` field in `email_list_mailboxes`. References identi
 resources; every request checks the current account, mailbox, and operation
 permissions. The application makes exact-name requests only for authorized
 mailboxes. INBOX is case-insensitive; other mailbox identities retain their case.
-The current IMAP route supports printable ASCII names, including spaces and
-ampersands. Wildcard characters and international names return an explicit
-unsupported result.
+Mailbox names support Unicode, including names such as `Entwürfe`. Configure
+the actual server folder name; special-use attributes such as `\Drafts` are
+standardized independently of that name and may be absent. The IMAP route
+encodes international names as modified UTF-7. Control characters and LIST
+wildcards (`*` and `%`) return an explicit unsupported result.
 
 References remain usable across CLI exits and MCP sessions in one installation.
 An alias rename preserves them; an account generation change invalidates them.

@@ -3,9 +3,19 @@ use super::Service;
 use crate::domain::{Error, ErrorCode};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ring::hmac;
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use std::fmt::Write;
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct MessageReference<S = String> {
+    pub account: S,
+    pub generation: u64,
+    pub mailbox: S,
+    pub uid_validity: u32,
+    pub uid: u32,
+}
 
 impl Service {
     pub(super) fn encode(
@@ -42,9 +52,16 @@ impl Service {
         if version != kind {
             return Err(invalid());
         }
-        let tag = URL_SAFE_NO_PAD.decode(tag).map_err(|_| invalid())?;
+        let mut signature = [0; 32];
+        if URL_SAFE_NO_PAD
+            .decode_slice(tag, &mut signature)
+            .map_err(|_| invalid())?
+            != signature.len()
+        {
+            return Err(invalid());
+        }
         let key = hmac::Key::new(hmac::HMAC_SHA256, self.registry.reference_key());
-        hmac::verify(&key, signed.as_bytes(), &tag).map_err(|_| invalid())?;
+        hmac::verify(&key, signed.as_bytes(), &signature).map_err(|_| invalid())?;
         let payload = URL_SAFE_NO_PAD.decode(payload).map_err(|_| invalid())?;
         serde_json::from_slice(&payload).map_err(|_| invalid())
     }

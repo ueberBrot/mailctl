@@ -100,7 +100,7 @@ fn application_search_pages_and_predicates_preserve_independently_observed_mailb
             config::Config,
             credentials::{Availability, Secret, SecretSource, SourceError},
             domain::{ListMailboxesInput, Operation, OperationResult, SearchMessagesInput},
-            service::{ImapMailboxes, ImapMessages, Service},
+            service::{ImapBackend, Service},
         };
         use std::{collections::BTreeMap, sync::Arc};
         struct FixtureSecret;
@@ -113,6 +113,7 @@ fn application_search_pages_and_predicates_preserve_independently_observed_mailb
             }
         }
         let mut fixture = greenmail_support::Fixture::start().await?;
+        fixture.seed_multipart_with_large_attachment().await?;
         let before = fixture.snapshot().await?;
         let contents = fixture.contents().await?;
         let configuration = Config::parse(&format!(
@@ -144,12 +145,11 @@ mailboxes = ["INBOX"]
             "fixture".into(),
             Arc::new(FixtureSecret) as Arc<dyn SecretSource>,
         )]);
+        let backend = Arc::new(ImapBackend::new(runtime, sources));
         let service = Service::in_memory(configuration)?
-            .with_mailbox_backend(Arc::new(ImapMailboxes::new(
-                runtime.clone(),
-                sources.clone(),
-            )))
-            .with_search_backend(Arc::new(ImapMessages::new(runtime, sources)));
+            .with_mailbox_backend(backend.clone())
+            .with_search_backend(backend.clone())
+            .with_body_backend(backend);
         let context = service.context("reader", &Default::default())?;
         let OperationResult::Mailboxes(discovery) = service
             .execute(
@@ -195,6 +195,25 @@ mailboxes = ["INBOX"]
                 metadata.flags.iter().any(|flag| flag == "\\Seen"),
                 observed.seen
             );
+            let OperationResult::Message(body) = service
+                .execute(
+                    &context,
+                    Operation::GetMessage(mailctl::domain::GetMessageInput {
+                        message: page.messages[0].reference.clone(),
+                    }),
+                )
+                .await?
+            else {
+                panic!("body")
+            };
+            let expected = match id.as_str() {
+                "<large-attachment-body@example.test>" => "Synthetic multipart body.",
+                "<observed-seen@example.test>" => "Synthetic seen message.",
+                "<bootstrap-smoke@example.test>" => "Synthetic bootstrap message.",
+                _ => panic!("unexpected fixture"),
+            };
+            assert_eq!(body.body.text, expected);
+            assert!(!body.body.truncated);
             identifiers.push(id.clone());
             if page.complete {
                 assert!(page.next_cursor.is_none());
@@ -217,7 +236,8 @@ mailboxes = ["INBOX"]
         ] {
             let criteria = serde_json::from_value(serde_json::json!([
                 {"field":field,"flag":flag}, {"field":"from","value":"sender@example.test"},
-                {"field":"text","value":"Synthetic"}, {"field":"received_after","date":"2000-01-01"}
+                {"field":"text","value":"Synthetic"}, {"field":"received_after","date":"2000-01-01"},
+                {"field":"subject","value": if field == "required_flag" { "Observed seen" } else { "Bootstrap smoke" }}
             ]))?;
             let OperationResult::Messages(page) = service
                 .execute(
@@ -624,7 +644,7 @@ fn application_mailbox_discovery_and_reference_reuse_preserve_independently_obse
             credentials::{Availability, Secret, SecretSource, SourceError},
             domain::{ListMailboxesInput, Operation, OperationResult},
             policy::Narrowing,
-            service::{ImapMailboxes, Service},
+            service::{ImapBackend, Service},
         };
         use std::{collections::BTreeMap, sync::Arc};
         struct Source;
@@ -663,7 +683,7 @@ mailboxes = ["INBOX"]
             port = fixture.imaps_port()
         ))?;
         let runtime = Arc::new(Runtime::new(config.limits.clone(), fixture.tls_roots()).unwrap());
-        let backend = ImapMailboxes::new(
+        let backend = ImapBackend::new(
             runtime,
             BTreeMap::from([("fixture".into(), Arc::new(Source) as Arc<dyn SecretSource>)]),
         );

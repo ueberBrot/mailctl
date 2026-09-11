@@ -55,7 +55,7 @@ macro_rules! limits {
                 if self.buffered_bytes < crate::encoding::request_buffer_bytes(self.envelope_bytes) + self.envelope_bytes + 192 || self.envelope_bytes < 1024
                     || self.connection_seconds > self.operation_seconds
                     || self.initialization_seconds > self.operation_seconds
-                    || self.mailbox_page > self.mailbox_inventory { return Err(invalid()); }
+                    || self.text_page_bytes < 4 || self.mailbox_page > self.mailbox_inventory { return Err(invalid()); }
                 Ok(())
             }
         }

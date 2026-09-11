@@ -97,6 +97,10 @@ impl<'a> Connection<'a> {
     pub fn metrics(&self) -> Metrics {
         *self.metrics
     }
+    pub(super) fn limit_body(&mut self, limits: &Limits) {
+        self.session.limits = limits.clone();
+        self.session.fragmentizer = Fragmentizer::new(limits.max_response_bytes as u32);
+    }
     pub(super) fn limit_search(&mut self, limits: &crate::config::Limits) {
         self.session.limits.max_literal_bytes = limits.header_bytes;
         self.session.limits.max_response_bytes = limits
@@ -709,7 +713,7 @@ impl CommandState {
             CommandKind::Search {
                 remaining_literals, ..
             } if remaining_literals != 0 => Err(Error::Protocol),
-            CommandKind::BodyFetch { seen: false, .. } => Err(Error::Protocol),
+            CommandKind::BodyFetch { seen: false, .. } => Err(Error::MessageNotFound),
             CommandKind::Logout { bye: false, .. } | CommandKind::Logout { tagged: false, .. } => {
                 Err(Error::Protocol)
             }

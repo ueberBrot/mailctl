@@ -203,7 +203,7 @@ fn imap_service(mut configuration: Config, fixture: &imap_support::Fixture) -> S
     )]);
     Service::in_memory(configuration)
         .unwrap()
-        .with_mailbox_backend(Arc::new(mailctl::service::ImapMailboxes::new(
+        .with_mailbox_backend(Arc::new(mailctl::service::ImapBackend::new(
             runtime, sources,
         )))
 }
@@ -239,34 +239,47 @@ async fn imap_runs_the_same_application_discovery_contract_with_exact_non_mutati
 }
 
 #[tokio::test]
-async fn imap_preserves_ampersands_and_deduplicates_exact_server_identities() {
+async fn imap_preserves_international_names_and_deduplicates_exact_server_identities() {
     use imap_support::*;
-    let fixture = repeating_fixture(mailctl::imap::Limits::default(), 1, |mut wire| Box::pin(async move {
+    for (name, wire_name) in [
+        ("Projects & notes", "Projects &- notes"),
+        ("Entwürfe", "Entw&APw-rfe"),
+        ("台北/日本語", "&U,BTFw-/&ZeVnLIqe-"),
+        ("📧 & Entwürfe", "&2D3c5w- &- Entw&APw-rfe"),
+        ("e\u{301}", "e&AwE-"),
+    ] {
+        let fixture = repeating_fixture(mailctl::imap::Limits::default(), 1, move |mut wire| Box::pin(async move {
         authenticate(&mut wire).await;
-        let tag = expect(&mut wire, "LIST \"\" \"Projects &- notes\"").await;
-        write(&mut wire, &format!("* LIST (\\Archive) \"/\" \"Projects &- notes\"\r\n* LIST (\\Archive) \"/\" \"Projects &- notes\"\r\n{tag} OK listed\r\n")).await;
+        let pattern = if wire_name.contains(' ') {
+            format!("\"{wire_name}\"")
+        } else {
+            wire_name.into()
+        };
+        let tag = expect(&mut wire, &format!("LIST \"\" {pattern}")).await;
+        write(&mut wire, &format!("* LIST (\\Archive) \"/\" \"{wire_name}\"\r\n* LIST (\\Archive) \"/\" \"{wire_name}\"\r\n{tag} OK listed\r\n")).await;
         logout(&mut wire).await;
     })).await;
-    let mut configuration = config();
-    configuration.accounts[0].mailboxes = vec!["Projects & notes".into()];
-    configuration.grants[0].mailboxes = vec!["Projects & notes".into()];
-    let service = imap_service(configuration, &fixture);
-    let context = service.context("reader", &Narrowing::default()).unwrap();
-    let OperationResult::Mailboxes(page) = service
-        .execute(
-            &context,
-            Operation::ListMailboxes(ListMailboxesInput::default()),
-        )
-        .await
-        .unwrap()
-    else {
-        panic!("mailboxes")
-    };
-    assert_eq!(page.mailboxes.len(), 1);
-    assert_eq!(page.mailboxes[0].metadata.name, "Projects & notes");
-    assert_eq!(page.mailboxes[0].display_label, "Projects & notes");
-    assert_eq!(page.mailboxes[0].metadata.special_use, ["\\Archive"]);
-    fixture.task.await.unwrap();
+        let mut configuration = config();
+        configuration.accounts[0].mailboxes = vec![name.into()];
+        configuration.grants[0].mailboxes = vec![name.into()];
+        let service = imap_service(configuration, &fixture);
+        let context = service.context("reader", &Narrowing::default()).unwrap();
+        let OperationResult::Mailboxes(page) = service
+            .execute(
+                &context,
+                Operation::ListMailboxes(ListMailboxesInput::default()),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("mailboxes")
+        };
+        assert_eq!(page.mailboxes.len(), 1);
+        assert_eq!(page.mailboxes[0].metadata.name, name);
+        assert_eq!(page.mailboxes[0].display_label, name);
+        assert_eq!(page.mailboxes[0].metadata.special_use, ["\\Archive"]);
+        fixture.task.await.unwrap();
+    }
 }
 
 #[tokio::test]
@@ -377,6 +390,32 @@ async fn cursors_bind_inventory_grant_scope_and_token_kind() {
         .code,
         ErrorCode::StaleReference
     );
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    for (token, code, is_cursor) in [
+        (&reference, ErrorCode::StaleReference, false),
+        (&cursor, ErrorCode::StaleCursor, true),
+    ] {
+        let (signed, _) = token.rsplit_once('.').unwrap();
+        for length in [0, 1, 31, 32, 33, 1024] {
+            let tag = URL_SAFE_NO_PAD.encode(vec![0; length]);
+            let token = format!("{signed}.{tag}");
+            let input = if is_cursor {
+                ListMailboxesInput {
+                    cursor: Some(token),
+                    ..Default::default()
+                }
+            } else {
+                ListMailboxesInput {
+                    reference: Some(token),
+                    ..Default::default()
+                }
+            };
+            assert_eq!(
+                list(&service, "reader", input).await.unwrap_err().code,
+                code
+            );
+        }
+    }
     let mut tampered = reference.into_bytes();
     tampered[10] = if tampered[10] == b'A' { b'B' } else { b'A' };
     assert_eq!(
@@ -776,7 +815,7 @@ async fn imap_runtime_inventory_ceiling_is_enforced_before_credential_work() {
         Runtime::new(runtime_limits, tokio_rustls::rustls::RootCertStore::empty()).unwrap(),
     );
     let missing = Arc::new(Missing(std::sync::atomic::AtomicUsize::new(0)));
-    let backend = mailctl::service::ImapMailboxes::new(
+    let backend = mailctl::service::ImapBackend::new(
         runtime,
         std::collections::BTreeMap::from([(
             "work".into(),

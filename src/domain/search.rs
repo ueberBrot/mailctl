@@ -186,7 +186,7 @@ impl TryFrom<Vec<SearchPredicate>> for SearchCriteria {
             || after.into_iter().zip(before).any(|(after, before)| {
                 matches!((after, before), (Some(after), Some(before)) if after >= before)
             }) { return Err(invalid()); }
-        predicates.sort();
+        predicates.sort_unstable();
         Ok(Self(predicates))
     }
 }

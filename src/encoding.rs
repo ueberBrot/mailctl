@@ -56,10 +56,15 @@ pub(crate) fn serialize_bounded<T: Serialize>(value: &T, maximum: usize) -> Resu
     Ok(bytes)
 }
 
-/// Check nesting before the JSON decoder allocates nested values.
+/// Bound nesting and structural nodes before the JSON decoder allocates values.
 #[cfg(any(feature = "cli", feature = "mcp", target_os = "macos"))]
-pub(crate) fn validate_json_depth(bytes: &[u8], maximum_depth: usize) -> Result<(), Error> {
+pub(crate) fn validate_json_bounds(
+    bytes: &[u8],
+    maximum_depth: usize,
+    maximum_nodes: usize,
+) -> Result<(), Error> {
     let mut depth = 0usize;
+    let mut nodes = 1usize;
     let mut quoted = false;
     let mut escaped = false;
     for byte in bytes {
@@ -83,6 +88,12 @@ pub(crate) fn validate_json_depth(bytes: &[u8], maximum_depth: usize) -> Result<
                 b'}' | b']' => depth = depth.saturating_sub(1),
                 _ => {}
             }
+            if matches!(byte, b'{' | b'[' | b',' | b':') {
+                nodes += 1;
+                if nodes > maximum_nodes {
+                    return Err(Error::new(ErrorCode::InvalidRequest));
+                }
+            }
         }
     }
     Ok(())
@@ -92,6 +103,32 @@ pub(crate) fn validate_json_depth(bytes: &[u8], maximum_depth: usize) -> Result<
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    #[cfg(any(feature = "cli", feature = "mcp", target_os = "macos"))]
+    fn json_bounds_ignore_structure_inside_escaped_strings() {
+        let bytes = serde_json::to_vec(&json!({"value": "\\\"[{,:}]"})).unwrap();
+        validate_json_bounds(&bytes, 1, 3).unwrap();
+        assert_eq!(
+            validate_json_bounds(&bytes, 0, 3).unwrap_err().code,
+            ErrorCode::InvalidRequest
+        );
+        assert_eq!(
+            validate_json_bounds(&bytes, 1, 2).unwrap_err().code,
+            ErrorCode::InvalidRequest
+        );
+    }
+
+    #[test]
+    #[cfg(any(feature = "cli", feature = "mcp", target_os = "macos"))]
+    fn json_bounds_enforce_depth_and_nodes_independently() {
+        let bytes = br#"{"values":[{},[]]}"#;
+        validate_json_bounds(bytes, 3, 7).unwrap();
+        assert!(validate_json_bounds(bytes, 2, usize::MAX).is_err());
+        assert!(validate_json_bounds(bytes, 3, 6).is_err());
+        validate_json_bounds(b"[[],[]]", 2, usize::MAX).unwrap();
+    }
+
     #[test]
     fn response_serialization_stops_at_the_frame_ceiling() {
         assert_eq!(

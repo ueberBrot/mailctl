@@ -380,7 +380,7 @@ async fn imap_service_with_config(
     use mailctl::{
         authentication::Runtime,
         domain::MailboxMetadata,
-        service::{ImapMessages, MemoryMailboxes, Service},
+        service::{ImapBackend, MemoryMailboxes, Service},
     };
     configuration.accounts[0].server = "127.0.0.1".into();
     configuration.accounts[0].port = fixture.port;
@@ -395,7 +395,7 @@ async fn imap_service_with_config(
     inventory.set(
         "work",
         vec![MailboxMetadata {
-            name: "INBOX".into(),
+            name: configuration.accounts[0].mailboxes[0].clone(),
             selectable: true,
             special_use: vec![],
         }],
@@ -403,7 +403,7 @@ async fn imap_service_with_config(
     let service = Service::in_memory(configuration)
         .unwrap()
         .with_mailbox_backend(inventory)
-        .with_search_backend(Arc::new(ImapMessages::new(runtime, sources)));
+        .with_search_backend(Arc::new(ImapBackend::new(runtime, sources)));
     let reference = mailbox(&service).await;
     (service, reference)
 }
@@ -421,7 +421,8 @@ async fn imap_pages_use_one_read_only_selection_and_fetch_only_the_requested_pag
         let first = page == 1;
         Box::pin(async move {
             authenticate(&mut wire).await;
-            examine(&mut wire).await;
+            let tag = expect(&mut wire, "EXAMINE Entw&APw-rfe").await;
+            write(&mut wire, &format!("* 2 EXISTS\r\n* OK [UIDVALIDITY 77] identity\r\n{tag} OK [READ-ONLY] selected\r\n")).await;
             if first {
                 let tag = expect(&mut wire, "UID SEARCH UID *").await;
                 write(
@@ -462,7 +463,10 @@ async fn imap_pages_use_one_read_only_selection_and_fetch_only_the_requested_pag
         })
     })
     .await;
-    let (service, reference) = imap_service(&fixture).await;
+    let mut configuration = config();
+    configuration.accounts[0].mailboxes = vec!["Entwürfe".into()];
+    configuration.grants[0].mailboxes = vec!["Entwürfe".into()];
+    let (service, reference) = imap_service_with_config(&fixture, configuration).await;
     let first = search(&service, json!({"mailbox":reference,"limit":2})).await;
     assert_eq!(first["messages"][0]["subject"]["value"], "message 5");
     assert_eq!(first["messages"][1]["subject"]["value"], "message 4");

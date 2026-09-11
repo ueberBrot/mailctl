@@ -2,8 +2,8 @@
 use super::application::Application;
 use super::mcp_transport::{BoundedStdio, Bounds};
 use crate::domain::{
-    AccountDiscovery, Capabilities, Envelope, Error, ErrorCode, ListAccountsInput,
-    ListMailboxesInput, MailboxDiscovery, MessageSearch, Operation, OperationResult,
+    AccountDiscovery, Capabilities, Envelope, Error, ErrorCode, GetMessageInput, ListAccountsInput,
+    ListMailboxesInput, MailboxDiscovery, MessageBody, MessageSearch, Operation, OperationResult,
     SearchMessagesInput,
 };
 use rmcp::model::ErrorData as McpError;
@@ -16,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 struct EmailTools {
     mailboxes: bool,
     search: bool,
+    read: bool,
     application: Application,
     active: Semaphore,
     envelope_limit: usize,
@@ -23,7 +24,7 @@ struct EmailTools {
     shutdown: CancellationToken,
 }
 
-fn definitions(mailboxes: bool, search: bool) -> Vec<Tool> {
+fn definitions(mailboxes: bool, search: bool, read: bool) -> Vec<Tool> {
     let empty = json!({"type":"object","properties":{},"additionalProperties":false});
     let mut tools = vec![
         Tool::new(
@@ -62,6 +63,17 @@ fn definitions(mailboxes: bool, search: bool) -> Vec<Tool> {
             .with_output_schema::<Envelope<MessageSearch>>(),
         );
     }
+    if read {
+        tools.push(
+            Tool::new(
+                "email_get_message",
+                "Read bounded selected message text with representation and truncation metadata.",
+                serde_json::Map::new(),
+            )
+            .with_input_schema::<GetMessageInput>()
+            .with_output_schema::<Envelope<MessageBody>>(),
+        );
+    }
     tools
 }
 
@@ -93,7 +105,7 @@ impl ServerHandler for EmailTools {
                     .map_err(|_| McpError::internal_error("Service unavailable", None))?,
         };
         Ok(ListToolsResult {
-            tools: definitions(self.mailboxes, self.search),
+            tools: definitions(self.mailboxes, self.search, self.read),
             ..Default::default()
         })
     }
@@ -114,6 +126,9 @@ impl ServerHandler for EmailTools {
         let input = request.arguments.unwrap_or_default();
         let operation = match (admitted.as_ref(), request.name.as_ref()) {
             (Err(error), _) => Err(error.clone()),
+            (_, "email_get_message") if self.read => serde_json::from_value(Value::Object(input))
+                .map(Operation::GetMessage)
+                .map_err(|_| Error::new(ErrorCode::InvalidRequest)),
             (_, "email_search_messages") if self.search => {
                 serde_json::from_value(Value::Object(input))
                     .map(Operation::SearchMessages)
@@ -191,6 +206,10 @@ pub(super) async fn run(application: Application) -> Result<(), Error> {
         .operations
         .iter()
         .any(|operation| operation == "search_messages");
+    let read = capabilities
+        .operations
+        .iter()
+        .any(|operation| operation == "get_message");
     let limits = application.limits()?;
     let bounds = Bounds::new(limits, application.response_bound()?)?;
     let expires = tokio::time::Instant::now()
@@ -201,6 +220,7 @@ pub(super) async fn run(application: Application) -> Result<(), Error> {
     let shutdown = CancellationToken::new();
     let _cancel_on_exit = shutdown.clone().drop_guard();
     let handler = EmailTools {
+        read,
         search,
         mailboxes,
         active: Semaphore::new(limits.active_requests),

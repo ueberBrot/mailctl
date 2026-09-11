@@ -115,7 +115,7 @@ impl<'a, 'b> Projection<'a, 'b> {
                 FlagFetch::Recent => "\\Recent".into(),
             })
             .collect::<Vec<_>>();
-        flags.sort();
+        flags.sort_unstable();
         flags.dedup();
         crate::search::LocatedMessage {
             uid: self.uid.get(),
@@ -164,7 +164,8 @@ fn header_text(bytes: &[u8]) -> Option<String> {
             return None;
         }
     }
-    let mut line = bytes.to_vec();
+    let mut line = Vec::with_capacity(bytes.len() + 2);
+    line.extend_from_slice(bytes);
     line.extend_from_slice(b"\r\n");
     let parsed = mail_parser::parsers::MessageStream::new(&line).parse_unstructured();
     match parsed {

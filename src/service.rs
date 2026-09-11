@@ -2,7 +2,11 @@
 mod credentials;
 #[cfg(any(feature = "cli", feature = "mcp"))]
 pub(crate) use credentials::credential_error;
+mod imap;
+pub use imap::ImapBackend;
 mod mailboxes;
+mod message;
+pub use message::{BodyBackend, MemoryBodies};
 mod search;
 mod state;
 mod tokens;
@@ -16,8 +20,8 @@ use crate::{
     },
     policy::{Narrowing, RequestContext},
 };
-pub use mailboxes::{ImapMailboxes, MailboxBackend, MailboxTarget, MemoryMailboxes};
-pub use search::{ImapMessages, MemoryMessage, MemoryMessages, SearchBackend};
+pub use mailboxes::{MailboxBackend, MailboxTarget, MemoryMailboxes};
+pub use search::{MemoryMessage, MemoryMessages, SearchBackend};
 use state::AccountRegistry;
 use uuid::Uuid;
 
@@ -26,6 +30,7 @@ pub struct Service {
     registry: AccountRegistry,
     context_id: Uuid,
     mailbox_backend: Option<std::sync::Arc<dyn MailboxBackend>>,
+    body_backend: Option<std::sync::Arc<dyn BodyBackend>>,
     search_backend: Option<std::sync::Arc<dyn SearchBackend>>,
     authentication: tokio::sync::OnceCell<std::sync::Arc<crate::authentication::Runtime>>,
 }
@@ -72,6 +77,7 @@ impl Service {
             context_id: Uuid::new_v4(),
             mailbox_backend: None,
             search_backend: None,
+            body_backend: None,
             authentication: tokio::sync::OnceCell::new(),
         }
     }
@@ -200,9 +206,18 @@ impl Service {
             {
                 operations.push("search_messages".into());
             }
+            if context
+                .permissions()
+                .contains(&crate::policy::Permission::ReadMessage)
+            {
+                operations.push("get_message".into());
+            }
             operations
         };
         let result = match operation {
+            Operation::GetMessage(input) => {
+                OperationResult::Message(self.get_message(context, input).await?)
+            }
             Operation::SearchMessages(input) => {
                 OperationResult::Messages(self.search_messages(context, input).await?)
             }

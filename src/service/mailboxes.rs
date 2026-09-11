@@ -66,78 +66,12 @@ impl MailboxBackend for MemoryMailboxes {
     }
 }
 
-/// IMAP inventory adapter sharing the process's bounded credential runtime.
-pub struct ImapMailboxes {
-    runtime: Arc<crate::authentication::Runtime>,
-    sources: BTreeMap<String, Arc<dyn crate::credentials::SecretSource>>,
-}
-impl ImapMailboxes {
-    pub fn new(
-        runtime: Arc<crate::authentication::Runtime>,
-        sources: BTreeMap<String, Arc<dyn crate::credentials::SecretSource>>,
-    ) -> Self {
-        Self { runtime, sources }
-    }
-}
-impl MailboxBackend for ImapMailboxes {
-    fn discover<'a>(
-        &'a self,
-        target: MailboxTarget<'a>,
-        names: &'a [String],
-        limits: &'a Limits,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<MailboxMetadata>, Error>> + Send + 'a>> {
-        Box::pin(async move {
-            let source = self
-                .sources
-                .get(&target.config.key)
-                .ok_or_else(|| Error::new(ErrorCode::CredentialUnavailable))?
-                .clone();
-            let account = crate::authentication::Account {
-                id: uuid::Uuid::parse_str(target.account_id)
-                    .map_err(|_| Error::new(ErrorCode::InternalError))?,
-                generation: target.generation,
-                config: target.config.clone(),
-                source,
-            };
-            self.runtime
-                .discover(&account, names, limits)
-                .await
-                .map_err(super::credentials::authentication_error)
-                .map(|rows| {
-                    rows.into_iter()
-                        .map(|row| MailboxMetadata {
-                            name: row.name,
-                            selectable: row.selectable,
-                            special_use: row
-                                .attributes
-                                .into_iter()
-                                .filter(|attribute| {
-                                    [
-                                        "\\All",
-                                        "\\Archive",
-                                        "\\Drafts",
-                                        "\\Flagged",
-                                        "\\Junk",
-                                        "\\Sent",
-                                        "\\Trash",
-                                    ]
-                                    .iter()
-                                    .any(|flag| attribute.eq_ignore_ascii_case(flag))
-                                })
-                                .collect(),
-                        })
-                        .collect()
-                })
-        })
-    }
-}
-
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct Reference {
-    pub(super) account: String,
+pub(super) struct Reference<S = String> {
+    pub(super) account: S,
     pub(super) generation: u64,
-    pub(super) mailbox: String,
+    pub(super) mailbox: S,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -150,6 +84,43 @@ struct Cursor {
 }
 
 impl Service {
+    pub(super) fn authorize_mailbox<'a>(
+        &'a self,
+        context: &'a RequestContext,
+        account_id: &str,
+        expected_generation: u64,
+        mailbox: &str,
+    ) -> Result<MailboxTarget<'a>, Error> {
+        let grant = self.grant(context)?;
+        let (account, id, generation) = self
+            .visible_accounts(context)
+            .find_map(|account| {
+                let (id, generation) = self.registry.identity(&account.key);
+                (id == account_id).then_some((account, id, generation))
+            })
+            .ok_or_else(|| Error::new(ErrorCode::AccountNotAllowed))?;
+        if generation != expected_generation {
+            return Err(Error::new(ErrorCode::StaleReference));
+        }
+        let name = mailbox_identity(mailbox);
+        if !account
+            .mailboxes
+            .iter()
+            .any(|allowed| mailbox_identity(allowed) == name)
+            || !grant
+                .mailboxes
+                .iter()
+                .any(|allowed| mailbox_identity(allowed) == name)
+        {
+            return Err(Error::new(ErrorCode::MailboxNotAllowed));
+        }
+        Ok(MailboxTarget {
+            config: account,
+            account_id: id,
+            generation,
+        })
+    }
+
     /// Select a provider adapter when composing the application, before accepting requests.
     pub fn with_mailbox_backend(mut self, backend: Arc<dyn MailboxBackend>) -> Self {
         self.mailbox_backend = Some(backend);
@@ -273,13 +244,7 @@ impl Service {
             let backend: &dyn MailboxBackend = match &self.mailbox_backend {
                 Some(backend) => backend.as_ref(),
                 None => {
-                    live = ImapMailboxes::new(
-                        self.authentication().await?.clone(),
-                        BTreeMap::from([(
-                            account.key.clone(),
-                            crate::credentials::source_for(&account.credential),
-                        )]),
-                    );
+                    live = self.imap_backend(account).await?;
                     &live
                 }
             };
@@ -314,7 +279,7 @@ impl Service {
             if identity != row.name {
                 row.name = identity.to_owned();
             }
-            row.special_use.sort();
+            row.special_use.sort_unstable();
             row.special_use.dedup();
             match inventory.entry(row.name.clone()) {
                 Entry::Vacant(entry) => {
@@ -366,9 +331,9 @@ impl Service {
             let reference = self.encode(
                 "mb1",
                 &Reference {
-                    account: id.into(),
+                    account: id,
                     generation,
-                    mailbox: metadata.name.clone(),
+                    mailbox: metadata.name.as_str(),
                 },
                 limits.token_bytes,
             )?;

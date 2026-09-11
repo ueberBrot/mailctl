@@ -21,6 +21,7 @@ struct Expected {
     username: &'static str,
     password: &'static str,
     mailboxes: Vec<&'static str>,
+    body: Option<&'static str>,
     search: Option<(&'static str, Option<u32>)>,
 }
 
@@ -67,7 +68,7 @@ impl NativeServer {
                         connection = listener.accept() => connection.unwrap().0,
                     };
                     count.fetch_add(1, Ordering::SeqCst);
-                    let Expected { username, password, mailboxes, search } = queue.lock().unwrap().pop_front().expect("unexpected provider connection");
+                    let Expected { username, password, mailboxes, search, body } = queue.lock().unwrap().pop_front().expect("unexpected provider connection");
                     tokio::select! {
                         _ = stopping.changed() => return,
                         result = tokio::time::timeout(Duration::from_secs(10), async {
@@ -85,6 +86,7 @@ impl NativeServer {
                             if let Some((mailbox, position)) = search {
                                 search_page(&mut wire, mailbox, position).await;
                             }
+                            if let Some(mailbox) = body { body_page(&mut wire, mailbox).await; }
                             imap_support::logout(&mut wire).await;
                         }) => result.expect("native authentication transcript deadline"),
                     }
@@ -107,6 +109,7 @@ impl NativeServer {
             password,
             mailboxes: Vec::new(),
             search: None,
+            body: None,
         });
     }
 
@@ -121,6 +124,7 @@ impl NativeServer {
             password,
             mailboxes: mailboxes.to_vec(),
             search: None,
+            body: None,
         });
     }
 
@@ -136,6 +140,22 @@ impl NativeServer {
             password,
             mailboxes: vec![],
             search: Some((mailbox, position)),
+            body: None,
+        });
+    }
+
+    pub fn expect_body(
+        &self,
+        username: &'static str,
+        password: &'static str,
+        mailbox: &'static str,
+    ) {
+        self.expected.lock().unwrap().push_back(Expected {
+            username,
+            password,
+            mailboxes: vec![],
+            search: None,
+            body: Some(mailbox),
         });
     }
 
@@ -193,6 +213,40 @@ async fn search_page(wire: &mut imap_support::Wire, mailbox: &str, position: Opt
     let flags = if uid == 1 { "" } else { "\\Seen" };
     let subject = format!("Search fixture {uid} {}", "x".repeat(12000));
     write(wire, &format!("* {uid} FETCH (UID {uid} ENVELOPE (NIL \"{subject}\" NIL NIL NIL NIL NIL NIL NIL \"<search-{uid}@example.test>\") FLAGS ({flags}) INTERNALDATE \"01-Sep-2026 12:00:00 +0000\" RFC822.SIZE 13000)\r\n{tag} OK fetched\r\n")).await;
+}
+
+async fn body_page(wire: &mut imap_support::Wire, mailbox: &str) {
+    use imap_support::{expect, write};
+    let tag = expect(wire, &format!("EXAMINE {mailbox}")).await;
+    write(
+        wire,
+        &format!("* 3 EXISTS\r\n* OK [UIDVALIDITY 77] stable\r\n{tag} OK [READ-ONLY] selected\r\n"),
+    )
+    .await;
+    let tag = expect(wire, "UID FETCH 3 (UID RFC822.SIZE BODYSTRUCTURE)").await;
+    write(wire, &format!("* 3 FETCH (UID 3 RFC822.SIZE 3000300 BODYSTRUCTURE ((\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" 13 1 NIL NIL NIL NIL)(\"APPLICATION\" \"OCTET-STREAM\" NIL NIL NIL \"BASE64\" 3000000 NIL (\"ATTACHMENT\" NIL) NIL NIL) \"MIXED\" NIL NIL NIL NIL))\r\n{tag} OK fetched\r\n")).await;
+    for (section, count, value) in [
+        (
+            "HEADER",
+            16384,
+            "MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=fixture\r\n\r\n",
+        ),
+        ("1", 14, "Short body.\r\n"),
+    ] {
+        let tag = expect(
+            wire,
+            &format!("UID FETCH 3 (UID BODY.PEEK[{section}]<0.{count}>)"),
+        )
+        .await;
+        write(
+            wire,
+            &format!(
+                "* 3 FETCH (UID 3 BODY[{section}]<0> {{{}}}\r\n{value})\r\n{tag} OK fetched\r\n",
+                value.len()
+            ),
+        )
+        .await;
+    }
 }
 
 impl Drop for NativeServer {

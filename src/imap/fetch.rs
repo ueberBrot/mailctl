@@ -105,26 +105,29 @@ impl Fetch {
         }
     }
     fn request(&self) -> MacroOrMessageDataItemNames<'static> {
-        let mut names = vec![MessageDataItemName::Uid];
-        match self {
-            Self::Metadata { .. } => names.extend([
+        let names = match self {
+            Self::Metadata { .. } => vec![
+                MessageDataItemName::Uid,
                 MessageDataItemName::Rfc822Size,
                 MessageDataItemName::BodyStructure,
-            ]),
+            ],
             Self::Bytes {
                 section,
                 offset,
                 count,
                 ..
-            } => names.push(MessageDataItemName::BodyExt {
-                section: section.clone(),
-                partial: Some((
-                    *offset,
-                    NonZeroU32::new(*count).expect("nonzero bounded chunk"),
-                )),
-                peek: true,
-            }),
-        }
+            } => vec![
+                MessageDataItemName::Uid,
+                MessageDataItemName::BodyExt {
+                    section: section.clone(),
+                    partial: Some((
+                        *offset,
+                        NonZeroU32::new(*count).expect("nonzero bounded chunk"),
+                    )),
+                    peek: true,
+                },
+            ],
+        };
         names.into()
     }
     pub(super) fn from_command(body: &CommandBody<'_>) -> Option<Self> {
@@ -275,6 +278,9 @@ impl Fetch {
                 },
             ))
             .await?;
+        if rows.is_empty() {
+            return Err(Error::MessageNotFound);
+        }
         if rows.len() != 1 {
             return Err(Error::Protocol);
         }

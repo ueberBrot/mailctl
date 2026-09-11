@@ -72,6 +72,8 @@ pub enum Error {
     Limit,
     Authentication,
     UnsafeSelection,
+    StaleReference,
+    MessageNotFound,
     StaleCursor,
     TransferExpired,
 }
@@ -88,6 +90,8 @@ impl fmt::Display for Error {
             Self::Limit => "IMAP resource limit exceeded",
             Self::Authentication => "IMAP authentication failed",
             Self::UnsafeSelection => "IMAP read-only selection was not established",
+            Self::StaleReference => "message reference is stale",
+            Self::MessageNotFound => "message was not found",
             Self::StaleCursor => "message body continuation is stale",
             Self::TransferExpired => "attachment transfer expired",
         })
@@ -273,8 +277,8 @@ pub struct Search {
 /// A verified TLS endpoint. Inputs and results contain no raw IMAP commands.
 ///
 /// Authentication accepts printable ASCII credentials; literal authentication remains
-/// gated. This proof accepts printable ASCII mailbox names. Wildcard and international
-/// names remain gated until exact discovery has dedicated transcript evidence.
+/// gated. Mailbox names use Unicode with modified UTF-7 on the IMAP wire.
+/// Control characters and LIST wildcards remain unsupported.
 /// Search enumerates one bounded UID window; application predicates and cursors
 /// are separate delivery work. Overflow returns an error, never a partial list.
 pub struct ImapProbe {
@@ -512,12 +516,47 @@ pub(crate) fn mailbox(name: &str) -> Result<(), Error> {
         return Err(Error::InvalidInput);
     }
     if name
-        .bytes()
-        .any(|b| !(32..=126).contains(&b) || b == b'*' || b == b'%')
+        .chars()
+        .any(|c| c.is_control() || matches!(c, '*' | '%'))
     {
         return Err(Error::Unsupported);
     }
     Ok(())
+}
+
+// io-imap encodes mailbox arguments but leaves LIST patterns in wire form.
+fn mailbox_pattern(name: &str) -> String {
+    use base64::{
+        Engine,
+        alphabet::IMAP_MUTF7,
+        engine::general_purpose::{GeneralPurpose, NO_PAD},
+    };
+    const BASE64: GeneralPurpose = GeneralPurpose::new(&IMAP_MUTF7, NO_PAD);
+    let mut encoded = String::with_capacity(name.len());
+    let mut remaining = name;
+    while !remaining.is_empty() {
+        let end = remaining
+            .find(|c: char| c.is_ascii())
+            .unwrap_or(remaining.len());
+        if end > 0 {
+            let bytes: Vec<_> = remaining[..end]
+                .encode_utf16()
+                .flat_map(u16::to_be_bytes)
+                .collect();
+            encoded.push('&');
+            BASE64.encode_string(bytes, &mut encoded);
+            encoded.push('-');
+            remaining = &remaining[end..];
+        }
+        if let Some(ascii) = remaining.bytes().next() {
+            encoded.push(char::from(ascii));
+            if ascii == b'&' {
+                encoded.push('-');
+            }
+            remaining = &remaining[1..];
+        }
+    }
+    encoded
 }
 
 impl Connection<'_> {
@@ -530,8 +569,7 @@ impl Connection<'_> {
         let mut row_count = 0usize;
         for (expected, name) in names {
             // The coroutine decodes response names; its LIST pattern needs wire encoding.
-            let pattern = name
-                .replace('&', "&-")
+            let pattern = mailbox_pattern(name)
                 .try_into()
                 .map_err(|_| Error::InvalidInput)?;
             let rows = self
@@ -589,6 +627,8 @@ impl From<Error> for crate::domain::Error {
             Error::Unsupported => ErrorCode::UnsupportedCapability,
             Error::Limit => ErrorCode::ResponseTooLarge,
             Error::InvalidInput => ErrorCode::InvalidRequest,
+            Error::StaleReference => ErrorCode::StaleReference,
+            Error::MessageNotFound => ErrorCode::MessageNotFound,
             _ => ErrorCode::ProviderUnavailable,
         })
     }

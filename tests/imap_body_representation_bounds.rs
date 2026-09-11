@@ -110,9 +110,8 @@ async fn all_mime_nodes_count_even_when_selection_excludes_their_subtrees() {
             ..Limits::default()
         },
         move |mut wire| {
-            let structure = accepted_structure.clone();
             Box::pin(async move {
-                selected_prefix(&mut wire, &structure, 100).await;
+                selected_prefix(&mut wire, &accepted_structure, 100).await;
                 literal_bytes(&mut wire, "3", 0, 3, b"ok").await;
                 logout(&mut wire).await;
             })

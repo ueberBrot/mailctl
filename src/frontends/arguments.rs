@@ -2,7 +2,8 @@
 use super::{Executable, diagnostics};
 #[cfg(feature = "cli")]
 use crate::domain::{
-    ListAccountsInput, ListMailboxesInput, Operation, SearchCriteria, SearchMessagesInput,
+    GetMessageInput, ListAccountsInput, ListMailboxesInput, Operation, SearchCriteria,
+    SearchMessagesInput,
 };
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use std::path::PathBuf;
@@ -84,6 +85,11 @@ enum Email {
 #[cfg(feature = "cli")]
 #[derive(Subcommand)]
 enum Message {
+    /// Read bounded selected text from a reusable message reference.
+    Get {
+        #[arg(long)]
+        message: String,
+    },
     /// Search a mailbox with AND-only criteria and descending-UID continuation.
     Search {
         #[arg(long)]
@@ -102,7 +108,7 @@ fn search_criteria(value: &str) -> Result<SearchCriteria, &'static str> {
     if value.len() > 1024 * 1024 {
         return Err("Search criteria exceed the input limit");
     }
-    crate::encoding::validate_json_depth(value.as_bytes(), 32)
+    crate::encoding::validate_json_bounds(value.as_bytes(), 32, usize::MAX)
         .map_err(|_| "Invalid search criteria")?;
     serde_json::from_str(value).map_err(|_| "Invalid search criteria")
 }
@@ -194,6 +200,9 @@ impl Invocation {
             Executable::Cli => {
                 let parsed = Mailctl::from_arg_matches(matches)?;
                 let action = match parsed.command {
+                    Email::Message(Message::Get { message }) => {
+                        Action::Email(Operation::GetMessage(GetMessageInput { message }))
+                    }
                     Email::Message(Message::Search {
                         mailbox,
                         criteria,
