@@ -233,7 +233,11 @@ fn unsupported_configuration_and_state_versions_preserve_established_identities(
             .unwrap()
             .join("state/accounts.json");
         let state = std::fs::read(&state_path).unwrap();
-        let unsupported = original.replacen("version = 1", "version = 999", 1);
+        let unsupported = original.replacen(
+            "version = 1",
+            "version = 999\nfuture_schema_field = true",
+            1,
+        );
         std::fs::write(installation.config(), &unsupported).unwrap();
         let output = run_bounded({
             let mut command = installation.command(executable);
@@ -255,6 +259,7 @@ fn unsupported_configuration_and_state_versions_preserve_established_identities(
         std::fs::write(installation.config(), &original).unwrap();
         let mut future_state: serde_json::Value = serde_json::from_slice(&state).unwrap();
         future_state["version"] = serde_json::json!(999);
+        future_state["future_schema_field"] = serde_json::json!(true);
         let future_state = serde_json::to_vec(&future_state).unwrap();
         std::fs::write(&state_path, &future_state).unwrap();
         let output = run_bounded({

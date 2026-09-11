@@ -330,6 +330,14 @@ fn load(directory: &Path) -> Result<Option<Registry>, Error> {
     let Some(bytes) = storage::read(directory)? else {
         return Ok(None);
     };
+    #[derive(Deserialize)]
+    struct SchemaVersion {
+        version: u32,
+    }
+    let schema: SchemaVersion = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+    if schema.version != 1 {
+        return Err(Error::incompatible_schema());
+    }
     let registry: Registry = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
     registry.validate()?;
     Ok(Some(registry))
