@@ -147,6 +147,11 @@ async fn execute(
         return Ok(report(json, color, Ok(OperationResult::Setup(setup)), (), 30).await);
     }
     let config = configuration::load(&options.config)?;
+    #[cfg(feature = "cli")]
+    let export_roots = match action {
+        Action::Export { .. } => config.export_roots.clone(),
+        _ => Vec::new(),
+    };
     let deadline = config.limits.operation_seconds;
     let selected = options
         .grant
@@ -193,12 +198,18 @@ async fn execute(
             service: Box::new(service),
             context,
         },
+        #[cfg(feature = "cli")]
+        export_roots,
     )
     .await
 }
 
 #[cfg(target_os = "macos")]
 async fn execute_isolated(mut options: arguments::Options, action: Action) -> Result<u8, Error> {
+    #[cfg(feature = "cli")]
+    if matches!(action, Action::Export { .. }) {
+        return Err(Error::new(ErrorCode::UnsupportedCapability));
+    }
     if matches!(action, Action::Setup(_) | Action::Credential(_)) {
         return Err(Error::new(ErrorCode::InvalidRequest));
     }
@@ -209,7 +220,14 @@ async fn execute_isolated(mut options: arguments::Options, action: Action) -> Re
         _ = &mut shutdown => return Err(Error::new(ErrorCode::Cancelled)),
         result = crate::isolation::Client::connect(narrowing) => result?,
     };
-    execute_application(options, action, Application::Isolated(Box::new(client))).await
+    execute_application(
+        options,
+        action,
+        Application::Isolated(Box::new(client)),
+        #[cfg(feature = "cli")]
+        Vec::new(),
+    )
+    .await
 }
 
 fn invocation_narrowing(
@@ -238,6 +256,7 @@ async fn execute_application(
     options: arguments::Options,
     action: Action,
     application: Application,
+    #[cfg(feature = "cli")] export_roots: Vec<std::path::PathBuf>,
 ) -> Result<u8, Error> {
     let deadline = application.limits()?.operation_seconds;
     let shutdown = termination_signal()?;
@@ -249,8 +268,27 @@ async fn execute_application(
             result = mcp::run(application) => result.map(|()| 0),
         };
     }
+    #[cfg(feature = "cli")]
+    let mut export = match &action {
+        Action::Export { root, name, .. } => Some(crate::export::ExportWriter::create(
+            &export_roots,
+            root,
+            name,
+            application.limits()?.attachment_decoded_bytes,
+        )?),
+        _ => None,
+    };
     let operation = async {
         match action {
+            #[cfg(feature = "cli")]
+            Action::Export { attachment, .. } => {
+                application
+                    .export_attachment(
+                        attachment,
+                        export.as_mut().expect("export writer initialized"),
+                    )
+                    .await
+            }
             Action::Doctor { check_account } => application.doctor(check_account).await,
             #[cfg(feature = "cli")]
             Action::Email(crate::domain::Operation::GetAttachment(input)) => {
@@ -268,6 +306,11 @@ async fn execute_application(
         result = tokio::time::timeout(Duration::from_secs(deadline as u64), operation) =>
             result.map_err(|_| Error::new(ErrorCode::Timeout)).flatten(),
     };
+    #[cfg(feature = "cli")]
+    let result = export
+        .as_mut()
+        .map_or(Ok(()), crate::export::ExportWriter::abort)
+        .and(result);
     Ok(report(
         options.json,
         options.diagnostics.color,

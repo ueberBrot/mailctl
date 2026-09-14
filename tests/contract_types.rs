@@ -19,6 +19,12 @@ const _: fn(OperationResult) = |result| match result {
     OperationResult::Attachment(value) => {
         let _: mailctl::domain::AttachmentChunk = value;
     }
+    OperationResult::Export(receipt) => {
+        let _: std::path::PathBuf = receipt.path;
+        let _: String = receipt.filesystem;
+        let _: u64 = receipt.total_decoded_bytes;
+        let _: String = receipt.sha256;
+    }
 
     OperationResult::Message(message) => {
         let _: String = message.account_id;

@@ -4,6 +4,15 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct ExportReceipt {
+    pub path: std::path::PathBuf,
+    pub filesystem: String,
+    pub total_decoded_bytes: u64,
+    pub sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ListAttachmentsInput {
     #[serde(deserialize_with = "reference")]
     #[schemars(length(min = 1, max = 8192), extend("x-maxUtf8Bytes" = 8192))]

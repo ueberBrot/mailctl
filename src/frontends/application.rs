@@ -5,6 +5,8 @@ use crate::{
     policy::RequestContext,
     service::Service,
 };
+#[cfg(feature = "cli")]
+use std::ops::ControlFlow;
 
 pub(super) enum Application {
     Embedded {
@@ -70,23 +72,32 @@ impl Application {
 
 #[cfg(feature = "cli")]
 impl Application {
+    pub async fn export_attachment(
+        &self,
+        attachment: String,
+        writer: &mut crate::export::ExportWriter,
+    ) -> Result<OperationResult, Error> {
+        self.transfer_attachment(
+            crate::domain::GetAttachmentInput::Start(crate::domain::AttachmentStart { attachment }),
+            |chunk| {
+                Ok(match writer.write_chunk(&chunk)? {
+                    Some(receipt) => ControlFlow::Break(OperationResult::Export(receipt)),
+                    None => ControlFlow::Continue(chunk),
+                })
+            },
+        )
+        .await
+    }
+
     pub async fn download_attachment(
         &self,
         input: crate::domain::GetAttachmentInput,
     ) -> Result<OperationResult, Error> {
-        use crate::domain::{
-            AttachmentContinuation, AttachmentProgress, ErrorCode, GetAttachmentInput,
-        };
+        use crate::domain::{AttachmentProgress, ErrorCode};
         use base64::{Engine, engine::general_purpose::STANDARD};
         let limits = self.limits()?;
-        let mut input = input;
         let mut bytes = Vec::new();
-        loop {
-            let OperationResult::Attachment(mut chunk) =
-                self.execute(Operation::GetAttachment(input)).await?
-            else {
-                return Err(Error::new(ErrorCode::InternalError));
-            };
+        self.transfer_attachment(input, |mut chunk| {
             if chunk.decoded_offset != bytes.len() as u64 {
                 return Err(Error::new(ErrorCode::InternalError));
             }
@@ -99,17 +110,44 @@ impl Application {
             {
                 return Err(Error::new(ErrorCode::ResponseTooLarge));
             }
-            match chunk.progress {
-                AttachmentProgress::Continue { next_token } => {
-                    input =
-                        GetAttachmentInput::Continue(AttachmentContinuation { token: next_token })
-                }
-                AttachmentProgress::Complete { .. } => {
-                    chunk.bytes_base64 = STANDARD.encode(bytes);
-                    chunk.decoded_offset = 0;
-                    return Ok(OperationResult::Attachment(chunk));
-                }
+            if matches!(chunk.progress, AttachmentProgress::Complete { .. }) {
+                chunk.bytes_base64 = STANDARD.encode(&bytes);
+                chunk.decoded_offset = 0;
+                Ok(ControlFlow::Break(OperationResult::Attachment(chunk)))
+            } else {
+                Ok(ControlFlow::Continue(chunk))
             }
+        })
+        .await
+    }
+
+    async fn transfer_attachment(
+        &self,
+        mut input: crate::domain::GetAttachmentInput,
+        mut consume: impl FnMut(
+            crate::domain::AttachmentChunk,
+        ) -> Result<
+            ControlFlow<OperationResult, crate::domain::AttachmentChunk>,
+            Error,
+        >,
+    ) -> Result<OperationResult, Error> {
+        use crate::domain::{
+            AttachmentContinuation, AttachmentProgress, ErrorCode, GetAttachmentInput,
+        };
+        loop {
+            let OperationResult::Attachment(chunk) =
+                self.execute(Operation::GetAttachment(input)).await?
+            else {
+                return Err(Error::new(ErrorCode::InternalError));
+            };
+            let chunk = match consume(chunk)? {
+                ControlFlow::Break(result) => return Ok(result),
+                ControlFlow::Continue(chunk) => chunk,
+            };
+            let AttachmentProgress::Continue { next_token } = chunk.progress else {
+                return Err(Error::new(ErrorCode::InternalError));
+            };
+            input = GetAttachmentInput::Continue(AttachmentContinuation { token: next_token });
         }
     }
 }

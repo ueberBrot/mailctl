@@ -4,6 +4,10 @@ mod support;
 use support::{Installation, assert_success, envelope, run_bounded};
 
 #[test]
+#[allow(
+    clippy::single_element_loop,
+    reason = "feature selections exercise one or both executables"
+)]
 fn setup_and_credential_status_do_not_load_tls_trust() {
     for executable in [
         #[cfg(feature = "cli")]

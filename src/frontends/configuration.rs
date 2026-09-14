@@ -81,6 +81,7 @@ pub(super) fn setup(
                 parent.join("state")
             },
             default_grant: "default".into(),
+            export_roots: Vec::new(),
             limits: Limits::default(),
             accounts: Vec::new(),
             grants: vec![AccessGrant {

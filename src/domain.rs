@@ -38,6 +38,8 @@ pub enum ErrorCode {
     JournalUnavailable,
     JournalFull,
     ExportFailed,
+    ExportCleanupFailed,
+    ExportFinalizationFailed,
     InternalError,
     OperationNotFound,
 }
@@ -90,6 +92,12 @@ impl Error {
             ErrorCode::ResponseTooLarge => "Result exceeds the configured limit",
             ErrorCode::UnsupportedCapability => "Operation is not supported",
             ErrorCode::Cancelled => "Request cancelled",
+            ErrorCode::ExportCleanupFailed => {
+                "Export partial-file cleanup failed; inspect the approved export root"
+            }
+            ErrorCode::ExportFinalizationFailed => {
+                "Export created a destination but could not finish; inspect the approved export root for the destination and partial files before retrying"
+            }
             ErrorCode::OperationConflict => {
                 "Configuration changed; restart the command or MCP session"
             }
@@ -386,6 +394,7 @@ pub enum OperationResult {
     Message(MessageBody),
     Attachments(AttachmentList),
     Attachment(AttachmentChunk),
+    Export(ExportReceipt),
     Capabilities(Capabilities),
     Health(Health),
     Cancelled(Cancellation),

@@ -176,6 +176,7 @@ pub struct Config {
     pub default_grant: String,
     pub topology: Topology,
     pub state_dir: PathBuf,
+    pub export_roots: Vec<PathBuf>,
     pub limits: Limits,
     pub accounts: Vec<AccountConfig>,
     pub grants: Vec<AccessGrant>,
@@ -189,6 +190,8 @@ struct RawConfig {
     #[serde(default)]
     topology: Topology,
     state_dir: PathBuf,
+    #[serde(default)]
+    export_roots: Vec<PathBuf>,
     #[serde(default)]
     limits: Limits,
     accounts: Vec<AccountConfig>,
@@ -237,6 +240,7 @@ impl Config {
             default_grant: raw.default_grant,
             topology: raw.topology,
             state_dir: raw.state_dir,
+            export_roots: raw.export_roots,
             limits: raw.limits,
             accounts: raw.accounts,
             grants,
@@ -250,6 +254,8 @@ impl Config {
         }
         self.limits.validate()?;
         if !safe_path(&self.state_dir)
+            || self.export_roots.len() > 32
+            || self.export_roots.iter().any(|root| !safe_path(root))
             || self.accounts.len() > self.limits.accounts
             || self.grants.is_empty()
             || self.grants.len() > self.limits.grants

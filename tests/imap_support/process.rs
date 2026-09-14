@@ -36,6 +36,7 @@ pub enum AttachmentPhase {
     List,
     Start,
     Continue,
+    Interrupted,
 }
 
 pub struct ImapServer {
@@ -43,6 +44,8 @@ pub struct ImapServer {
     pub certificate: PathBuf,
     expected: Arc<Mutex<VecDeque<Expected>>>,
     accepted: Arc<AtomicUsize>,
+    #[allow(dead_code, reason = "observed only by export cancellation tests")]
+    interrupted: Arc<AtomicUsize>,
     stop: watch::Sender<bool>,
     task: Option<thread::JoinHandle<()>>,
 }
@@ -71,6 +74,8 @@ impl ImapServer {
         let (stop, mut stopping) = watch::channel(false);
         let queue = expected.clone();
         let count = accepted.clone();
+        let interrupted = Arc::new(AtomicUsize::new(0));
+        let stalled = interrupted.clone();
         let task = thread::spawn(move || {
             tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
                 let listener = tokio::net::TcpListener::from_std(listener).unwrap();
@@ -102,7 +107,10 @@ impl ImapServer {
                                 }
                                 ExpectedOperation::Search(mailbox, position) => search_page(&mut wire, mailbox, position).await,
                                 ExpectedOperation::Body(mailbox) => body_page(&mut wire, mailbox).await,
-                                ExpectedOperation::Attachment(mailbox, phase) => attachment_page(&mut wire, mailbox, phase).await,
+                                ExpectedOperation::Attachment(mailbox, phase) => {
+                                    attachment_page(&mut wire, mailbox, phase, &stalled).await;
+                                    if phase == AttachmentPhase::Interrupted { return; }
+                                },
                             }
                             imap_support::logout(&mut wire).await;
                         }) => result.expect("IMAP authentication transcript deadline"),
@@ -115,9 +123,15 @@ impl ImapServer {
             certificate,
             expected,
             accepted,
+            interrupted,
             stop,
             task: Some(task),
         }
+    }
+
+    #[allow(dead_code, reason = "observed only by export cancellation tests")]
+    pub fn interrupted(&self) -> usize {
+        self.interrupted.load(Ordering::SeqCst)
     }
 
     pub fn expect(&self, username: &'static str, password: &'static str) {
@@ -281,7 +295,12 @@ impl Drop for ImapServer {
     }
 }
 
-async fn attachment_page(wire: &mut imap_support::Wire, mailbox: &str, payload: AttachmentPhase) {
+async fn attachment_page(
+    wire: &mut imap_support::Wire,
+    mailbox: &str,
+    payload: AttachmentPhase,
+    interrupted: &AtomicUsize,
+) {
     use imap_support::{expect, write};
     let tag = expect(wire, &format!("EXAMINE {mailbox}")).await;
     write(
@@ -292,6 +311,17 @@ async fn attachment_page(wire: &mut imap_support::Wire, mailbox: &str, payload: 
     if payload != AttachmentPhase::Continue {
         let tag = expect(wire, "UID FETCH 3 (UID RFC822.SIZE BODYSTRUCTURE)").await;
         write(wire, &format!("* 3 FETCH (UID 3 RFC822.SIZE 3000300 BODYSTRUCTURE ((\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" 13 1 NIL NIL NIL NIL)(\"APPLICATION\" \"OCTET-STREAM\" NIL NIL NIL \"BASE64\" 8 NIL (\"ATTACHMENT\" (\"FILENAME\" \"fixture.bin\")) NIL NIL) \"MIXED\" NIL NIL NIL NIL))\r\n{tag} OK fetched\r\n")).await;
+    }
+    if payload == AttachmentPhase::Interrupted {
+        use tokio::io::AsyncReadExt;
+        expect(wire, "UID FETCH 3 (UID BODY.PEEK[2]<0.16384>)").await;
+        interrupted.fetch_add(1, Ordering::SeqCst);
+        let closed = wire.read(&mut [0]).await;
+        assert!(
+            matches!(closed, Ok(0))
+                || closed.is_err_and(|error| error.kind() == std::io::ErrorKind::UnexpectedEof),
+            "cancelled export disposes the connection"
+        );
     }
     if payload == AttachmentPhase::Start {
         let tag = expect(wire, "UID FETCH 3 (UID BODY.PEEK[2]<0.16384>)").await;

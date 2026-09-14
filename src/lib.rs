@@ -5,6 +5,8 @@ pub mod credentials;
 pub mod domain;
 pub mod draft_journal;
 mod encoding;
+#[cfg(feature = "cli")]
+pub mod export;
 mod file_storage;
 #[cfg(any(feature = "cli", feature = "mcp"))]
 pub mod frontends;

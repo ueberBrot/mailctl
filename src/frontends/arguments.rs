@@ -87,6 +87,16 @@ enum Email {
 #[cfg(feature = "cli")]
 #[derive(Subcommand)]
 enum Attachment {
+    /// Save an attachment under a configured export root (embedded macOS only).
+    Export {
+        #[arg(long)]
+        attachment: String,
+        #[arg(long)]
+        root: PathBuf,
+        /// Safe basename; defaults to attachment.bin.
+        #[arg(long, default_value = "attachment.bin")]
+        name: String,
+    },
     /// List attachment metadata without retrieving payloads.
     List {
         #[arg(long)]
@@ -180,6 +190,12 @@ pub(super) struct Invocation {
 }
 pub(super) enum Action {
     #[cfg(feature = "cli")]
+    Export {
+        attachment: String,
+        root: PathBuf,
+        name: String,
+    },
+    #[cfg(feature = "cli")]
     Email(Operation),
     #[cfg(feature = "mcp")]
     Mcp {
@@ -218,6 +234,15 @@ impl Invocation {
             Executable::Cli => {
                 let parsed = Mailctl::from_arg_matches(matches)?;
                 let action = match parsed.command {
+                    Email::Attachment(Attachment::Export {
+                        attachment,
+                        root,
+                        name,
+                    }) => Action::Export {
+                        attachment,
+                        root,
+                        name,
+                    },
                     Email::Attachment(Attachment::List { message }) => Action::Email(
                         Operation::ListAttachments(crate::domain::ListAttachmentsInput { message }),
                     ),
