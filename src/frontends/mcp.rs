@@ -14,6 +14,7 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 struct EmailTools {
+    attachments: bool,
     mailboxes: bool,
     search: bool,
     read: bool,
@@ -24,7 +25,7 @@ struct EmailTools {
     shutdown: CancellationToken,
 }
 
-fn definitions(mailboxes: bool, search: bool, read: bool) -> Vec<Tool> {
+fn definitions(mailboxes: bool, search: bool, read: bool, attachments: bool) -> Vec<Tool> {
     let empty = json!({"type":"object","properties":{},"additionalProperties":false});
     let mut tools = vec![
         Tool::new(
@@ -74,6 +75,26 @@ fn definitions(mailboxes: bool, search: bool, read: bool) -> Vec<Tool> {
             .with_output_schema::<Envelope<MessageBody>>(),
         );
     }
+    if attachments {
+        tools.push(
+            Tool::new(
+                "email_list_attachments",
+                "List attachment metadata and reusable references without retrieving payloads.",
+                serde_json::Map::new(),
+            )
+            .with_input_schema::<crate::domain::ListAttachmentsInput>()
+            .with_output_schema::<Envelope<crate::domain::AttachmentList>>(),
+        );
+        tools.push(
+            Tool::new(
+                "email_get_attachment",
+                "Retrieve a bounded base64 chunk, or resume a transfer in this session.",
+                serde_json::Map::new(),
+            )
+            .with_input_schema::<crate::domain::GetAttachmentInput>()
+            .with_output_schema::<Envelope<crate::domain::AttachmentChunk>>(),
+        );
+    }
     tools
 }
 
@@ -105,7 +126,7 @@ impl ServerHandler for EmailTools {
                     .map_err(|_| McpError::internal_error("Service unavailable", None))?,
         };
         Ok(ListToolsResult {
-            tools: definitions(self.mailboxes, self.search, self.read),
+            tools: definitions(self.mailboxes, self.search, self.read, self.attachments),
             ..Default::default()
         })
     }
@@ -126,6 +147,16 @@ impl ServerHandler for EmailTools {
         let input = request.arguments.unwrap_or_default();
         let operation = match (admitted.as_ref(), request.name.as_ref()) {
             (Err(error), _) => Err(error.clone()),
+            (_, "email_list_attachments") if self.attachments => {
+                serde_json::from_value(Value::Object(input))
+                    .map(Operation::ListAttachments)
+                    .map_err(|_| Error::new(ErrorCode::InvalidRequest))
+            }
+            (_, "email_get_attachment") if self.attachments => {
+                serde_json::from_value(Value::Object(input))
+                    .map(Operation::GetAttachment)
+                    .map_err(|_| Error::new(ErrorCode::InvalidRequest))
+            }
             (_, "email_get_message") if self.read => serde_json::from_value(Value::Object(input))
                 .map(Operation::GetMessage)
                 .map_err(|_| Error::new(ErrorCode::InvalidRequest)),
@@ -210,6 +241,10 @@ pub(super) async fn run(application: Application) -> Result<(), Error> {
         .operations
         .iter()
         .any(|operation| operation == "get_message");
+    let attachments = capabilities
+        .operations
+        .iter()
+        .any(|operation| operation == "get_attachment");
     let limits = application.limits()?;
     let bounds = Bounds::new(limits, application.response_bound()?)?;
     let expires = tokio::time::Instant::now()
@@ -220,6 +255,7 @@ pub(super) async fn run(application: Application) -> Result<(), Error> {
     let shutdown = CancellationToken::new();
     let _cancel_on_exit = shutdown.clone().drop_guard();
     let handler = EmailTools {
+        attachments,
         read,
         search,
         mailboxes,

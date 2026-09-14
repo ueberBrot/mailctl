@@ -607,6 +607,34 @@ fn search_handoffs(
     assert_success(&output);
     let body = envelope(&output)["result"].clone();
     assert_eq!(body["body"]["text"], "Short body.\r\n");
+    server.expect_attachment("work@example.test", FIRST, "Archive", false);
+    let mut command = installation.command(cli);
+    command.env("SSL_CERT_FILE", &server.certificate).args([
+        "--json",
+        "attachment",
+        "list",
+        "--message",
+        message_reference,
+    ]);
+    let output = run_bounded(command);
+    assert_success(&output);
+    let attachments = envelope(&output)["result"].clone();
+    let attachment = attachments["attachments"][0]["reference"].as_str().unwrap();
+    server.expect_attachment("work@example.test", FIRST, "Archive", true);
+    let mut command = installation.command(cli);
+    command.env("SSL_CERT_FILE", &server.certificate).args([
+        "--json",
+        "attachment",
+        "get",
+        "--attachment",
+        attachment,
+    ]);
+    let output = run_bounded(command);
+    assert_success(&output);
+    let downloaded = envelope(&output)["result"].clone();
+    assert_eq!(downloaded["bytes_base64"], "YWJjZGVm");
+    assert_eq!(downloaded["progress"]["total_decoded_bytes"], 6);
+
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -622,6 +650,38 @@ fn search_handoffs(
                 TokioChildProcess::new(command).unwrap()
             };
             let reader = ().serve(connect("default")).await.unwrap();
+            for (name, input, expected, payload) in [
+                (
+                    "email_list_attachments",
+                    json!({"message":message_reference}),
+                    &attachments,
+                    false,
+                ),
+                (
+                    "email_get_attachment",
+                    json!({"attachment":attachment}),
+                    &downloaded,
+                    true,
+                ),
+            ] {
+                server.expect_attachment("work@example.test", FIRST, "Archive", payload);
+                let response = reader
+                    .call_tool(
+                        CallToolRequestParams::new(name)
+                            .with_arguments(input.as_object().unwrap().clone()),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.is_error, Some(false));
+                let structured = response.structured_content.unwrap();
+                assert_eq!(&structured["result"], expected);
+                assert_eq!(
+                    serde_json::from_str::<Value>(&response.content[0].as_text().unwrap().text)
+                        .unwrap(),
+                    structured
+                );
+            }
+
             server.expect_body("work@example.test", FIRST, "Archive");
             let response = reader
                 .call_tool(

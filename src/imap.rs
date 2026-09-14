@@ -11,8 +11,9 @@ mod wire;
 
 pub use append::{AppendOutcome, AppendResult, AppendUid, DraftInput, PreparedDraft};
 
+pub(crate) use attachment::AttachmentDecoder;
 pub use attachment::{
-    AttachmentChunk, AttachmentIntegrity, AttachmentList, AttachmentListRequest,
+    AttachmentChunk, AttachmentData, AttachmentIntegrity, AttachmentList, AttachmentListRequest,
     AttachmentMetadata, AttachmentProgress, AttachmentRequest, AttachmentTransfer,
 };
 

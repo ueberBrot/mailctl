@@ -145,3 +145,69 @@ impl From<crate::imap::BodyPage> for BodyText {
         }
     }
 }
+
+impl super::AttachmentBackend for ImapBackend {
+    fn start(
+        &self,
+        target: MailboxTarget<'_>,
+        mailbox: &str,
+        uid: u32,
+        validity: u32,
+        part: &str,
+        limits: &Limits,
+    ) -> Result<Box<dyn super::AttachmentReader>, Error> {
+        let account = self.account(target)?;
+        let decoder = crate::imap::AttachmentDecoder::new(
+            &account.config.username,
+            mailbox,
+            uid,
+            validity,
+            part,
+            limits,
+        )
+        .map_err(Error::from)?;
+        Ok(Box::new(ImapAttachment {
+            runtime: self.runtime.clone(),
+            account,
+            decoder,
+        }))
+    }
+
+    fn list<'a>(
+        &'a self,
+        target: MailboxTarget<'a>,
+        mailbox: &'a str,
+        request: crate::imap::AttachmentListRequest,
+        limits: &'a Limits,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<Vec<crate::imap::AttachmentMetadata>, Error>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            self.acquire(target, limits)
+                .await?
+                .list_attachments(mailbox, request, limits)
+                .await
+        })
+    }
+}
+
+struct ImapAttachment {
+    runtime: Arc<crate::authentication::Runtime>,
+    account: crate::authentication::Account,
+    decoder: crate::imap::AttachmentDecoder,
+}
+impl super::AttachmentReader for ImapAttachment {
+    fn next<'a>(
+        &'a mut self,
+        limits: &'a Limits,
+    ) -> Pin<Box<dyn Future<Output = Result<crate::imap::AttachmentData, Error>> + Send + 'a>> {
+        Box::pin(async move {
+            let lease = self
+                .runtime
+                .acquire(&self.account, limits)
+                .await
+                .map_err(super::credentials::authentication_error)?;
+            lease.read_attachment(&mut self.decoder, limits).await
+        })
+    }
+}

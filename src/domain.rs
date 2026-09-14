@@ -3,6 +3,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 mod message;
 pub use message::*;
+mod attachment;
+pub use attachment::*;
 mod search;
 pub use search::*;
 
@@ -160,6 +162,8 @@ pub enum Operation {
     ListMailboxes(ListMailboxesInput),
     SearchMessages(SearchMessagesInput),
     GetMessage(GetMessageInput),
+    ListAttachments(ListAttachmentsInput),
+    GetAttachment(GetAttachmentInput),
     Capabilities,
     Health,
 }
@@ -187,6 +191,12 @@ impl<'de> Deserialize<'de> for Operation {
         let wire = Wire::deserialize(deserializer)?;
         let invalid = || serde::de::Error::custom("invalid operation input");
         match (wire.operation.as_str(), wire.input) {
+            ("list_attachments", Input::Present(input)) => serde_json::from_value(input)
+                .map(Self::ListAttachments)
+                .map_err(|_| invalid()),
+            ("get_attachment", Input::Present(input)) => serde_json::from_value(input)
+                .map(Self::GetAttachment)
+                .map_err(|_| invalid()),
             ("list_accounts", Input::Present(input)) => serde_json::from_value(input)
                 .map(Self::ListAccounts)
                 .map_err(|_| invalid()),
@@ -374,6 +384,8 @@ pub enum OperationResult {
     Mailboxes(MailboxDiscovery),
     Messages(MessageSearch),
     Message(MessageBody),
+    Attachments(AttachmentList),
+    Attachment(AttachmentChunk),
     Capabilities(Capabilities),
     Health(Health),
     Cancelled(Cancellation),

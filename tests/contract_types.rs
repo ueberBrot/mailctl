@@ -13,6 +13,13 @@ const _: for<'a> fn(&'a Service, &RequestContext) -> Result<&'a mailctl::config:
 const _: fn(Envelope<AccountDiscovery>) -> Result<AccountDiscovery, Error> = Envelope::into_result;
 const _: fn(Envelope<Capabilities>) -> Result<Capabilities, Error> = Envelope::into_result;
 const _: fn(OperationResult) = |result| match result {
+    OperationResult::Attachments(value) => {
+        let _: mailctl::domain::AttachmentList = value;
+    }
+    OperationResult::Attachment(value) => {
+        let _: mailctl::domain::AttachmentChunk = value;
+    }
+
     OperationResult::Message(message) => {
         let _: String = message.account_id;
         let _: u64 = message.generation;

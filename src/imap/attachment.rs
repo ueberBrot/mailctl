@@ -587,3 +587,135 @@ fn safe_filename(value: &str) -> Option<String> {
 fn principal(username: &str) -> [u8; 32] {
     Sha256::digest(username.as_bytes()).into()
 }
+
+impl super::AuthenticatedConnection {
+    pub(crate) async fn list_attachments(
+        self,
+        name: &str,
+        request: AttachmentListRequest,
+        limits: &crate::config::Limits,
+    ) -> Result<Vec<AttachmentMetadata>, Error> {
+        let limits = application_limits(limits);
+        limits.validate()?;
+        let mut metrics = Metrics::default();
+        let mut conn = self.0.resume(&mut metrics);
+        conn.limit_body(&limits);
+        mailbox(name)?;
+        if request.uid == 0 || request.uid_validity == 0 {
+            return Err(Error::InvalidInput);
+        }
+        if conn.examine(name).await? != request.uid_validity {
+            return Err(Error::StaleReference);
+        }
+        let fetch = Fetch::Metadata { uid: request.uid };
+        let fields = fetch.execute(&mut conn).await?;
+        let (_, structure) = fetch.metadata(&fields)?;
+        let result = attachments(structure, &limits)?
+            .into_iter()
+            .map(|entry| AttachmentMetadata {
+                part: part_name(&entry.part),
+                filename: entry.filename,
+                media_type: entry.media_type,
+                declared_size: entry.declared_size,
+                available: entry.encoding.is_some(),
+            })
+            .collect();
+        conn.drive(ImapLogout::new()).await?;
+        Ok(result)
+    }
+}
+fn application_limits(limits: &crate::config::Limits) -> Limits {
+    Limits {
+        max_header_bytes: limits.header_bytes,
+        max_nesting: limits.mime_depth,
+        max_mime_parts: limits.mime_parts,
+        max_attachment_wire_bytes: limits.attachment_wire_bytes,
+        max_attachment_decoded_bytes: limits.attachment_decoded_bytes,
+        max_attachment_chunk_bytes: limits.attachment_chunk_bytes,
+        max_transfer_lifetime: std::time::Duration::from_secs(limits.transfer_seconds as u64),
+        max_transfers: limits.transfers_per_account,
+        max_operation_bytes: limits.wire_fetch_bytes,
+        ..Limits::default()
+    }
+}
+
+/// One decoded page. Only a completed page carries its final byte count and digest.
+pub struct AttachmentData {
+    pub bytes: Vec<u8>,
+    pub decoded_offset: u64,
+    pub integrity: Option<AttachmentIntegrity>,
+}
+
+pub(crate) struct AttachmentDecoder(Option<TransferState>);
+impl AttachmentDecoder {
+    pub(crate) fn new(
+        username: &str,
+        mailbox: &str,
+        uid: u32,
+        validity: u32,
+        part: &str,
+        limits: &crate::config::Limits,
+    ) -> Result<Self, Error> {
+        let limits = application_limits(limits);
+        limits.validate()?;
+        Ok(Self(Some(TransferState::new(
+            username,
+            mailbox,
+            uid,
+            validity,
+            parse_part(part, &limits)?,
+            &limits,
+        ))))
+    }
+}
+impl super::AuthenticatedConnection {
+    pub(crate) async fn read_attachment(
+        self,
+        decoder: &mut AttachmentDecoder,
+        limits: &crate::config::Limits,
+    ) -> Result<AttachmentData, Error> {
+        let limits = application_limits(limits);
+        limits.validate()?;
+        let mut state = decoder.0.take().ok_or(Error::TransferExpired)?;
+        if Instant::now() >= state.expires {
+            return Err(Error::TransferExpired);
+        }
+        let mut metrics = Metrics::default();
+        let mut conn = self.0.resume(&mut metrics);
+        conn.limit_body(&limits);
+        if conn.examine(&state.mailbox).await? != state.uid_validity {
+            return Err(Error::StaleReference);
+        }
+        if state.wire_bytes == 0 && !state.eof {
+            let fetch = Fetch::Metadata { uid: state.uid };
+            let fields = fetch.execute(&mut conn).await?;
+            let (_, structure) = fetch.metadata(&fields)?;
+            let definition = attachments(structure, &limits)?
+                .into_iter()
+                .find(|entry| entry.part == state.part)
+                .ok_or(Error::StaleReference)?;
+            state.decoder = Decoder::new(definition.encoding.ok_or(Error::Unsupported)?);
+        }
+        let bytes = attachment_bytes(&mut conn, &mut state, &limits).await?;
+        conn.drive(ImapLogout::new()).await?;
+        if Instant::now() >= state.expires {
+            return Err(Error::TransferExpired);
+        }
+        let decoded_offset = (state.decoder.decoded_offset() - bytes.len()) as u64;
+        let integrity = if state.eof && state.decoder.pending_len() == 0 {
+            let (total_decoded_bytes, sha256) = state.decoder.integrity();
+            Some(AttachmentIntegrity {
+                total_decoded_bytes,
+                sha256,
+            })
+        } else {
+            decoder.0 = Some(state);
+            None
+        };
+        Ok(AttachmentData {
+            bytes,
+            decoded_offset,
+            integrity,
+        })
+    }
+}

@@ -238,6 +238,10 @@ async fn execute_application(
         match action {
             Action::Doctor { check_account } => application.doctor(check_account).await,
             #[cfg(feature = "cli")]
+            Action::Email(crate::domain::Operation::GetAttachment(input)) => {
+                application.download_attachment(input).await
+            }
+            #[cfg(feature = "cli")]
             Action::Email(operation) => application.execute(operation).await,
             #[cfg(feature = "mcp")]
             Action::Mcp { .. } => unreachable!(),

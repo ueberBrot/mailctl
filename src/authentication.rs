@@ -152,6 +152,45 @@ pub struct Lease {
     capacity: usize,
 }
 impl Lease {
+    pub(crate) async fn read_attachment(
+        self,
+        decoder: &mut imap::AttachmentDecoder,
+        limits: &Limits,
+    ) -> Result<imap::AttachmentData, crate::domain::Error> {
+        let Self {
+            idle,
+            admission: _admission,
+            ..
+        } = self;
+        idle.connection
+            .read_attachment(decoder, limits)
+            .await
+            .map_err(|error| {
+                if error == imap::Error::Limit {
+                    crate::domain::Error::new(crate::domain::ErrorCode::AttachmentTooLarge)
+                } else {
+                    error.into()
+                }
+            })
+    }
+
+    pub(crate) async fn list_attachments(
+        self,
+        mailbox: &str,
+        request: imap::AttachmentListRequest,
+        limits: &Limits,
+    ) -> Result<Vec<imap::AttachmentMetadata>, crate::domain::Error> {
+        let Self {
+            idle,
+            admission: _admission,
+            ..
+        } = self;
+        idle.connection
+            .list_attachments(mailbox, request, limits)
+            .await
+            .map_err(Into::into)
+    }
+
     pub(crate) async fn search(
         self,
         request: crate::search::SearchRequest<'_>,
@@ -383,7 +422,12 @@ impl Runtime {
 
     fn validate_limits(&self, limits: &Limits) -> Result<(), Error> {
         limits.validate().map_err(|_| Error::InvalidInput)?;
-        if limits.text_page_bytes > self.limits.text_page_bytes
+        if limits.attachment_decoded_bytes > self.limits.attachment_decoded_bytes
+            || limits.attachment_wire_bytes > self.limits.attachment_wire_bytes
+            || limits.attachment_chunk_bytes > self.limits.attachment_chunk_bytes
+            || limits.transfer_seconds > self.limits.transfer_seconds
+            || limits.transfers_per_account > self.limits.transfers_per_account
+            || limits.text_page_bytes > self.limits.text_page_bytes
             || limits.mime_depth > self.limits.mime_depth
             || limits.mime_parts > self.limits.mime_parts
             || limits.mailbox_inventory > self.limits.mailbox_inventory

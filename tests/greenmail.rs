@@ -149,7 +149,8 @@ mailboxes = ["INBOX"]
         let service = Service::in_memory(configuration)?
             .with_mailbox_backend(backend.clone())
             .with_search_backend(backend.clone())
-            .with_body_backend(backend);
+            .with_body_backend(backend.clone())
+            .with_attachment_backend(backend);
         let context = service.context("reader", &Default::default())?;
         let OperationResult::Mailboxes(discovery) = service
             .execute(
@@ -214,6 +215,63 @@ mailboxes = ["INBOX"]
             };
             assert_eq!(body.body.text, expected);
             assert!(!body.body.truncated);
+            if id == "<large-attachment-body@example.test>" {
+                use base64::{Engine, engine::general_purpose::STANDARD};
+                use mailctl::domain::{
+                    AttachmentContinuation, AttachmentProgress, AttachmentStart,
+                    GetAttachmentInput, ListAttachmentsInput,
+                };
+                let OperationResult::Attachments(list) = service
+                    .execute(
+                        &context,
+                        Operation::ListAttachments(ListAttachmentsInput {
+                            message: page.messages[0].reference.clone(),
+                        }),
+                    )
+                    .await?
+                else {
+                    panic!("attachments")
+                };
+                assert_eq!(list.attachments.len(), 1);
+                let mut input = GetAttachmentInput::Start(AttachmentStart {
+                    attachment: list.attachments[0].reference.clone(),
+                });
+                let mut downloaded = Vec::new();
+                loop {
+                    let OperationResult::Attachment(chunk) = service
+                        .execute(&context, Operation::GetAttachment(input))
+                        .await?
+                    else {
+                        panic!("chunk")
+                    };
+                    assert_eq!(chunk.decoded_offset, downloaded.len() as u64);
+                    downloaded.extend(STANDARD.decode(&chunk.bytes_base64)?);
+                    match chunk.progress {
+                        AttachmentProgress::Continue { next_token } => {
+                            input = GetAttachmentInput::Continue(AttachmentContinuation {
+                                token: next_token,
+                            })
+                        }
+                        AttachmentProgress::Complete {
+                            total_decoded_bytes,
+                            sha256,
+                        } => {
+                            use sha2::{Digest, Sha256};
+                            assert_eq!(total_decoded_bytes, downloaded.len() as u64);
+                            assert_eq!(
+                                sha256,
+                                Sha256::digest(greenmail_support::large_attachment_bytes())
+                                    .iter()
+                                    .map(|byte| format!("{byte:02x}"))
+                                    .collect::<String>()
+                            );
+                            break;
+                        }
+                    }
+                }
+                assert_eq!(downloaded, greenmail_support::large_attachment_bytes());
+            }
+
             identifiers.push(id.clone());
             if page.complete {
                 assert!(page.next_cursor.is_none());

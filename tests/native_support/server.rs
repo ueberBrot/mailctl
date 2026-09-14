@@ -21,6 +21,7 @@ struct Expected {
     username: &'static str,
     password: &'static str,
     mailboxes: Vec<&'static str>,
+    attachment: Option<(&'static str, bool)>,
     body: Option<&'static str>,
     search: Option<(&'static str, Option<u32>)>,
 }
@@ -68,7 +69,7 @@ impl NativeServer {
                         connection = listener.accept() => connection.unwrap().0,
                     };
                     count.fetch_add(1, Ordering::SeqCst);
-                    let Expected { username, password, mailboxes, search, body } = queue.lock().unwrap().pop_front().expect("unexpected provider connection");
+                    let Expected { username, password, mailboxes, search, body, attachment } = queue.lock().unwrap().pop_front().expect("unexpected provider connection");
                     tokio::select! {
                         _ = stopping.changed() => return,
                         result = tokio::time::timeout(Duration::from_secs(10), async {
@@ -87,6 +88,7 @@ impl NativeServer {
                                 search_page(&mut wire, mailbox, position).await;
                             }
                             if let Some(mailbox) = body { body_page(&mut wire, mailbox).await; }
+                            if let Some((mailbox, payload)) = attachment { attachment_page(&mut wire, mailbox, payload).await; }
                             imap_support::logout(&mut wire).await;
                         }) => result.expect("native authentication transcript deadline"),
                     }
@@ -110,6 +112,7 @@ impl NativeServer {
             mailboxes: Vec::new(),
             search: None,
             body: None,
+            attachment: None,
         });
     }
 
@@ -125,6 +128,7 @@ impl NativeServer {
             mailboxes: mailboxes.to_vec(),
             search: None,
             body: None,
+            attachment: None,
         });
     }
 
@@ -141,6 +145,7 @@ impl NativeServer {
             mailboxes: vec![],
             search: Some((mailbox, position)),
             body: None,
+            attachment: None,
         });
     }
 
@@ -156,6 +161,24 @@ impl NativeServer {
             mailboxes: vec![],
             search: None,
             body: Some(mailbox),
+            attachment: None,
+        });
+    }
+
+    pub fn expect_attachment(
+        &self,
+        username: &'static str,
+        password: &'static str,
+        mailbox: &'static str,
+        payload: bool,
+    ) {
+        self.expected.lock().unwrap().push_back(Expected {
+            username,
+            password,
+            mailboxes: vec![],
+            search: None,
+            body: None,
+            attachment: Some((mailbox, payload)),
         });
     }
 
@@ -255,5 +278,25 @@ impl Drop for NativeServer {
         if let Some(task) = self.task.take() {
             let _ = task.join();
         }
+    }
+}
+
+async fn attachment_page(wire: &mut imap_support::Wire, mailbox: &str, payload: bool) {
+    use imap_support::{expect, write};
+    let tag = expect(wire, &format!("EXAMINE {mailbox}")).await;
+    write(
+        wire,
+        &format!("* 3 EXISTS\r\n* OK [UIDVALIDITY 77] stable\r\n{tag} OK [READ-ONLY] selected\r\n"),
+    )
+    .await;
+    let tag = expect(wire, "UID FETCH 3 (UID RFC822.SIZE BODYSTRUCTURE)").await;
+    write(wire, &format!("* 3 FETCH (UID 3 RFC822.SIZE 3000300 BODYSTRUCTURE ((\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" 13 1 NIL NIL NIL NIL)(\"APPLICATION\" \"OCTET-STREAM\" NIL NIL NIL \"BASE64\" 8 NIL (\"ATTACHMENT\" (\"FILENAME\" \"fixture.bin\")) NIL NIL) \"MIXED\" NIL NIL NIL NIL))\r\n{tag} OK fetched\r\n")).await;
+    if payload {
+        let tag = expect(wire, "UID FETCH 3 (UID BODY.PEEK[2]<0.16384>)").await;
+        write(
+            wire,
+            &format!("* 3 FETCH (UID 3 BODY[2]<0> {{8}}\r\nYWJjZGVm)\r\n{tag} OK fetched\r\n"),
+        )
+        .await;
     }
 }

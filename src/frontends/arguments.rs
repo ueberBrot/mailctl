@@ -74,6 +74,8 @@ enum Email {
     #[command(subcommand)]
     Message(Message),
     #[command(subcommand)]
+    Attachment(Attachment),
+    #[command(subcommand)]
     Mailbox(Mailbox),
     #[command(subcommand)]
     Account(Account),
@@ -81,6 +83,20 @@ enum Email {
     Capability(Capability),
     #[command(flatten)]
     Administration(Administration),
+}
+#[cfg(feature = "cli")]
+#[derive(Subcommand)]
+enum Attachment {
+    /// List attachment metadata without retrieving payloads.
+    List {
+        #[arg(long)]
+        message: String,
+    },
+    /// Retrieve an attachment in one invocation as a bounded base64 result.
+    Get {
+        #[arg(long)]
+        attachment: String,
+    },
 }
 #[cfg(feature = "cli")]
 #[derive(Subcommand)]
@@ -200,6 +216,14 @@ impl Invocation {
             Executable::Cli => {
                 let parsed = Mailctl::from_arg_matches(matches)?;
                 let action = match parsed.command {
+                    Email::Attachment(Attachment::List { message }) => Action::Email(
+                        Operation::ListAttachments(crate::domain::ListAttachmentsInput { message }),
+                    ),
+                    Email::Attachment(Attachment::Get { attachment }) => Action::Email(
+                        Operation::GetAttachment(crate::domain::GetAttachmentInput::Start(
+                            crate::domain::AttachmentStart { attachment },
+                        )),
+                    ),
                     Email::Message(Message::Get { message }) => {
                         Action::Email(Operation::GetMessage(GetMessageInput { message }))
                     }

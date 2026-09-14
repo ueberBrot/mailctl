@@ -48,6 +48,7 @@ pub struct Narrowing {
 #[derive(Clone, Debug)]
 pub struct RequestContext {
     service_id: Uuid,
+    session: std::sync::Arc<crate::service::TransferSession>,
     grant: String,
     // Indices into the immutable configuration of the issuing Service.
     account_indices: Vec<usize>,
@@ -58,6 +59,7 @@ pub struct RequestContext {
 impl RequestContext {
     pub(crate) fn new(
         service_id: Uuid,
+        session: std::sync::Arc<crate::service::TransferSession>,
         grant: String,
         account_indices: Vec<usize>,
         permissions: Vec<Permission>,
@@ -65,6 +67,7 @@ impl RequestContext {
     ) -> Self {
         Self {
             service_id,
+            session,
             grant,
             account_indices,
             permissions,
@@ -74,6 +77,9 @@ impl RequestContext {
     pub fn with_response_limit(mut self, maximum: usize) -> Self {
         self.response_limit = self.response_limit.min(maximum);
         self
+    }
+    pub(crate) fn session_id(&self) -> Uuid {
+        self.session.id
     }
     pub(crate) fn belongs_to(&self, service_id: Uuid) -> bool {
         self.service_id == service_id

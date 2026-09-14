@@ -1,8 +1,9 @@
 # mailctl
 
 Email tools for the command line and MCP. It supports account and mailbox
-discovery, bounded message search and body reads, reusable resource references, capability reporting, macOS credential
-provisioning, and authentication diagnostics.
+discovery, bounded message search and body reads, attachment retrieval, reusable
+resource references, capability reporting, macOS credential provisioning, and
+authentication diagnostics.
 
 Build both executables:
 
@@ -25,6 +26,7 @@ for available commands.
 [Discover approved mailboxes and reuse their references](docs/mailboxes.md).
 [Search messages with resumable pages](docs/search.md) and
 [read selected message text](docs/messages.md).
+[List and retrieve attachments](docs/attachments.md).
 
 Standard operation needs no service. Operators who want a separate protected
 credential identity can explicitly [set up native macOS isolation](docs/isolation.md).

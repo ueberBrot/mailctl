@@ -4,8 +4,11 @@ mod credentials;
 pub(crate) use credentials::credential_error;
 mod imap;
 pub use imap::ImapBackend;
+mod attachments;
 mod mailboxes;
 mod message;
+pub(crate) use attachments::TransferSession;
+pub use attachments::{AttachmentBackend, AttachmentReader, MemoryAttachments};
 pub use message::{BodyBackend, MemoryBodies};
 mod search;
 mod state;
@@ -30,6 +33,8 @@ pub struct Service {
     registry: AccountRegistry,
     context_id: Uuid,
     mailbox_backend: Option<std::sync::Arc<dyn MailboxBackend>>,
+    transfers: attachments::Transfers,
+    attachment_backend: Option<std::sync::Arc<dyn AttachmentBackend>>,
     body_backend: Option<std::sync::Arc<dyn BodyBackend>>,
     search_backend: Option<std::sync::Arc<dyn SearchBackend>>,
     authentication: tokio::sync::OnceCell<std::sync::Arc<crate::authentication::Runtime>>,
@@ -78,6 +83,8 @@ impl Service {
             mailbox_backend: None,
             search_backend: None,
             body_backend: None,
+            attachment_backend: None,
+            transfers: Default::default(),
             authentication: tokio::sync::OnceCell::new(),
         }
     }
@@ -114,6 +121,7 @@ impl Service {
             .collect();
         Ok(RequestContext::new(
             self.context_id,
+            self.transfers.session(),
             grant_name.into(),
             account_indices,
             grant.profile.permissions(narrowing.read_only),
@@ -212,9 +220,21 @@ impl Service {
             {
                 operations.push("get_message".into());
             }
+            if context
+                .permissions()
+                .contains(&crate::policy::Permission::ReadAttachment)
+            {
+                operations.extend(["list_attachments".into(), "get_attachment".into()]);
+            }
             operations
         };
         let result = match operation {
+            Operation::ListAttachments(input) => {
+                OperationResult::Attachments(self.list_attachments(context, input).await?)
+            }
+            Operation::GetAttachment(input) => {
+                OperationResult::Attachment(self.get_attachment(context, input).await?)
+            }
             Operation::GetMessage(input) => {
                 OperationResult::Message(self.get_message(context, input).await?)
             }
