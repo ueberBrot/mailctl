@@ -7,7 +7,7 @@ use crate::{
     policy::{Permission, RequestContext},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
-use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{fmt::Write, future::Future, pin::Pin, sync::Arc, time::Duration};
 use tokio::time::Instant;
 use uuid::Uuid;
 mod memory;
@@ -115,7 +115,7 @@ impl Service {
             })
             .collect::<Result<_, Error>>()?;
         Ok(domain::AttachmentList {
-            account_id: reference.account.clone(),
+            account_id: reference.account,
             generation: reference.generation,
             message_reference: input.message,
             attachments,
@@ -251,14 +251,16 @@ impl Service {
         budget.reserve(512 + limits.token_bytes + page.bytes.len().div_ceil(3) * 4)?;
         budget.count(&entry.reference)?;
         let progress = match page.integrity {
-            Some(integrity) => domain::AttachmentProgress::Complete {
-                total_decoded_bytes: integrity.total_decoded_bytes,
-                sha256: integrity
-                    .sha256
-                    .iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect(),
-            },
+            Some(integrity) => {
+                let mut sha256 = String::with_capacity(64);
+                for byte in integrity.sha256 {
+                    let _ = write!(sha256, "{byte:02x}");
+                }
+                domain::AttachmentProgress::Complete {
+                    total_decoded_bytes: integrity.total_decoded_bytes,
+                    sha256,
+                }
+            }
             None => domain::AttachmentProgress::Continue {
                 next_token: self.encode(
                     "tx1",

@@ -78,6 +78,7 @@ impl Application {
             AttachmentContinuation, AttachmentProgress, ErrorCode, GetAttachmentInput,
         };
         use base64::{Engine, engine::general_purpose::STANDARD};
+        let limits = self.limits()?;
         let mut input = input;
         let mut bytes = Vec::new();
         loop {
@@ -89,21 +90,15 @@ impl Application {
             if chunk.decoded_offset != bytes.len() as u64 {
                 return Err(Error::new(ErrorCode::InternalError));
             }
-            let decoded = STANDARD
-                .decode(&chunk.bytes_base64)
+            STANDARD
+                .decode_vec(&chunk.bytes_base64, &mut bytes)
                 .map_err(|_| Error::new(ErrorCode::InternalError))?;
-            let next_len = bytes
-                .len()
-                .checked_add(decoded.len())
-                .ok_or_else(|| Error::new(ErrorCode::ResponseTooLarge))?;
-            let envelope_bytes = self.limits()?.envelope_bytes;
-            if next_len > self.limits()?.attachment_decoded_bytes
-                || next_len.div_ceil(3) * 4 + 4096 + chunk.attachment_reference.len()
-                    > envelope_bytes
+            if bytes.len() > limits.attachment_decoded_bytes
+                || bytes.len().div_ceil(3) * 4 + 4096 + chunk.attachment_reference.len()
+                    > limits.envelope_bytes
             {
                 return Err(Error::new(ErrorCode::ResponseTooLarge));
             }
-            bytes.extend_from_slice(&decoded);
             match chunk.progress {
                 AttachmentProgress::Continue { next_token } => {
                     input =
