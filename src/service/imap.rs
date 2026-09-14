@@ -13,7 +13,7 @@ impl Service {
             self.authentication().await?.clone(),
             BTreeMap::from([(
                 account.key.clone(),
-                crate::credentials::source_for(&account.credential),
+                self.host.credential_source(&account.credential),
             )]),
         ))
     }
@@ -106,7 +106,9 @@ impl SearchBackend for ImapBackend {
     ) -> Pin<Box<dyn Future<Output = Result<SearchBatch, Error>> + Send + 'a>> {
         Box::pin(async move {
             let lease = self.acquire(target, limits).await?;
-            lease.search(request, limits).await
+            lease
+                .with_connection(async |connection| connection.search(request, limits).await)
+                .await
         })
     }
 }
@@ -117,31 +119,38 @@ impl super::message::BodyBackend for ImapBackend {
         mailbox: &'a str,
         request: crate::imap::BodyRequest,
         limits: &'a Limits,
-    ) -> Pin<Box<dyn Future<Output = Result<crate::domain::BodyText, Error>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<super::BodyRead, Error>> + Send + 'a>> {
         Box::pin(async move {
             let lease = self.acquire(target, limits).await?;
             lease
-                .read_body(mailbox, request, limits)
+                .with_connection(async |connection| {
+                    connection.read_body(mailbox, request, limits).await
+                })
                 .await
                 .map(Into::into)
+                .map_err(Into::into)
         })
     }
 }
-impl From<crate::imap::BodyPage> for BodyText {
+impl From<crate::imap::BodyPage> for super::BodyRead {
     fn from(page: crate::imap::BodyPage) -> Self {
         Self {
-            empty_reason: page
-                .selected_part
-                .is_none()
-                .then_some(EmptyBodyReason::NoSupportedBody),
-            text: page.text,
-            selected_part: page.selected_part,
-            source_media_type: page.source_media_type,
-            representation_version: page.representation_version.into(),
-            converted: page.converted,
-            replacements: page.replacements,
-            truncated: page.truncated,
-            continuation_available: false,
+            continuation: page.continuation,
+            body: BodyText {
+                empty_reason: page
+                    .selected_part
+                    .is_none()
+                    .then_some(EmptyBodyReason::NoSupportedBody),
+                text: page.text,
+                selected_part: page.selected_part,
+                source_media_type: page.source_media_type,
+                representation_version: page.representation_version.into(),
+                converted: page.converted,
+                replacements: page.replacements,
+                truncated: page.truncated,
+                continuation_available: false,
+                next_cursor: None,
+            },
         }
     }
 }
@@ -185,8 +194,11 @@ impl super::AttachmentBackend for ImapBackend {
         Box::pin(async move {
             self.acquire(target, limits)
                 .await?
-                .list_attachments(mailbox, request, limits)
+                .with_connection(async |connection| {
+                    connection.list_attachments(mailbox, request, limits).await
+                })
                 .await
+                .map_err(Into::into)
         })
     }
 }
@@ -207,7 +219,15 @@ impl super::AttachmentReader for ImapAttachment {
                 .acquire(&self.account, limits)
                 .await
                 .map_err(super::credentials::authentication_error)?;
-            lease.read_attachment(&mut self.decoder, limits).await
+            lease
+                .with_connection(async |connection| {
+                    connection.read_attachment(&mut self.decoder, limits).await
+                })
+                .await
+                .map_err(|error| match error {
+                    crate::imap::Error::Limit => Error::new(ErrorCode::AttachmentTooLarge),
+                    error => error.into(),
+                })
         })
     }
 }

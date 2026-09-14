@@ -12,12 +12,40 @@ use io_imap::{
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
-/// In-memory continuation for this route proof. Public authenticated tokens belong to
-/// the application reading contract. A continuation is revalidated after each fetch.
-#[derive(Clone, Debug)]
+/// A position in a revalidated body representation. The application authenticates
+/// this position before accepting it from a consuming application.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BodyCursor {
     fingerprint: [u8; 32],
     offset: usize,
+}
+
+impl BodyCursor {
+    pub(crate) fn page(
+        previous: Option<Self>,
+        text: &str,
+        fingerprint: [u8; 32],
+        maximum: usize,
+    ) -> Result<(std::ops::Range<usize>, Option<Self>), Error> {
+        let offset = match previous {
+            Some(cursor)
+                if cursor.fingerprint == fingerprint
+                    && text.is_char_boundary(cursor.offset)
+                    && cursor.offset < text.len() =>
+            {
+                cursor.offset
+            }
+            Some(_) => return Err(Error::StaleCursor),
+            None => 0,
+        };
+        let end = text.floor_char_boundary(offset.saturating_add(maximum));
+        let continuation = (end < text.len()).then_some(Self {
+            fingerprint,
+            offset: end,
+        });
+        Ok((offset..end, continuation))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -70,14 +98,13 @@ impl ImapProbe {
         }
         let limits = self.limits.clone();
         let mut context = Sha256::new();
-        for value in [self.host.as_str(), username, name, REPRESENTATION] {
+        for value in [self.host.as_str(), username, name] {
             context.update(value.len().to_be_bytes());
             context.update(value.as_bytes());
         }
         context.update(self.port.to_be_bytes());
         context.update(request.uid.to_be_bytes());
         context.update(request.uid_validity.to_be_bytes());
-        context.update(format!("{limits:?}").as_bytes());
         tokio::time::timeout(limits.operation_timeout, async {
             let mut conn = self.authenticate(username, password).await?;
             let page = read_selected(&mut conn, name, request, &limits, context).await?;
@@ -123,6 +150,8 @@ async fn read_selected(
     limits: &Limits,
     mut context: Sha256,
 ) -> Result<BodyPage, Error> {
+    context.update(REPRESENTATION.as_bytes());
+    context.update(format!("{limits:?}").as_bytes());
     mailbox(name)?;
     if request.uid == 0 || request.uid_validity == 0 {
         return Err(Error::InvalidInput);
@@ -224,27 +253,17 @@ async fn read_selected(
     });
     context.update(text.as_bytes());
     let fingerprint = context.finalize().into();
-    let offset = match request.continuation {
-        Some(cursor)
-            if cursor.fingerprint == fingerprint
-                && text.is_char_boundary(cursor.offset)
-                && cursor.offset < text.len() =>
-        {
-            cursor.offset
-        }
-        Some(_) => return Err(Error::StaleCursor),
-        None => 0,
-    };
-    let end = text.floor_char_boundary(offset + limits.max_text_bytes);
-    let continuation = (end < text.len()).then_some(BodyCursor {
+    let (range, continuation) = BodyCursor::page(
+        request.continuation,
+        &text,
         fingerprint,
-        offset: end,
-    });
+        limits.max_text_bytes,
+    )?;
     Ok(BodyPage {
-        text: if offset == 0 && end == text.len() {
+        text: if range.start == 0 && range.end == text.len() {
             text
         } else {
-            text[offset..end].to_owned()
+            text[range].to_owned()
         },
         selected_part,
         source_media_type: selected.map(|s| s.media_type),

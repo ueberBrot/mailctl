@@ -24,7 +24,9 @@ const _: fn(OperationResult) = |result| match result {
         let _: String = message.account_id;
         let _: u64 = message.generation;
         let _: String = message.message_reference;
-        let _: mailctl::domain::BodyText = message.body;
+        let body: mailctl::domain::BodyText = message.body;
+        let _: Option<String> = body.next_cursor;
+        let _: bool = body.continuation_available;
     }
     OperationResult::Messages(search) => {
         let _: Vec<mailctl::domain::MessageEnvelope> = search.messages;
@@ -68,3 +70,14 @@ const _: fn(OperationResult) = |result| match result {
         let _: Vec<mailctl::domain::DoctorAccount> = doctor.accounts;
     }
 };
+
+const _: fn(mailctl::domain::GetMessageInput) = |input| {
+    let _: String = input.message;
+    let _: Option<String> = input.cursor;
+};
+
+#[cfg(any(feature = "cli", feature = "mcp"))]
+const _: fn(
+    mailctl::frontends::Executable,
+    std::sync::Arc<dyn mailctl::host::HostEnvironment>,
+) -> std::process::ExitCode = mailctl::frontends::run_with_environment;

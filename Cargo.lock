@@ -1778,6 +1778,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "mailctl-process-tests"
+version = "0.1.0"
+dependencies = [
+ "io-imap",
+ "mailctl",
+ "rcgen",
+ "rmcp",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
+ "toml",
+ "uuid",
+]
+
+[[package]]
 name = "markup5ever"
 version = "0.39.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

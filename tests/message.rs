@@ -36,6 +36,13 @@ async fn setup(
     config: mailctl::config::Config,
     backend: Arc<dyn mailctl::service::BodyBackend>,
 ) -> (Service, String) {
+    setup_with_state(config, backend, false).await
+}
+async fn setup_with_state(
+    config: mailctl::config::Config,
+    backend: Arc<dyn mailctl::service::BodyBackend>,
+    persistent: bool,
+) -> (Service, String) {
     let name = config.accounts[0].mailboxes[0].clone();
     let inventory = Arc::new(MemoryMailboxes::default());
     inventory.set(
@@ -61,7 +68,7 @@ async fn setup(
             text: "".into(),
         }],
     );
-    let service = Service::in_memory(config)
+    let service = setup_service(config, persistent)
         .unwrap()
         .with_mailbox_backend(inventory)
         .with_search_backend(messages)
@@ -84,9 +91,21 @@ async fn setup(
     };
     (service, page.messages[0].reference.clone())
 }
+fn setup_service(
+    config: mailctl::config::Config,
+    persistent: bool,
+) -> Result<Service, mailctl::domain::Error> {
+    if persistent {
+        Service::setup(config.clone())?;
+        Service::open(config)
+    } else {
+        Service::in_memory(config)
+    }
+}
 fn get(reference: &str) -> Operation {
     Operation::GetMessage(GetMessageInput {
         message: reference.into(),
+        cursor: None,
     })
 }
 fn body(text: &str) -> BodyText {
@@ -100,6 +119,7 @@ fn body(text: &str) -> BodyText {
         truncated: false,
         empty_reason: None,
         continuation_available: false,
+        next_cursor: None,
     }
 }
 #[tokio::test]
@@ -120,7 +140,7 @@ async fn body_reads_preserve_identity_bound_text_and_reauthorize_references() {
     assert_eq!(result.generation, 1);
     assert_eq!(result.body.text, "a");
     assert!(result.body.truncated);
-    assert!(!result.body.continuation_available);
+    assert!(result.body.continuation_available);
     let denied = service
         .context(
             "reader",
@@ -346,9 +366,257 @@ fn message_input_rejects_unknown_fields_and_oversized_references() {
         json!({"message":null}),
         json!({"message":""}),
         json!({"message":"é".repeat(4097)}),
-        json!({"message":"valid", "cursor":"not supported"}),
+        json!({"message":"valid", "unknown":"not supported"}),
+        json!({"message":"valid", "cursor":""}),
+        json!({"message":"valid", "cursor":"é".repeat(4097)}),
     ] {
         assert!(serde_json::from_value::<GetMessageInput>(input).is_err());
     }
     assert!(serde_json::from_value::<GetMessageInput>(json!({"message":"é".repeat(4096)})).is_ok());
+}
+
+#[tokio::test]
+async fn authenticated_text_pages_reconstruct_the_available_representation() {
+    let bodies = Arc::new(MemoryBodies::default());
+    bodies.set("work", "INBOX", 77, 4, body("a🦀éxyz"));
+    let mut configuration = config();
+    configuration.grants[0].limits.text_page_bytes = 4;
+    let (service, reference) = setup(configuration, bodies).await;
+    let context = service.context("reader", &Default::default()).unwrap();
+    let mut cursor = None;
+    let mut text = String::new();
+    for expected in ["a", "🦀", "éxy", "z"] {
+        let input = GetMessageInput {
+            message: reference.clone(),
+            cursor,
+        };
+        let OperationResult::Message(result) = service
+            .execute(&context, Operation::GetMessage(input))
+            .await
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(result.body.text, expected);
+        cursor = result.body.next_cursor;
+        assert_eq!(result.body.truncated, cursor.is_some());
+        assert_eq!(result.body.continuation_available, cursor.is_some());
+        text.push_str(&result.body.text);
+    }
+    assert_eq!(text, "a🦀éxyz");
+    assert!(cursor.is_none());
+}
+
+#[tokio::test]
+async fn text_cursors_reject_tampering_and_changes_after_fresh_authorization() {
+    use mailctl::domain::ErrorCode;
+    let bodies = Arc::new(MemoryBodies::default());
+    let original = body("a🦀éxyz");
+    bodies.set("work", "INBOX", 77, 4, original.clone());
+    let mut configuration = config();
+    configuration.grants[0].limits.text_page_bytes = 4;
+    let mut narrower = configuration.grants[0].clone();
+    narrower.name = "narrower".into();
+    narrower.limits.text_page_bytes = 5;
+    configuration.grants.push(narrower);
+    let (service, reference) = setup(configuration, bodies.clone()).await;
+    let context = service.context("reader", &Default::default()).unwrap();
+    let OperationResult::Message(first) = service.execute(&context, get(&reference)).await.unwrap()
+    else {
+        panic!()
+    };
+    let cursor = first.body.next_cursor.unwrap();
+    let resume = |message: &str, cursor: &str| {
+        Operation::GetMessage(GetMessageInput {
+            message: message.into(),
+            cursor: Some(cursor.into()),
+        })
+    };
+    let denied = service
+        .context(
+            "reader",
+            &mailctl::policy::Narrowing {
+                accounts: Some(vec![]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        service
+            .execute(&denied, resume(&reference, &cursor))
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::AccountNotAllowed
+    );
+    let narrower = service.context("narrower", &Default::default()).unwrap();
+    assert_eq!(
+        service
+            .execute(&narrower, resume(&reference, &cursor))
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::StaleCursor
+    );
+    for invalid in ["invalid".to_owned(), format!("{cursor}x")] {
+        assert_eq!(
+            service
+                .execute(&context, resume(&reference, &invalid))
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::StaleCursor
+        );
+    }
+    assert_eq!(
+        service
+            .execute(&context, resume("invalid", &cursor))
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::StaleCursor
+    );
+    for change in ["content", "version", "part", "media", "validity", "missing"] {
+        let mut changed = original.clone();
+        match change {
+            "content" => changed.text = "b🦀éxyz".into(),
+            "version" => changed.representation_version = "fixture-2".into(),
+            "part" => changed.selected_part = Some("2".into()),
+            "media" => changed.source_media_type = Some("text/html".into()),
+            _ => {}
+        }
+        bodies.set(
+            "work",
+            "INBOX",
+            if change == "validity" { 78 } else { 77 },
+            if change == "missing" { 5 } else { 4 },
+            changed,
+        );
+        assert_eq!(
+            service
+                .execute(&context, resume(&reference, &cursor))
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::StaleCursor,
+            "{change}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn whole_and_partial_body_pages_decode_malformed_html_with_finite_work() {
+    use imap_support::*;
+    let raw = b"<p>a\xf0\x9f\xa6\x80\xffxyz</p>";
+    for whole in [true, false] {
+        let fixture = repeating_fixture(Default::default(), 5, move |mut wire| Box::pin(async move {
+            authenticate(&mut wire).await;
+            examine(&mut wire).await;
+            let tag = expect(&mut wire, "UID FETCH 4 (UID RFC822.SIZE BODYSTRUCTURE)").await;
+            let part = format!("(\"TEXT\" \"HTML\" (\"CHARSET\" \"UTF-8\") NIL NIL \"8BIT\" {} 1 NIL NIL NIL NIL)", raw.len());
+            let header = if whole { b"Content-Type: text/html; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n".as_slice() } else { b"Content-Type: multipart/mixed; boundary=fixture\r\n\r\n".as_slice() };
+            let (structure, size) = if whole { (part, header.len() + raw.len()) } else { (format!("({part}(\"APPLICATION\" \"OCTET-STREAM\" NIL NIL NIL \"BASE64\" 3000000 NIL (\"ATTACHMENT\" NIL) NIL NIL) \"MIXED\" NIL NIL NIL NIL)"), 3000300) };
+            write(&mut wire, &format!("* 1 FETCH (UID 4 RFC822.SIZE {size} BODYSTRUCTURE {structure})\r\n{tag} OK fetched\r\n")).await;
+            literal_bytes(&mut wire, "HEADER", 0, 16384, header).await;
+            if whole {
+                let mut message = header.to_vec(); message.extend_from_slice(raw);
+                literal_bytes(&mut wire, "", 0, message.len() + 1, &message).await;
+            } else {
+                literal_bytes(&mut wire, "1", 0, raw.len() + 1, raw).await;
+            }
+            logout(&mut wire).await;
+        })).await;
+        let mut configuration = config();
+        configuration.grants[0].limits.text_page_bytes = 4;
+        let (service, reference) = live(&fixture, configuration).await;
+        let context = service.context("reader", &Default::default()).unwrap();
+        let mut cursor = None;
+        let mut text = String::new();
+        for _ in 0..5 {
+            let input = GetMessageInput {
+                message: reference.clone(),
+                cursor,
+            };
+            let OperationResult::Message(page) = service
+                .execute(&context, Operation::GetMessage(input))
+                .await
+                .unwrap()
+            else {
+                panic!()
+            };
+            assert!(page.body.converted);
+            assert!(page.body.replacements);
+            assert!(page.body.text.len() <= 4);
+            text.push_str(&page.body.text);
+            cursor = page.body.next_cursor;
+        }
+        assert_eq!(text, "�\n\na🦀�xyz\n");
+        assert!(cursor.is_none());
+        fixture.task.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn restarted_installations_resume_under_new_grants_and_enforce_output_limits() {
+    let directory = std::fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .join(format!("mailctl-text-{}", uuid::Uuid::new_v4()));
+    let mut configuration = config();
+    configuration.state_dir = directory.clone();
+    configuration.grants[0].limits.text_page_bytes = 4;
+    let mut second = configuration.grants[0].clone();
+    second.name = "second".into();
+    configuration.grants.push(second);
+    let bodies = Arc::new(MemoryBodies::default());
+    bodies.set("work", "INBOX", 77, 4, body("a🦀éxyz"));
+    let (first, reference) = setup_with_state(configuration.clone(), bodies.clone(), true).await;
+    let context = first.context("reader", &Default::default()).unwrap();
+    let OperationResult::Message(page) = first.execute(&context, get(&reference)).await.unwrap()
+    else {
+        panic!()
+    };
+    let cursor = page.body.next_cursor.unwrap();
+    drop(first);
+    let service = Service::open(configuration.clone())
+        .unwrap()
+        .with_body_backend(bodies.clone());
+    let context = service.context("second", &Default::default()).unwrap();
+    let resume = || {
+        Operation::GetMessage(GetMessageInput {
+            message: reference.clone(),
+            cursor: Some(cursor.clone()),
+        })
+    };
+    for _ in 0..2 {
+        let OperationResult::Message(page) = service.execute(&context, resume()).await.unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(page.body.text, "🦀");
+        assert!(page.body.next_cursor.is_some());
+    }
+    let bounded = service
+        .context("second", &Default::default())
+        .unwrap()
+        .with_response_limit(1);
+    assert_eq!(
+        service.execute(&bounded, resume()).await.unwrap_err().code,
+        mailctl::domain::ErrorCode::ResponseTooLarge
+    );
+    drop(service);
+    configuration.state_dir = directory.join("independent");
+    let independent = setup_service(configuration, true)
+        .unwrap()
+        .with_body_backend(bodies);
+    let context = independent.context("second", &Default::default()).unwrap();
+    assert_eq!(
+        independent
+            .execute(&context, resume())
+            .await
+            .unwrap_err()
+            .code,
+        mailctl::domain::ErrorCode::StaleCursor
+    );
+    drop(independent);
+    std::fs::remove_dir_all(directory).unwrap();
 }

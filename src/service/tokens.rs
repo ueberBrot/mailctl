@@ -1,6 +1,10 @@
 //! Installation-authenticated resource references and continuation tokens.
-use super::Service;
-use crate::domain::{Error, ErrorCode};
+use super::{MailboxTarget, Service};
+use crate::{
+    domain::{Error, ErrorCode},
+    encoding::OutputBudget,
+    policy::RequestContext,
+};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ring::hmac;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -18,6 +22,32 @@ pub(super) struct MessageReference<S = String> {
 }
 
 impl Service {
+    pub(super) fn authorize_message<'a>(
+        &'a self,
+        context: &'a RequestContext,
+        reference: &MessageReference,
+        stale: ErrorCode,
+    ) -> Result<MailboxTarget<'a>, Error> {
+        let target = self
+            .authorize_mailbox(
+                context,
+                &reference.account,
+                reference.generation,
+                &reference.mailbox,
+            )
+            .map_err(|error| {
+                if error.code == ErrorCode::StaleReference {
+                    Error::new(stale)
+                } else {
+                    error
+                }
+            })?;
+        if reference.uid == 0 || reference.uid_validity == 0 {
+            return Err(Error::new(stale));
+        }
+        Ok(target)
+    }
+
     pub(super) fn encode(
         &self,
         kind: &str,
@@ -67,10 +97,33 @@ impl Service {
     }
 }
 pub(super) fn fingerprint(value: &impl Serialize) -> Result<String, Error> {
-    let bytes = crate::encoding::serialize_bounded(value, 4 * 1024 * 1024)?;
+    let mut writer = Fingerprint {
+        digest: Sha256::new(),
+        budget: OutputBudget::new(4 * 1024 * 1024),
+    };
+    serde_json::to_writer(&mut writer, value)
+        .map_err(|_| Error::new(ErrorCode::ResponseTooLarge))?;
     let mut fingerprint = String::with_capacity(64);
-    for byte in Sha256::digest(bytes) {
+    for byte in writer.digest.finalize() {
         let _ = write!(fingerprint, "{byte:02x}");
     }
     Ok(fingerprint)
+}
+
+struct Fingerprint {
+    digest: Sha256,
+    budget: OutputBudget,
+}
+impl std::io::Write for Fingerprint {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.budget
+            .reserve(bytes.len())
+            .map_err(std::io::Error::other)?;
+        self.digest.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }

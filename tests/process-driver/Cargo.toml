@@ -1,0 +1,38 @@
+[package]
+name = "mailctl-process-tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+default = ["cli", "mcp"]
+cli = ["mailctl/cli"]
+mcp = ["mailctl/mcp"]
+
+[dependencies]
+mailctl = { path = "../..", default-features = false }
+tokio-rustls = { version = "=0.26.5", default-features = false, features = ["ring", "tls12"] }
+uuid = "1.26.0"
+
+[dev-dependencies]
+toml = "1.1.5"
+tokio = { version = "=1.53.1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "process"] }
+rmcp = { version = "=3.2.0", default-features = false, features = ["client", "transport-child-process"] }
+serde_json = "1.0.151"
+rcgen = { version = "=0.14.7", default-features = false, features = ["ring", "pem"] }
+io-imap = { version = "=0.6.0", default-features = false }
+
+[[bin]]
+name = "mailctl-test-cli"
+path = "src/bin/cli.rs"
+required-features = ["cli"]
+
+[[bin]]
+name = "mailctl-test-mcp"
+path = "src/bin/mcp.rs"
+required-features = ["mcp"]
+
+[lints]
+workspace = true

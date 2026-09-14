@@ -9,7 +9,7 @@ mod mailboxes;
 mod message;
 pub(crate) use attachments::TransferSession;
 pub use attachments::{AttachmentBackend, AttachmentReader, MemoryAttachments};
-pub use message::{BodyBackend, MemoryBodies};
+pub use message::{BodyBackend, BodyRead, MemoryBodies};
 mod search;
 mod state;
 mod tokens;
@@ -30,6 +30,7 @@ use uuid::Uuid;
 
 pub struct Service {
     config: Config,
+    host: std::sync::Arc<dyn crate::host::HostEnvironment>,
     registry: AccountRegistry,
     context_id: Uuid,
     mailbox_backend: Option<std::sync::Arc<dyn MailboxBackend>>,
@@ -78,6 +79,7 @@ impl Service {
     fn build(config: Config, registry: AccountRegistry) -> Self {
         Self {
             config,
+            host: std::sync::Arc::new(crate::host::NativeEnvironment),
             registry,
             context_id: Uuid::new_v4(),
             mailbox_backend: None,
@@ -87,6 +89,14 @@ impl Service {
             transfers: Default::default(),
             authentication: tokio::sync::OnceCell::new(),
         }
+    }
+    /// Select host dependencies during frontend initialization, before operations.
+    pub(crate) fn with_environment(
+        mut self,
+        host: std::sync::Arc<dyn crate::host::HostEnvironment>,
+    ) -> Self {
+        self.host = host;
+        self
     }
     pub fn context(
         &self,

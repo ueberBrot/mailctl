@@ -22,7 +22,7 @@ mod process;
     dead_code,
     reason = "the qualification uses only the native authentication transcript"
 )]
-#[path = "native_support/server.rs"]
+#[path = "imap_support/process.rs"]
 mod server;
 
 use isolation_support::{
@@ -52,7 +52,7 @@ const DOCTOR_RECHECK: Duration = Duration::from_secs(6);
 async fn isolated_launchd_qualification_uses_disposable_identities_and_a_real_native_keychain() {
     eprintln!("native isolation: provision disposable identities and install");
     let mut fixture = Qualification::begin(Path::new(ISOLATED), Path::new(CLI), Path::new(MCP));
-    let mut provider = server::NativeServer::new(Path::new(SERVICE_HOME));
+    let mut provider = server::ImapServer::new(Path::new(SERVICE_HOME));
 
     eprintln!("native isolation: configure synthetic accounts");
     operator_setup(&fixture, "work", "work@isolated.example.test");
@@ -134,7 +134,7 @@ async fn isolated_launchd_qualification_uses_disposable_identities_and_a_real_na
     provider.finish();
 }
 
-fn assert_service_authentication(fixture: &Qualification, provider: &server::NativeServer) {
+fn assert_service_authentication(fixture: &Qualification, provider: &server::ImapServer) {
     provider.expect("work@isolated.example.test", WORK_SECRET);
     let doctor = bounded(
         fixture
@@ -159,7 +159,7 @@ fn assert_service_authentication(fixture: &Qualification, provider: &server::Nat
 async fn assert_locked_keychain_failure(
     fixture: &Qualification,
     keychain: &Path,
-    provider: &server::NativeServer,
+    provider: &server::ImapServer,
 ) {
     tokio::time::sleep(DOCTOR_RECHECK).await;
     fixture.lock_service_keychain_context(keychain);

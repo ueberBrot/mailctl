@@ -105,6 +105,8 @@ enum Message {
     Get {
         #[arg(long)]
         message: String,
+        #[arg(long)]
+        cursor: Option<String>,
     },
     /// Search a mailbox with AND-only criteria and descending-UID continuation.
     Search {
@@ -224,8 +226,8 @@ impl Invocation {
                             crate::domain::AttachmentStart { attachment },
                         )),
                     ),
-                    Email::Message(Message::Get { message }) => {
-                        Action::Email(Operation::GetMessage(GetMessageInput { message }))
+                    Email::Message(Message::Get { message, cursor }) => {
+                        Action::Email(Operation::GetMessage(GetMessageInput { message, cursor }))
                     }
                     Email::Message(Message::Search {
                         mailbox,

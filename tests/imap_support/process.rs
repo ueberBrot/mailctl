@@ -20,10 +20,15 @@ use tokio_rustls::{
 struct Expected {
     username: &'static str,
     password: &'static str,
-    mailboxes: Vec<&'static str>,
-    attachment: Option<(&'static str, AttachmentPhase)>,
-    body: Option<&'static str>,
-    search: Option<(&'static str, Option<u32>)>,
+    operation: ExpectedOperation,
+}
+
+enum ExpectedOperation {
+    Authenticate,
+    Mailboxes(Vec<&'static str>),
+    Search(&'static str, Option<u32>),
+    Body(&'static str),
+    Attachment(&'static str, AttachmentPhase),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -33,7 +38,7 @@ pub enum AttachmentPhase {
     Continue,
 }
 
-pub struct NativeServer {
+pub struct ImapServer {
     pub port: u16,
     pub certificate: PathBuf,
     expected: Arc<Mutex<VecDeque<Expected>>>,
@@ -42,7 +47,7 @@ pub struct NativeServer {
     task: Option<thread::JoinHandle<()>>,
 }
 
-impl NativeServer {
+impl ImapServer {
     pub fn new(directory: &Path) -> Self {
         let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
         let certificate = directory.join("fixture-ca.pem");
@@ -76,7 +81,7 @@ impl NativeServer {
                         connection = listener.accept() => connection.unwrap().0,
                     };
                     count.fetch_add(1, Ordering::SeqCst);
-                    let Expected { username, password, mailboxes, search, body, attachment } = queue.lock().unwrap().pop_front().expect("unexpected provider connection");
+                    let Expected { username, password, operation } = queue.lock().unwrap().pop_front().expect("unexpected provider connection");
                     tokio::select! {
                         _ = stopping.changed() => return,
                         result = tokio::time::timeout(Duration::from_secs(10), async {
@@ -86,18 +91,21 @@ impl NativeServer {
                             let tag = imap_support::expect(&mut wire, &format!("LOGIN \"{username}\" \"{password}\"")).await;
                             imap_support::write(&mut wire, &format!("{tag} OK authenticated\r\n")).await;
                             imap_support::capability(&mut wire, "IMAP4rev1").await;
-                            for name in mailboxes {
-                                let tag = imap_support::expect(&mut wire, &format!("LIST \"\" {name}")).await;
-                                let attributes = if name == "Archive" { "\\Archive" } else { "" };
-                                imap_support::write(&mut wire, &format!("* LIST ({attributes}) \"/\" {name}\r\n{tag} OK listed\r\n")).await;
+                            match operation {
+                                ExpectedOperation::Authenticate => {},
+                                ExpectedOperation::Mailboxes(mailboxes) => {
+                                    for name in mailboxes {
+                                        let tag = imap_support::expect(&mut wire, &format!("LIST \"\" {name}")).await;
+                                        let attributes = if name == "Archive" { "\\Archive" } else { "" };
+                                        imap_support::write(&mut wire, &format!("* LIST ({attributes}) \"/\" {name}\r\n{tag} OK listed\r\n")).await;
+                                    }
+                                }
+                                ExpectedOperation::Search(mailbox, position) => search_page(&mut wire, mailbox, position).await,
+                                ExpectedOperation::Body(mailbox) => body_page(&mut wire, mailbox).await,
+                                ExpectedOperation::Attachment(mailbox, phase) => attachment_page(&mut wire, mailbox, phase).await,
                             }
-                            if let Some((mailbox, position)) = search {
-                                search_page(&mut wire, mailbox, position).await;
-                            }
-                            if let Some(mailbox) = body { body_page(&mut wire, mailbox).await; }
-                            if let Some((mailbox, payload)) = attachment { attachment_page(&mut wire, mailbox, payload).await; }
                             imap_support::logout(&mut wire).await;
-                        }) => result.expect("native authentication transcript deadline"),
+                        }) => result.expect("IMAP authentication transcript deadline"),
                     }
                 }
             });
@@ -116,10 +124,7 @@ impl NativeServer {
         self.expected.lock().unwrap().push_back(Expected {
             username,
             password,
-            mailboxes: Vec::new(),
-            search: None,
-            body: None,
-            attachment: None,
+            operation: ExpectedOperation::Authenticate,
         });
     }
 
@@ -132,10 +137,7 @@ impl NativeServer {
         self.expected.lock().unwrap().push_back(Expected {
             username,
             password,
-            mailboxes: mailboxes.to_vec(),
-            search: None,
-            body: None,
-            attachment: None,
+            operation: ExpectedOperation::Mailboxes(mailboxes.to_vec()),
         });
     }
 
@@ -149,10 +151,7 @@ impl NativeServer {
         self.expected.lock().unwrap().push_back(Expected {
             username,
             password,
-            mailboxes: vec![],
-            search: Some((mailbox, position)),
-            body: None,
-            attachment: None,
+            operation: ExpectedOperation::Search(mailbox, position),
         });
     }
 
@@ -165,10 +164,7 @@ impl NativeServer {
         self.expected.lock().unwrap().push_back(Expected {
             username,
             password,
-            mailboxes: vec![],
-            search: None,
-            body: Some(mailbox),
-            attachment: None,
+            operation: ExpectedOperation::Body(mailbox),
         });
     }
 
@@ -182,10 +178,7 @@ impl NativeServer {
         self.expected.lock().unwrap().push_back(Expected {
             username,
             password,
-            mailboxes: vec![],
-            search: None,
-            body: None,
-            attachment: Some((mailbox, payload)),
+            operation: ExpectedOperation::Attachment(mailbox, payload),
         });
     }
 
@@ -199,7 +192,7 @@ impl NativeServer {
             .take()
             .unwrap()
             .join()
-            .expect("native authentication transcript");
+            .expect("IMAP authentication transcript");
         assert!(
             self.expected.lock().unwrap().is_empty(),
             "every expected authentication occurred"
@@ -279,7 +272,7 @@ async fn body_page(wire: &mut imap_support::Wire, mailbox: &str) {
     }
 }
 
-impl Drop for NativeServer {
+impl Drop for ImapServer {
     fn drop(&mut self) {
         let _ = self.stop.send(true);
         if let Some(task) = self.task.take() {

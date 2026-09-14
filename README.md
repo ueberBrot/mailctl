@@ -22,19 +22,6 @@ Run `./target/debug/mailctl-mcp` to serve MCP over STDIO using the same configur
 Use `--grant` to select an access grant, `--account` to narrow accounts, or `--help`
 for available commands.
 
-[Configure credentials, check authentication, and rotate passwords](docs/credentials.md).
-[Discover approved mailboxes and reuse their references](docs/mailboxes.md).
-[Search messages with resumable pages](docs/search.md) and
-[read selected message text](docs/messages.md).
-[List and retrieve attachments](docs/attachments.md).
-
-Standard operation needs no service. Operators who want a separate protected
-credential identity can explicitly [set up native macOS isolation](docs/isolation.md).
-
-Native Keychain acceptance runs in a dedicated macOS CI job. Its ignored local
-test requires a disposable macOS user: it temporarily selects a test Keychain,
-uses synthetic passwords, and restores the original preferences during cleanup.
-
 ## Commit conventions
 
 Use [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/) for PR

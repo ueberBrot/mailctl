@@ -38,6 +38,17 @@ impl Executable {
 }
 
 pub fn run(executable: Executable) -> ExitCode {
+    run_with_environment(
+        executable,
+        std::sync::Arc::new(crate::host::NativeEnvironment),
+    )
+}
+
+/// Run the shared executable lifecycle with explicitly supplied host dependencies.
+pub fn run_with_environment(
+    executable: Executable,
+    host: std::sync::Arc<dyn crate::host::HostEnvironment>,
+) -> ExitCode {
     let arguments: Vec<_> = std::env::args_os().collect();
     let command = Invocation::command(executable);
     let preliminary = command
@@ -96,7 +107,7 @@ pub fn run(executable: Executable) -> ExitCode {
             Ok(()) => match invocation {
                 Ok(invocation) => {
                     diagnostics::started();
-                    let result = execute(invocation).await;
+                    let result = execute(invocation, host).await;
                     diagnostics::stopped();
                     result
                 }
@@ -113,7 +124,10 @@ pub fn run(executable: Executable) -> ExitCode {
     code.into()
 }
 
-async fn execute(invocation: Invocation) -> Result<u8, Error> {
+async fn execute(
+    invocation: Invocation,
+    host: std::sync::Arc<dyn crate::host::HostEnvironment>,
+) -> Result<u8, Error> {
     let Invocation {
         mut options,
         action,
@@ -148,6 +162,7 @@ async fn execute(invocation: Invocation) -> Result<u8, Error> {
         _ = &mut shutdown => return Err(Error::new(ErrorCode::Cancelled)),
         result = initialization => result.map_err(|_| Error::new(ErrorCode::InternalError))??,
     };
+    let service = service.with_environment(host);
     if let Action::Credential(command) = action {
         let (status, service) = tokio::select! {
             _ = &mut shutdown => return Err(Error::new(ErrorCode::Cancelled)),

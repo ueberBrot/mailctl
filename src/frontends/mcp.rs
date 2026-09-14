@@ -68,7 +68,7 @@ fn definitions(mailboxes: bool, search: bool, read: bool, attachments: bool) -> 
         tools.push(
             Tool::new(
                 "email_get_message",
-                "Read bounded selected message text with representation and truncation metadata.",
+                "Read or continue bounded selected message text with representation and truncation metadata.",
                 serde_json::Map::new(),
             )
             .with_input_schema::<GetMessageInput>()

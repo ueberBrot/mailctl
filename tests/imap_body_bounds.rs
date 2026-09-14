@@ -355,71 +355,107 @@ fn selected_body_allocations_do_not_follow_attachment_metadata_size() {
 }
 
 #[test]
-fn whole_message_budget_and_continuation_have_measured_finite_costs() {
+fn whole_and_partial_continuation_have_measured_finite_costs() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
-    let limits = Limits::default();
-    let size = limits.max_body_wire_bytes;
-    let body_size = size - TEXT_HEADERS.len();
-    let server_bytes = Arc::new(AtomicUsize::new(0));
-    let counted = server_bytes.clone();
-    let (mut probe, server) = dedicated_sessions(
-        TlsMode::Implicit,
-        limits.clone(),
-        2,
-        move |wire| {
-            counted.fetch_add(b"* OK synthetic server ready\r\n".len(), Ordering::Relaxed);
-            let mut wire: Wire = Box::new(CountedWire {
-                wire,
-                written: counted.clone(),
-            });
-            Box::pin(async move {
-                authenticate(&mut wire).await;
-                examine(&mut wire).await;
-                metadata(&mut wire, &format!("* 1 FETCH (UID 4 RFC822.SIZE {size} BODYSTRUCTURE (\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" {body_size} 1 NIL NIL NIL NIL))\r\n{{tag}} OK fetched\r\n")).await;
-                literal(&mut wire, "HEADER", 0, 16384, TEXT_HEADERS).await;
-                let whole = format!("{TEXT_HEADERS}{}", "x".repeat(body_size));
-                for offset in (0..size).step_by(16384) {
-                    literal(&mut wire, "", offset, 16384, &whole[offset..offset + 16384]).await;
-                }
-                literal(&mut wire, "", size, 1, "").await;
-                logout(&mut wire).await;
-            })
-        },
-    );
-    let mut request = BodyRequest::new(4, 77);
-    let mut observed_bytes = 0;
-    for _ in 0..2 {
-        let allocations = allocation_counter::measure(|| {
-            runtime.block_on(async {
-                let page = probe
-                    .read_body("fixture", "disposable-password", "INBOX", request.clone())
-                    .await
-                    .unwrap();
-                assert_eq!(page.text.len(), limits.max_text_bytes);
-                assert!(page.text.bytes().all(|byte| byte == b'x'));
-                assert_eq!(page.metrics.decoded_bytes, body_size);
-                assert!(page.metrics.decode_steps >= body_size * 7);
-                assert!(page.metrics.decode_steps <= limits.max_decode_steps);
-                assert!(page.metrics.parser_steps <= limits.max_parser_steps);
-                assert!(page.metrics.max_literal_bytes <= 16384);
-                assert!(page.metrics.max_response_bytes <= limits.max_response_bytes);
-                assert!(page.metrics.wire_bytes < size + 64 * 1024);
-                observed_bytes += page.metrics.wire_bytes;
-                request.continuation = page.continuation;
-                assert!(request.continuation.is_some());
-            });
-        });
-        assert!(allocations.bytes_max < 32 * 1024 * 1024, "{allocations:?}");
-        assert!(
-            allocations.bytes_total < 128 * 1024 * 1024,
-            "{allocations:?}"
+    for partial in [false, true] {
+        let limits = Limits::default();
+        let size = limits.max_body_wire_bytes;
+        let body_size = if partial {
+            size
+        } else {
+            size - TEXT_HEADERS.len()
+        };
+        let server_bytes = Arc::new(AtomicUsize::new(0));
+        let counted = server_bytes.clone();
+        let (mut probe, server) = dedicated_sessions(
+            TlsMode::Implicit,
+            limits.clone(),
+            2,
+            move |wire| {
+                counted.fetch_add(b"* OK synthetic server ready\r\n".len(), Ordering::Relaxed);
+                let mut wire: Wire = Box::new(CountedWire {
+                    wire,
+                    written: counted.clone(),
+                });
+                Box::pin(async move {
+                    authenticate(&mut wire).await;
+                    examine(&mut wire).await;
+                    let text_part = format!(
+                        "(\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" {body_size} 1 NIL NIL NIL NIL)"
+                    );
+                    let structure = if partial {
+                        format!(
+                            "({text_part}(\"APPLICATION\" \"OCTET-STREAM\" NIL NIL NIL \"BASE64\" 3000000 NIL (\"ATTACHMENT\" NIL) NIL NIL) \"MIXED\" NIL NIL NIL NIL)"
+                        )
+                    } else {
+                        text_part
+                    };
+                    let message_size = if partial { size + 3000000 } else { size };
+                    metadata(&mut wire, &format!("* 1 FETCH (UID 4 RFC822.SIZE {message_size} BODYSTRUCTURE {structure})\r\n{{tag}} OK fetched\r\n")).await;
+                    literal(
+                        &mut wire,
+                        "HEADER",
+                        0,
+                        16384,
+                        if partial { ROOT_HEADERS } else { TEXT_HEADERS },
+                    )
+                    .await;
+                    let payload = if partial {
+                        "x".repeat(body_size)
+                    } else {
+                        format!("{TEXT_HEADERS}{}", "x".repeat(body_size))
+                    };
+                    let section = if partial { "1" } else { "" };
+                    for offset in (0..size).step_by(16384) {
+                        literal(
+                            &mut wire,
+                            section,
+                            offset,
+                            16384,
+                            &payload[offset..offset + 16384],
+                        )
+                        .await;
+                    }
+                    literal(&mut wire, section, size, 1, "").await;
+                    logout(&mut wire).await;
+                })
+            },
         );
+        let mut request = BodyRequest::new(4, 77);
+        let mut observed_bytes = 0;
+        for _ in 0..2 {
+            let allocations = allocation_counter::measure(|| {
+                runtime.block_on(async {
+                    let page = probe
+                        .read_body("fixture", "disposable-password", "INBOX", request.clone())
+                        .await
+                        .unwrap();
+                    assert_eq!(page.text.len(), limits.max_text_bytes);
+                    assert!(page.text.bytes().all(|byte| byte == b'x'));
+                    assert_eq!(page.metrics.decoded_bytes, body_size);
+                    assert!(page.metrics.decode_steps >= body_size * 7);
+                    assert!(page.metrics.decode_steps <= limits.max_decode_steps);
+                    assert!(page.metrics.parser_steps <= limits.max_parser_steps);
+                    assert!(page.metrics.max_literal_bytes <= 16384);
+                    assert!(page.metrics.max_response_bytes <= limits.max_response_bytes);
+                    assert!(page.metrics.wire_bytes < size + 64 * 1024);
+                    observed_bytes += page.metrics.wire_bytes;
+                    request.continuation = page.continuation;
+                    assert!(request.continuation.is_some());
+                });
+            });
+            assert!(allocations.bytes_max < 32 * 1024 * 1024, "{allocations:?}");
+            assert!(
+                allocations.bytes_total < 128 * 1024 * 1024,
+                "{allocations:?}"
+            );
+        }
+        server.join().unwrap();
+        assert_eq!(observed_bytes, server_bytes.load(Ordering::Relaxed));
     }
-    server.join().unwrap();
-    assert_eq!(observed_bytes, server_bytes.load(Ordering::Relaxed));
 }
 
 #[test]

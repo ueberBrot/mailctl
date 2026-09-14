@@ -200,6 +200,7 @@ mailboxes = ["INBOX"]
                 .execute(
                     &context,
                     Operation::GetMessage(mailctl::domain::GetMessageInput {
+                        cursor: None,
                         message: page.messages[0].reference.clone(),
                     }),
                 )

@@ -64,11 +64,7 @@ impl Service {
             ErrorCode::StaleReference,
         )?;
         let name = domain::mailbox_identity(&reference.mailbox);
-        let target =
-            self.authorize_mailbox(context, &reference.account, reference.generation, name)?;
-        if reference.uid == 0 || reference.uid_validity == 0 {
-            return Err(Error::new(ErrorCode::StaleReference));
-        }
+        let target = self.authorize_message(context, &reference, ErrorCode::StaleReference)?;
         let live;
         let backend = match &self.attachment_backend {
             Some(backend) => backend.as_ref(),
@@ -152,15 +148,8 @@ impl Service {
                     limits.token_bytes,
                     ErrorCode::StaleReference,
                 )?;
-                let target = self.authorize_mailbox(
-                    context,
-                    &resource.account,
-                    resource.generation,
-                    &resource.mailbox,
-                )?;
-                if resource.uid == 0 || resource.uid_validity == 0 {
-                    return Err(Error::new(ErrorCode::StaleReference));
-                }
+                let target =
+                    self.authorize_message(context, &resource, ErrorCode::StaleReference)?;
                 let reservation =
                     self.transfers
                         .reserve(context.session_id(), &resource.account, limits)?;

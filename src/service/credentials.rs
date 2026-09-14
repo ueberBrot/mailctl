@@ -12,7 +12,6 @@ use crate::{
     policy::{Permission, RequestContext},
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio_rustls::rustls::RootCertStore;
 use uuid::Uuid;
 #[cfg(any(feature = "cli", feature = "mcp"))]
 use {crate::credentials::SecretSource, std::sync::Arc};
@@ -78,7 +77,7 @@ impl Service {
         for configured in accounts {
             let (id, generation) = self.registry.identity(&configured.key);
             let id = Uuid::parse_str(id).map_err(|_| Error::new(ErrorCode::InternalError))?;
-            let source = credentials::source_for(&configured.credential);
+            let source = self.host.credential_source(&configured.credential);
             if let Some(prerequisite) = source.prerequisite()
                 && !result
                     .prerequisites
@@ -146,14 +145,11 @@ impl Service {
     pub(super) async fn authentication(&self) -> Result<&std::sync::Arc<Runtime>, Error> {
         self.authentication
             .get_or_try_init(|| async {
-                let roots = tokio::task::spawn_blocking(|| -> Result<_, Error> {
-                    credentials::prepare_native_access().map_err(credential_error)?;
-                    let mut roots = RootCertStore::empty();
-                    roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
-                    Ok(roots)
-                })
-                .await
-                .map_err(|_| Error::new(ErrorCode::InternalError))??;
+                let host = self.host.clone();
+                let roots = tokio::task::spawn_blocking(move || host.tls_roots())
+                    .await
+                    .map_err(|_| Error::new(ErrorCode::InternalError))?
+                    .map_err(credential_error)?;
                 Runtime::new(self.config.limits.clone(), roots)
                     .map(std::sync::Arc::new)
                     .map_err(authentication_error)
@@ -180,7 +176,7 @@ impl Service {
         let (id, _) = self.registry.identity(&account.key);
         Ok((
             Uuid::parse_str(id).map_err(|_| Error::new(ErrorCode::InternalError))?,
-            credentials::source_for(&account.credential),
+            self.host.credential_source(&account.credential),
         ))
     }
 

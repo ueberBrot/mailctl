@@ -9,6 +9,13 @@ pub struct GetMessageInput {
     #[serde(deserialize_with = "message_reference")]
     #[schemars(length(min = 1, max = 8192), extend("x-maxUtf8Bytes" = 8192))]
     pub message: String,
+    /// Authenticated continuation returned by the preceding text page.
+    #[serde(
+        default,
+        deserialize_with = "super::bounded_optional_string::<_, 8192>"
+    )]
+    #[schemars(length(min = 1, max = 8192), extend("x-maxUtf8Bytes" = 8192))]
+    pub cursor: Option<String>,
 }
 fn message_reference<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
     super::bounded_optional_string::<D, 8192>(d)?
@@ -35,8 +42,9 @@ pub struct BodyText {
     pub replacements: bool,
     pub truncated: bool,
     pub empty_reason: Option<EmptyBodyReason>,
-    /// Public text continuation is not yet implemented.
+    /// Whether another page of this representation is available.
     pub continuation_available: bool,
+    pub next_cursor: Option<String>,
 }
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]

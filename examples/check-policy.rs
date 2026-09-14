@@ -61,7 +61,7 @@ fn check_dependencies(
     let mut pending: Vec<_> = metadata
         .workspace_members
         .iter()
-        .filter(|id| metadata[id].name != "greenmail-support")
+        .filter(|id| metadata[id].name == "mailctl")
         .collect();
     let mut visited = HashSet::new();
     while let Some(id) = pending.pop() {

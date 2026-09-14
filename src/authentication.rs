@@ -152,72 +152,16 @@ pub struct Lease {
     capacity: usize,
 }
 impl Lease {
-    pub(crate) async fn read_attachment(
+    pub(crate) async fn with_connection<T>(
         self,
-        decoder: &mut imap::AttachmentDecoder,
-        limits: &Limits,
-    ) -> Result<imap::AttachmentData, crate::domain::Error> {
+        operation: impl AsyncFnOnce(AuthenticatedConnection) -> T,
+    ) -> T {
         let Self {
             idle,
             admission: _admission,
             ..
         } = self;
-        idle.connection
-            .read_attachment(decoder, limits)
-            .await
-            .map_err(|error| {
-                if error == imap::Error::Limit {
-                    crate::domain::Error::new(crate::domain::ErrorCode::AttachmentTooLarge)
-                } else {
-                    error.into()
-                }
-            })
-    }
-
-    pub(crate) async fn list_attachments(
-        self,
-        mailbox: &str,
-        request: imap::AttachmentListRequest,
-        limits: &Limits,
-    ) -> Result<Vec<imap::AttachmentMetadata>, crate::domain::Error> {
-        let Self {
-            idle,
-            admission: _admission,
-            ..
-        } = self;
-        idle.connection
-            .list_attachments(mailbox, request, limits)
-            .await
-            .map_err(Into::into)
-    }
-
-    pub(crate) async fn search(
-        self,
-        request: crate::search::SearchRequest<'_>,
-        limits: &Limits,
-    ) -> Result<crate::search::SearchBatch, crate::domain::Error> {
-        let Self {
-            idle,
-            admission: _admission,
-            ..
-        } = self;
-        idle.connection.search(request, limits).await
-    }
-    pub(crate) async fn read_body(
-        self,
-        mailbox: &str,
-        request: imap::BodyRequest,
-        limits: &Limits,
-    ) -> Result<imap::BodyPage, crate::domain::Error> {
-        let Self {
-            idle,
-            admission: _admission,
-            ..
-        } = self;
-        idle.connection
-            .read_body(mailbox, request, limits)
-            .await
-            .map_err(Into::into)
+        operation(idle.connection).await
     }
     pub fn release(self) {
         let mut state = self.pool.state.lock().unwrap();

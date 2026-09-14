@@ -4,7 +4,7 @@
 mod imap_support;
 #[path = "native_support/process.rs"]
 mod process;
-#[path = "native_support/server.rs"]
+#[path = "imap_support/process.rs"]
 mod server;
 mod support;
 #[path = "native_support/terminal.rs"]
@@ -37,7 +37,7 @@ fn native_credentials_cross_components_rotate_and_clean_up() {
     let cli = frozen_cli.to_str().unwrap();
     let mcp = frozen_mcp.to_str().unwrap();
     let mut keychain = NativeKeychain::new(installation.config().parent().unwrap());
-    let mut server = server::NativeServer::new(installation.config().parent().unwrap());
+    let mut server = server::ImapServer::new(installation.config().parent().unwrap());
     let configuration = fs::read_to_string(installation.config())
         .unwrap()
         .replace(
@@ -254,7 +254,7 @@ fn status(installation: &Installation, executable: &str, alias: &str, id: Uuid, 
 
 fn authenticate(
     installation: &Installation,
-    server: &server::NativeServer,
+    server: &server::ImapServer,
     executable: &str,
     alias: &str,
     username: &'static str,
@@ -558,12 +558,7 @@ fn read_preference(command: &str) -> Result<Vec<String>, ()> {
         .collect()
 }
 
-fn search_handoffs(
-    installation: &Installation,
-    server: &server::NativeServer,
-    cli: &str,
-    mcp: &str,
-) {
+fn search_handoffs(installation: &Installation, server: &server::ImapServer, cli: &str, mcp: &str) {
     use rmcp::{ServiceExt, model::CallToolRequestParams, transport::TokioChildProcess};
     use serde_json::{Value, json};
     server.expect_mailboxes("work@example.test", FIRST, &["Archive", "INBOX"]);
@@ -870,7 +865,7 @@ fn search_handoffs(
 
 fn mailbox_handoffs(
     installation: &Installation,
-    server: &server::NativeServer,
+    server: &server::ImapServer,
     cli: &str,
     mcp: &str,
 ) {

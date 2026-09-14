@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "tests/greenmail-support"]
+members = [".", "tests/greenmail-support", "tests/process-driver"]
 resolver = "3"
 
 [workspace.package]

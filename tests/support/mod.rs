@@ -19,9 +19,21 @@ use uuid::Uuid;
 static COPY_OR_SPAWN: Mutex<()> = Mutex::new(());
 
 #[cfg(feature = "cli")]
-pub(crate) const MAILCTL: &str = env!("CARGO_BIN_EXE_mailctl");
+pub(crate) const MAILCTL: &str = match option_env!("CARGO_BIN_EXE_mailctl") {
+    Some(path) => path,
+    None => match option_env!("CARGO_BIN_EXE_mailctl-test-cli") {
+        Some(path) => path,
+        None => panic!("missing CLI test executable"),
+    },
+};
 #[cfg(feature = "mcp")]
-pub(crate) const MAILCTL_MCP: &str = env!("CARGO_BIN_EXE_mailctl-mcp");
+pub(crate) const MAILCTL_MCP: &str = match option_env!("CARGO_BIN_EXE_mailctl-mcp") {
+    Some(path) => path,
+    None => match option_env!("CARGO_BIN_EXE_mailctl-test-mcp") {
+        Some(path) => path,
+        None => panic!("missing MCP test executable"),
+    },
+};
 
 /// A complete disposable installation, deliberately independent of the
 /// operator's normal configuration and state directories.
