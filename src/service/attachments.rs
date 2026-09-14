@@ -7,17 +7,15 @@ use crate::{
     policy::{Permission, RequestContext},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
-use std::{
-    collections::HashMap,
-    future::Future,
-    pin::Pin,
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 use tokio::time::Instant;
 use uuid::Uuid;
 mod memory;
+mod transfers;
 pub use memory::MemoryAttachments;
+use transfers::Entry;
+pub(crate) use transfers::TransferSession;
+pub(super) use transfers::Transfers;
 
 pub trait AttachmentReader: Send {
     fn next<'a>(
@@ -125,44 +123,6 @@ impl Service {
     }
 }
 
-#[derive(Default)]
-pub(super) struct Transfers(Arc<Mutex<HashMap<Uuid, Slot>>>);
-struct Slot {
-    session: Uuid,
-    account: String,
-    expires: Instant,
-    entry: Option<Entry>,
-}
-struct Entry {
-    resource: MessageReference,
-    reference: String,
-    scope: String,
-    offset: u64,
-    reader: Box<dyn AttachmentReader>,
-}
-// A request owns its slot while awaiting provider work. Cancellation drops both
-// decoder and reservation; an in-flight transfer still counts toward the quota.
-struct Reservation {
-    store: Arc<Mutex<HashMap<Uuid, Slot>>>,
-    id: Uuid,
-    retained: bool,
-}
-impl Drop for Reservation {
-    fn drop(&mut self) {
-        if !self.retained {
-            self.store.lock().unwrap().remove(&self.id);
-        }
-    }
-}
-impl Reservation {
-    fn retain(mut self, entry: Entry) -> Result<(), Error> {
-        let mut store = self.store.lock().unwrap();
-        let slot = store.get_mut(&self.id).ok_or_else(expired)?;
-        slot.entry = Some(entry);
-        self.retained = true;
-        Ok(())
-    }
-}
 fn expired() -> Error {
     Error::new(ErrorCode::TransferExpired)
 }
@@ -184,7 +144,7 @@ impl Service {
             limits,
             context.response_limit(),
         ))?;
-        let (reservation, mut entry, expires) = match input {
+        let (reservation, mut entry) = match input {
             domain::GetAttachmentInput::Start(input) => {
                 let (resource, part): (MessageReference, String) = self.decode(
                     "at1",
@@ -201,34 +161,9 @@ impl Service {
                 if resource.uid == 0 || resource.uid_validity == 0 {
                     return Err(Error::new(ErrorCode::StaleReference));
                 }
-                let id = Uuid::new_v4();
-                let expires = Instant::now() + Duration::from_secs(limits.transfer_seconds as u64);
-                {
-                    let mut store = self.transfers.0.lock().unwrap();
-                    store.retain(|_, slot| slot.entry.is_none() || slot.expires > Instant::now());
-                    if store
-                        .values()
-                        .filter(|slot| slot.account == resource.account)
-                        .count()
-                        >= limits.transfers_per_account
-                    {
-                        return Err(Error::new(ErrorCode::RateLimited));
-                    }
-                    store.insert(
-                        id,
-                        Slot {
-                            session: context.session_id(),
-                            account: resource.account.clone(),
-                            expires,
-                            entry: None,
-                        },
-                    );
-                }
-                let reservation = Reservation {
-                    store: self.transfers.0.clone(),
-                    id,
-                    retained: false,
-                };
+                let reservation =
+                    self.transfers
+                        .reserve(context.session_id(), &resource.account, limits)?;
                 let live;
                 let backend = match &self.attachment_backend {
                     Some(backend) => backend.as_ref(),
@@ -254,7 +189,6 @@ impl Service {
                         offset: 0,
                         reader,
                     },
-                    expires,
                 )
             }
             domain::GetAttachmentInput::Continue(input) => {
@@ -267,32 +201,19 @@ impl Service {
                 if session != context.session_id() {
                     return Err(expired());
                 }
-                let mut store = self.transfers.0.lock().unwrap();
-                store.retain(|_, slot| slot.entry.is_none() || slot.expires > Instant::now());
-                let slot = store.get_mut(&id).ok_or_else(expired)?;
-                let entry = slot.entry.as_ref().ok_or_else(expired)?;
-                if entry.scope != scope || entry.offset != offset {
-                    return Err(expired());
-                }
-                self.authorize_mailbox(
-                    context,
-                    &entry.resource.account,
-                    entry.resource.generation,
-                    &entry.resource.mailbox,
-                )?;
-                let expires = slot.expires;
-                let entry = slot.entry.take().ok_or_else(expired)?;
-                (
-                    Reservation {
-                        store: self.transfers.0.clone(),
-                        id,
-                        retained: false,
-                    },
-                    entry,
-                    expires,
-                )
+                self.transfers
+                    .checkout(context.session_id(), id, &scope, offset, |entry| {
+                        self.authorize_mailbox(
+                            context,
+                            &entry.resource.account,
+                            entry.resource.generation,
+                            &entry.resource.mailbox,
+                        )
+                        .map(|_| ())
+                    })?
             }
         };
+        let expires = reservation.expires();
         let operation_deadline =
             Instant::now() + Duration::from_secs(limits.operation_seconds as u64);
         let deadline = operation_deadline.min(expires);
@@ -341,7 +262,7 @@ impl Service {
             None => domain::AttachmentProgress::Continue {
                 next_token: self.encode(
                     "tx1",
-                    &(context.session_id(), reservation.id, next_offset),
+                    &(context.session_id(), reservation.id(), next_offset),
                     limits.token_bytes,
                 )?,
             },
@@ -360,29 +281,5 @@ impl Service {
             reservation.retain(entry)?;
         }
         Ok(result)
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct TransferSession {
-    pub id: Uuid,
-    store: std::sync::Weak<Mutex<HashMap<Uuid, Slot>>>,
-}
-impl Drop for TransferSession {
-    fn drop(&mut self) {
-        if let Some(store) = self.store.upgrade() {
-            store
-                .lock()
-                .unwrap()
-                .retain(|_, slot| slot.session != self.id);
-        }
-    }
-}
-impl Transfers {
-    pub(super) fn session(&self) -> Arc<TransferSession> {
-        Arc::new(TransferSession {
-            id: Uuid::new_v4(),
-            store: Arc::downgrade(&self.0),
-        })
     }
 }

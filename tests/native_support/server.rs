@@ -21,9 +21,16 @@ struct Expected {
     username: &'static str,
     password: &'static str,
     mailboxes: Vec<&'static str>,
-    attachment: Option<(&'static str, bool)>,
+    attachment: Option<(&'static str, AttachmentPhase)>,
     body: Option<&'static str>,
     search: Option<(&'static str, Option<u32>)>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum AttachmentPhase {
+    List,
+    Start,
+    Continue,
 }
 
 pub struct NativeServer {
@@ -170,7 +177,7 @@ impl NativeServer {
         username: &'static str,
         password: &'static str,
         mailbox: &'static str,
-        payload: bool,
+        payload: AttachmentPhase,
     ) {
         self.expected.lock().unwrap().push_back(Expected {
             username,
@@ -281,7 +288,7 @@ impl Drop for NativeServer {
     }
 }
 
-async fn attachment_page(wire: &mut imap_support::Wire, mailbox: &str, payload: bool) {
+async fn attachment_page(wire: &mut imap_support::Wire, mailbox: &str, payload: AttachmentPhase) {
     use imap_support::{expect, write};
     let tag = expect(wire, &format!("EXAMINE {mailbox}")).await;
     write(
@@ -289,9 +296,11 @@ async fn attachment_page(wire: &mut imap_support::Wire, mailbox: &str, payload: 
         &format!("* 3 EXISTS\r\n* OK [UIDVALIDITY 77] stable\r\n{tag} OK [READ-ONLY] selected\r\n"),
     )
     .await;
-    let tag = expect(wire, "UID FETCH 3 (UID RFC822.SIZE BODYSTRUCTURE)").await;
-    write(wire, &format!("* 3 FETCH (UID 3 RFC822.SIZE 3000300 BODYSTRUCTURE ((\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" 13 1 NIL NIL NIL NIL)(\"APPLICATION\" \"OCTET-STREAM\" NIL NIL NIL \"BASE64\" 8 NIL (\"ATTACHMENT\" (\"FILENAME\" \"fixture.bin\")) NIL NIL) \"MIXED\" NIL NIL NIL NIL))\r\n{tag} OK fetched\r\n")).await;
-    if payload {
+    if payload != AttachmentPhase::Continue {
+        let tag = expect(wire, "UID FETCH 3 (UID RFC822.SIZE BODYSTRUCTURE)").await;
+        write(wire, &format!("* 3 FETCH (UID 3 RFC822.SIZE 3000300 BODYSTRUCTURE ((\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" 13 1 NIL NIL NIL NIL)(\"APPLICATION\" \"OCTET-STREAM\" NIL NIL NIL \"BASE64\" 8 NIL (\"ATTACHMENT\" (\"FILENAME\" \"fixture.bin\")) NIL NIL) \"MIXED\" NIL NIL NIL NIL))\r\n{tag} OK fetched\r\n")).await;
+    }
+    if payload == AttachmentPhase::Start {
         let tag = expect(wire, "UID FETCH 3 (UID BODY.PEEK[2]<0.16384>)").await;
         write(
             wire,

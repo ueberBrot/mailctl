@@ -1,7 +1,7 @@
 //! In-memory attachment adapter with live mailbox-incarnation checks.
 use super::*;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Mutex};
 #[derive(Clone, Default)]
 pub struct MemoryAttachments(Arc<Mutex<BTreeMap<(String, String), Mailbox>>>);
 struct Mailbox {

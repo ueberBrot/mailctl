@@ -643,3 +643,61 @@ async fn narrowed_attachment_byte_limits_fail_without_retaining_a_transfer() {
         }
     }
 }
+
+#[allow(dead_code)]
+mod attachment_support;
+#[tokio::test]
+async fn imap_continuations_reconnect_and_check_identity_before_returning_buffered_bytes() {
+    use imap_support::*;
+    for stale in [false, true] {
+        let mut session = 0;
+        let fixture = repeating_fixture(Default::default(), if stale { 3 } else { 4 }, move |mut wire| {
+            let step = session; session += 1;
+            Box::pin(async move {
+                authenticate(&mut wire).await;
+                if stale && step == 2 {
+                    let tag = expect(&mut wire, "EXAMINE INBOX").await;
+                    write(&mut wire, &format!("* 1 EXISTS\r\n* OK [UIDVALIDITY 78] recreated\r\n{tag} OK [READ-ONLY] selected\r\n")).await;
+                    dropped(&mut wire).await;
+                    return;
+                }
+                examine(&mut wire).await;
+                if step <= 1 { attachment_support::metadata(&mut wire, &attachment_support::structure("BASE64", 8)).await; }
+                if step == 1 { literal_bytes(&mut wire, "2", 0, 16384, b"YWJjZGVm").await; }
+                logout(&mut wire).await;
+            })
+        }).await;
+        let (service, message) = live(&fixture, small_config()).await;
+        let context = service.context("reader", &Default::default()).unwrap();
+        let reference = attachment_reference(&service, &context, &message).await;
+        let mut token = start(&service, &context, &reference).await;
+        for (offset, expected) in [(2, "Y2Q="), (4, "ZWY=")] {
+            let result = service
+                .execute(
+                    &context,
+                    operation("get_attachment", json!({"token":token})),
+                )
+                .await;
+            if stale {
+                assert_eq!(
+                    result.unwrap_err().code,
+                    mailctl::domain::ErrorCode::StaleReference
+                );
+                break;
+            }
+            let OperationResult::Attachment(chunk) = result.unwrap() else {
+                panic!()
+            };
+            assert_eq!(chunk.bytes_base64, expected);
+            assert_eq!(chunk.decoded_offset, offset);
+            match chunk.progress {
+                mailctl::domain::AttachmentProgress::Continue { next_token } => token = next_token,
+                mailctl::domain::AttachmentProgress::Complete {
+                    total_decoded_bytes,
+                    ..
+                } => assert_eq!(total_decoded_bytes, 6),
+            }
+        }
+        fixture.task.await.unwrap();
+    }
+}

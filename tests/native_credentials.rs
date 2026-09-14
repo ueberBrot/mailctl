@@ -11,6 +11,7 @@ mod support;
 mod terminal;
 
 use security_framework::os::macos::keychain::{CreateOptions, SecKeychain};
+use server::AttachmentPhase;
 use std::{
     fs::{self, OpenOptions},
     io::Write,
@@ -48,6 +49,8 @@ fn native_credentials_cross_components_rotate_and_clean_up() {
             "mailboxes = [\"INBOX\", \"Archive\"]",
         )
         + "\n[[grants]]\nname = \"restricted\"\naccounts = [\"work\"]\nmailboxes = [\"INBOX\"]\n";
+    let configuration = configuration
+        + "\n[limits]\nattachment_chunk_bytes = 2\n\n[[grants]]\nname = \"limited\"\naccounts = [\"work\"]\nmailboxes = [\"Archive\"]\n[grants.limits]\nenvelope_bytes = 4096\n";
     fs::write(
         installation.config(),
         configuration.replace(
@@ -607,7 +610,7 @@ fn search_handoffs(
     assert_success(&output);
     let body = envelope(&output)["result"].clone();
     assert_eq!(body["body"]["text"], "Short body.\r\n");
-    server.expect_attachment("work@example.test", FIRST, "Archive", false);
+    server.expect_attachment("work@example.test", FIRST, "Archive", AttachmentPhase::List);
     let mut command = installation.command(cli);
     command.env("SSL_CERT_FILE", &server.certificate).args([
         "--json",
@@ -620,7 +623,25 @@ fn search_handoffs(
     assert_success(&output);
     let attachments = envelope(&output)["result"].clone();
     let attachment = attachments["attachments"][0]["reference"].as_str().unwrap();
-    server.expect_attachment("work@example.test", FIRST, "Archive", true);
+    server.expect_attachment(
+        "work@example.test",
+        FIRST,
+        "Archive",
+        AttachmentPhase::Start,
+    );
+    server.expect_attachment(
+        "work@example.test",
+        FIRST,
+        "Archive",
+        AttachmentPhase::Continue,
+    );
+    server.expect_attachment(
+        "work@example.test",
+        FIRST,
+        "Archive",
+        AttachmentPhase::Continue,
+    );
+
     let mut command = installation.command(cli);
     command.env("SSL_CERT_FILE", &server.certificate).args([
         "--json",
@@ -634,6 +655,25 @@ fn search_handoffs(
     let downloaded = envelope(&output)["result"].clone();
     assert_eq!(downloaded["bytes_base64"], "YWJjZGVm");
     assert_eq!(downloaded["progress"]["total_decoded_bytes"], 6);
+
+    server.expect_attachment(
+        "work@example.test",
+        FIRST,
+        "Archive",
+        AttachmentPhase::Start,
+    );
+    let mut command = installation.command(cli);
+    command.env("SSL_CERT_FILE", &server.certificate).args([
+        "--json",
+        "--grant",
+        "limited",
+        "attachment",
+        "get",
+        "--attachment",
+        attachment,
+    ]);
+    let output = run_bounded(command);
+    assert_eq!(envelope(&output)["error"]["code"], "response_too_large");
 
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -650,38 +690,60 @@ fn search_handoffs(
                 TokioChildProcess::new(command).unwrap()
             };
             let reader = ().serve(connect("default")).await.unwrap();
-            for (name, input, expected, payload) in [
-                (
-                    "email_list_attachments",
-                    json!({"message":message_reference}),
-                    &attachments,
-                    false,
-                ),
-                (
-                    "email_get_attachment",
-                    json!({"attachment":attachment}),
-                    &downloaded,
-                    true,
-                ),
-            ] {
-                server.expect_attachment("work@example.test", FIRST, "Archive", payload);
+
+            server.expect_attachment("work@example.test", FIRST, "Archive", AttachmentPhase::List);
+            let response = reader
+                .call_tool(
+                    CallToolRequestParams::new("email_list_attachments").with_arguments(
+                        json!({"message":message_reference})
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.structured_content.unwrap()["result"], attachments);
+            let mut input = json!({"attachment":attachment});
+            let mut bytes = Vec::new();
+            for (index, phase) in [
+                AttachmentPhase::Start,
+                AttachmentPhase::Continue,
+                AttachmentPhase::Continue,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                server.expect_attachment("work@example.test", FIRST, "Archive", phase);
                 let response = reader
                     .call_tool(
-                        CallToolRequestParams::new(name)
+                        CallToolRequestParams::new("email_get_attachment")
                             .with_arguments(input.as_object().unwrap().clone()),
                     )
                     .await
                     .unwrap();
                 assert_eq!(response.is_error, Some(false));
                 let structured = response.structured_content.unwrap();
-                assert_eq!(&structured["result"], expected);
                 assert_eq!(
                     serde_json::from_str::<Value>(&response.content[0].as_text().unwrap().text)
                         .unwrap(),
                     structured
                 );
+                let chunk = &structured["result"];
+                assert_eq!(chunk["decoded_offset"], index * 2);
+                use base64::{Engine, engine::general_purpose::STANDARD};
+                bytes.extend(
+                    STANDARD
+                        .decode(chunk["bytes_base64"].as_str().unwrap())
+                        .unwrap(),
+                );
+                if index == 2 {
+                    assert_eq!(chunk["progress"], downloaded["progress"]);
+                    assert_eq!(STANDARD.encode(&bytes), downloaded["bytes_base64"]);
+                } else {
+                    input = json!({"token":chunk["progress"]["next_token"]});
+                }
             }
-
             server.expect_body("work@example.test", FIRST, "Archive");
             let response = reader
                 .call_tool(

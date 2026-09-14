@@ -237,18 +237,10 @@ impl ImapProbe {
             if conn.examine(name).await? != request.uid_validity {
                 return Err(Error::UnsafeSelection);
             }
-            let fetch = Fetch::Metadata { uid: request.uid };
-            let fields = fetch.execute(&mut conn).await?;
-            let (_, structure) = fetch.metadata(&fields)?;
-            let attachments = attachments(structure, &limits)?
+            let attachments = attachment_definitions(&mut conn, request.uid, &limits)
+                .await?
                 .into_iter()
-                .map(|attachment| AttachmentMetadata {
-                    part: part_name(&attachment.part),
-                    filename: attachment.filename,
-                    media_type: attachment.media_type,
-                    declared_size: attachment.declared_size,
-                    available: attachment.encoding.is_some(),
-                })
+                .map(AttachmentDefinition::into_metadata)
                 .collect();
             conn.drive(ImapLogout::new()).await?;
             let mut metrics = conn.metrics();
@@ -321,10 +313,8 @@ impl ImapProbe {
                 return Err(Error::UnsafeSelection);
             }
             if starting {
-                let metadata = Fetch::Metadata { uid: state.uid };
-                let fields = metadata.execute(&mut conn).await?;
-                let (_, structure) = metadata.metadata(&fields)?;
-                let definition = attachments(structure, &limits)?
+                let definition = attachment_definitions(&mut conn, state.uid, &limits)
+                    .await?
                     .into_iter()
                     .find(|definition| definition.part == state.part)
                     .ok_or(Error::InvalidInput)?;
@@ -607,18 +597,10 @@ impl super::AuthenticatedConnection {
         if conn.examine(name).await? != request.uid_validity {
             return Err(Error::StaleReference);
         }
-        let fetch = Fetch::Metadata { uid: request.uid };
-        let fields = fetch.execute(&mut conn).await?;
-        let (_, structure) = fetch.metadata(&fields)?;
-        let result = attachments(structure, &limits)?
+        let result = attachment_definitions(&mut conn, request.uid, &limits)
+            .await?
             .into_iter()
-            .map(|entry| AttachmentMetadata {
-                part: part_name(&entry.part),
-                filename: entry.filename,
-                media_type: entry.media_type,
-                declared_size: entry.declared_size,
-                available: entry.encoding.is_some(),
-            })
+            .map(AttachmentDefinition::into_metadata)
             .collect();
         conn.drive(ImapLogout::new()).await?;
         Ok(result)
@@ -687,10 +669,8 @@ impl super::AuthenticatedConnection {
             return Err(Error::StaleReference);
         }
         if state.wire_bytes == 0 && !state.eof {
-            let fetch = Fetch::Metadata { uid: state.uid };
-            let fields = fetch.execute(&mut conn).await?;
-            let (_, structure) = fetch.metadata(&fields)?;
-            let definition = attachments(structure, &limits)?
+            let definition = attachment_definitions(&mut conn, state.uid, &limits)
+                .await?
                 .into_iter()
                 .find(|entry| entry.part == state.part)
                 .ok_or(Error::StaleReference)?;
@@ -717,5 +697,27 @@ impl super::AuthenticatedConnection {
             decoded_offset,
             integrity,
         })
+    }
+}
+
+async fn attachment_definitions(
+    conn: &mut Connection<'_>,
+    uid: u32,
+    limits: &Limits,
+) -> Result<Vec<AttachmentDefinition>, Error> {
+    let fetch = Fetch::Metadata { uid };
+    let fields = fetch.execute(conn).await?;
+    let (_, structure) = fetch.metadata(&fields)?;
+    attachments(structure, limits)
+}
+impl AttachmentDefinition {
+    fn into_metadata(self) -> AttachmentMetadata {
+        AttachmentMetadata {
+            part: part_name(&self.part),
+            filename: self.filename,
+            media_type: self.media_type,
+            declared_size: self.declared_size,
+            available: self.encoding.is_some(),
+        }
     }
 }
