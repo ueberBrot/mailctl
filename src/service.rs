@@ -2,9 +2,8 @@
 mod credentials;
 #[cfg(any(feature = "cli", feature = "mcp"))]
 pub(crate) use credentials::credential_error;
-mod imap;
-pub use imap::ImapBackend;
 mod attachments;
+mod imap;
 mod mailboxes;
 mod message;
 pub(crate) use attachments::TransferSession;
@@ -21,7 +20,7 @@ use crate::{
         Account, AccountDiscovery, AccountHealth, Availability, Capabilities, Capacity, Error,
         ErrorCode, Health, Operation, OperationResult, ProcessCapacity, Setup,
     },
-    policy::{Narrowing, RequestContext},
+    policy::{Narrowing, Permission, RequestContext},
 };
 pub use mailboxes::{MailboxBackend, MailboxTarget, MemoryMailboxes};
 pub use search::{MemoryMessage, MemoryMessages, SearchBackend};
@@ -91,7 +90,7 @@ impl Service {
         }
     }
     /// Select host dependencies during frontend initialization, before operations.
-    pub(crate) fn with_environment(
+    pub fn with_environment(
         mut self,
         host: std::sync::Arc<dyn crate::host::HostEnvironment>,
     ) -> Self {
@@ -148,10 +147,7 @@ impl Service {
             .limits(context)?
             .envelope_bytes
             .min(context.response_limit());
-        if context
-            .permissions()
-            .contains(&crate::policy::Permission::SearchMessages)
-        {
+        if context.permissions().contains(&Permission::SearchMessages) {
             return Ok(maximum);
         }
         let mut size = 2048usize.min(maximum);
@@ -168,10 +164,7 @@ impl Service {
             };
             size += identities;
         }
-        if context
-            .permissions()
-            .contains(&crate::policy::Permission::ListMailboxes)
-        {
+        if context.permissions().contains(&Permission::ListMailboxes) {
             let grant = self.grant(context)?;
             for account in self.visible_accounts(context) {
                 let mut entries = account
@@ -204,39 +197,51 @@ impl Service {
         context: &RequestContext,
         operation: Operation,
     ) -> Result<OperationResult, Error> {
+        let transfer = matches!(operation, Operation::GetAttachment(_));
+        let execution = self.execute_inner(context, operation);
+        // Transfers own the earlier of operation timeout and transfer expiry, including
+        // which error to return when both deadlines coincide.
+        if transfer {
+            execution.await
+        } else {
+            self.with_deadline(context, execution).await
+        }
+    }
+    async fn with_deadline<T>(
+        &self,
+        context: &RequestContext,
+        execution: impl std::future::Future<Output = Result<T, Error>>,
+    ) -> Result<T, Error> {
+        let deadline =
+            std::time::Duration::from_secs(self.limits(context)?.operation_seconds as u64);
+        tokio::time::timeout(deadline, execution)
+            .await
+            .map_err(|_| Error::new(ErrorCode::Timeout))?
+    }
+    async fn execute_inner(
+        &self,
+        context: &RequestContext,
+        operation: Operation,
+    ) -> Result<OperationResult, Error> {
         let grant = self.grant(context)?;
         self.registry.check_revision()?;
         let operations = || {
-            let mut operations = vec![
-                "list_accounts".to_string(),
-                "capabilities".to_string(),
-                "health".to_string(),
-            ];
-            if context
-                .permissions()
-                .contains(&crate::policy::Permission::ListMailboxes)
-            {
-                operations.push("list_mailboxes".into());
-            }
-            if context
-                .permissions()
-                .contains(&crate::policy::Permission::SearchMessages)
-            {
-                operations.push("search_messages".into());
-            }
-            if context
-                .permissions()
-                .contains(&crate::policy::Permission::ReadMessage)
-            {
-                operations.push("get_message".into());
-            }
-            if context
-                .permissions()
-                .contains(&crate::policy::Permission::ReadAttachment)
-            {
-                operations.extend(["list_attachments".into(), "get_attachment".into()]);
-            }
-            operations
+            [
+                ("list_accounts", None),
+                ("capabilities", None),
+                ("health", None),
+                ("list_mailboxes", Some(Permission::ListMailboxes)),
+                ("search_messages", Some(Permission::SearchMessages)),
+                ("get_message", Some(Permission::ReadMessage)),
+                ("list_attachments", Some(Permission::ReadAttachment)),
+                ("get_attachment", Some(Permission::ReadAttachment)),
+            ]
+            .into_iter()
+            .filter(|(_, permission)| {
+                permission.is_none_or(|permission| context.permissions().contains(&permission))
+            })
+            .map(|(name, _)| name.to_owned())
+            .collect()
         };
         let result = match operation {
             Operation::ListAttachments(input) => {

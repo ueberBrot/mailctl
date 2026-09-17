@@ -7,7 +7,7 @@ use crate::{
     policy::{Permission, RequestContext},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
-use std::{fmt::Write, future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 use tokio::time::Instant;
 use uuid::Uuid;
 mod memory;
@@ -69,21 +69,18 @@ impl Service {
         let backend = match &self.attachment_backend {
             Some(backend) => backend.as_ref(),
             None => {
-                live = self.imap_backend(target.config).await?;
+                live = self.imap_backend(target).await?;
                 &live
             }
         };
-        let entries = tokio::time::timeout(
-            Duration::from_secs(limits.operation_seconds as u64),
-            backend.list(
+        let entries = backend
+            .list(
                 target,
                 name,
                 imap::AttachmentListRequest::new(reference.uid, reference.uid_validity),
                 limits,
-            ),
-        )
-        .await
-        .map_err(|_| Error::new(ErrorCode::Timeout))??;
+            )
+            .await?;
         if entries.len() > limits.mime_parts {
             return Err(Error::new(ErrorCode::ResponseTooLarge));
         }
@@ -157,7 +154,7 @@ impl Service {
                 let backend = match &self.attachment_backend {
                     Some(backend) => backend.as_ref(),
                     None => {
-                        live = self.imap_backend(target.config).await?;
+                        live = self.imap_backend(target).await?;
                         &live
                     }
                 };
@@ -206,15 +203,18 @@ impl Service {
         let operation_deadline =
             Instant::now() + Duration::from_secs(limits.operation_seconds as u64);
         let deadline = operation_deadline.min(expires);
-        let page = tokio::time::timeout_at(deadline, entry.reader.next(limits))
-            .await
-            .map_err(|_| {
-                if expires <= operation_deadline {
+        let page = tokio::select! {
+            // Preserve expiry precedence when a nested reader timeout is also ready.
+            biased;
+            () = tokio::time::sleep_until(deadline) => {
+                return Err(if expires <= operation_deadline {
                     expired()
                 } else {
                     Error::new(ErrorCode::Timeout)
-                }
-            })??;
+                });
+            }
+            page = entry.reader.next(limits) => page?,
+        };
         if Instant::now() >= expires {
             return Err(expired());
         }
@@ -240,16 +240,10 @@ impl Service {
         budget.reserve(512 + limits.token_bytes + page.bytes.len().div_ceil(3) * 4)?;
         budget.count(&entry.reference)?;
         let progress = match page.integrity {
-            Some(integrity) => {
-                let mut sha256 = String::with_capacity(64);
-                for byte in integrity.sha256 {
-                    let _ = write!(sha256, "{byte:02x}");
-                }
-                domain::AttachmentProgress::Complete {
-                    total_decoded_bytes: integrity.total_decoded_bytes,
-                    sha256,
-                }
-            }
+            Some(integrity) => domain::AttachmentProgress::Complete {
+                total_decoded_bytes: integrity.total_decoded_bytes,
+                sha256: crate::encoding::hex(&integrity.sha256),
+            },
             None => domain::AttachmentProgress::Continue {
                 next_token: self.encode(
                     "tx1",

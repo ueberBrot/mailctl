@@ -4,6 +4,7 @@ use super::super::{
     Error, Limits,
     mime::{attachment, child_path, imap_text, validate_structure},
 };
+use base64::{Engine, engine::general_purpose::STANDARD};
 use io_imap::types::{
     body::{Body, BodyStructure, SpecificFields},
     core::IString,
@@ -389,7 +390,7 @@ fn scan_base64(wire: &[u8]) -> (usize, bool) {
         quartet[len] = byte;
         len += 1;
         if len == quartet.len() {
-            if !valid_base64_quartet(quartet) {
+            if STANDARD.decode_slice(quartet, &mut [0; 3]).is_err() {
                 return (complete, false);
             }
             complete = index + 1;
@@ -402,31 +403,6 @@ fn scan_base64(wire: &[u8]) -> (usize, bool) {
 
 fn base64_alphabet(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/')
-}
-
-fn valid_base64_quartet(quartet: [u8; 4]) -> bool {
-    (quartet.iter().all(|byte| base64_alphabet(*byte)))
-        || (base64_alphabet(quartet[0])
-            && base64_alphabet(quartet[1])
-            && base64_alphabet(quartet[2])
-            && quartet[3] == b'='
-            && base64_value(quartet[2]).is_some_and(|value| value & 0b11 == 0))
-        || (base64_alphabet(quartet[0])
-            && base64_alphabet(quartet[1])
-            && quartet[2] == b'='
-            && quartet[3] == b'='
-            && base64_value(quartet[1]).is_some_and(|value| value & 0b1111 == 0))
-}
-
-fn base64_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'A'..=b'Z' => Some(byte - b'A'),
-        b'a'..=b'z' => Some(byte - b'a' + 26),
-        b'0'..=b'9' => Some(byte - b'0' + 52),
-        b'+' => Some(62),
-        b'/' => Some(63),
-        _ => None,
-    }
 }
 
 fn decode_quoted_printable(wire: &[u8]) -> (Vec<u8>, bool) {

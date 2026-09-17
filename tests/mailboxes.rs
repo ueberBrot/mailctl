@@ -1,4 +1,4 @@
-#[allow(dead_code)]
+mod host_support;
 mod imap_support;
 
 use mailctl::{
@@ -176,36 +176,16 @@ async fn references_reauthorize_mailbox_scope_and_cannot_cross_installations() {
     );
 }
 
-struct SyntheticSource;
-impl mailctl::credentials::SecretSource for SyntheticSource {
-    fn availability(&self, _: uuid::Uuid) -> mailctl::credentials::Availability {
-        mailctl::credentials::Availability::Available
-    }
-    fn resolve(
-        &self,
-        _: uuid::Uuid,
-    ) -> Result<mailctl::credentials::Secret, mailctl::credentials::SourceError> {
-        mailctl::credentials::Secret::new(b"disposable-password".to_vec())
-    }
-}
-
 fn imap_service(mut configuration: Config, fixture: &imap_support::Fixture) -> Service {
     configuration.accounts[0].server = "127.0.0.1".into();
     configuration.accounts[0].port = fixture.port;
     configuration.accounts[0].username = "fixture".into();
-    let runtime = Arc::new(
-        mailctl::authentication::Runtime::new(configuration.limits.clone(), fixture.roots.clone())
-            .unwrap(),
-    );
-    let sources = std::collections::BTreeMap::from([(
-        "work".into(),
-        Arc::new(SyntheticSource) as Arc<dyn mailctl::credentials::SecretSource>,
-    )]);
     Service::in_memory(configuration)
         .unwrap()
-        .with_mailbox_backend(Arc::new(mailctl::service::ImapBackend::new(
-            runtime, sources,
-        )))
+        .with_environment(host_support::Host::new(
+            fixture.roots.clone(),
+            b"disposable-password",
+        ))
 }
 
 #[tokio::test]
@@ -795,7 +775,6 @@ async fn imap_runtime_inventory_ceiling_is_enforced_before_credential_work() {
     use mailctl::{
         authentication::Runtime,
         credentials::{Availability, Secret, SecretSource, SourceError},
-        domain::ErrorCode,
     };
     struct Missing(std::sync::atomic::AtomicUsize);
     impl SecretSource for Missing {
@@ -815,22 +794,17 @@ async fn imap_runtime_inventory_ceiling_is_enforced_before_credential_work() {
         Runtime::new(runtime_limits, tokio_rustls::rustls::RootCertStore::empty()).unwrap(),
     );
     let missing = Arc::new(Missing(std::sync::atomic::AtomicUsize::new(0)));
-    let backend = mailctl::service::ImapBackend::new(
-        runtime,
-        std::collections::BTreeMap::from([(
-            "work".into(),
-            missing.clone() as Arc<dyn SecretSource>,
-        )]),
-    );
-    let service = Service::in_memory(configuration)
-        .unwrap()
-        .with_mailbox_backend(Arc::new(backend));
+    let account = mailctl::authentication::Account {
+        id: uuid::Uuid::new_v4(),
+        generation: 1,
+        config: configuration.accounts[0].clone(),
+        source: missing.clone(),
+    };
     assert_eq!(
-        list(&service, "reader", ListMailboxesInput::default())
-            .await
-            .unwrap_err()
-            .code,
-        ErrorCode::InvalidRequest
+        runtime
+            .discover(&account, &["INBOX".into()], &configuration.limits)
+            .await,
+        Err(mailctl::authentication::Error::InvalidInput),
     );
     assert_eq!(missing.0.load(std::sync::atomic::Ordering::SeqCst), 0);
 }

@@ -698,9 +698,8 @@ fn remove_stale_socket() -> Result<(), Error> {
         Ok(metadata) if metadata.file_type().is_socket() => {
             fs::remove_file(SOCKET).map_err(|_| Error::new(ErrorCode::BrokerUnavailable))
         }
-        Ok(_) => Err(Error::new(ErrorCode::BrokerUnavailable)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(_) => Err(Error::new(ErrorCode::BrokerUnavailable)),
+        Ok(_) | Err(_) => Err(Error::new(ErrorCode::BrokerUnavailable)),
     }
 }
 

@@ -1,4 +1,5 @@
 //! Domain inputs, discovery results, and safe errors shared by every frontend.
+use crate::encoding::BoundedString;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 mod message;
@@ -154,7 +155,7 @@ impl std::error::Error for Error {}
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ListAccountsInput {
-    #[serde(default, deserialize_with = "account_limit")]
+    #[serde(default, deserialize_with = "page_limit::<_, 256>")]
     #[schemars(range(min = 1, max = 256))]
     pub limit: Option<usize>,
 }
@@ -199,28 +200,29 @@ impl<'de> Deserialize<'de> for Operation {
         let wire = Wire::deserialize(deserializer)?;
         let invalid = || serde::de::Error::custom("invalid operation input");
         match (wire.operation.as_str(), wire.input) {
-            ("list_attachments", Input::Present(input)) => serde_json::from_value(input)
-                .map(Self::ListAttachments)
-                .map_err(|_| invalid()),
-            ("get_attachment", Input::Present(input)) => serde_json::from_value(input)
-                .map(Self::GetAttachment)
-                .map_err(|_| invalid()),
-            ("list_accounts", Input::Present(input)) => serde_json::from_value(input)
-                .map(Self::ListAccounts)
-                .map_err(|_| invalid()),
-            ("list_mailboxes", Input::Present(input)) => serde_json::from_value(input)
-                .map(Self::ListMailboxes)
-                .map_err(|_| invalid()),
-            ("get_message", Input::Present(input)) => serde_json::from_value(input)
-                .map(Self::GetMessage)
-                .map_err(|_| invalid()),
-            ("search_messages", Input::Present(input)) => serde_json::from_value(input)
-                .map(Self::SearchMessages)
-                .map_err(|_| invalid()),
+            ("list_attachments", Input::Present(input)) => {
+                serde_json::from_value(input).map(Self::ListAttachments)
+            }
+            ("get_attachment", Input::Present(input)) => {
+                serde_json::from_value(input).map(Self::GetAttachment)
+            }
+            ("list_accounts", Input::Present(input)) => {
+                serde_json::from_value(input).map(Self::ListAccounts)
+            }
+            ("list_mailboxes", Input::Present(input)) => {
+                serde_json::from_value(input).map(Self::ListMailboxes)
+            }
+            ("get_message", Input::Present(input)) => {
+                serde_json::from_value(input).map(Self::GetMessage)
+            }
+            ("search_messages", Input::Present(input)) => {
+                serde_json::from_value(input).map(Self::SearchMessages)
+            }
             ("capabilities", Input::Absent) => Ok(Self::Capabilities),
             ("health", Input::Absent) => Ok(Self::Health),
-            _ => Err(invalid()),
+            _ => return Err(invalid()),
         }
+        .map_err(|_| invalid())
     }
 }
 
@@ -235,7 +237,7 @@ pub struct ListMailboxesInput {
     #[serde(default, deserialize_with = "bounded_optional_string::<_, 8192>")]
     #[schemars(length(min = 1, max = 8192), extend("x-maxUtf8Bytes" = 8192))]
     pub reference: Option<String>,
-    #[serde(default, deserialize_with = "mailbox_limit")]
+    #[serde(default, deserialize_with = "page_limit::<_, 1000>")]
     #[schemars(range(min = 1, max = 1000))]
     pub limit: Option<usize>,
     #[serde(default, deserialize_with = "bounded_optional_string::<_, 8192>")]
@@ -374,15 +376,6 @@ impl<T> Envelope<T> {
             EnvelopeData::Failure { error, .. } => Err(error),
         }
     }
-}
-fn account_limit<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Option<usize>, D::Error> {
-    let limit = Option::<usize>::deserialize(deserializer)?;
-    if limit.is_some_and(|limit| !(1..=256).contains(&limit)) {
-        return Err(serde::de::Error::custom("invalid account limit"));
-    }
-    Ok(limit)
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -562,38 +555,23 @@ pub struct ProcessCapacity {
     pub buffered_bytes: u64,
 }
 
-fn mailbox_limit<'de, D: serde::Deserializer<'de>>(
+fn page_limit<'de, D: serde::Deserializer<'de>, const MAX: usize>(
     deserializer: D,
 ) -> Result<Option<usize>, D::Error> {
     let limit = Option::<usize>::deserialize(deserializer)?;
-    if limit.is_some_and(|limit| !(1..=1000).contains(&limit)) {
-        return Err(serde::de::Error::custom("invalid mailbox limit"));
+    if limit.is_some_and(|limit| !(1..=MAX).contains(&limit)) {
+        return Err(serde::de::Error::custom("invalid page limit"));
     }
     Ok(limit)
 }
 fn bounded_optional_string<'de, D: serde::Deserializer<'de>, const MAX: usize>(
     deserializer: D,
 ) -> Result<Option<String>, D::Error> {
-    struct Bounded<const MAX: usize>(String);
-    impl<'de, const MAX: usize> Deserialize<'de> for Bounded<MAX> {
-        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-            struct Visitor<const MAX: usize>;
-            impl<const MAX: usize> serde::de::Visitor<'_> for Visitor<MAX> {
-                type Value = Bounded<MAX>;
-                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                    write!(f, "a nonempty string of at most {MAX} UTF-8 bytes")
-                }
-                fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
-                    if value.is_empty() || value.len() > MAX {
-                        return Err(E::custom("string exceeds its bound"));
-                    }
-                    Ok(Bounded(value.into()))
-                }
-            }
-            deserializer.deserialize_str(Visitor::<MAX>)
-        }
-    }
-    Option::<Bounded<MAX>>::deserialize(deserializer).map(|value| value.map(|value| value.0))
+    Option::<BoundedString<1, MAX>>::deserialize(deserializer)
+        .map(|value| value.map(|value| value.0))
+}
+fn reference<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    BoundedString::<1, 8192>::deserialize(deserializer).map(|value| value.0)
 }
 
 /// IMAP reserves case-insensitive INBOX; every other mailbox keeps its exact identity.

@@ -1,3 +1,8 @@
+#![allow(
+    dead_code,
+    reason = "integration-test crates use different subsets of these shared fixture helpers"
+)]
+
 use crate::imap_support::*;
 use io_imap::codec::{CommandCodec, decode::Decoder};
 use io_imap::types::command::CommandBody;
@@ -7,11 +12,9 @@ use std::sync::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-pub fn continuation(chunk: mailctl::imap::AttachmentChunk) -> mailctl::imap::AttachmentTransfer {
-    let mailctl::imap::AttachmentProgress::Continue(token) = chunk.progress else {
-        panic!("expected an incomplete attachment transfer");
-    };
-    token
+pub fn decoder() -> mailctl::imap::AttachmentDecoder {
+    mailctl::imap::AttachmentDecoder::new("INBOX", 4, 77, "2", &mailctl::imap::Limits::default())
+        .unwrap()
 }
 
 pub fn structure(encoding: &str, size: usize) -> String {

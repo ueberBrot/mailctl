@@ -1,5 +1,5 @@
 //! Search windows and envelope reads on one exclusive read-only selection.
-use super::{AuthenticatedConnection, Metrics, Projection, wire::Connection};
+use super::{AuthenticatedConnection, Metrics, projection::Projection, wire::Connection};
 use crate::{
     domain::{Error, ErrorCode, SearchCriteria},
     search::{LocatedMessage, SearchBatch, SearchRequest, SelectedMailbox, page},
@@ -15,64 +15,23 @@ use io_imap::{
 use std::num::NonZeroU32;
 
 impl AuthenticatedConnection {
-    pub(crate) async fn search(
+    pub async fn search(
         self,
         request: SearchRequest<'_>,
         limits: &crate::config::Limits,
+        metrics: &mut Metrics,
     ) -> Result<SearchBatch, Error> {
-        let mut metrics = Metrics::default();
-        self.0
-            .resume(&mut metrics)
-            .search_messages(request, limits)
-            .await
-    }
-}
-impl super::ImapProbe {
-    /// Typed traversal through the same selected-mailbox routine used by the application.
-    /// `metrics()` retains progress after success, failure, or cancellation.
-    pub async fn search_messages(
-        &mut self,
-        username: &str,
-        password: &str,
-        request: SearchRequest<'_>,
-        limits: &crate::config::Limits,
-    ) -> Result<SearchBatch, Error> {
-        self.metrics = Metrics::default();
-        limits.validate()?;
-        super::credentials(username, password).map_err(Error::from)?;
-        let deadline = self
-            .limits
-            .operation_timeout
-            .min(std::time::Duration::from_secs(
-                limits.operation_seconds as u64,
-            ));
-        tokio::time::timeout(deadline, async {
-            let mut connection = self
-                .authenticate(username, password)
-                .await
-                .map_err(Error::from)?;
-            connection.search_messages(request, limits).await
-        })
-        .await
-        .map_err(|_| Error::new(ErrorCode::Timeout))?
-    }
-}
-impl Connection<'_> {
-    async fn search_messages(
-        &mut self,
-        request: SearchRequest<'_>,
-        limits: &crate::config::Limits,
-    ) -> Result<SearchBatch, Error> {
+        let mut connection = self.session.resume(metrics);
         super::mailbox(request.mailbox).map_err(Error::from)?;
         limits.validate()?;
-        self.limit_search(limits);
-        let (validity, uid_next) = self
+        connection.limit_search(limits);
+        let (validity, uid_next) = connection
             .examine_selection(request.mailbox)
             .await
             .map_err(Error::from)?;
         let result = page(
             &mut Selection {
-                connection: self,
+                connection: &mut connection,
                 validity,
                 uid_next,
                 header_bytes: limits.header_bytes,
@@ -81,7 +40,10 @@ impl Connection<'_> {
             limits,
         )
         .await?;
-        self.drive(ImapLogout::new()).await.map_err(Error::from)?;
+        connection
+            .drive(ImapLogout::new())
+            .await
+            .map_err(Error::from)?;
         Ok(result)
     }
 }

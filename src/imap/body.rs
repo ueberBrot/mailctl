@@ -1,10 +1,7 @@
 //! A bounded body read owns selection, byte retrieval, representation, and continuation.
 mod representation;
 
-use super::{
-    Error, ImapProbe, Limits, Metrics, credentials, fetch::Fetch, mailbox, mime::part_name,
-    wire::Connection,
-};
+use super::{Error, Limits, Metrics, fetch::Fetch, mailbox, mime::part_name, wire::Connection};
 use io_imap::{
     rfc3501::logout::ImapLogout,
     types::{body::BodyStructure, fetch::Section},
@@ -79,52 +76,29 @@ pub struct BodyPage {
 
 const REPRESENTATION: &str = "mailctl-body-1/mail-parser-0.11.8/html2text-0.17.1";
 
-impl ImapProbe {
-    /// Reads one selected body under an exclusive connection lease, checking the
-    /// expected UIDVALIDITY before fetching. Cancellation disposes the connection.
-    /// Each continuation refetches within the same finite bounds.
-    pub async fn read_body(
-        &mut self,
-        username: &str,
-        password: &str,
-        name: &str,
-        request: BodyRequest,
-    ) -> Result<BodyPage, Error> {
-        self.metrics = Metrics::default();
-        credentials(username, password)?;
-        mailbox(name)?;
-        if request.uid == 0 || request.uid_validity == 0 {
-            return Err(Error::InvalidInput);
-        }
-        let limits = self.limits.clone();
-        let mut context = Sha256::new();
-        for value in [self.host.as_str(), username, name] {
-            context.update(value.len().to_be_bytes());
-            context.update(value.as_bytes());
-        }
-        context.update(self.port.to_be_bytes());
-        context.update(request.uid.to_be_bytes());
-        context.update(request.uid_validity.to_be_bytes());
-        tokio::time::timeout(limits.operation_timeout, async {
-            let mut conn = self.authenticate(username, password).await?;
-            let page = read_selected(&mut conn, name, request, &limits, context).await?;
-            drop(conn);
-            self.metrics = page.metrics;
-            Ok(page)
-        })
-        .await
-        .map_err(|_| Error::Timeout)?
-    }
-}
-
 impl super::AuthenticatedConnection {
-    pub(crate) async fn read_body(
+    pub async fn read_body(
         self,
         name: &str,
         request: BodyRequest,
-        limits: &crate::config::Limits,
+        limits: &Limits,
+        metrics: &mut Metrics,
     ) -> Result<BodyPage, Error> {
-        let limits = Limits {
+        limits.validate()?;
+        let mut context = Sha256::new();
+        context.update(self.identity);
+        context.update(name.len().to_be_bytes());
+        context.update(name.as_bytes());
+        context.update(request.uid.to_be_bytes());
+        context.update(request.uid_validity.to_be_bytes());
+        let mut conn = self.session.resume(metrics);
+        conn.limit_body(limits);
+        read_selected(&mut conn, name, request, limits, context).await
+    }
+}
+impl Limits {
+    pub(crate) fn body(limits: &crate::config::Limits) -> Self {
+        Self {
             max_body_wire_bytes: limits.wire_fetch_bytes,
             max_header_bytes: limits.header_bytes,
             max_nesting: limits.mime_depth,
@@ -133,13 +107,8 @@ impl super::AuthenticatedConnection {
             max_operation_bytes: 16 * 1024 * 1024,
             max_response_bytes: 256 * 1024,
             max_literal_bytes: 64 * 1024,
-            ..Limits::default()
-        };
-        limits.validate()?;
-        let mut metrics = Metrics::default();
-        let mut conn = self.0.resume(&mut metrics);
-        conn.limit_body(&limits);
-        read_selected(&mut conn, name, request, &limits, Sha256::new()).await
+            ..Self::default()
+        }
     }
 }
 
@@ -161,7 +130,7 @@ async fn read_selected(
     }
     let metadata = Fetch::Metadata { uid: request.uid };
     let fields = metadata.execute(conn).await?;
-    let (size, structure) = metadata.metadata(&fields)?;
+    let (size, structure) = Fetch::metadata(&fields)?;
     // Validate every MIME node, including excluded attachment subtrees.
     let mut related_ids = HashMap::new();
     let needed_headers = representation::related_multipart_headers(structure, limits)?;

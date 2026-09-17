@@ -234,7 +234,7 @@ fn invocation_narrowing(
     options: &mut arguments::Options,
     _action: &Action,
 ) -> Result<Narrowing, Error> {
-    #[allow(unused_mut)]
+    #[allow(unused_mut, reason = "MCP builds apply additional read-only narrowing")]
     let mut narrowing = Narrowing {
         read_only: options.read_only,
         accounts: (!options.accounts.is_empty()).then(|| std::mem::take(&mut options.accounts)),

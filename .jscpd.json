@@ -1,0 +1,11 @@
+{
+  "path": ["src"],
+  "format": ["rust"],
+  "mode": "weak",
+  "minTokens": 100,
+  "minLines": 10,
+  "threshold": 0,
+  "failOnEmpty": true,
+  "reporters": ["console"],
+  "noColors": true
+}

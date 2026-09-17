@@ -1,10 +1,7 @@
 use crate::domain::{AttachmentChunk, AttachmentProgress, Error, ErrorCode};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use sha2::{Digest, Sha256};
-use std::{
-    fmt::Write,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 #[path = "export/macos.rs"]
 mod native;
@@ -96,10 +93,8 @@ impl ExportWriter {
                 total_decoded_bytes,
                 sha256,
             } => {
-                let mut actual = String::with_capacity(64);
-                for byte in std::mem::take(&mut self.digest).finalize() {
-                    write!(actual, "{byte:02x}").map_err(|_| failed())?;
-                }
+                let actual =
+                    crate::encoding::hex(std::mem::take(&mut self.digest).finalize().as_slice());
                 if *total_decoded_bytes != total || *sha256 != actual {
                     return Err(failed());
                 }

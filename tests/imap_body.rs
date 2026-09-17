@@ -1,4 +1,3 @@
-#[allow(dead_code)]
 mod imap_support;
 
 use imap_support::*;
@@ -215,6 +214,8 @@ async fn unsupported_and_attached_bodies_return_an_explicit_empty_representation
 async fn decoding_preserves_plain_quotes_and_marks_malformed_data() {
     let cases: &[(&str, &str, &[u8], &str, bool)] = &[
         ("UTF-8", "BASE64", b"SGVsbG8=", "Hello", false),
+        ("UTF-8", "BASE64", b" Zg==\r\n", "f", false),
+        ("UTF-8", "BASE64", b"Zm9v", "foo", false),
         ("UTF-8", "QUOTED-PRINTABLE", b"caf=C3=A9", "café", false),
         ("ISO-8859-1", "8BIT", b"caf\xe9", "café", false),
         (

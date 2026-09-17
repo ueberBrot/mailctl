@@ -1,3 +1,6 @@
+mod imap_support;
+use imap_support::Client;
+mod host_support;
 #[test]
 fn owned_fixture_authenticates_seeds_resets_and_cleans_up_twice() {
     greenmail_support::run(async {
@@ -17,7 +20,7 @@ fn owned_fixture_authenticates_seeds_resets_and_cleans_up_twice() {
 #[test]
 fn imap_discovery_and_search_preserve_mailbox_content_identity_and_flags() {
     greenmail_support::run(async {
-        use mailctl::imap::{ImapProbe, Limits, TlsMode, UidWindow};
+        use mailctl::imap::{Limits, TlsMode};
 
         let mut fixture = greenmail_support::Fixture::start().await?;
         let content_before = fixture.contents().await?;
@@ -26,7 +29,7 @@ fn imap_discovery_and_search_preserve_mailbox_content_identity_and_flags() {
         assert!(snapshot_before.messages.iter().any(|message| message.seen));
         assert!(snapshot_before.messages.iter().any(|message| !message.seen));
 
-        let mut probe = ImapProbe::new(
+        let mut probe = Client::new(
             "localhost".to_owned(),
             fixture.imaps_port(),
             TlsMode::Implicit,
@@ -40,9 +43,9 @@ fn imap_discovery_and_search_preserve_mailbox_content_identity_and_flags() {
                 &["INBOX".to_owned()],
             )
             .await?;
-        assert_eq!(discovery.mailboxes.len(), 1);
-        assert_eq!(discovery.mailboxes[0].name, "INBOX");
-        assert!(discovery.mailboxes[0].selectable);
+        assert_eq!(discovery.len(), 1);
+        assert_eq!(discovery[0].name, "INBOX");
+        assert!(discovery[0].selectable);
 
         let first = snapshot_before
             .messages
@@ -55,28 +58,33 @@ fn imap_discovery_and_search_preserve_mailbox_content_identity_and_flags() {
             .expect("fixture has messages")
             .uid;
         let search = probe
-            .search(
+            .search_window(
                 "fixture+smoke@example.test",
                 "disposable-fixture-password",
                 "INBOX",
-                UidWindow { first, last },
+                snapshot_before.uid_validity,
+                first..=last,
             )
             .await?;
-        assert_eq!(search.uid_validity, snapshot_before.uid_validity);
-        assert_eq!(search.envelopes.len(), snapshot_before.messages.len());
+        assert_eq!(search.position.uid_validity, snapshot_before.uid_validity);
+        assert_eq!(search.messages.len(), snapshot_before.messages.len());
         for message in &snapshot_before.messages {
             let envelope = search
-                .envelopes
+                .messages
                 .iter()
                 .find(|envelope| envelope.uid == message.uid)
                 .expect("search retains observed UID identity");
             assert_eq!(
-                envelope.message_id.as_deref(),
+                envelope.metadata.message_id.value().map(String::as_str),
                 Some(message.message_id.as_str())
             );
-            assert_eq!(envelope.subject.as_deref(), Some(message.subject.as_str()));
+            assert_eq!(
+                envelope.metadata.subject.value().map(String::as_str),
+                Some(message.subject.as_str())
+            );
             assert_eq!(
                 envelope
+                    .metadata
                     .flags
                     .iter()
                     .any(|flag| flag.eq_ignore_ascii_case("\\Seen")),
@@ -96,22 +104,11 @@ fn imap_discovery_and_search_preserve_mailbox_content_identity_and_flags() {
 fn application_search_pages_and_predicates_preserve_independently_observed_mailbox_state() {
     greenmail_support::run(async {
         use mailctl::{
-            authentication::Runtime,
             config::Config,
-            credentials::{Availability, Secret, SecretSource, SourceError},
             domain::{ListMailboxesInput, Operation, OperationResult, SearchMessagesInput},
-            service::{ImapBackend, Service},
+            service::Service,
         };
-        use std::{collections::BTreeMap, sync::Arc};
-        struct FixtureSecret;
-        impl SecretSource for FixtureSecret {
-            fn availability(&self, _: uuid::Uuid) -> Availability {
-                Availability::Available
-            }
-            fn resolve(&self, _: uuid::Uuid) -> Result<Secret, SourceError> {
-                Secret::new(b"disposable-fixture-password".to_vec())
-            }
-        }
+
         let mut fixture = greenmail_support::Fixture::start().await?;
         fixture.seed_multipart_with_large_attachment().await?;
         let before = fixture.snapshot().await?;
@@ -139,18 +136,10 @@ mailboxes = ["INBOX"]
             state = serde_json::to_string(&std::env::temp_dir().join("mailctl-greenmail-search"))?,
             port = fixture.imaps_port()
         ))?;
-        let runtime =
-            Arc::new(Runtime::new(configuration.limits.clone(), fixture.tls_roots()).unwrap());
-        let sources = BTreeMap::from([(
-            "fixture".into(),
-            Arc::new(FixtureSecret) as Arc<dyn SecretSource>,
-        )]);
-        let backend = Arc::new(ImapBackend::new(runtime, sources));
-        let service = Service::in_memory(configuration)?
-            .with_mailbox_backend(backend.clone())
-            .with_search_backend(backend.clone())
-            .with_body_backend(backend.clone())
-            .with_attachment_backend(backend);
+        let service = Service::in_memory(configuration)?.with_environment(host_support::Host::new(
+            fixture.tls_roots(),
+            b"disposable-fixture-password",
+        ));
         let context = service.context("reader", &Default::default())?;
         let OperationResult::Mailboxes(discovery) = service
             .execute(
@@ -333,7 +322,7 @@ mailboxes = ["INBOX"]
 #[test]
 fn imap_body_reads_selected_text_without_downloading_a_large_attachment() {
     greenmail_support::run(async {
-        use mailctl::imap::{BodyRequest, ImapProbe, Limits, TlsMode};
+        use mailctl::imap::{BodyRequest, Limits, TlsMode};
 
         const MULTIPART_MESSAGE_ID: &str = "<large-attachment-body@example.test>";
         // GreenMail 2.1.13 trims selected-part whitespace before serving it.
@@ -356,7 +345,7 @@ fn imap_body_reads_selected_text_without_downloading_a_large_attachment() {
             max_text_bytes: 4,
             ..Limits::default()
         };
-        let mut probe = ImapProbe::new(
+        let mut probe = Client::new(
             "localhost".to_owned(),
             fixture.imaps_port(),
             TlsMode::Implicit,
@@ -400,7 +389,7 @@ fn imap_body_reads_selected_text_without_downloading_a_large_attachment() {
         assert_eq!(selected_part.as_deref(), Some("1.1"));
         assert_eq!(source_media_type.as_deref(), Some("text/plain"));
 
-        let mut probe = ImapProbe::new(
+        let mut probe = Client::new(
             "localhost".to_owned(),
             fixture.imaps_port(),
             TlsMode::Implicit,
@@ -443,12 +432,8 @@ fn imap_body_reads_selected_text_without_downloading_a_large_attachment() {
 #[test]
 fn imap_attachment_listing_and_chunks_preserve_exact_base64_decoded_data() {
     greenmail_support::run(async {
-        use mailctl::imap::{
-            AttachmentListRequest, AttachmentProgress, AttachmentRequest, Error, ImapProbe, Limits,
-            TlsMode,
-        };
+        use mailctl::imap::{AttachmentDecoder, AttachmentListRequest, Limits, TlsMode};
         use sha2::{Digest, Sha256};
-        use std::time::Duration;
 
         const MULTIPART_MESSAGE_ID: &str = "<large-attachment-body@example.test>";
 
@@ -470,7 +455,7 @@ fn imap_attachment_listing_and_chunks_preserve_exact_base64_decoded_data() {
                 .contains("Content-Transfer-Encoding: base64")
         );
 
-        let mut probe = ImapProbe::new(
+        let mut probe = Client::new(
             "localhost".to_owned(),
             fixture.imaps_port(),
             TlsMode::Implicit,
@@ -490,39 +475,22 @@ fn imap_attachment_listing_and_chunks_preserve_exact_base64_decoded_data() {
             .await?;
         // Listing is a metadata route: its response must not include the multi-megabyte
         // encoded payload that a full message fetch would contain.
-        assert!(listed.metrics.wire_bytes < 64 * 1024);
-        assert_eq!(listed.attachments.len(), 1);
-        let attachment = &listed.attachments[0];
+        assert!(probe.metrics().wire_bytes < 64 * 1024);
+        assert_eq!(listed.len(), 1);
+        let attachment = &listed[0];
         assert_eq!(attachment.part, "2");
         assert_eq!(attachment.filename.as_deref(), Some("large.bin"));
         assert_eq!(attachment.media_type, "application/octet-stream");
         assert!(attachment.declared_size.is_some());
         assert!(attachment.available);
 
-        // A partial transfer can be explicitly cancelled and frees its session-local state.
-        let cancelled = probe
-            .read_attachment(
-                "fixture+smoke@example.test",
-                "disposable-fixture-password",
-                "INBOX",
-                AttachmentRequest::new(
-                    multipart_uid,
-                    snapshot_before.uid_validity,
-                    attachment.part.clone(),
-                ),
-            )
-            .await?;
-        let AttachmentProgress::Continue(cancelled) = cancelled.progress else {
-            panic!("expected continuation");
-        };
-        probe.cancel_attachment(cancelled)?;
-        assert_eq!(probe.metrics().active_transfers, 0);
-
-        let mut request = AttachmentRequest::new(
+        let mut decoder = AttachmentDecoder::new(
+            "INBOX",
             multipart_uid,
             snapshot_before.uid_validity,
-            attachment.part.clone(),
-        );
+            &attachment.part,
+            &Limits::default(),
+        )?;
         let mut received = Vec::with_capacity(expected.len());
         let mut final_digest = None;
         // The route may fetch a smaller encoded wire slice than the decoded output ceiling;
@@ -532,8 +500,7 @@ fn imap_attachment_listing_and_chunks_preserve_exact_base64_decoded_data() {
                 .read_attachment(
                     "fixture+smoke@example.test",
                     "disposable-fixture-password",
-                    "INBOX",
-                    request,
+                    &mut decoder,
                 )
                 .await?;
             assert_eq!(chunk.decoded_offset, received.len() as u64);
@@ -542,62 +509,16 @@ fn imap_attachment_listing_and_chunks_preserve_exact_base64_decoded_data() {
             let end = received.len() + chunk.bytes.len();
             assert_eq!(chunk.bytes, expected[received.len()..end]);
             received.extend_from_slice(&chunk.bytes);
-            if let AttachmentProgress::Complete(integrity) = chunk.progress {
+            if let Some(integrity) = chunk.integrity {
                 assert_eq!(received.len(), expected.len());
                 assert_eq!(integrity.total_decoded_bytes, expected.len() as u64);
                 assert_eq!(integrity.sha256, expected_digest);
                 final_digest = Some(integrity.sha256);
                 break;
-            }
-            let AttachmentProgress::Continue(token) = chunk.progress else {
-                unreachable!();
             };
-            request = AttachmentRequest::resume(token);
         }
         assert_eq!(received, expected);
         assert_eq!(final_digest, Some(Sha256::digest(&received).into()));
-        assert_eq!(probe.metrics().active_transfers, 0);
-
-        // Expired opaque transfers cannot be revived and must release their retained state.
-        let mut expiring_probe = ImapProbe::new(
-            "localhost".to_owned(),
-            fixture.imaps_port(),
-            TlsMode::Implicit,
-            fixture.tls_roots(),
-            Limits {
-                max_transfer_lifetime: Duration::from_secs(1),
-                ..Limits::default()
-            },
-        )?;
-        let incomplete = expiring_probe
-            .read_attachment(
-                "fixture+smoke@example.test",
-                "disposable-fixture-password",
-                "INBOX",
-                AttachmentRequest::new(
-                    multipart_uid,
-                    snapshot_before.uid_validity,
-                    attachment.part.clone(),
-                ),
-            )
-            .await?;
-        let AttachmentProgress::Continue(expired) = incomplete.progress else {
-            panic!("expected continuation");
-        };
-        tokio::time::sleep(Duration::from_millis(1100)).await;
-        assert!(matches!(
-            expiring_probe
-                .read_attachment(
-                    "fixture+smoke@example.test",
-                    "disposable-fixture-password",
-                    "INBOX",
-                    AttachmentRequest::resume(expired),
-                )
-                .await,
-            Err(Error::TransferExpired)
-        ));
-        assert_eq!(expiring_probe.metrics().active_transfers, 0);
-
         // Both the administrative API and a fresh non-mutating IMAP observer must
         // agree that listing/streaming did not alter UIDVALIDITY, UID identity,
         // raw content, or the independent seen/unseen observations.
@@ -611,7 +532,7 @@ fn imap_attachment_listing_and_chunks_preserve_exact_base64_decoded_data() {
 #[test]
 fn imap_append_creates_exact_draft_in_existing_target_without_changing_inbox() {
     greenmail_support::run(async {
-        use mailctl::imap::{AppendOutcome, DraftInput, ImapProbe, Limits, PreparedDraft, TlsMode};
+        use mailctl::imap::{AppendOutcome, DraftInput, Limits, PreparedDraft, TlsMode};
 
         const TARGET: &str = "fixture folder/child";
         const ID: &str = "append-proof@example.test";
@@ -635,7 +556,7 @@ fn imap_append_creates_exact_draft_in_existing_target_without_changing_inbox() {
             },
             64 * 1024,
         )?;
-        let mut probe = ImapProbe::new(
+        let mut probe = Client::new(
             "localhost".into(),
             fixture.imaps_port(),
             TlsMode::Implicit,
@@ -650,8 +571,8 @@ fn imap_append_creates_exact_draft_in_existing_target_without_changing_inbox() {
                 &draft,
             )
             .await?;
-        let AppendOutcome::Created { uid } = result.outcome else {
-            panic!("APPEND was not acknowledged: {:?}", result.outcome);
+        let AppendOutcome::Created { uid } = result else {
+            panic!("APPEND was not acknowledged: {:?}", result);
         };
         let after = fixture.snapshot_mailbox(TARGET).await?;
         assert_eq!(after.uid_validity, target.uid_validity);
@@ -698,23 +619,12 @@ fn imap_append_creates_exact_draft_in_existing_target_without_changing_inbox() {
 fn application_mailbox_discovery_and_reference_reuse_preserve_independently_observed_mail() {
     greenmail_support::run(async {
         use mailctl::{
-            authentication::Runtime,
             config::Config,
-            credentials::{Availability, Secret, SecretSource, SourceError},
             domain::{ListMailboxesInput, Operation, OperationResult},
             policy::Narrowing,
-            service::{ImapBackend, Service},
+            service::Service,
         };
-        use std::{collections::BTreeMap, sync::Arc};
-        struct Source;
-        impl SecretSource for Source {
-            fn availability(&self, _: uuid::Uuid) -> Availability {
-                Availability::Available
-            }
-            fn resolve(&self, _: uuid::Uuid) -> Result<Secret, SourceError> {
-                Secret::new(b"disposable-fixture-password".to_vec())
-            }
-        }
+
         let fixture = greenmail_support::Fixture::start().await?;
         let contents = fixture.contents().await?;
         let snapshot = fixture.snapshot().await?;
@@ -741,12 +651,10 @@ mailboxes = ["INBOX"]
                 serde_json::to_string(&std::env::temp_dir().join("mailctl-greenmail-application"))?,
             port = fixture.imaps_port()
         ))?;
-        let runtime = Arc::new(Runtime::new(config.limits.clone(), fixture.tls_roots()).unwrap());
-        let backend = ImapBackend::new(
-            runtime,
-            BTreeMap::from([("fixture".into(), Arc::new(Source) as Arc<dyn SecretSource>)]),
-        );
-        let service = Service::in_memory(config)?.with_mailbox_backend(Arc::new(backend));
+        let service = Service::in_memory(config)?.with_environment(host_support::Host::new(
+            fixture.tls_roots(),
+            b"disposable-fixture-password",
+        ));
         let context = service.context("reader", &Narrowing::default())?;
         let OperationResult::Mailboxes(first) = service
             .execute(

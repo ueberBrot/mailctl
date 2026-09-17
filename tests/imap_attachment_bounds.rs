@@ -1,13 +1,9 @@
-#[allow(dead_code)]
 mod attachment_support;
-#[allow(dead_code)]
 mod imap_support;
 
-use attachment_support::{continuation, metadata, structure};
+use attachment_support::{decoder, metadata, structure};
 use imap_support::*;
-use mailctl::imap::{
-    AttachmentListRequest, AttachmentProgress, AttachmentRequest, Error, Limits, TlsMode,
-};
+use mailctl::imap::{AttachmentListRequest, Error, Limits, TlsMode};
 use std::time::Duration;
 
 async fn start(wire: &mut Wire, encoding: &str, size: usize) {
@@ -39,28 +35,20 @@ async fn resumed_attachment_rechecks_uidvalidity_before_returning_buffered_bytes
             })
         },
     ).await;
+    let mut request = decoder();
     let chunk = fixture
         .probe
-        .read_attachment(
-            "fixture",
-            "disposable-password",
-            "INBOX",
-            AttachmentRequest::new(4, 77, "2"),
-        )
+        .read_attachment("fixture", "disposable-password", &mut request)
         .await
         .unwrap();
+    assert!(chunk.integrity.is_none());
     let error = fixture
         .probe
-        .read_attachment(
-            "fixture",
-            "disposable-password",
-            "INBOX",
-            AttachmentRequest::resume(continuation(chunk)),
-        )
+        .read_attachment("fixture", "disposable-password", &mut request)
         .await
         .unwrap_err();
-    assert_eq!(error, Error::UnsafeSelection);
-    assert_eq!(fixture.probe.metrics().active_transfers, 0);
+    assert_eq!(error, Error::StaleReference);
+
     fixture.task.await.unwrap();
 }
 
@@ -84,205 +72,64 @@ async fn malformed_or_oversized_attachment_frames_dispose_the_transport() {
         .await;
         let error = fixture
             .probe
-            .read_attachment(
-                "fixture",
-                "disposable-password",
-                "INBOX",
-                AttachmentRequest::new(4, 77, "2"),
-            )
+            .read_attachment("fixture", "disposable-password", &mut decoder())
             .await
             .unwrap_err();
         assert_eq!(error, expected);
         assert!(fixture.probe.metrics().wire_bytes < 4096);
-        assert_eq!(fixture.probe.metrics().active_transfers, 0);
+
         fixture.task.await.unwrap();
     }
 }
 
 #[tokio::test]
-async fn cancellation_during_a_literal_releases_the_transport_and_transfer_slot() {
+async fn cancellation_during_a_literal_closes_transport_and_invalidates_decoder() {
     let (started, received) = tokio::sync::oneshot::channel();
-    let mut fixture = fixture(
-        TlsMode::Implicit,
-        Limits {
-            max_transfers: 1,
-            ..Limits::default()
-        },
-        move |mut wire| {
-            Box::pin(async move {
-                start(&mut wire, "7BIT", 40_000).await;
+    let mut started = Some(started);
+    let mut fixture = repeating_fixture(Limits::default(), 2, move |mut wire| {
+        let started = started.take();
+        Box::pin(async move {
+            authenticate(&mut wire).await;
+            if let Some(started) = started {
+                examine(&mut wire).await;
+                metadata(&mut wire, &structure("7BIT", 40_000)).await;
                 expect(&mut wire, "UID FETCH 4 (UID BODY.PEEK[2]<0.16384>)").await;
                 write(&mut wire, "* 1 FETCH (UID 4 BODY[2]<0> {16384}\r\npartial").await;
                 started.send(()).unwrap();
-                dropped(&mut wire).await;
-            })
-        },
-    )
+            }
+            dropped(&mut wire).await;
+        })
+    })
     .await;
+    let mut request = decoder();
     {
-        let read = fixture.probe.read_attachment(
-            "fixture",
-            "disposable-password",
-            "INBOX",
-            AttachmentRequest::new(4, 77, "2"),
-        );
+        let read = fixture
+            .probe
+            .read_attachment("fixture", "disposable-password", &mut request);
         tokio::pin!(read);
         tokio::select! {
             _ = received => {},
             result = &mut read => panic!("unexpected completion: {result:?}"),
         }
     }
-    assert_eq!(fixture.probe.metrics().active_transfers, 0);
+    assert_eq!(
+        fixture
+            .probe
+            .read_attachment("fixture", "disposable-password", &mut request)
+            .await
+            .unwrap_err(),
+        Error::TransferExpired
+    );
     fixture.task.await.unwrap();
 }
 
 #[tokio::test]
-async fn explicit_cancel_and_expiry_release_bounded_transfer_slots() {
-    for expire in [false, true] {
-        let mut fixture = repeating_fixture(
-            Limits {
-                max_attachment_chunk_bytes: 4,
-                max_transfers: 1,
-                max_transfer_lifetime: Duration::from_secs(1),
-                ..Limits::default()
-            },
-            2,
-            |mut wire| {
-                Box::pin(async move {
-                    start(&mut wire, "7BIT", 13).await;
-                    literal_bytes(&mut wire, "2", 0, 16384, b"Hello, world!").await;
-                    logout(&mut wire).await;
-                })
-            },
-        )
-        .await;
-        let first = fixture
-            .probe
-            .read_attachment(
-                "fixture",
-                "disposable-password",
-                "INBOX",
-                AttachmentRequest::new(4, 77, "2"),
-            )
-            .await
-            .unwrap();
-        assert_eq!(fixture.probe.metrics().active_transfers, 1);
-        let token = continuation(first);
-        // A full slot rejects new work before opening another connection.
-        assert_eq!(
-            fixture
-                .probe
-                .read_attachment(
-                    "fixture",
-                    "disposable-password",
-                    "INBOX",
-                    AttachmentRequest::new(4, 77, "2")
-                )
-                .await
-                .unwrap_err(),
-            Error::Limit
-        );
-        assert_eq!(fixture.probe.metrics().active_transfers, 1);
-        if expire {
-            tokio::time::sleep(Duration::from_millis(1100)).await;
-            assert_eq!(
-                fixture
-                    .probe
-                    .read_attachment(
-                        "fixture",
-                        "disposable-password",
-                        "INBOX",
-                        AttachmentRequest::resume(token)
-                    )
-                    .await
-                    .unwrap_err(),
-                Error::TransferExpired
-            );
-        } else {
-            fixture.probe.cancel_attachment(token).unwrap();
-        }
-        let next = fixture
-            .probe
-            .read_attachment(
-                "fixture",
-                "disposable-password",
-                "INBOX",
-                AttachmentRequest::new(4, 77, "2"),
-            )
-            .await
-            .unwrap();
-        fixture.probe.cancel_attachment(continuation(next)).unwrap();
-        assert_eq!(fixture.probe.metrics().active_transfers, 0);
-        fixture.task.await.unwrap();
-    }
-}
-
-#[tokio::test]
-async fn invalid_resume_input_releases_its_consumed_transfer() {
-    for (password, mailbox) in [("", "INBOX"), ("disposable-password", "")] {
-        let mut fixture = repeating_fixture(
-            Limits {
-                max_attachment_chunk_bytes: 4,
-                max_transfers: 1,
-                ..Limits::default()
-            },
-            2,
-            |mut wire| {
-                Box::pin(async move {
-                    start(&mut wire, "7BIT", 13).await;
-                    literal_bytes(&mut wire, "2", 0, 16384, b"Hello, world!").await;
-                    logout(&mut wire).await;
-                })
-            },
-        )
-        .await;
-        let first = fixture
-            .probe
-            .read_attachment(
-                "fixture",
-                "disposable-password",
-                "INBOX",
-                AttachmentRequest::new(4, 77, "2"),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            fixture
-                .probe
-                .read_attachment(
-                    "fixture",
-                    password,
-                    mailbox,
-                    AttachmentRequest::resume(continuation(first))
-                )
-                .await
-                .unwrap_err(),
-            Error::InvalidInput
-        );
-        assert_eq!(fixture.probe.metrics().active_transfers, 0);
-        let next = fixture
-            .probe
-            .read_attachment(
-                "fixture",
-                "disposable-password",
-                "INBOX",
-                AttachmentRequest::new(4, 77, "2"),
-            )
-            .await
-            .unwrap();
-        fixture.probe.cancel_attachment(continuation(next)).unwrap();
-        fixture.task.await.unwrap();
-    }
-}
-
-#[tokio::test]
-async fn transfer_expiry_interrupts_authentication_and_incomplete_fetches() {
+async fn operation_deadline_interrupts_authentication_and_incomplete_fetches() {
     for during_fetch in [false, true] {
         let mut fixture = fixture(
             TlsMode::Implicit,
             Limits {
-                max_transfer_lifetime: Duration::from_millis(150),
-                operation_timeout: Duration::from_secs(3),
+                operation_timeout: Duration::from_millis(150),
                 ..Limits::default()
             },
             move |mut wire| {
@@ -302,17 +149,12 @@ async fn transfer_expiry_interrupts_authentication_and_incomplete_fetches() {
         assert_eq!(
             fixture
                 .probe
-                .read_attachment(
-                    "fixture",
-                    "disposable-password",
-                    "INBOX",
-                    AttachmentRequest::new(4, 77, "2")
-                )
+                .read_attachment("fixture", "disposable-password", &mut decoder())
                 .await
                 .unwrap_err(),
-            Error::TransferExpired
+            Error::Timeout
         );
-        assert_eq!(fixture.probe.metrics().active_transfers, 0);
+
         fixture.task.await.unwrap();
     }
 }
@@ -330,12 +172,7 @@ async fn decoder_failure_preserves_observed_transfer_progress() {
     assert_eq!(
         fixture
             .probe
-            .read_attachment(
-                "fixture",
-                "disposable-password",
-                "INBOX",
-                AttachmentRequest::new(4, 77, "2")
-            )
+            .read_attachment("fixture", "disposable-password", &mut decoder())
             .await
             .unwrap_err(),
         Error::Protocol
@@ -347,86 +184,18 @@ async fn decoder_failure_preserves_observed_transfer_progress() {
 }
 
 #[tokio::test]
-async fn dropping_or_misdirecting_a_continuation_releases_its_issuing_slot() {
-    for mode in [0, 1, 2] {
-        let mut fixture = repeating_fixture(
-            Limits {
-                max_attachment_chunk_bytes: 4,
-                max_transfers: 1,
-                ..Limits::default()
-            },
-            2,
-            |mut wire| {
-                Box::pin(async move {
-                    start(&mut wire, "7BIT", 13).await;
-                    literal_bytes(&mut wire, "2", 0, 16384, b"Hello, world!").await;
-                    logout(&mut wire).await;
-                })
-            },
-        )
-        .await;
-        let mut other = mailctl::imap::ImapProbe::new(
-            "127.0.0.1".to_owned(),
-            1,
-            TlsMode::Implicit,
-            tokio_rustls::rustls::RootCertStore::empty(),
-            Limits::default(),
-        )
-        .unwrap();
-        let first = fixture
-            .probe
-            .read_attachment(
-                "fixture",
-                "disposable-password",
-                "INBOX",
-                AttachmentRequest::new(4, 77, "2"),
-            )
-            .await
-            .unwrap();
-        match mode {
-            0 => drop(first),
-            1 => assert_eq!(
-                other.cancel_attachment(continuation(first)).unwrap_err(),
-                Error::TransferExpired
-            ),
-            2 => assert_eq!(
-                other
-                    .read_attachment(
-                        "fixture",
-                        "disposable-password",
-                        "INBOX",
-                        AttachmentRequest::resume(continuation(first))
-                    )
-                    .await
-                    .unwrap_err(),
-                Error::TransferExpired
-            ),
-            _ => unreachable!(),
-        }
-        assert_eq!(fixture.probe.metrics().active_transfers, 0);
-        let next = fixture
-            .probe
-            .read_attachment(
-                "fixture",
-                "disposable-password",
-                "INBOX",
-                AttachmentRequest::new(4, 77, "2"),
-            )
-            .await
-            .unwrap();
-        drop(next);
-        assert_eq!(fixture.probe.metrics().active_transfers, 0);
-        fixture.task.await.unwrap();
-    }
-}
-
-#[tokio::test]
 async fn malformed_encodings_fail_without_fabricating_attachment_bytes() {
     for (encoding, payload) in [
         ("BASE64", "SGVsbG8"),
         ("BASE64", "SGVsbG8=trailing"),
         ("BASE64", "SGVsbG8=AAAA"),
         ("BASE64", "%%%"),
+        ("BASE64", "Zh=="),
+        ("BASE64", "Zm9="),
+        ("BASE64", "=m9v"),
+        ("BASE64", "Z=9v"),
+        ("BASE64", "Zg=A"),
+        ("BASE64", "===="),
         ("QUOTED-PRINTABLE", "=QZ"),
         ("QUOTED-PRINTABLE", "unfinished="),
     ] {
@@ -441,17 +210,12 @@ async fn malformed_encodings_fail_without_fabricating_attachment_bytes() {
         assert_eq!(
             fixture
                 .probe
-                .read_attachment(
-                    "fixture",
-                    "disposable-password",
-                    "INBOX",
-                    AttachmentRequest::new(4, 77, "2")
-                )
+                .read_attachment("fixture", "disposable-password", &mut decoder())
                 .await
                 .unwrap_err(),
             Error::Protocol
         );
-        assert_eq!(fixture.probe.metrics().active_transfers, 0);
+
         fixture.task.await.unwrap();
     }
 }
@@ -498,17 +262,12 @@ async fn wire_decoded_and_decoder_work_limits_fail_at_the_narrowed_ceiling() {
         assert_eq!(
             fixture
                 .probe
-                .read_attachment(
-                    "fixture",
-                    "disposable-password",
-                    "INBOX",
-                    AttachmentRequest::new(4, 77, "2")
-                )
+                .read_attachment("fixture", "disposable-password", &mut decoder())
                 .await
                 .unwrap_err(),
             Error::Limit
         );
-        assert_eq!(fixture.probe.metrics().active_transfers, 0);
+
         fixture.task.await.unwrap();
     }
 }
@@ -536,64 +295,62 @@ async fn exact_wire_and_decoded_limits_require_a_bounded_eof_check() {
     .await;
     let chunk = fixture
         .probe
-        .read_attachment(
-            "fixture",
-            "disposable-password",
-            "INBOX",
-            AttachmentRequest::new(4, 77, "2"),
-        )
+        .read_attachment("fixture", "disposable-password", &mut decoder())
         .await
         .unwrap();
-    assert!(matches!(chunk.progress, AttachmentProgress::Complete(_)));
-    let AttachmentProgress::Complete(integrity) = chunk.progress else {
+    assert!(chunk.integrity.is_some());
+    let Some(integrity) = chunk.integrity else {
         panic!("expected completion");
     };
     assert_eq!(integrity.total_decoded_bytes, 8);
-    assert_eq!(chunk.metrics.transfer_wire_bytes, 8);
+    assert_eq!(fixture.probe.metrics().transfer_wire_bytes, 8);
     fixture.task.await.unwrap();
 }
 
 #[tokio::test]
 async fn transfer_cannot_resume_with_a_different_authentication_identity() {
-    let mut fixture = fixture(
-        TlsMode::Implicit,
+    let mut first = true;
+    let mut fixture = repeating_fixture(
         Limits {
             max_attachment_chunk_bytes: 4,
             ..Limits::default()
         },
-        |mut wire| {
+        2,
+        move |mut wire| {
+            let initial = first;
+            first = false;
             Box::pin(async move {
-                start(&mut wire, "7BIT", 13).await;
-                literal_bytes(&mut wire, "2", 0, 16384, b"Hello, world!").await;
-                logout(&mut wire).await;
+                if initial {
+                    start(&mut wire, "7BIT", 13).await;
+                    literal_bytes(&mut wire, "2", 0, 16384, b"Hello, world!").await;
+                    logout(&mut wire).await;
+                } else {
+                    capability(&mut wire, "IMAP4rev1").await;
+                    let tag = expect(&mut wire, "LOGIN another-account disposable-password").await;
+                    write(&mut wire, &format!("{tag} OK authenticated\r\n")).await;
+                    capability(&mut wire, "IMAP4rev1 UIDPLUS").await;
+                    dropped(&mut wire).await;
+                }
             })
         },
     )
     .await;
+    let mut request = decoder();
     let chunk = fixture
         .probe
-        .read_attachment(
-            "fixture",
-            "disposable-password",
-            "INBOX",
-            AttachmentRequest::new(4, 77, "2"),
-        )
+        .read_attachment("fixture", "disposable-password", &mut request)
         .await
         .unwrap();
-    fixture.task.await.unwrap();
+    assert!(chunk.integrity.is_none());
     assert_eq!(
         fixture
             .probe
-            .read_attachment(
-                "another-account",
-                "disposable-password",
-                "INBOX",
-                AttachmentRequest::resume(continuation(chunk))
-            )
+            .read_attachment("another-account", "disposable-password", &mut request)
             .await
             .unwrap_err(),
         Error::TransferExpired
     );
+    fixture.task.await.unwrap();
 }
 
 #[tokio::test]
@@ -658,17 +415,12 @@ async fn unsupported_transfer_encodings_are_listed_but_never_fetched() {
             )
             .await
             .unwrap();
-        assert_eq!(listing.attachments.len(), 1);
-        assert!(!listing.attachments[0].available);
+        assert_eq!(listing.len(), 1);
+        assert!(!listing[0].available);
         assert_eq!(
             fixture
                 .probe
-                .read_attachment(
-                    "fixture",
-                    "disposable-password",
-                    "INBOX",
-                    AttachmentRequest::new(4, 77, "2")
-                )
+                .read_attachment("fixture", "disposable-password", &mut decoder())
                 .await
                 .unwrap_err(),
             Error::Unsupported

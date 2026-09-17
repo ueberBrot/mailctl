@@ -68,6 +68,10 @@ pub(crate) struct BrokerPeer {
     pub(crate) uid: u32,
 }
 
+#[expect(
+    clippy::unused_self,
+    reason = "these operations require the fixture to retain its installed service and disposable identities"
+)]
 impl Qualification {
     pub(crate) fn begin(isolated: &Path, cli: &Path, mcp: &Path) -> Self {
         prerequisites();

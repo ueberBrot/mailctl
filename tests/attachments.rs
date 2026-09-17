@@ -1,6 +1,6 @@
+mod host_support;
 use mailctl::service::Service;
 use serde_json::json;
-#[allow(dead_code)]
 mod imap_support;
 fn config() -> mailctl::config::Config {
     mailctl::config::Config::parse(&format!(
@@ -55,6 +55,15 @@ async fn setup(
     backend: Arc<dyn mailctl::service::AttachmentBackend>,
 ) -> (Service, String) {
     let name = config.accounts[0].mailboxes[0].clone();
+    setup_service(
+        name,
+        Service::in_memory(config)
+            .unwrap()
+            .with_attachment_backend(backend),
+    )
+    .await
+}
+async fn setup_service(name: String, service: Service) -> (Service, String) {
     let inventory = Arc::new(MemoryMailboxes::default());
     inventory.set(
         "work",
@@ -79,11 +88,9 @@ async fn setup(
             text: "".into(),
         }],
     );
-    let service = Service::in_memory(config)
-        .unwrap()
+    let service = service
         .with_mailbox_backend(inventory)
-        .with_search_backend(messages)
-        .with_attachment_backend(backend);
+        .with_search_backend(messages);
     let context = service.context("reader", &Default::default()).unwrap();
     let OperationResult::Mailboxes(page) = service
         .execute(&context, Operation::ListMailboxes(Default::default()))
@@ -102,18 +109,6 @@ async fn setup(
     };
     (service, page.messages[0].reference.clone())
 }
-struct SyntheticSource;
-impl mailctl::credentials::SecretSource for SyntheticSource {
-    fn availability(&self, _: uuid::Uuid) -> mailctl::credentials::Availability {
-        mailctl::credentials::Availability::Available
-    }
-    fn resolve(
-        &self,
-        _: uuid::Uuid,
-    ) -> Result<mailctl::credentials::Secret, mailctl::credentials::SourceError> {
-        mailctl::credentials::Secret::new(b"disposable-password".to_vec())
-    }
-}
 async fn live(
     fixture: &imap_support::Fixture,
     mut config: mailctl::config::Config,
@@ -121,19 +116,14 @@ async fn live(
     config.accounts[0].server = "127.0.0.1".into();
     config.accounts[0].port = fixture.port;
     config.accounts[0].username = "fixture".into();
-    let runtime = Arc::new(
-        mailctl::authentication::Runtime::new(config.limits.clone(), fixture.roots.clone())
-            .unwrap(),
-    );
-    let sources = std::collections::BTreeMap::from([(
-        "work".into(),
-        Arc::new(SyntheticSource) as Arc<dyn mailctl::credentials::SecretSource>,
-    )]);
-    setup(
-        config,
-        Arc::new(mailctl::service::ImapBackend::new(runtime, sources)),
-    )
-    .await
+    let name = config.accounts[0].mailboxes[0].clone();
+    let service = Service::in_memory(config)
+        .unwrap()
+        .with_environment(host_support::Host::new(
+            fixture.roots.clone(),
+            b"disposable-password",
+        ));
+    setup_service(name, service).await
 }
 
 #[tokio::test]
@@ -492,6 +482,8 @@ async fn denied_attachment_reads_and_invalid_inputs_do_not_reveal_resources() {
         json!({}),
         json!({"attachment":"a","token":"b"}),
         json!({"attachment":""}),
+        json!({"attachment":null}),
+        json!({"token":null}),
         json!({"token":"x".repeat(8193)}),
         json!({"attachment":"x","grant":"reader"}),
     ] {
@@ -644,7 +636,6 @@ async fn narrowed_attachment_byte_limits_fail_without_retaining_a_transfer() {
     }
 }
 
-#[allow(dead_code)]
 mod attachment_support;
 #[tokio::test]
 async fn imap_continuations_reconnect_and_check_identity_before_returning_buffered_bytes() {
@@ -698,6 +689,81 @@ async fn imap_continuations_reconnect_and_check_identity_before_returning_buffer
                 } => assert_eq!(total_decoded_bytes, 6),
             }
         }
+        fixture.task.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn transfer_deadlines_interrupt_imap_authentication_and_incomplete_fetches() {
+    use imap_support::*;
+    use mailctl::domain::ErrorCode::{Timeout, TransferExpired};
+    for (during_fetch, operation_seconds, transfer_seconds, expected) in
+        [false, true].into_iter().flat_map(|fetch| {
+            [
+                (30, 1, TransferExpired),
+                (1, 1, TransferExpired),
+                (1, 30, Timeout),
+            ]
+            .map(|(operation, transfer, error)| (fetch, operation, transfer, error))
+        })
+    {
+        let mut session = 0;
+        let fixture = repeating_fixture(Default::default(), 3, move |mut wire| {
+            let step = session;
+            session += 1;
+            Box::pin(async move {
+                if step == 1 && !during_fetch {
+                    expect(&mut wire, "CAPABILITY").await;
+                    dropped(&mut wire).await;
+                    return;
+                }
+                authenticate(&mut wire).await;
+                examine(&mut wire).await;
+                attachment_support::metadata(
+                    &mut wire,
+                    &attachment_support::structure("7BIT", 40_000),
+                )
+                .await;
+                if step == 1 {
+                    expect(&mut wire, "UID FETCH 4 (UID BODY.PEEK[2]<0.16384>)").await;
+                    write(&mut wire, "* 1 FETCH (UID 4 BODY[2]<0> {16384}\r\npartial").await;
+                    dropped(&mut wire).await;
+                } else {
+                    if step == 2 {
+                        literal_bytes(&mut wire, "2", 0, 16384, b"abcdef").await;
+                    }
+                    logout(&mut wire).await;
+                }
+            })
+        })
+        .await;
+        let mut configuration = small_config();
+        for limits in [
+            &mut configuration.limits,
+            &mut configuration.grants[0].limits,
+        ] {
+            limits.operation_seconds = operation_seconds;
+            limits.transfer_seconds = transfer_seconds;
+            limits.connection_seconds = 1;
+            limits.initialization_seconds = 1;
+        }
+        let (service, message) = live(&fixture, configuration).await;
+        let context = service.context("reader", &Default::default()).unwrap();
+        let reference = attachment_reference(&service, &context, &message).await;
+        assert_eq!(
+            service
+                .execute(
+                    &context,
+                    operation("get_attachment", json!({"attachment": reference}))
+                )
+                .await
+                .unwrap_err()
+                .code,
+            expected,
+            "fetch={during_fetch}, operation={operation_seconds}, transfer={transfer_seconds}"
+        );
+        // Either deadline must release the account's only transfer slot.
+        let _token = start(&service, &context, &reference).await;
         fixture.task.await.unwrap();
     }
 }

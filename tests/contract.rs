@@ -418,11 +418,46 @@ fn operation_schemas_reject_forged_authority_and_unknown_inputs() {
         r#"{"operation":"capabilities","input":{"read_only":false}}"#,
         r#"{"operation":"health","harness":"admin"}"#,
         r#"{"operation":"list_accounts","input":{"limit":-1}}"#,
+        r#"{"operation":"search_messages","input":{"mailbox":null}}"#,
+        r#"{"operation":"list_attachments","input":{"message":null}}"#,
     ] {
         assert!(
             serde_json::from_str::<Operation>(input).is_err(),
             "accepted {input}"
         );
+    }
+}
+
+#[test]
+fn operation_page_limits_preserve_each_ceiling_and_optional_defaults() {
+    use serde_json::json;
+    for (operation, input, maximum) in [
+        ("list_accounts", json!({}), 256),
+        ("list_mailboxes", json!({}), 1000),
+        ("search_messages", json!({"mailbox": "reference"}), 200),
+    ] {
+        let mut request = json!({"operation": operation, "input": input});
+        assert!(serde_json::from_value::<Operation>(request.clone()).is_ok());
+        for limit in [json!(null), json!(1), json!(maximum)] {
+            request["input"]["limit"] = limit;
+            assert!(
+                serde_json::from_value::<Operation>(request.clone()).is_ok(),
+                "{request}"
+            );
+        }
+        for limit in [
+            json!(0),
+            json!(-1),
+            json!(maximum + 1),
+            json!(1.5),
+            json!("1"),
+        ] {
+            request["input"]["limit"] = limit;
+            assert!(
+                serde_json::from_value::<Operation>(request.clone()).is_err(),
+                "{request}"
+            );
+        }
     }
 }
 
@@ -629,16 +664,20 @@ fn concurrent_processes_share_maintenance_leases_and_exclude_setup_until_they_ar
 
 #[test]
 fn narrowing_rejects_oversized_scopes_while_deserializing() {
+    for input in [
+        serde_json::json!({}),
+        serde_json::json!({"accounts": null}),
+        serde_json::json!({"accounts": []}),
+        serde_json::json!({"accounts": [""]}),
+    ] {
+        assert!(serde_json::from_value::<Narrowing>(input).is_ok());
+    }
     let at_limit = serde_json::json!({"accounts":vec!["x";256]});
     assert!(serde_json::from_value::<Narrowing>(at_limit).is_ok());
     // The excess element is rejected before its invalid nested payload is parsed.
     let prefix = format!(r#"{{"accounts":[{},"#, vec![r#""x""#; 256].join(","));
     let error = serde_json::from_str::<Narrowing>(&(prefix + "[not-json")).unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .starts_with("account scope exceeds its bound")
-    );
+    assert!(error.to_string().starts_with("sequence exceeds its bound"));
     assert!(
         serde_json::from_value::<Narrowing>(serde_json::json!({"accounts":["x".repeat(1024)]}))
             .is_ok()

@@ -16,7 +16,7 @@ use crate::{
 mod memory;
 pub use memory::{MemoryMessage, MemoryMessages};
 use serde::{Deserialize, Serialize};
-use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{future::Future, pin::Pin, sync::Arc};
 
 pub trait SearchBackend: Send + Sync {
     fn search<'a>(
@@ -48,16 +48,6 @@ impl Service {
         context: &RequestContext,
         input: SearchMessagesInput,
     ) -> Result<MessageSearch, Error> {
-        let deadline = Duration::from_secs(self.grant(context)?.limits.operation_seconds as u64);
-        tokio::time::timeout(deadline, self.search_inner(context, input))
-            .await
-            .map_err(|_| Error::new(ErrorCode::Timeout))?
-    }
-    async fn search_inner(
-        &self,
-        context: &RequestContext,
-        input: SearchMessagesInput,
-    ) -> Result<MessageSearch, Error> {
         let grant = self.grant(context)?;
         if !context.permissions().contains(&Permission::SearchMessages) {
             return Err(super::denied());
@@ -75,9 +65,9 @@ impl Service {
         )?;
         let name = mailbox_identity(&reference.mailbox);
         let target @ MailboxTarget {
-            config: account,
             account_id: id,
             generation,
+            ..
         } = self.authorize_mailbox(context, &reference.account, reference.generation, name)?;
 
         let scope = fingerprint(&(
@@ -107,7 +97,7 @@ impl Service {
         let backend: &dyn SearchBackend = match &self.search_backend {
             Some(backend) => backend.as_ref(),
             None => {
-                live = self.imap_backend(account).await?;
+                live = self.imap_backend(target).await?;
                 &live
             }
         };

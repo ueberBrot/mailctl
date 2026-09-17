@@ -1,7 +1,7 @@
+mod host_support;
 use mailctl::domain::Operation;
 use serde_json::json;
 use std::sync::Arc;
-#[allow(dead_code)]
 mod imap_support;
 
 fn config() -> mailctl::config::Config {
@@ -103,6 +103,12 @@ fn contradictory_or_oversized_criteria_fail_before_application_work() {
     ]))
     .unwrap();
     assert_eq!(criteria.predicates().len(), 32);
+    let prefix = format!(
+        "[{},",
+        vec![r#"{"field":"text","value":"x"}"#; 32].join(",")
+    );
+    let error = serde_json::from_str::<SearchCriteria>(&(prefix + "[not-json")).unwrap_err();
+    assert!(error.to_string().starts_with("sequence exceeds its bound"));
     assert!(
         serde_json::from_value::<SearchCriteria>(json!([
             {"field":"received_after","date":"2024-03-01"},
@@ -358,18 +364,6 @@ async fn every_predicate_uses_and_substrings_and_the_named_calendar_date() {
     }
 }
 
-struct SyntheticSource;
-impl mailctl::credentials::SecretSource for SyntheticSource {
-    fn availability(&self, _: uuid::Uuid) -> mailctl::credentials::Availability {
-        mailctl::credentials::Availability::Available
-    }
-    fn resolve(
-        &self,
-        _: uuid::Uuid,
-    ) -> Result<mailctl::credentials::Secret, mailctl::credentials::SourceError> {
-        mailctl::credentials::Secret::new(b"disposable-password".to_vec())
-    }
-}
 async fn imap_service(fixture: &imap_support::Fixture) -> (mailctl::service::Service, String) {
     imap_service_with_config(fixture, config()).await
 }
@@ -378,19 +372,12 @@ async fn imap_service_with_config(
     mut configuration: mailctl::config::Config,
 ) -> (mailctl::service::Service, String) {
     use mailctl::{
-        authentication::Runtime,
         domain::MailboxMetadata,
-        service::{ImapBackend, MemoryMailboxes, Service},
+        service::{MemoryMailboxes, Service},
     };
     configuration.accounts[0].server = "127.0.0.1".into();
     configuration.accounts[0].port = fixture.port;
     configuration.accounts[0].username = "fixture".into();
-    let runtime =
-        Arc::new(Runtime::new(configuration.limits.clone(), fixture.roots.clone()).unwrap());
-    let sources = std::collections::BTreeMap::from([(
-        "work".into(),
-        Arc::new(SyntheticSource) as Arc<dyn mailctl::credentials::SecretSource>,
-    )]);
     let inventory = Arc::new(MemoryMailboxes::default());
     inventory.set(
         "work",
@@ -403,7 +390,10 @@ async fn imap_service_with_config(
     let service = Service::in_memory(configuration)
         .unwrap()
         .with_mailbox_backend(inventory)
-        .with_search_backend(Arc::new(ImapBackend::new(runtime, sources)));
+        .with_environment(host_support::Host::new(
+            fixture.roots.clone(),
+            b"disposable-password",
+        ));
     let reference = mailbox(&service).await;
     (service, reference)
 }

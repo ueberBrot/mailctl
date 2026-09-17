@@ -1,3 +1,8 @@
+#![allow(
+    dead_code,
+    reason = "integration-test crates use different subsets of these shared fixture helpers"
+)]
+
 use std::{
     future::Future,
     pin::Pin,
@@ -14,7 +19,9 @@ use io_imap::codec::{
     decode::{CommandDecodeError, Decoder},
 };
 use io_imap::types::command::CommandBody;
-use mailctl::imap::{ImapProbe, Limits, TlsMode};
+use mailctl::imap::{Limits, TlsMode};
+mod client;
+pub use client::Client;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::TcpListener,
@@ -33,7 +40,7 @@ pub type Script = Pin<Box<dyn Future<Output = ()> + Send>>;
 pub struct Fixture {
     pub port: u16,
     pub roots: RootCertStore,
-    pub probe: ImapProbe,
+    pub probe: Client,
     pub task: JoinHandle<()>,
 }
 
@@ -90,7 +97,7 @@ async fn fixture_sessions(
     let port = listener.local_addr().unwrap().port();
     // Match the IPv4 listener directly so the operation deadline cannot expire
     // while localhost first attempts an unavailable IPv6 address on Windows.
-    let probe = ImapProbe::new("127.0.0.1".into(), port, mode, roots.clone(), limits).unwrap();
+    let probe = Client::new("127.0.0.1".into(), port, mode, roots.clone(), limits).unwrap();
     let task = tokio::spawn(async move {
         for _ in 0..sessions {
             let (mut socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
@@ -238,7 +245,7 @@ pub fn dedicated_fixture(
     mode: TlsMode,
     limits: Limits,
     script: impl FnOnce(Wire) -> Script + Send + 'static,
-) -> (ImapProbe, std::thread::JoinHandle<()>) {
+) -> (Client, std::thread::JoinHandle<()>) {
     let mut script = Some(script);
     dedicated_sessions(mode, limits, 1, move |wire| script.take().unwrap()(wire))
 }
@@ -249,7 +256,7 @@ pub fn dedicated_sessions(
     limits: Limits,
     sessions: usize,
     script: impl FnMut(Wire) -> Script + Send + 'static,
-) -> (ImapProbe, std::thread::JoinHandle<()>) {
+) -> (Client, std::thread::JoinHandle<()>) {
     let (send, receive) = std::sync::mpsc::sync_channel(1);
     let server = std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -272,7 +279,7 @@ pub async fn plaintext_fixture(
 ) -> Fixture {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let probe = ImapProbe::new(
+    let probe = Client::new(
         "127.0.0.1".into(),
         port,
         TlsMode::StartTls,

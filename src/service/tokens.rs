@@ -9,7 +9,6 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ring::hmac;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
-use std::fmt::Write;
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -103,11 +102,7 @@ pub(super) fn fingerprint(value: &impl Serialize) -> Result<String, Error> {
     };
     serde_json::to_writer(&mut writer, value)
         .map_err(|_| Error::new(ErrorCode::ResponseTooLarge))?;
-    let mut fingerprint = String::with_capacity(64);
-    for byte in writer.digest.finalize() {
-        let _ = write!(fingerprint, "{byte:02x}");
-    }
-    Ok(fingerprint)
+    Ok(crate::encoding::hex(writer.digest.finalize().as_slice()))
 }
 
 struct Fingerprint {

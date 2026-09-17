@@ -9,19 +9,11 @@
     feature = "mcp"
 ))]
 
-#[allow(
-    dead_code,
-    reason = "the native TLS fixture shares the full IMAP transcript support"
-)]
 #[path = "imap_support/mod.rs"]
 mod imap_support;
 mod isolation_support;
 #[path = "native_support/process.rs"]
 mod process;
-#[allow(
-    dead_code,
-    reason = "the qualification uses only the native authentication transcript"
-)]
 #[path = "imap_support/process.rs"]
 mod server;
 

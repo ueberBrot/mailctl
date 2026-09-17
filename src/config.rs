@@ -49,9 +49,11 @@ macro_rules! limits {
             }
         }
         impl Limits {
+            // Independent field ceilings; a combination must still pass validate().
+            pub(crate) const MAXIMUM: Self = Self { $($name: $max,)+ };
             fn fits_within(&self, ceiling: &Self) -> bool { $(self.$name <= ceiling.$name)&&+ }
             pub fn validate(&self) -> Result<(), Error> {
-                if $(self.$name == 0 || self.$name > $max)||+ { return Err(invalid()); }
+                if $(self.$name == 0 || self.$name > Self::MAXIMUM.$name)||+ { return Err(invalid()); }
                 if self.buffered_bytes < crate::encoding::request_buffer_bytes(self.envelope_bytes) + self.envelope_bytes + 192 || self.envelope_bytes < 1024
                     || self.connection_seconds > self.operation_seconds
                     || self.initialization_seconds > self.operation_seconds

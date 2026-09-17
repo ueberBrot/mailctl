@@ -12,9 +12,9 @@ use std::{
     future::Future,
     pin::Pin,
     sync::{Arc, RwLock},
-    time::Duration,
 };
 
+#[derive(Clone, Copy)]
 pub struct MailboxTarget<'a> {
     pub account_id: &'a str,
     pub generation: u64,
@@ -132,17 +132,6 @@ impl Service {
         context: &RequestContext,
         input: ListMailboxesInput,
     ) -> Result<MailboxDiscovery, Error> {
-        let deadline = Duration::from_secs(self.grant(context)?.limits.operation_seconds as u64);
-        tokio::time::timeout(deadline, self.list_mailboxes_inner(context, input))
-            .await
-            .map_err(|_| Error::new(ErrorCode::Timeout))?
-    }
-
-    async fn list_mailboxes_inner(
-        &self,
-        context: &RequestContext,
-        input: ListMailboxesInput,
-    ) -> Result<MailboxDiscovery, Error> {
         let grant = self.grant(context)?;
         if !context.permissions().contains(&Permission::ListMailboxes) {
             return Err(super::denied());
@@ -184,20 +173,7 @@ impl Service {
         }
         let (id, generation) = self.registry.identity(&account.key);
         if let Some(reference) = &reference {
-            if reference.generation != generation {
-                return Err(Error::new(ErrorCode::StaleReference));
-            }
-            if !account
-                .mailboxes
-                .iter()
-                .any(|name| mailbox_identity(name) == mailbox_identity(&reference.mailbox))
-                || !grant
-                    .mailboxes
-                    .iter()
-                    .any(|name| mailbox_identity(name) == mailbox_identity(&reference.mailbox))
-            {
-                return Err(Error::new(ErrorCode::MailboxNotAllowed));
-            }
+            self.authorize_mailbox(context, id, reference.generation, &reference.mailbox)?;
         }
         let scope = fingerprint(&(
             self.registry.revision(),
@@ -240,25 +216,20 @@ impl Service {
         let rows = if names.is_empty() {
             Vec::new()
         } else {
+            let target = MailboxTarget {
+                account_id: id,
+                generation,
+                config: account,
+            };
             let live;
             let backend: &dyn MailboxBackend = match &self.mailbox_backend {
                 Some(backend) => backend.as_ref(),
                 None => {
-                    live = self.imap_backend(account).await?;
+                    live = self.imap_backend(target).await?;
                     &live
                 }
             };
-            backend
-                .discover(
-                    MailboxTarget {
-                        account_id: id,
-                        generation,
-                        config: account,
-                    },
-                    &names,
-                    limits,
-                )
-                .await?
+            backend.discover(target, &names, limits).await?
         };
         if rows.len() > limits.mailbox_inventory {
             return Err(Error::new(ErrorCode::ResponseTooLarge));

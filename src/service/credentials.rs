@@ -11,7 +11,7 @@ use crate::{
     encoding::serialized_size,
     policy::{Permission, RequestContext},
 };
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 #[cfg(any(feature = "cli", feature = "mcp"))]
 use {crate::credentials::SecretSource, std::sync::Arc};
@@ -24,10 +24,8 @@ impl Service {
         context: &RequestContext,
         check_account: bool,
     ) -> Result<Doctor, Error> {
-        let deadline = Duration::from_secs(self.grant(context)?.limits.operation_seconds as u64);
-        tokio::time::timeout(deadline, self.doctor_inner(context, check_account))
+        self.with_deadline(context, self.doctor_inner(context, check_account))
             .await
-            .map_err(|_| Error::new(ErrorCode::Timeout))?
     }
 
     async fn doctor_inner(

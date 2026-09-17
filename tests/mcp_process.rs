@@ -4,7 +4,7 @@
 mod support;
 
 use rmcp::{ServiceExt, model::CallToolRequestParams, transport::TokioChildProcess};
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use std::{
     io::Write,
     process::{Command, Stdio},
@@ -225,18 +225,30 @@ async fn standalone_mcp_negotiates_schemas_and_applies_configured_grant_scope() 
     assert_eq!(envelope["ok"], true);
     assert_eq!(envelope["result"]["accounts"].as_array().unwrap().len(), 2);
 
-    let invalid = all_client
-        .call_tool(
-            CallToolRequestParams::new("email_list_accounts")
-                .with_arguments(Map::from_iter([(String::from("limit"), json!(0))])),
-        )
-        .await
-        .expect("receive application error envelope");
-    assert_eq!(invalid.is_error, Some(true));
-    assert_eq!(
-        invalid.structured_content.unwrap()["error"]["code"],
-        "invalid_request"
-    );
+    for (name, arguments) in [
+        ("email_list_accounts", json!({"limit": 0})),
+        ("email_capabilities", json!({"read_only": false})),
+        ("email_get_message", json!({})),
+        ("email_list_attachments", json!({"message": ""})),
+        (
+            "email_get_attachment",
+            json!({"attachment": "ref", "token": "token"}),
+        ),
+    ] {
+        let invalid = all_client
+            .call_tool(
+                CallToolRequestParams::new(name)
+                    .with_arguments(arguments.as_object().unwrap().clone()),
+            )
+            .await
+            .expect("receive application error envelope");
+        assert_eq!(invalid.is_error, Some(true), "{name}");
+        assert_eq!(
+            invalid.structured_content.unwrap()["error"]["code"],
+            "invalid_request",
+            "{name}"
+        );
+    }
     all_client.cancel().await.expect("close MCP session");
 
     let (restricted, envelope) = listed_accounts(&installation, &[]).await;
@@ -289,13 +301,15 @@ async fn mcp_hides_administration_tools_and_releases_setup_after_eof() {
             .iter()
             .all(|tool| !tool.name.contains("credential") && !tool.name.contains("setup"))
     );
-    assert!(
-        client
-            .call_tool(CallToolRequestParams::new("email_credential_set"))
-            .await
-            .is_err(),
-        "administration must not be callable as an MCP tool"
-    );
+    for name in ["email_credential_set", "email_health", "list_accounts"] {
+        assert!(
+            client
+                .call_tool(CallToolRequestParams::new(name))
+                .await
+                .is_err(),
+            "unadvertised operation {name} must not be callable as an MCP tool"
+        );
+    }
 
     let busy = run_bounded({
         let mut command = installation.mcp();

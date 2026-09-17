@@ -95,6 +95,11 @@ unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 redundant_clone = "warn"
+unnecessary_wraps = "warn"
+unused_async = "warn"
+unused_self = "warn"
+match_same_arms = "warn"
+allow_attributes_without_reason = "warn"
 
 [lints]
 workspace = true

@@ -1,5 +1,3 @@
-#![allow(dead_code)] // This route uses only part of the shared transcript fixture helpers.
-
 mod imap_support;
 
 use imap_support::*;

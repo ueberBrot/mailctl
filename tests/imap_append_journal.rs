@@ -1,5 +1,3 @@
-#![allow(dead_code)] // Each integration crate uses part of the shared fixture helpers.
-
 mod append_support;
 mod imap_support;
 mod support;
@@ -11,7 +9,7 @@ use mailctl::{
         DraftJournal, DraftJournalError, DraftOperationIdentity, DraftOperationState,
         PreparedDraftOperation,
     },
-    imap::{AppendOutcome, Limits, PreparedDraft, TlsMode, UidWindow},
+    imap::{AppendOutcome, Limits, PreparedDraft, TlsMode},
 };
 use uuid::Uuid;
 
@@ -81,18 +79,13 @@ async fn acknowledged_creation_is_durable_before_optional_reference_lookup_fails
         .append_draft("fixture", "disposable-password", "Drafts", &mime)
         .await
         .unwrap();
-    assert_eq!(result.outcome, AppendOutcome::Created { uid: None });
+    assert_eq!(result, AppendOutcome::Created { uid: None });
     journal.record_created(&operation.identity, None).unwrap();
     drop(journal);
 
     assert!(
         probe
-            .search(
-                "fixture",
-                "disposable-password",
-                "Drafts",
-                UidWindow { first: 1, last: 1 }
-            )
+            .search_window("fixture", "disposable-password", "Drafts", 77, 1..=1)
             .await
             .is_err()
     );
@@ -139,7 +132,7 @@ async fn lost_acknowledgement_persists_uncertainty_and_refuses_redispatch() {
         .append_draft("fixture", "disposable-password", "Drafts", &mime)
         .await
         .unwrap();
-    assert_eq!(result.outcome, AppendOutcome::Unknown);
+    assert_eq!(result, AppendOutcome::Unknown);
     journal.record_outcome_unknown(&operation.identity).unwrap();
     drop(journal);
     let mut reopened = DraftJournal::open(&path).unwrap();

@@ -1,5 +1,6 @@
 //! Strict incremental transfer decoding owns carry, output limits, and integrity.
 use crate::imap::{Error, Limits};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use sha2::{Digest, Sha256};
 
 pub(super) const WIRE_SLICE_BYTES: usize = 16 * 1024;
@@ -63,7 +64,9 @@ impl Decoder {
                     if byte.is_ascii_whitespace() {
                         continue;
                     }
-                    if self.base64_padded || !(base64_value(byte).is_some() || byte == b'=') {
+                    if self.base64_padded
+                        || !(byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
+                    {
                         return Err(Error::Protocol);
                     }
                     if self.retained_bytes() >= Self::state_limit(limits) {
@@ -71,13 +74,12 @@ impl Decoder {
                     }
                     self.base64.push(byte);
                     if self.base64.len() == 4 {
-                        let quartet: [u8; 4] = self
-                            .base64
-                            .as_slice()
-                            .try_into()
+                        let mut decoded = [0; 3];
+                        let length = STANDARD
+                            .decode_slice(&self.base64, &mut decoded)
                             .map_err(|_| Error::Protocol)?;
-                        self.append_base64_quartet(quartet, limits)?;
-                        self.base64_padded = quartet[2] == b'=' || quartet[3] == b'=';
+                        self.append(&decoded[..length], limits)?;
+                        self.base64_padded = length < 3;
                         self.base64.clear();
                     }
                     self.account_state();
@@ -253,45 +255,6 @@ impl Decoder {
         self.max_state_bytes = self
             .max_state_bytes
             .max(self.retained_bytes().saturating_add(128));
-    }
-
-    fn append_base64_quartet(&mut self, quartet: [u8; 4], limits: &Limits) -> Result<(), Error> {
-        let values = [
-            base64_value(quartet[0]).ok_or(Error::Protocol)?,
-            base64_value(quartet[1]).ok_or(Error::Protocol)?,
-        ];
-        let mut decoded = [0; 3];
-        decoded[0] = (values[0] << 2) | (values[1] >> 4);
-        let length = match (quartet[2], quartet[3]) {
-            (b'=', b'=') if values[1] & 0b1111 == 0 => 1,
-            (third, b'=') => {
-                let third = base64_value(third).ok_or(Error::Protocol)?;
-                if third & 0b11 != 0 {
-                    return Err(Error::Protocol);
-                }
-                decoded[1] = (values[1] << 4) | (third >> 2);
-                2
-            }
-            (third, fourth) => {
-                let third = base64_value(third).ok_or(Error::Protocol)?;
-                let fourth = base64_value(fourth).ok_or(Error::Protocol)?;
-                decoded[1] = (values[1] << 4) | (third >> 2);
-                decoded[2] = (third << 6) | fourth;
-                3
-            }
-        };
-        self.append(&decoded[..length], limits)
-    }
-}
-
-fn base64_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'A'..=b'Z' => Some(byte - b'A'),
-        b'a'..=b'z' => Some(byte - b'a' + 26),
-        b'0'..=b'9' => Some(byte - b'0' + 52),
-        b'+' => Some(62),
-        b'/' => Some(63),
-        _ => None,
     }
 }
 

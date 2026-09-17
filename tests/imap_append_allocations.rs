@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 mod append_support;
 mod imap_support;
 use append_support::*;
@@ -33,8 +32,8 @@ fn streamed_append_keeps_backend_allocations_independent_of_mime_size() {
                     .append_draft("fixture", "disposable-password", "Drafts", &draft)
                     .await
                     .unwrap();
-                assert_eq!(result.outcome, AppendOutcome::Created { uid: None });
-                metrics = Some(result.metrics);
+                assert_eq!(result, AppendOutcome::Created { uid: None });
+                metrics = Some(probe.metrics());
             })
         });
         server.join().unwrap();

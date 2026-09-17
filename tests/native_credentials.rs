@@ -1,6 +1,5 @@
 #![cfg(all(target_os = "macos", feature = "cli", feature = "mcp"))]
 
-#[allow(dead_code)]
 mod imap_support;
 #[path = "native_support/process.rs"]
 mod process;

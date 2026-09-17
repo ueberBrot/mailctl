@@ -1,4 +1,4 @@
-use super::{Error, ImapProbe, Metrics, credentials, mailbox};
+use super::{AuthenticatedConnection, Error, Limits, Metrics, dot_atom, mailbox};
 use mail_builder::MessageBuilder;
 use sha2::{Digest, Sha256};
 use std::io::{self, Write};
@@ -149,14 +149,6 @@ fn identifier(value: &str) -> Result<(), Error> {
     }
     Ok(())
 }
-fn dot_atom(value: &str) -> bool {
-    value.split('.').all(|atom| {
-        !atom.is_empty()
-            && atom
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-/=?^_`{|}~".contains(&byte))
-    })
-}
 struct BoundedMime {
     bytes: Vec<u8>,
     limit: usize,
@@ -188,57 +180,41 @@ pub enum AppendOutcome {
     /// APPEND may have reached the provider. This outcome never permits automatic retry.
     Unknown,
 }
-#[derive(Clone, Copy, Debug)]
-pub struct AppendResult {
-    pub outcome: AppendOutcome,
-    pub metrics: Metrics,
-}
-
-impl ImapProbe {
-    /// Last APPEND acknowledgement, including after dropping a suspended operation.
-    pub fn append_outcome(&self) -> Option<AppendOutcome> {
-        self.metrics.append_outcome
-    }
-
-    /// Append frozen MIME to the caller's exact approved target with the initial Draft flag.
-    /// Authentication and validation failures occur before dispatch. Once dispatch starts,
-    /// transport failures and cancellation leave an unknown outcome. Connections are dropped
-    /// at completion; no cleanup or optional lookup can replace a tagged acknowledgement.
+impl AuthenticatedConnection {
+    /// Append frozen MIME with the initial Draft flag. The caller owns authorization
+    /// and durable draft coordination. Progress retains the outcome after cancellation.
     pub async fn append_draft(
-        &mut self,
-        user: &str,
-        password: &str,
+        self,
         target: &str,
         draft: &PreparedDraft,
-    ) -> Result<AppendResult, Error> {
-        self.metrics = Metrics::default();
-        credentials(user, password)?;
+        limits: &Limits,
+        metrics: &mut Metrics,
+    ) -> Result<AppendOutcome, Error> {
+        metrics.append_outcome = None;
+        metrics.append_wire_bytes = 0;
+        metrics.mime_bytes = 0;
         mailbox(target)?;
-        if draft.header_bytes > self.limits.max_header_bytes {
-            return Err(Error::Limit);
-        }
-        if draft
-            .bytes
-            .len()
-            .saturating_add(target.len())
-            .saturating_add(128)
-            > self.limits.max_operation_bytes
+        limits.validate()?;
+        if draft.header_bytes > limits.max_header_bytes
+            || draft
+                .bytes
+                .len()
+                .saturating_add(target.len())
+                .saturating_add(128)
+                > limits.max_operation_bytes
         {
             return Err(Error::Limit);
         }
-        self.metrics.mime_bytes = draft.bytes.len();
-        let result = tokio::time::timeout(self.limits.operation_timeout, async {
-            let mut conn = self.authenticate(user, password).await?;
+        metrics.mime_bytes = draft.bytes.len();
+        let result = tokio::time::timeout(limits.operation_timeout, async {
+            let mut conn = self.session.resume(metrics);
+            conn.limit_body(limits);
             conn.append(target, &draft.bytes).await
         })
         .await
         .unwrap_or(Err(Error::Timeout));
-        match self.metrics.append_outcome {
-            Some(outcome) => Ok(AppendResult {
-                outcome,
-                metrics: self.metrics,
-            }),
-            None => Err(result.err().unwrap_or(Error::Protocol)),
-        }
+        metrics
+            .append_outcome
+            .ok_or_else(|| result.err().unwrap_or(Error::Protocol))
     }
 }

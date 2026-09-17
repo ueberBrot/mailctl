@@ -1,4 +1,4 @@
-//! Bounded IMAP route proofs. Each operation owns and disposes its connection.
+//! Bounded IMAP operations shared by the application and protocol fixtures.
 use crate::domain::mailbox_identity;
 mod append;
 mod attachment;
@@ -9,54 +9,84 @@ mod projection;
 mod search;
 mod wire;
 
-pub use append::{AppendOutcome, AppendResult, AppendUid, DraftInput, PreparedDraft};
+pub use append::{AppendOutcome, AppendUid, DraftInput, PreparedDraft};
 
-pub(crate) use attachment::AttachmentDecoder;
 pub use attachment::{
-    AttachmentChunk, AttachmentData, AttachmentIntegrity, AttachmentList, AttachmentListRequest,
-    AttachmentMetadata, AttachmentProgress, AttachmentRequest, AttachmentTransfer,
+    AttachmentData, AttachmentDecoder, AttachmentIntegrity, AttachmentListRequest,
+    AttachmentMetadata,
 };
 
 pub use body::{BodyCursor, BodyPage, BodyRequest};
 
 use io_imap::{
     rfc3501::{
-        capability::ImapCapabilityGet,
-        fetch::{ImapMessageFetch, ImapMessageFetchOptions},
-        greeting::ImapGreetingGet,
-        list::ImapMailboxList,
-        login::ImapLogin,
-        logout::ImapLogout,
-        search::{ImapMessageSearch, ImapMessageSearchOptions},
+        capability::ImapCapabilityGet, greeting::ImapGreetingGet, list::ImapMailboxList,
+        login::ImapLogin, logout::ImapLogout,
     },
-    types::{mailbox::Mailbox as WireMailbox, response::Capability, search::SearchKey},
+    types::{mailbox::Mailbox as WireMailbox, response::Capability},
 };
-use projection::Projection;
+use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, fmt, sync::Arc, time::Duration};
 use tokio_rustls::rustls::{self, RootCertStore};
 use wire::Connection;
 
 /// An authenticated connection with no selected mailbox or retained credential.
-pub(crate) struct AuthenticatedConnection(wire::Session);
+/// Operations consume the connection; cancellation closes its transport.
+/// Progress is borrowed separately so it survives a dropped operation. The application
+/// owns the deadline spanning authentication and retrieval.
+///
+/// A connection cannot run a second operation after being consumed:
+/// ```compile_fail
+/// use mailctl::imap::{AuthenticatedConnection, Limits, Metrics};
+/// async fn reuse(connection: AuthenticatedConnection, limits: &Limits) {
+///     let mut metrics = Metrics::default();
+///     connection.discover(&[], limits, &mut metrics).await.unwrap();
+///     connection.discover(&[], limits, &mut metrics).await.unwrap();
+/// }
+/// ```
+/// Progress cannot be inspected while a live operation can still mutate it:
+/// ```compile_fail
+/// use mailctl::imap::{AuthenticatedConnection, Limits, Metrics};
+/// async fn observe(connection: AuthenticatedConnection, limits: &Limits) {
+///     let mut metrics = Metrics::default();
+///     let operation = connection.discover(&[], limits, &mut metrics);
+///     let _snapshot = metrics;
+///     operation.await.unwrap();
+/// }
+/// ```
+pub struct AuthenticatedConnection {
+    session: wire::Session,
+    identity: [u8; 32],
+}
 impl AuthenticatedConnection {
-    pub(crate) async fn discover(
+    pub async fn discover(
         self,
         allowlist: &[String],
-        maximum: usize,
+        limits: &Limits,
+        metrics: &mut Metrics,
     ) -> Result<Vec<Mailbox>, Error> {
-        let mut metrics = Metrics::default();
-        let mut connection = self.0.resume(&mut metrics);
+        limits.validate()?;
+        if allowlist.len() > limits.max_mailboxes {
+            return Err(Error::Limit);
+        }
+        for name in allowlist {
+            mailbox(name)?;
+        }
+        let mut connection = self.session.resume(metrics);
+        connection.limit_body(limits);
         let names = allowlist
             .iter()
             .map(|name| (mailbox_identity(name), name.as_str()))
             .collect();
-        let result = connection.discover_names(names, maximum).await?;
+        let result = connection
+            .discover_names(names, limits.max_mailboxes)
+            .await?;
         connection.drive(ImapLogout::new()).await?;
         Ok(result)
     }
     pub(crate) async fn disconnect(self) -> Result<(), Error> {
         let mut metrics = Metrics::default();
-        let mut connection = self.0.resume(&mut metrics);
+        let mut connection = self.session.resume(&mut metrics);
         connection.drive(ImapLogout::new()).await
     }
 }
@@ -116,8 +146,6 @@ pub struct Limits {
     pub max_parser_steps: usize,
     pub max_nesting: usize,
     pub max_mailboxes: usize,
-    pub max_uid_window: usize,
-    pub max_messages: usize,
     pub max_header_bytes: usize,
     pub max_mime_parts: usize,
     pub max_body_wire_bytes: usize,
@@ -127,41 +155,37 @@ pub struct Limits {
     pub max_attachment_decoded_bytes: usize,
     pub max_attachment_wire_bytes: usize,
     pub max_attachment_chunk_bytes: usize,
-    pub max_transfer_lifetime: Duration,
-    pub max_transfers: usize,
     pub operation_timeout: Duration,
     pub connect_timeout: Duration,
 }
 impl Default for Limits {
     fn default() -> Self {
+        let defaults = crate::config::Limits::default();
         Self {
             max_response_bytes: 64 * 1024,
             max_operation_bytes: 4 * 1024 * 1024,
             max_literal_bytes: 64 * 1024,
             max_responses: 4096,
             max_parser_steps: 8 * 1024 * 1024,
-            max_nesting: 20,
-            max_mailboxes: 1000,
-            max_uid_window: 1000,
-            max_messages: 50,
-            max_header_bytes: 64 * 1024,
-            max_mime_parts: 200,
-            max_body_wire_bytes: 2 * 1024 * 1024,
+            max_nesting: defaults.mime_depth,
+            max_mailboxes: defaults.mailbox_inventory,
+            max_header_bytes: defaults.header_bytes,
+            max_mime_parts: defaults.mime_parts,
+            max_body_wire_bytes: defaults.wire_fetch_bytes,
             max_decoded_bytes: 8 * 1024 * 1024,
-            max_text_bytes: 256 * 1024,
+            max_text_bytes: defaults.text_page_bytes,
             max_decode_steps: 32 * 1024 * 1024,
-            max_attachment_decoded_bytes: 10 * 1024 * 1024,
-            max_attachment_wire_bytes: 16 * 1024 * 1024,
-            max_attachment_chunk_bytes: 64 * 1024,
-            max_transfer_lifetime: Duration::from_secs(5 * 60),
-            max_transfers: 2,
-            operation_timeout: Duration::from_secs(30),
-            connect_timeout: Duration::from_secs(10),
+            max_attachment_decoded_bytes: defaults.attachment_decoded_bytes,
+            max_attachment_wire_bytes: defaults.attachment_wire_bytes,
+            max_attachment_chunk_bytes: defaults.attachment_chunk_bytes,
+            operation_timeout: Duration::from_secs(defaults.operation_seconds as u64),
+            connect_timeout: Duration::from_secs(defaults.connection_seconds as u64),
         }
     }
 }
 impl Limits {
     fn validate(&self) -> Result<(), Error> {
+        let maximum = crate::config::Limits::MAXIMUM;
         if self.max_response_bytes == 0
             || self.max_response_bytes > 256 * 1024
             || self.max_operation_bytes < self.max_response_bytes
@@ -172,40 +196,23 @@ impl Limits {
             || self.max_responses > 16384
             || self.max_parser_steps == 0
             || self.max_parser_steps > 32 * 1024 * 1024
-            || self.max_nesting == 0
-            || self.max_nesting > 40
-            || self.max_mailboxes == 0
-            || self.max_mailboxes > 1000
-            || self.max_uid_window == 0
-            || self.max_uid_window > 10000
-            || self.max_messages == 0
-            || self.max_messages > 200
-            || self.max_header_bytes == 0
-            || self.max_header_bytes > 256 * 1024
-            || self.max_mime_parts == 0
-            || self.max_mime_parts > 1000
-            || self.max_body_wire_bytes == 0
-            || self.max_body_wire_bytes > 8 * 1024 * 1024
+            || !(1..=maximum.mime_depth).contains(&self.max_nesting)
+            || !(1..=maximum.mailbox_inventory).contains(&self.max_mailboxes)
+            || !(1..=maximum.header_bytes).contains(&self.max_header_bytes)
+            || !(1..=maximum.mime_parts).contains(&self.max_mime_parts)
+            || !(1..=maximum.wire_fetch_bytes).contains(&self.max_body_wire_bytes)
             || self.max_decoded_bytes == 0
             || self.max_decoded_bytes > 32 * 1024 * 1024
-            || self.max_text_bytes < 4
-            || self.max_text_bytes > 2 * 1024 * 1024
+            || !(4..=maximum.text_page_bytes).contains(&self.max_text_bytes)
             || self.max_decode_steps == 0
             || self.max_decode_steps > 128 * 1024 * 1024
-            || self.max_attachment_decoded_bytes == 0
-            || self.max_attachment_decoded_bytes > 32 * 1024 * 1024
-            || self.max_attachment_wire_bytes == 0
-            || self.max_attachment_wire_bytes > 64 * 1024 * 1024
-            || self.max_attachment_chunk_bytes == 0
-            || self.max_attachment_chunk_bytes > 256 * 1024
-            || self.max_transfer_lifetime.is_zero()
-            || self.max_transfer_lifetime > Duration::from_secs(10 * 60)
-            || self.max_transfers == 0
-            || self.max_transfers > 4
+            || !(1..=maximum.attachment_decoded_bytes).contains(&self.max_attachment_decoded_bytes)
+            || !(1..=maximum.attachment_wire_bytes).contains(&self.max_attachment_wire_bytes)
+            || !(1..=maximum.attachment_chunk_bytes).contains(&self.max_attachment_chunk_bytes)
             || self.operation_timeout.is_zero()
-            || self.operation_timeout > Duration::from_secs(120)
+            || self.operation_timeout > Duration::from_secs(maximum.operation_seconds as u64)
             || self.connect_timeout.is_zero()
-            || self.connect_timeout > Duration::from_secs(30)
+            || self.connect_timeout > Duration::from_secs(maximum.connection_seconds as u64)
         {
             Err(Error::InvalidInput)
         } else {
@@ -231,7 +238,6 @@ pub struct Metrics {
     pub transfer_decoded_bytes: usize,
     pub transfer_decode_steps: usize,
     pub max_transfer_state_bytes: usize,
-    pub active_transfers: usize,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Mailbox {
@@ -239,69 +245,40 @@ pub struct Mailbox {
     pub selectable: bool,
     pub attributes: Vec<String>,
 }
-#[derive(Clone, Debug)]
-pub struct Discovery {
-    pub mailboxes: Vec<Mailbox>,
-    pub metrics: Metrics,
-}
-#[derive(Clone, Copy, Debug)]
-pub struct UidWindow {
-    pub first: u32,
-    pub last: u32,
-}
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Address {
-    pub name: Option<String>,
-    pub mailbox: Option<String>,
-    pub host: Option<String>,
-}
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Envelope {
-    pub uid: u32,
-    pub subject: Option<String>,
-    pub from: Vec<Address>,
-    pub to: Vec<Address>,
-    pub cc: Vec<Address>,
-    pub received_date: Option<String>,
-    pub sent_date: Option<String>,
-    pub flags: Vec<String>,
-    pub message_id: Option<String>,
-    pub size: Option<u32>,
-}
-#[derive(Clone, Debug)]
-pub struct Search {
-    pub uid_validity: u32,
-    pub envelopes: Vec<Envelope>,
-    pub metrics: Metrics,
-}
-
 /// A verified TLS endpoint. Inputs and results contain no raw IMAP commands.
 ///
 /// Authentication accepts printable ASCII credentials; literal authentication remains
 /// gated. Mailbox names use Unicode with modified UTF-7 on the IMAP wire.
 /// Control characters and LIST wildcards remain unsupported.
-/// Search enumerates one bounded UID window; application predicates and cursors
-/// are separate delivery work. Overflow returns an error, never a partial list.
-pub struct ImapProbe {
+pub struct ImapEndpoint {
     host: String,
     port: u16,
     mode: TlsMode,
     tls: Arc<rustls::ClientConfig>,
     limits: Limits,
-    metrics: Metrics,
-    transfers: attachment::TransferStore,
 }
-impl ImapProbe {
-    pub(crate) async fn connect_authenticated(
-        &mut self,
+impl ImapEndpoint {
+    pub async fn connect_authenticated(
+        &self,
         username: &str,
         password: &str,
+        metrics: &mut Metrics,
     ) -> Result<AuthenticatedConnection, Error> {
+        *metrics = Metrics::default();
         credentials(username, password)?;
+        let mut identity = Sha256::new();
+        for value in [self.host.as_str(), username] {
+            identity.update(value.len().to_be_bytes());
+            identity.update(value.as_bytes());
+        }
+        identity.update(self.port.to_be_bytes());
         tokio::time::timeout(self.limits.operation_timeout, async {
-            self.authenticate(username, password)
+            self.authenticate(username, password, metrics)
                 .await
-                .map(|connection| AuthenticatedConnection(connection.into_session()))
+                .map(|connection| AuthenticatedConnection {
+                    session: connection.into_session(),
+                    identity: identity.finalize().into(),
+                })
         })
         .await
         .map_err(|_| Error::Timeout)?
@@ -330,140 +307,14 @@ impl ImapProbe {
             mode,
             tls: Arc::new(tls),
             limits,
-            metrics: Metrics::default(),
-            transfers: attachment::TransferStore::default(),
         })
     }
-    /// Last progress snapshot, including a failed or cancelled operation.
-    pub fn metrics(&self) -> Metrics {
-        Metrics {
-            active_transfers: self.transfers.active_count(),
-            ..self.metrics
-        }
-    }
-    /// A probe permits one operation at a time, including while its future is suspended.
-    ///
-    /// ```compile_fail
-    /// use mailctl::imap::ImapProbe;
-    /// fn overlapping(probe: &mut ImapProbe) {
-    ///     let mailboxes = vec!["INBOX".to_owned()];
-    ///     let first = probe.discover("fixture", "disposable-password", &mailboxes);
-    ///     let second = probe.discover("fixture", "disposable-password", &mailboxes);
-    ///     drop((first, second));
-    /// }
-    /// ```
-    pub async fn discover(
-        &mut self,
-        username: &str,
+    async fn authenticate<'a>(
+        &self,
+        user: &str,
         password: &str,
-        allowlist: &[String],
-    ) -> Result<Discovery, Error> {
-        self.metrics = Metrics::default();
-        credentials(username, password)?;
-        if allowlist.len() > self.limits.max_mailboxes {
-            return Err(Error::Limit);
-        }
-        let mut names = BTreeMap::new();
-        for name in allowlist {
-            mailbox(name)?;
-            names.insert(mailbox_identity(name), name.as_str());
-        }
-        tokio::time::timeout(self.limits.operation_timeout, async {
-            let maximum = self.limits.max_mailboxes;
-            let mut conn = self.authenticate(username, password).await?;
-            let mailboxes = conn.discover_names(names, maximum).await?;
-            conn.drive(ImapLogout::new()).await?;
-            Ok(Discovery {
-                mailboxes,
-                metrics: conn.metrics(),
-            })
-        })
-        .await
-        .map_err(|_| Error::Timeout)?
-    }
-    pub async fn search(
-        &mut self,
-        username: &str,
-        password: &str,
-        name: &str,
-        window: UidWindow,
-    ) -> Result<Search, Error> {
-        self.metrics = Metrics::default();
-        credentials(username, password)?;
-        mailbox(name)?;
-        if window.first == 0 || window.last < window.first {
-            return Err(Error::InvalidInput);
-        }
-        if u64::from(window.last) - u64::from(window.first) + 1 > self.limits.max_uid_window as u64
-        {
-            return Err(Error::Limit);
-        }
-        let max_messages = self.limits.max_messages;
-        tokio::time::timeout(self.limits.operation_timeout, async {
-            let mut conn = self.authenticate(username, password).await?;
-            let uid_validity = conn.examine(name).await?;
-            let range = (window.first..=window.last)
-                .try_into()
-                .map_err(|_| Error::InvalidInput)?;
-            let mut uids = conn
-                .drive(ImapMessageSearch::new(
-                    vec![SearchKey::Uid(range)]
-                        .try_into()
-                        .map_err(|_| Error::InvalidInput)?,
-                    ImapMessageSearchOptions { uid: true },
-                ))
-                .await?;
-            if uids.len() > max_messages {
-                return Err(Error::Limit);
-            }
-            if uids
-                .iter()
-                .any(|u| u.get() < window.first || u.get() > window.last)
-            {
-                return Err(Error::Protocol);
-            }
-            uids.sort_unstable();
-            if uids.windows(2).any(|w| w[0] == w[1]) {
-                return Err(Error::Protocol);
-            }
-            let mut envelopes = BTreeMap::new();
-            if !uids.is_empty() {
-                let set = uids
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| Error::InvalidInput)?;
-                let fetched = conn
-                    .drive(ImapMessageFetch::new(
-                        set,
-                        Projection::FIELDS.to_vec().into(),
-                        ImapMessageFetchOptions {
-                            uid: true,
-                            ..Default::default()
-                        },
-                    ))
-                    .await?;
-                for items in fetched.into_values() {
-                    let envelope = Projection::parse(items.as_ref())?.normalize();
-                    if uids
-                        .binary_search_by_key(&envelope.uid, |uid| uid.get())
-                        .is_err()
-                        || envelopes.insert(envelope.uid, envelope).is_some()
-                    {
-                        return Err(Error::Protocol);
-                    }
-                }
-            }
-            conn.drive(ImapLogout::new()).await?;
-            Ok(Search {
-                uid_validity,
-                envelopes: envelopes.into_values().rev().collect(),
-                metrics: conn.metrics(),
-            })
-        })
-        .await
-        .map_err(|_| Error::Timeout)?
-    }
-    async fn authenticate(&mut self, user: &str, password: &str) -> Result<Connection<'_>, Error> {
+        metrics: &'a mut Metrics,
+    ) -> Result<Connection<'a>, Error> {
         let mut conn = tokio::time::timeout(
             self.limits.connect_timeout,
             Connection::connect(
@@ -472,7 +323,7 @@ impl ImapProbe {
                 self.mode,
                 self.tls.clone(),
                 self.limits.clone(),
-                &mut self.metrics,
+                metrics,
             ),
         )
         .await
@@ -523,6 +374,15 @@ pub(crate) fn mailbox(name: &str) -> Result<(), Error> {
         return Err(Error::Unsupported);
     }
     Ok(())
+}
+
+fn dot_atom(value: &str) -> bool {
+    value.split('.').all(|atom| {
+        !atom.is_empty()
+            && atom
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-/=?^_`{|}~".contains(&byte))
+    })
 }
 
 // io-imap encodes mailbox arguments but leaves LIST patterns in wire form.

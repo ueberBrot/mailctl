@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 mod append_support;
 mod imap_support;
 use append_support::*;
@@ -42,9 +41,9 @@ async fn tagged_acknowledgement_survives_missing_uid_and_connection_close() {
             .append_draft("fixture", "disposable-password", "Drafts", &draft)
             .await
             .unwrap();
-        assert_eq!(result.outcome, AppendOutcome::Created { uid });
-        assert_eq!(fixture.probe.append_outcome(), Some(result.outcome));
-        assert!(result.metrics.append_wire_bytes > draft.bytes().len());
+        assert_eq!(result, AppendOutcome::Created { uid });
+        assert_eq!(fixture.probe.append_outcome(), Some(result));
+        assert!(fixture.probe.metrics().append_wire_bytes > draft.bytes().len());
         fixture.task.await.unwrap();
     }
 }
@@ -138,7 +137,7 @@ async fn tagged_no_and_bad_are_rejections_before_or_after_literal() {
                 .append_draft("fixture", "disposable-password", "Drafts", &draft)
                 .await
                 .unwrap();
-            assert_eq!(result.outcome, AppendOutcome::Rejected);
+            assert_eq!(result, AppendOutcome::Rejected);
             fixture.task.await.unwrap();
         }
     }
@@ -171,7 +170,7 @@ async fn lost_or_invalid_acknowledgement_is_unknown() {
             .append_draft("fixture", "disposable-password", "Drafts", &draft)
             .await
             .unwrap();
-        assert_eq!(result.outcome, AppendOutcome::Unknown);
+        assert_eq!(result, AppendOutcome::Unknown);
         fixture.task.await.unwrap();
     }
 }
@@ -197,8 +196,7 @@ async fn timeout_disposes_uncertain_transport() {
             .probe
             .append_draft("fixture", "disposable-password", "Drafts", &draft)
             .await
-            .unwrap()
-            .outcome,
+            .unwrap(),
         AppendOutcome::Unknown
     );
     fixture.task.await.unwrap();
@@ -359,8 +357,8 @@ async fn oversized_acknowledgement_keeps_unknown_and_disposes_transport() {
         .append_draft("fixture", "disposable-password", "Drafts", &draft)
         .await
         .unwrap();
-    assert_eq!(result.outcome, AppendOutcome::Unknown);
-    assert_eq!(result.metrics.max_response_bytes, 256);
+    assert_eq!(result, AppendOutcome::Unknown);
+    assert_eq!(fixture.probe.metrics().max_response_bytes, 256);
     fixture.task.await.unwrap();
 }
 
@@ -382,8 +380,7 @@ async fn premature_success_is_unknown_without_sending_literal() {
             .probe
             .append_draft("fixture", "disposable-password", "Drafts", &draft)
             .await
-            .unwrap()
-            .outcome,
+            .unwrap(),
         AppendOutcome::Unknown
     );
     fixture.task.await.unwrap();
@@ -414,7 +411,7 @@ async fn authentication_failure_has_no_append_dispatch() {
 }
 
 #[tokio::test]
-async fn mime_and_header_limits_reject_before_network_dispatch() {
+async fn mime_and_header_limits_reject_before_append_dispatch() {
     let mut input = input();
     input.body = "b\n".repeat(64 * 1024);
     let draft = PreparedDraft::compose(input, 1024 * 1024).unwrap();
@@ -428,21 +425,59 @@ async fn mime_and_header_limits_reject_before_network_dispatch() {
             ..Limits::default()
         },
     ] {
-        let mut probe = mailctl::imap::ImapProbe::new(
-            "invalid.test".into(),
-            993,
-            TlsMode::Implicit,
-            tokio_rustls::rustls::RootCertStore::empty(),
-            limits,
-        )
-        .unwrap();
+        let mut fixture = fixture(TlsMode::Implicit, limits, |mut wire| {
+            Box::pin(async move {
+                authenticate(&mut wire).await;
+                dropped(&mut wire).await;
+            })
+        })
+        .await;
         assert!(matches!(
-            probe
+            fixture
+                .probe
                 .append_draft("fixture", "disposable-password", "Drafts", &draft)
                 .await,
             Err(Error::Limit)
         ));
-        assert_eq!(probe.append_outcome(), None);
-        assert_eq!(probe.metrics().wire_bytes, 0);
+        assert_eq!(fixture.probe.append_outcome(), None);
+        assert_eq!(fixture.probe.metrics().append_wire_bytes, 0);
+        fixture.task.await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn rejected_input_cannot_reuse_an_earlier_append_acknowledgement() {
+    use mailctl::imap::{ImapEndpoint, Metrics};
+    let fixture = fixture(TlsMode::Implicit, Limits::default(), |mut wire| {
+        Box::pin(async move {
+            authenticate(&mut wire).await;
+            dropped(&mut wire).await;
+        })
+    })
+    .await;
+    let endpoint = ImapEndpoint::new(
+        "127.0.0.1".into(),
+        fixture.port,
+        TlsMode::Implicit,
+        fixture.roots,
+        Limits::default(),
+    )
+    .unwrap();
+    let mut metrics = Metrics::default();
+    let connection = endpoint
+        .connect_authenticated("fixture", "disposable-password", &mut metrics)
+        .await
+        .unwrap();
+    metrics.append_outcome = Some(AppendOutcome::Created { uid: None });
+    metrics.append_wire_bytes = 123;
+    assert_eq!(
+        connection
+            .append_draft("", &draft(), &Limits::default(), &mut metrics)
+            .await
+            .unwrap_err(),
+        Error::InvalidInput
+    );
+    assert_eq!(metrics.append_outcome, None);
+    assert_eq!(metrics.append_wire_bytes, 0);
+    fixture.task.await.unwrap();
 }

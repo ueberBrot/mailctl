@@ -3,7 +3,7 @@
 use crate::{
     config::{AccountConfig, Limits, TlsMode},
     credentials::{Availability, Secret, SecretSource, SourceError},
-    imap::{self, AuthenticatedConnection, ImapProbe},
+    imap::{self, AuthenticatedConnection, ImapEndpoint},
 };
 use std::{
     collections::{HashMap, VecDeque},
@@ -308,12 +308,11 @@ impl Runtime {
         tokio::time::timeout(
             Duration::from_secs(limits.operation_seconds as u64),
             async {
-                let Lease {
-                    idle,
-                    admission: _admission,
-                    ..
-                } = self.acquire_inner(account, limits, pool, true).await?;
-                idle.connection.disconnect().await.map_err(Error::Imap)
+                self.acquire_inner(account, limits, pool, true)
+                    .await?
+                    .with_connection(AuthenticatedConnection::disconnect)
+                    .await
+                    .map_err(Error::Imap)
             },
         )
         .await
@@ -338,13 +337,20 @@ impl Runtime {
         tokio::time::timeout(
             Duration::from_secs(limits.operation_seconds as u64),
             async {
-                let Lease {
-                    idle,
-                    admission: _admission,
-                    ..
-                } = self.acquire_inner(account, limits, pool, true).await?;
-                idle.connection
-                    .discover(names, limits.mailbox_inventory)
+                self.acquire_inner(account, limits, pool, true)
+                    .await?
+                    .with_connection(async |connection| {
+                        connection
+                            .discover(
+                                names,
+                                &imap::Limits {
+                                    max_mailboxes: limits.mailbox_inventory,
+                                    ..Default::default()
+                                },
+                                &mut imap::Metrics::default(),
+                            )
+                            .await
+                    })
                     .await
                     .map_err(Error::Imap)
             },
@@ -476,7 +482,7 @@ impl Runtime {
                 if secret.len() > limits.secret_bytes {
                     return Err(Error::Source(SourceError::InvalidSecret));
                 }
-                let mut probe = ImapProbe::new(
+                let endpoint = ImapEndpoint::new(
                     account.config.server.clone(),
                     account.config.port,
                     match account.config.tls {
@@ -491,8 +497,12 @@ impl Runtime {
                     },
                 )
                 .map_err(Error::Imap)?;
-                let connection = probe
-                    .connect_authenticated(&account.config.username, secret.expose())
+                let connection = endpoint
+                    .connect_authenticated(
+                        &account.config.username,
+                        secret.expose(),
+                        &mut imap::Metrics::default(),
+                    )
                     .await
                     .map_err(Error::Imap)?;
                 let established = Instant::now();
@@ -582,15 +592,12 @@ impl Runtime {
         tokio::time::timeout(
             Duration::from_secs(limits.operation_seconds as u64),
             async {
-                loop {
-                    if let Some(result) = receiver.borrow_and_update().clone() {
-                        return result;
-                    }
-                    receiver
-                        .changed()
-                        .await
-                        .map_err(|_| Error::Source(SourceError::Internal))?;
-                }
+                receiver
+                    .wait_for(Option::is_some)
+                    .await
+                    .map_err(|_| Error::Source(SourceError::Internal))?
+                    .clone()
+                    .expect("completed credential work")
             },
         )
         .await

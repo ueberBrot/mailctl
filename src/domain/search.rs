@@ -8,12 +8,12 @@ use serde::{Deserialize, Serialize};
 #[serde(deny_unknown_fields)]
 pub struct SearchMessagesInput {
     /// A mailbox reference returned by discovery in this installation.
-    #[serde(deserialize_with = "mailbox_reference")]
+    #[serde(deserialize_with = "super::reference")]
     #[schemars(length(min = 1, max = 8192), extend("x-maxUtf8Bytes" = 8192))]
     pub mailbox: String,
     #[serde(default)]
     pub criteria: SearchCriteria,
-    #[serde(default, deserialize_with = "page_limit")]
+    #[serde(default, deserialize_with = "super::page_limit::<_, 200>")]
     #[schemars(range(min = 1, max = 200))]
     pub limit: Option<usize>,
     #[serde(
@@ -192,44 +192,11 @@ impl TryFrom<Vec<SearchPredicate>> for SearchCriteria {
 }
 impl<'de> Deserialize<'de> for SearchCriteria {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct Visitor;
-        impl<'de> serde::de::Visitor<'de> for Visitor {
-            type Value = SearchCriteria;
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("at most 32 AND search predicates")
-            }
-            fn visit_seq<A: serde::de::SeqAccess<'de>>(
-                self,
-                mut sequence: A,
-            ) -> Result<Self::Value, A::Error> {
-                let mut predicates = Vec::new();
-                while let Some(predicate) = sequence.next_element()? {
-                    if predicates.len() == 32 {
-                        return Err(serde::de::Error::custom("too many predicates"));
-                    }
-                    predicates.push(predicate);
-                }
-                SearchCriteria::try_from(predicates)
-                    .map_err(|_| serde::de::Error::custom("invalid search criteria"))
-            }
-        }
-        deserializer.deserialize_seq(Visitor)
+        let predicates =
+            crate::encoding::BoundedVec::<SearchPredicate, 32>::deserialize(deserializer)?;
+        Self::try_from(predicates.0)
+            .map_err(|_| serde::de::Error::custom("invalid search criteria"))
     }
-}
-fn mailbox_reference<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<String, D::Error> {
-    super::bounded_optional_string::<D, 8192>(deserializer)?
-        .ok_or_else(|| serde::de::Error::custom("mailbox reference is required"))
-}
-fn page_limit<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Option<usize>, D::Error> {
-    let limit = Option::<usize>::deserialize(deserializer)?;
-    if limit.is_some_and(|limit| !(1..=200).contains(&limit)) {
-        return Err(serde::de::Error::custom("invalid search page limit"));
-    }
-    Ok(limit)
 }
 fn valid_search_text(value: &str) -> bool {
     value.len() <= 4096 && !value.contains('\0')

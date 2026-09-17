@@ -1,8 +1,7 @@
-#[allow(dead_code)]
 mod imap_support;
 
 use imap_support::*;
-use mailctl::imap::{Limits, TlsMode, UidWindow};
+use mailctl::imap::{Limits, TlsMode};
 
 #[tokio::test]
 async fn exact_discovery_authenticates_over_verified_tls_and_logs_out_safely() {
@@ -28,9 +27,9 @@ async fn exact_discovery_authenticates_over_verified_tls_and_logs_out_safely() {
         )
         .await
         .unwrap();
-    assert_eq!(result.mailboxes.len(), 1);
-    assert_eq!(result.mailboxes[0].name, "INBOX");
-    assert!(result.mailboxes[0].selectable);
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].name, "INBOX");
+    assert!(result[0].selectable);
     fixture.task.await.unwrap();
     assert_eq!(
         fixture
@@ -61,40 +60,43 @@ async fn starttls_refreshes_capabilities_before_login_and_reads_only_bounded_uid
     })).await;
     let result = fixture
         .probe
-        .search(
-            "fixture",
-            "disposable-password",
-            "INBOX",
-            UidWindow { first: 1, last: 10 },
-        )
+        .search_window("fixture", "disposable-password", "INBOX", 77, 1..=10)
         .await
         .unwrap();
-    assert_eq!(result.uid_validity, 77);
+    assert_eq!(result.position.uid_validity, 77);
     assert_eq!(
-        result.envelopes.iter().map(|e| e.uid).collect::<Vec<_>>(),
+        result.messages.iter().map(|e| e.uid).collect::<Vec<_>>(),
         [9, 4]
     );
     assert_eq!(
-        result.envelopes[0].subject.as_deref(),
+        result.messages[0]
+            .metadata
+            .subject
+            .value()
+            .map(String::as_str),
         Some("Synthetic second")
     );
-    assert_eq!(result.envelopes[0].flags, ["\\Seen"]);
-    assert!(result.envelopes[1].flags.is_empty());
+    assert_eq!(result.messages[0].metadata.flags, ["\\Seen"]);
+    assert!(result.messages[1].metadata.flags.is_empty());
     assert_eq!(
-        result.envelopes[1].from[0].mailbox.as_deref(),
-        Some("sender")
+        result.messages[1].metadata.from.value().unwrap()[0].address,
+        "sender@example.invalid"
     );
     assert_eq!(
-        result.envelopes[1].to[0].host.as_deref(),
-        Some("example.invalid")
+        result.messages[1].metadata.to.value().unwrap()[0].address,
+        "reader@example.invalid"
     );
-    assert_eq!(result.envelopes[1].size, Some(412));
+    assert_eq!(result.messages[1].metadata.size, 412);
     assert_eq!(
-        result.envelopes[1].message_id.as_deref(),
+        result.messages[1]
+            .metadata
+            .message_id
+            .value()
+            .map(String::as_str),
         Some("<four@example.invalid>")
     );
-    assert!(result.metrics.wire_bytes < 4096);
-    assert!(result.metrics.max_response_bytes <= Limits::default().max_response_bytes);
+    assert!(fixture.probe.metrics().wire_bytes < 4096);
+    assert!(fixture.probe.metrics().max_response_bytes <= Limits::default().max_response_bytes);
     fixture.task.await.unwrap();
 }
 
@@ -142,15 +144,10 @@ async fn invalid_envelope_projections_dispose_the_connection() {
         .await;
         let error = fixture
             .probe
-            .search(
-                "fixture",
-                "disposable-password",
-                "INBOX",
-                UidWindow { first: 1, last: 10 },
-            )
+            .search_window("fixture", "disposable-password", "INBOX", 77, 1..=10)
             .await
             .unwrap_err();
-        assert_eq!(error, expected);
+        assert_eq!(error.code, mailctl::domain::Error::from(expected).code);
         fixture.task.await.unwrap();
     }
 }
@@ -191,15 +188,13 @@ async fn unsafe_selection_never_reaches_search() {
         .await;
         let error = fixture
             .probe
-            .search(
-                "fixture",
-                "disposable-password",
-                "INBOX",
-                UidWindow { first: 1, last: 10 },
-            )
+            .search_window("fixture", "disposable-password", "INBOX", 77, 1..=10)
             .await
             .unwrap_err();
-        assert_eq!(error, mailctl::imap::Error::UnsafeSelection);
+        assert_eq!(
+            error.code,
+            mailctl::domain::Error::from(mailctl::imap::Error::UnsafeSelection).code
+        );
         fixture.task.await.unwrap();
     }
 }
@@ -436,15 +431,13 @@ async fn missing_or_duplicate_search_data_cannot_claim_an_empty_result() {
         .await;
         let error = fixture
             .probe
-            .search(
-                "fixture",
-                "disposable-password",
-                "INBOX",
-                UidWindow { first: 1, last: 10 },
-            )
+            .search_window("fixture", "disposable-password", "INBOX", 77, 1..=10)
             .await
             .unwrap_err();
-        assert_eq!(error, mailctl::imap::Error::Protocol);
+        assert_eq!(
+            error.code,
+            mailctl::domain::Error::from(mailctl::imap::Error::Protocol).code
+        );
         fixture.task.await.unwrap();
     }
 }
@@ -462,15 +455,13 @@ async fn unsolicited_uid_ranges_are_rejected_before_backend_expansion() {
     .await;
     let error = fixture
         .probe
-        .search(
-            "fixture",
-            "disposable-password",
-            "INBOX",
-            UidWindow { first: 1, last: 10 },
-        )
+        .search_window("fixture", "disposable-password", "INBOX", 77, 1..=10)
         .await
         .unwrap_err();
-    assert_eq!(error, mailctl::imap::Error::Unsupported);
+    assert_eq!(
+        error.code,
+        mailctl::domain::Error::from(mailctl::imap::Error::Unsupported).code
+    );
     assert!(fixture.probe.metrics().max_response_bytes < 256);
     fixture.task.await.unwrap();
 }
@@ -539,26 +530,23 @@ fn client_allocations_remain_bounded_for_discovery_envelopes_and_oversized_liter
                             .discover("fixture", "disposable-password", &["INBOX".into()])
                             .await
                             .unwrap()
-                            .mailboxes
                             .len(),
                         1
                     );
                 } else {
                     let result = probe
-                        .search(
-                            "fixture",
-                            "disposable-password",
-                            "INBOX",
-                            UidWindow { first: 1, last: 10 },
-                        )
+                        .search_window("fixture", "disposable-password", "INBOX", 77, 1..=10)
                         .await;
                     if route == "oversized-literal" {
-                        assert_eq!(result.unwrap_err(), mailctl::imap::Error::Limit);
+                        assert_eq!(
+                            result.unwrap_err().code,
+                            mailctl::domain::ErrorCode::ResponseTooLarge
+                        );
                     } else {
-                        let envelope = result.unwrap().envelopes.remove(0);
+                        let envelope = result.unwrap().messages.remove(0);
                         assert_eq!(envelope.uid, 4);
                         if route == "large-envelope" {
-                            assert_eq!(envelope.subject.unwrap().len(), 60 * 1024);
+                            assert_eq!(envelope.metadata.subject.value().unwrap().len(), 60 * 1024);
                         }
                     }
                 }
@@ -617,8 +605,8 @@ async fn exact_discovery_preserves_spaces_ampersands_and_fragmented_responses() 
         .discover("fixture", "disposable-password", &["A&B Box".into()])
         .await
         .unwrap();
-    assert_eq!(result.mailboxes[0].name, "A&B Box");
-    assert!(!result.mailboxes[0].selectable);
+    assert_eq!(result[0].name, "A&B Box");
+    assert!(!result[0].selectable);
     fixture.task.await.unwrap();
 }
 
@@ -654,59 +642,35 @@ async fn excessive_nesting_and_invalid_literal_declarations_dispose_connections(
 }
 
 #[tokio::test]
-async fn discovery_and_search_inputs_are_bounded_before_connecting() {
-    use mailctl::imap::{Error, ImapProbe};
-    use tokio_rustls::rustls::RootCertStore;
-    let mut probe = ImapProbe::new(
-        "localhost".into(),
-        9,
-        TlsMode::Implicit,
-        RootCertStore::empty(),
-        Limits::default(),
-    )
-    .unwrap();
-    for mailbox in [
+async fn discovery_inputs_are_bounded_before_mailbox_dispatch() {
+    use mailctl::imap::Error;
+    let mut cases = [
         "*",
         "Approved/%",
         "bad\r\nname",
         "bad\u{7f}name",
         "bad\u{85}name",
-    ] {
+    ]
+    .into_iter()
+    .map(|name| (vec![name.into()], Error::Unsupported))
+    .collect::<Vec<_>>();
+    cases.push((vec!["INBOX".into(); 1001], Error::Limit));
+    for (names, expected) in cases {
+        let mut fixture = fixture(TlsMode::Implicit, Limits::default(), |mut wire| {
+            Box::pin(async move {
+                authenticate(&mut wire).await;
+                dropped(&mut wire).await;
+            })
+        })
+        .await;
         assert_eq!(
-            probe
-                .discover("fixture", "disposable-password", &[mailbox.into()])
+            fixture
+                .probe
+                .discover("fixture", "disposable-password", &names)
                 .await
                 .unwrap_err(),
-            Error::Unsupported
+            expected
         );
-    }
-    assert_eq!(
-        probe
-            .discover(
-                "fixture",
-                "disposable-password",
-                &vec!["INBOX".into(); 1001]
-            )
-            .await
-            .unwrap_err(),
-        Error::Limit
-    );
-    for window in [
-        UidWindow {
-            first: 1,
-            last: 1001,
-        },
-        UidWindow {
-            first: 1,
-            last: u32::MAX,
-        },
-    ] {
-        assert_eq!(
-            probe
-                .search("fixture", "disposable-password", "INBOX", window)
-                .await
-                .unwrap_err(),
-            Error::Limit
-        );
+        fixture.task.await.unwrap();
     }
 }

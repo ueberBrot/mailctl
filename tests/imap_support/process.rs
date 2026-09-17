@@ -1,3 +1,8 @@
+#![allow(
+    dead_code,
+    reason = "integration-test crates use different subsets of these shared fixture helpers"
+)]
+
 use super::imap_support;
 use std::{
     collections::VecDeque,
@@ -44,7 +49,6 @@ pub struct ImapServer {
     pub certificate: PathBuf,
     expected: Arc<Mutex<VecDeque<Expected>>>,
     accepted: Arc<AtomicUsize>,
-    #[allow(dead_code, reason = "observed only by export cancellation tests")]
     interrupted: Arc<AtomicUsize>,
     stop: watch::Sender<bool>,
     task: Option<thread::JoinHandle<()>>,
@@ -129,7 +133,6 @@ impl ImapServer {
         }
     }
 
-    #[allow(dead_code, reason = "observed only by export cancellation tests")]
     pub fn interrupted(&self) -> usize {
         self.interrupted.load(Ordering::SeqCst)
     }

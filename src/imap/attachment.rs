@@ -1,7 +1,7 @@
 //! Bounded attachment transfer ownership and verified IMAP retrieval.
 mod decoder;
 use super::{
-    Error, ImapProbe, Limits, Metrics, credentials,
+    Error, Limits, Metrics,
     fetch::Fetch,
     mailbox,
     mime::{
@@ -18,14 +18,7 @@ use io_imap::{
         fetch::{Part, Section},
     },
 };
-use sha2::{Digest, Sha256};
-use std::{
-    collections::{HashMap, hash_map::Entry},
-    fmt,
-    num::NonZeroU32,
-    sync::{Arc, Mutex, MutexGuard, Weak},
-    time::Instant,
-};
+use std::num::NonZeroU32;
 
 /// A metadata-only attachment locator. Its part identifier is safe to retain in a message
 /// reference; it is not a transfer credential.
@@ -50,152 +43,14 @@ pub struct AttachmentMetadata {
     pub available: bool,
 }
 
-#[derive(Clone, Debug)]
-pub struct AttachmentList {
-    pub attachments: Vec<AttachmentMetadata>,
-    pub metrics: Metrics,
-}
-
-/// Starts a transfer from an attachment part, or consumes a continuation issued by this probe.
-/// The continuation constructor intentionally carries no caller-controlled message identity.
-#[derive(Debug)]
-pub struct AttachmentRequest {
-    kind: RequestKind,
-}
-#[derive(Debug)]
-enum RequestKind {
-    Start {
-        uid: u32,
-        uid_validity: u32,
-        part: String,
-    },
-    Resume(AttachmentTransfer),
-}
-impl AttachmentRequest {
-    pub fn new(uid: u32, uid_validity: u32, part: impl Into<String>) -> Self {
-        Self {
-            kind: RequestKind::Start {
-                uid,
-                uid_validity,
-                part: part.into(),
-            },
-        }
-    }
-    pub fn resume(transfer: AttachmentTransfer) -> Self {
-        Self {
-            kind: RequestKind::Resume(transfer),
-        }
-    }
-}
-
-/// An opaque continuation owned by one probe session. Resume or cancellation consumes it.
-///
-/// ```compile_fail
-/// use mailctl::imap::AttachmentTransfer;
-/// fn copy(transfer: AttachmentTransfer) { let _ = transfer.clone(); }
-/// ```
-///
-/// ```compile_fail
-/// use mailctl::imap::AttachmentTransfer;
-/// let transfer = AttachmentTransfer { value: String::from("invented") };
-/// ```
-///
-/// ```compile_fail
-/// use mailctl::imap::{AttachmentTransfer, AttachmentRequest};
-/// fn reuse(transfer: AttachmentTransfer) {
-///     let first = AttachmentRequest::resume(transfer);
-///     let second = AttachmentRequest::resume(transfer);
-/// }
-/// ```
-pub struct AttachmentTransfer {
-    value: [u8; 32],
-    owner: Weak<Mutex<HashMap<[u8; 32], TransferState>>>,
-}
-impl fmt::Debug for AttachmentTransfer {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("AttachmentTransfer(..)")
-    }
-}
-impl Drop for AttachmentTransfer {
-    fn drop(&mut self) {
-        if let Some(owner) = self.owner.upgrade() {
-            owner
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .remove(&self.value);
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct AttachmentChunk {
-    pub bytes: Vec<u8>,
-    pub decoded_offset: u64,
-    pub progress: AttachmentProgress,
-    pub metrics: Metrics,
-}
-
-/// A chunk either continues a transfer or carries its final integrity result.
-#[derive(Debug)]
-pub enum AttachmentProgress {
-    Continue(AttachmentTransfer),
-    Complete(AttachmentIntegrity),
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AttachmentIntegrity {
     pub total_decoded_bytes: u64,
     pub sha256: [u8; 32],
 }
 
-#[derive(Default)]
-pub(super) struct TransferStore {
-    entries: Arc<Mutex<HashMap<[u8; 32], TransferState>>>,
-}
-impl TransferStore {
-    fn entries(&self) -> MutexGuard<'_, HashMap<[u8; 32], TransferState>> {
-        self.entries
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-    pub(super) fn active_count(&self) -> usize {
-        let now = Instant::now();
-        self.entries()
-            .values()
-            .filter(|state| state.expires > now)
-            .count()
-    }
-    fn prune(&mut self) {
-        let now = Instant::now();
-        self.entries().retain(|_, state| state.expires > now);
-    }
-    fn remove(&mut self, token: AttachmentTransfer) -> Result<TransferState, Error> {
-        self.prune();
-        if !Weak::ptr_eq(&Arc::downgrade(&self.entries), &token.owner) {
-            return Err(Error::TransferExpired);
-        }
-        // Release the registry lock before the consumed token's Drop runs.
-        let state = self.entries().remove(&token.value);
-        state.ok_or(Error::TransferExpired)
-    }
-    fn insert(&mut self, state: TransferState) -> Result<AttachmentTransfer, Error> {
-        let mut value = [0_u8; 32];
-        getrandom::fill(&mut value).map_err(|_| Error::Transport)?;
-        match self.entries().entry(value) {
-            Entry::Vacant(entry) => {
-                entry.insert(state);
-            }
-            Entry::Occupied(_) => return Err(Error::Transport),
-        }
-        Ok(AttachmentTransfer {
-            value,
-            owner: Arc::downgrade(&self.entries),
-        })
-    }
-}
-
 struct TransferState {
-    principal: [u8; 32],
+    identity: Option<[u8; 32]>,
     mailbox: String,
     uid: u32,
     uid_validity: u32,
@@ -203,7 +58,6 @@ struct TransferState {
     decoder: Decoder,
     wire_bytes: usize,
     eof: bool,
-    expires: Instant,
 }
 
 struct AttachmentDefinition {
@@ -214,171 +68,77 @@ struct AttachmentDefinition {
     encoding: Option<TransferEncoding>,
 }
 
-impl ImapProbe {
-    /// Lists attachment metadata from BODYSTRUCTURE only. It never requests an attachment
-    /// section, so a large payload cannot affect this route's allocation or wire budget.
-    pub async fn list_attachments(
+impl TransferState {
+    async fn read_selected(
         &mut self,
-        username: &str,
-        password: &str,
-        name: &str,
-        request: AttachmentListRequest,
-    ) -> Result<AttachmentList, Error> {
-        self.metrics = Metrics::default();
-        self.transfers.prune();
-        credentials(username, password)?;
-        mailbox(name)?;
-        if request.uid == 0 || request.uid_validity == 0 {
-            return Err(Error::InvalidInput);
-        }
-        let limits = self.limits.clone();
-        tokio::time::timeout(limits.operation_timeout, async {
-            let mut conn = self.authenticate(username, password).await?;
-            if conn.examine(name).await? != request.uid_validity {
-                return Err(Error::UnsafeSelection);
-            }
-            let attachments = attachment_definitions(&mut conn, request.uid, &limits)
+        conn: &mut Connection<'_>,
+        limits: &Limits,
+    ) -> Result<Vec<u8>, Error> {
+        if self.wire_bytes == 0 && !self.eof {
+            let definition = attachment_definitions(conn, self.uid, limits)
                 .await?
                 .into_iter()
-                .map(AttachmentDefinition::into_metadata)
-                .collect();
-            conn.drive(ImapLogout::new()).await?;
-            let mut metrics = conn.metrics();
-            metrics.active_transfers = self.transfers.active_count();
-            self.metrics = metrics;
-            Ok(AttachmentList {
-                attachments,
-                metrics,
-            })
-        })
-        .await
-        .map_err(|_| Error::Timeout)?
+                .find(|entry| entry.part == self.part)
+                .ok_or(Error::StaleReference)?;
+            self.decoder = Decoder::new(definition.encoding.ok_or(Error::Unsupported)?);
+        }
+        let mut fetched = false;
+        while self.decoder.pending_len() < limits.max_attachment_chunk_bytes && !self.eof {
+            // Return the available prefix at a clean command boundary when another maximum
+            // response pair would approach the operation budget. Every call can attempt a slice.
+            if fetched
+                && limits
+                    .max_operation_bytes
+                    .saturating_sub(conn.metrics().wire_bytes)
+                    < limits.max_response_bytes.saturating_mul(2)
+            {
+                break;
+            }
+            let remaining = limits
+                .max_attachment_wire_bytes
+                .checked_sub(self.wire_bytes)
+                .ok_or(Error::Limit)?;
+            let count = WIRE_SLICE_BYTES
+                .min(limits.max_literal_bytes)
+                .min(limits.max_response_bytes / 2)
+                .min(remaining.saturating_add(1));
+            if count == 0 {
+                return Err(Error::InvalidInput);
+            }
+            let fetch = Fetch::Bytes {
+                uid: self.uid,
+                section: Some(Section::Part(self.part.clone())),
+                offset: u32::try_from(self.wire_bytes).map_err(|_| Error::Limit)?,
+                count: count as u32,
+            };
+            let fields = fetch.execute(conn).await?;
+            let wire = fetch.data(&fields)?;
+            self.wire_bytes = self
+                .wire_bytes
+                .checked_add(wire.len())
+                .ok_or(Error::Limit)?;
+            self.publish(conn.metrics_mut());
+            if wire.len() > remaining {
+                return Err(Error::Limit);
+            }
+            let decoded = self.decoder.push(wire, limits);
+            self.publish(conn.metrics_mut());
+            decoded?;
+            if wire.len() < count {
+                self.eof = true;
+                let finished = self.decoder.finish(limits);
+                self.publish(conn.metrics_mut());
+                finished?;
+            }
+            fetched = true;
+            tokio::task::yield_now().await;
+        }
+        let bytes = self.decoder.take_chunk(limits.max_attachment_chunk_bytes);
+        self.publish(conn.metrics_mut());
+        conn.drive(ImapLogout::new()).await?;
+        Ok(bytes)
     }
 
-    /// Fills a decoded chunk through bounded PEEK requests on one exclusive lease.
-    /// EOF comes from a short response; every continuation rechecks UIDVALIDITY.
-    pub async fn read_attachment(
-        &mut self,
-        username: &str,
-        password: &str,
-        name: &str,
-        request: AttachmentRequest,
-    ) -> Result<AttachmentChunk, Error> {
-        self.metrics = Metrics::default();
-        self.transfers.prune();
-        let limits = self.limits.clone();
-        let starting = matches!(request.kind, RequestKind::Start { .. });
-        // A moved continuation relinquishes its retained state even when later validation fails.
-        let mut state = match request.kind {
-            RequestKind::Resume(token) => self.transfers.remove(token)?,
-            RequestKind::Start {
-                uid,
-                uid_validity,
-                part,
-            } => {
-                credentials(username, password)?;
-                mailbox(name)?;
-                if uid == 0 || uid_validity == 0 {
-                    return Err(Error::InvalidInput);
-                }
-                if self.transfers.active_count() >= limits.max_transfers {
-                    return Err(Error::Limit);
-                }
-                TransferState::new(
-                    username,
-                    name,
-                    uid,
-                    uid_validity,
-                    parse_part(&part, &limits)?,
-                    &limits,
-                )
-            }
-        };
-        state.publish(&mut self.metrics);
-        credentials(username, password)?;
-        mailbox(name)?;
-        if state.mailbox != name || state.principal != principal(username) {
-            return Err(Error::TransferExpired);
-        }
-        let operation_deadline = Instant::now() + limits.operation_timeout;
-        let deadline = operation_deadline.min(state.expires);
-        let expired_error = if state.expires <= operation_deadline {
-            Error::TransferExpired
-        } else {
-            Error::Timeout
-        };
-        let bytes = tokio::time::timeout_at(deadline.into(), async {
-            let mut conn = self.authenticate(username, password).await?;
-            if conn.examine(name).await? != state.uid_validity {
-                return Err(Error::UnsafeSelection);
-            }
-            if starting {
-                let definition = attachment_definitions(&mut conn, state.uid, &limits)
-                    .await?
-                    .into_iter()
-                    .find(|definition| definition.part == state.part)
-                    .ok_or(Error::InvalidInput)?;
-                state.decoder = Decoder::new(definition.encoding.ok_or(Error::Unsupported)?);
-            }
-            let bytes = attachment_bytes(&mut conn, &mut state, &limits).await?;
-            conn.drive(ImapLogout::new()).await?;
-            Ok(bytes)
-        })
-        .await
-        .map_err(|_| expired_error)??;
-        // Synchronous decoding and finalization also obey the absolute transfer deadline.
-        if Instant::now() >= deadline {
-            return Err(expired_error);
-        }
-        let decoded_offset = state.decoder.decoded_offset() - bytes.len();
-        let complete = state.eof && state.decoder.pending_len() == 0;
-        let progress = if complete {
-            let (total_decoded_bytes, sha256) = state.decoder.integrity();
-            AttachmentProgress::Complete(AttachmentIntegrity {
-                total_decoded_bytes,
-                sha256,
-            })
-        } else {
-            AttachmentProgress::Continue(self.transfers.insert(state)?)
-        };
-        self.metrics.active_transfers = self.transfers.active_count();
-        Ok(AttachmentChunk {
-            bytes,
-            decoded_offset: decoded_offset as u64,
-            progress,
-            metrics: self.metrics,
-        })
-    }
-
-    /// Cancels an admitted transfer and releases its bounded decoder state immediately.
-    pub fn cancel_attachment(&mut self, transfer: AttachmentTransfer) -> Result<(), Error> {
-        self.transfers.remove(transfer)?;
-        self.metrics.active_transfers = self.transfers.active_count();
-        Ok(())
-    }
-}
-
-impl TransferState {
-    fn new(
-        username: &str,
-        mailbox: &str,
-        uid: u32,
-        uid_validity: u32,
-        part: Part,
-        limits: &Limits,
-    ) -> Self {
-        Self {
-            principal: principal(username),
-            mailbox: mailbox.to_owned(),
-            uid,
-            uid_validity,
-            part,
-            decoder: Decoder::new(TransferEncoding::Identity),
-            wire_bytes: 0,
-            eof: false,
-            expires: Instant::now() + limits.max_transfer_lifetime,
-        }
-    }
     fn publish(&self, metrics: &mut Metrics) {
         let decoder = self.decoder.snapshot();
         metrics.transfer_wire_bytes = self.wire_bytes;
@@ -386,70 +146,6 @@ impl TransferState {
         metrics.transfer_decode_steps = decoder.decode_steps;
         metrics.max_transfer_state_bytes = decoder.max_state_bytes;
     }
-}
-
-async fn attachment_bytes(
-    conn: &mut Connection<'_>,
-    state: &mut TransferState,
-    limits: &Limits,
-) -> Result<Vec<u8>, Error> {
-    let mut fetched = false;
-    while state.decoder.pending_len() < limits.max_attachment_chunk_bytes && !state.eof {
-        // Return the available prefix at a clean command boundary when another maximum
-        // response pair would approach the operation budget. Every call can attempt a slice.
-        if fetched
-            && limits
-                .max_operation_bytes
-                .saturating_sub(conn.metrics().wire_bytes)
-                < limits.max_response_bytes.saturating_mul(2)
-        {
-            break;
-        }
-        if Instant::now() >= state.expires {
-            return Err(Error::TransferExpired);
-        }
-        let remaining = limits
-            .max_attachment_wire_bytes
-            .checked_sub(state.wire_bytes)
-            .ok_or(Error::Limit)?;
-        let count = WIRE_SLICE_BYTES
-            .min(limits.max_literal_bytes)
-            .min(limits.max_response_bytes / 2)
-            .min(remaining.saturating_add(1));
-        if count == 0 {
-            return Err(Error::InvalidInput);
-        }
-        let fetch = Fetch::Bytes {
-            uid: state.uid,
-            section: Some(Section::Part(state.part.clone())),
-            offset: u32::try_from(state.wire_bytes).map_err(|_| Error::Limit)?,
-            count: count as u32,
-        };
-        let fields = fetch.execute(conn).await?;
-        let wire = fetch.data(&fields)?;
-        state.wire_bytes = state
-            .wire_bytes
-            .checked_add(wire.len())
-            .ok_or(Error::Limit)?;
-        state.publish(conn.metrics_mut());
-        if wire.len() > remaining {
-            return Err(Error::Limit);
-        }
-        let decoded = state.decoder.push(wire, limits);
-        state.publish(conn.metrics_mut());
-        decoded?;
-        if wire.len() < count {
-            state.eof = true;
-            let finished = state.decoder.finish(limits);
-            state.publish(conn.metrics_mut());
-            finished?;
-        }
-        fetched = true;
-        tokio::task::yield_now().await;
-    }
-    let bytes = state.decoder.take_chunk(limits.max_attachment_chunk_bytes);
-    state.publish(conn.metrics_mut());
-    Ok(bytes)
 }
 
 fn parse_part(part: &str, limits: &Limits) -> Result<Part, Error> {
@@ -574,22 +270,17 @@ fn safe_filename(value: &str) -> Option<String> {
     }
 }
 
-fn principal(username: &str) -> [u8; 32] {
-    Sha256::digest(username.as_bytes()).into()
-}
-
 impl super::AuthenticatedConnection {
-    pub(crate) async fn list_attachments(
+    pub async fn list_attachments(
         self,
         name: &str,
         request: AttachmentListRequest,
-        limits: &crate::config::Limits,
+        limits: &Limits,
+        metrics: &mut Metrics,
     ) -> Result<Vec<AttachmentMetadata>, Error> {
-        let limits = application_limits(limits);
         limits.validate()?;
-        let mut metrics = Metrics::default();
-        let mut conn = self.0.resume(&mut metrics);
-        conn.limit_body(&limits);
+        let mut conn = self.session.resume(metrics);
+        conn.limit_body(limits);
         mailbox(name)?;
         if request.uid == 0 || request.uid_validity == 0 {
             return Err(Error::InvalidInput);
@@ -597,7 +288,7 @@ impl super::AuthenticatedConnection {
         if conn.examine(name).await? != request.uid_validity {
             return Err(Error::StaleReference);
         }
-        let result = attachment_definitions(&mut conn, request.uid, &limits)
+        let result = attachment_definitions(&mut conn, request.uid, limits)
             .await?
             .into_iter()
             .map(AttachmentDefinition::into_metadata)
@@ -606,81 +297,91 @@ impl super::AuthenticatedConnection {
         Ok(result)
     }
 }
-fn application_limits(limits: &crate::config::Limits) -> Limits {
-    Limits {
-        max_header_bytes: limits.header_bytes,
-        max_nesting: limits.mime_depth,
-        max_mime_parts: limits.mime_parts,
-        max_attachment_wire_bytes: limits.attachment_wire_bytes,
-        max_attachment_decoded_bytes: limits.attachment_decoded_bytes,
-        max_attachment_chunk_bytes: limits.attachment_chunk_bytes,
-        max_transfer_lifetime: std::time::Duration::from_secs(limits.transfer_seconds as u64),
-        max_transfers: limits.transfers_per_account,
-        max_operation_bytes: limits.wire_fetch_bytes,
-        ..Limits::default()
+impl Limits {
+    pub(crate) fn attachment(limits: &crate::config::Limits) -> Self {
+        Self {
+            max_header_bytes: limits.header_bytes,
+            max_nesting: limits.mime_depth,
+            max_mime_parts: limits.mime_parts,
+            max_attachment_wire_bytes: limits.attachment_wire_bytes,
+            max_attachment_decoded_bytes: limits.attachment_decoded_bytes,
+            max_attachment_chunk_bytes: limits.attachment_chunk_bytes,
+            max_operation_bytes: limits.wire_fetch_bytes,
+            ..Self::default()
+        }
     }
 }
 
 /// One decoded page. Only a completed page carries its final byte count and digest.
+#[derive(Debug)]
 pub struct AttachmentData {
     pub bytes: Vec<u8>,
     pub decoded_offset: u64,
     pub integrity: Option<AttachmentIntegrity>,
 }
 
-pub(crate) struct AttachmentDecoder(Option<TransferState>);
+/// Incremental decoding state, bound to its mailbox, UIDVALIDITY, UID, and part.
+/// The first read binds the authenticated endpoint and username. Completion, a read
+/// failure, or cancellation during retrieval invalidates the state. The application
+/// owns deadlines, quotas, and continuation-token authorization.
+///
+/// State cannot be cloned or replaced by callers:
+/// ```compile_fail
+/// use mailctl::imap::AttachmentDecoder;
+/// fn duplicate(decoder: AttachmentDecoder) { let _ = decoder.clone(); }
+/// ```
+/// ```compile_fail
+/// use mailctl::imap::AttachmentDecoder;
+/// fn reset(decoder: &mut AttachmentDecoder) { decoder.0 = None; }
+/// ```
+pub struct AttachmentDecoder(Option<TransferState>);
 impl AttachmentDecoder {
-    pub(crate) fn new(
-        username: &str,
+    pub fn new(
         mailbox: &str,
         uid: u32,
         validity: u32,
         part: &str,
-        limits: &crate::config::Limits,
+        limits: &Limits,
     ) -> Result<Self, Error> {
-        let limits = application_limits(limits);
         limits.validate()?;
-        Ok(Self(Some(TransferState::new(
-            username,
-            mailbox,
+        super::mailbox(mailbox)?;
+        if uid == 0 || validity == 0 {
+            return Err(Error::InvalidInput);
+        }
+        Ok(Self(Some(TransferState {
+            identity: None,
+            mailbox: mailbox.to_owned(),
             uid,
-            validity,
-            parse_part(part, &limits)?,
-            &limits,
-        ))))
+            uid_validity: validity,
+            part: parse_part(part, limits)?,
+            decoder: Decoder::new(TransferEncoding::Identity),
+            wire_bytes: 0,
+            eof: false,
+        })))
     }
 }
 impl super::AuthenticatedConnection {
-    pub(crate) async fn read_attachment(
+    pub async fn read_attachment(
         self,
         decoder: &mut AttachmentDecoder,
-        limits: &crate::config::Limits,
+        limits: &Limits,
+        metrics: &mut Metrics,
     ) -> Result<AttachmentData, Error> {
-        let limits = application_limits(limits);
-        limits.validate()?;
         let mut state = decoder.0.take().ok_or(Error::TransferExpired)?;
-        if Instant::now() >= state.expires {
+        limits.validate()?;
+        if state
+            .identity
+            .is_some_and(|identity| identity != self.identity)
+        {
             return Err(Error::TransferExpired);
         }
-        let mut metrics = Metrics::default();
-        let mut conn = self.0.resume(&mut metrics);
-        conn.limit_body(&limits);
+        state.identity = Some(self.identity);
+        let mut conn = self.session.resume(metrics);
+        conn.limit_body(limits);
         if conn.examine(&state.mailbox).await? != state.uid_validity {
             return Err(Error::StaleReference);
         }
-        if state.wire_bytes == 0 && !state.eof {
-            let definition = attachment_definitions(&mut conn, state.uid, &limits)
-                .await?
-                .into_iter()
-                .find(|entry| entry.part == state.part)
-                .ok_or(Error::StaleReference)?;
-            state.decoder = Decoder::new(definition.encoding.ok_or(Error::Unsupported)?);
-        }
-        let bytes = attachment_bytes(&mut conn, &mut state, &limits).await?;
-        conn.drive(ImapLogout::new()).await?;
-        if Instant::now() >= state.expires {
-            return Err(Error::TransferExpired);
-        }
+        let bytes = state.read_selected(&mut conn, limits).await?;
         let decoded_offset = (state.decoder.decoded_offset() - bytes.len()) as u64;
         let integrity = if state.eof && state.decoder.pending_len() == 0 {
             let (total_decoded_bytes, sha256) = state.decoder.integrity();
@@ -707,7 +408,7 @@ async fn attachment_definitions(
 ) -> Result<Vec<AttachmentDefinition>, Error> {
     let fetch = Fetch::Metadata { uid };
     let fields = fetch.execute(conn).await?;
-    let (_, structure) = fetch.metadata(&fields)?;
+    let (_, structure) = Fetch::metadata(&fields)?;
     attachments(structure, limits)
 }
 impl AttachmentDefinition {

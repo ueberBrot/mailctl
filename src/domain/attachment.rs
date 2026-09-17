@@ -14,7 +14,7 @@ pub struct ExportReceipt {
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ListAttachmentsInput {
-    #[serde(deserialize_with = "reference")]
+    #[serde(deserialize_with = "super::reference")]
     #[schemars(length(min = 1, max = 8192), extend("x-maxUtf8Bytes" = 8192))]
     pub message: String,
 }
@@ -29,20 +29,16 @@ pub enum GetAttachmentInput {
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AttachmentStart {
-    #[serde(deserialize_with = "reference")]
+    #[serde(deserialize_with = "super::reference")]
     #[schemars(length(min = 1, max = 8192), extend("x-maxUtf8Bytes" = 8192))]
     pub attachment: String,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AttachmentContinuation {
-    #[serde(deserialize_with = "reference")]
+    #[serde(deserialize_with = "super::reference")]
     #[schemars(length(min = 1, max = 8192), extend("x-maxUtf8Bytes" = 8192))]
     pub token: String,
-}
-fn reference<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
-    super::bounded_optional_string::<D, 8192>(d)?
-        .ok_or_else(|| serde::de::Error::custom("reference is required"))
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]

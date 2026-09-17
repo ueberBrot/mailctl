@@ -1,13 +1,9 @@
-#[allow(dead_code)]
 mod attachment_support;
-#[allow(dead_code)]
 mod imap_support;
 
-use attachment_support::{continuation, metadata};
+use attachment_support::{decoder, metadata};
 use imap_support::*;
-use mailctl::imap::{
-    AttachmentListRequest, AttachmentProgress, AttachmentRequest, Error, Limits, TlsMode,
-};
+use mailctl::imap::{AttachmentListRequest, Error, Limits, TlsMode};
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -19,6 +15,11 @@ const MIXED: &str = "((\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT
 async fn supported_encodings_preserve_bytes_across_wire_and_decoded_chunk_boundaries() {
     let cases: &[(&str, &[u8], &[u8])] = &[
         ("BASE64", b"SGVsbG8sIHdvcmxkIQ==", b"Hello, world!"),
+        (
+            "BASE64",
+            b" SGVs\r\nbG8s\tIHdvcmxkIQ==\r\n",
+            b"Hello, world!",
+        ),
         (
             "QUOTED-PRINTABLE",
             b"Hello=2C=20wo=\r\nrld!",
@@ -58,20 +59,20 @@ async fn supported_encodings_preserve_bytes_across_wire_and_decoded_chunk_bounda
             },
         )
         .await;
-        let mut request = AttachmentRequest::new(4, 77, "2");
+        let mut request = decoder();
         let mut bytes: Vec<u8> = Vec::new();
         for chunk_number in 0..chunks {
             let chunk = fixture
                 .probe
-                .read_attachment("fixture", "disposable-password", "INBOX", request)
+                .read_attachment("fixture", "disposable-password", &mut request)
                 .await
                 .unwrap();
             assert_eq!(chunk.decoded_offset, bytes.len() as u64, "{encoding}");
             assert!(chunk.bytes.len() <= 4);
-            assert!(chunk.metrics.max_literal_bytes <= 5);
+            assert!(fixture.probe.metrics().max_literal_bytes <= 5);
             bytes.extend(&chunk.bytes);
             if chunk_number + 1 == chunks {
-                let AttachmentProgress::Complete(integrity) = chunk.progress else {
+                let Some(integrity) = chunk.integrity else {
                     panic!("expected completion");
                 };
                 assert_eq!(integrity.total_decoded_bytes, 13);
@@ -86,7 +87,6 @@ async fn supported_encodings_preserve_bytes_across_wire_and_decoded_chunk_bounda
                 );
                 break;
             }
-            request = AttachmentRequest::resume(continuation(chunk));
         }
         assert_eq!(bytes, expected, "{encoding}");
         assert_eq!(observed.load(Ordering::Relaxed), payload.len());
@@ -117,7 +117,7 @@ async fn attachment_listing_checks_uidvalidity_before_fetching() {
         )
         .await
         .unwrap_err();
-    assert_eq!(error, Error::UnsafeSelection);
+    assert_eq!(error, Error::StaleReference);
     fixture.task.await.unwrap();
 }
 
@@ -145,12 +145,7 @@ async fn binary_attachment_preserves_nul_high_bytes_and_line_endings() {
         .await;
         let chunk = fixture
             .probe
-            .read_attachment(
-                "fixture",
-                "disposable-password",
-                "INBOX",
-                AttachmentRequest::new(4, 77, "2"),
-            )
+            .read_attachment("fixture", "disposable-password", &mut decoder())
             .await
             .unwrap_or_else(|error| panic!("{encoding}: {error:?}"));
         let expected: &[u8] = if encoding == "8BIT" {
@@ -159,7 +154,7 @@ async fn binary_attachment_preserves_nul_high_bytes_and_line_endings() {
             b"\0\xff\r\nx"
         };
         assert_eq!(chunk.bytes, expected, "{encoding}");
-        assert!(matches!(chunk.progress, AttachmentProgress::Complete(_)));
+        assert!(chunk.integrity.is_some());
         fixture.task.await.unwrap();
     }
 }
@@ -188,14 +183,14 @@ async fn attachment_listing_reads_structure_without_fetching_any_payload() {
         )
         .await
         .unwrap();
-    assert_eq!(listing.attachments.len(), 1);
-    let attachment = &listing.attachments[0];
+    assert_eq!(listing.len(), 1);
+    let attachment = &listing[0];
     assert_eq!(attachment.part, "2");
     assert_eq!(attachment.filename.as_deref(), Some("large.bin"));
     assert_eq!(attachment.media_type, "application/octet-stream");
     assert_eq!(attachment.declared_size, Some(3_000_000));
     assert!(attachment.available);
-    assert!(listing.metrics.wire_bytes < 4096);
-    assert_eq!(listing.metrics.max_literal_bytes, 0);
+    assert!(fixture.probe.metrics().wire_bytes < 4096);
+    assert_eq!(fixture.probe.metrics().max_literal_bytes, 0);
     fixture.task.await.unwrap();
 }

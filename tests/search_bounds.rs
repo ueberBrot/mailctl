@@ -1,5 +1,4 @@
 //! Measure the exact typed search routine used by application requests.
-#[allow(dead_code)]
 mod imap_support;
 use imap_support::*;
 use mailctl::{

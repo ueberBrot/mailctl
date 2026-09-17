@@ -1,8 +1,6 @@
 #![cfg(all(feature = "cli", feature = "mcp"))]
-#[allow(dead_code)]
 #[path = "../../imap_support/mod.rs"]
 mod imap_support;
-#[allow(dead_code)]
 #[path = "../../imap_support/process.rs"]
 mod server;
 #[path = "../../support/mod.rs"]

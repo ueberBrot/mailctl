@@ -14,10 +14,7 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 struct EmailTools {
-    attachments: bool,
-    mailboxes: bool,
-    search: bool,
-    read: bool,
+    tools: Vec<Tool>,
     application: Application,
     active: Semaphore,
     envelope_limit: usize,
@@ -25,77 +22,57 @@ struct EmailTools {
     shutdown: CancellationToken,
 }
 
-fn definitions(mailboxes: bool, search: bool, read: bool, attachments: bool) -> Vec<Tool> {
+fn tool<I: schemars::JsonSchema + 'static, O: schemars::JsonSchema + 'static>(
+    name: &'static str,
+    description: &'static str,
+) -> Tool {
+    Tool::new(name, description, serde_json::Map::new())
+        .with_input_schema::<I>()
+        .with_output_schema::<Envelope<O>>()
+}
+
+fn definitions(operations: &[String]) -> Vec<Tool> {
     let empty = json!({"type":"object","properties":{},"additionalProperties":false});
-    let mut tools = vec![
-        Tool::new(
+    [
+        tool::<ListAccountsInput, AccountDiscovery>(
             "email_list_accounts",
             "List authorized email accounts with explicit completion.",
-            serde_json::Map::new(),
-        )
-        .with_input_schema::<ListAccountsInput>()
-        .with_output_schema::<Envelope<AccountDiscovery>>(),
+        ),
         Tool::new(
             "email_capabilities",
             "Show effective permissions and implemented operations.",
             empty.as_object().unwrap().clone(),
         )
         .with_output_schema::<Envelope<Capabilities>>(),
-    ];
-    if mailboxes {
-        tools.push(
-            Tool::new(
-                "email_list_mailboxes",
-                "List approved mailboxes or resolve a reusable mailbox reference.",
-                serde_json::Map::new(),
-            )
-            .with_input_schema::<ListMailboxesInput>()
-            .with_output_schema::<Envelope<MailboxDiscovery>>(),
-        );
-    }
-    if search {
-        tools.push(
-            Tool::new(
-                "email_search_messages",
-                "Search one approved mailbox with AND predicates and bounded descending-UID pages.",
-                serde_json::Map::new(),
-            )
-            .with_input_schema::<SearchMessagesInput>()
-            .with_output_schema::<Envelope<MessageSearch>>(),
-        );
-    }
-    if read {
-        tools.push(
-            Tool::new(
-                "email_get_message",
-                "Read or continue bounded selected message text with representation and truncation metadata.",
-                serde_json::Map::new(),
-            )
-            .with_input_schema::<GetMessageInput>()
-            .with_output_schema::<Envelope<MessageBody>>(),
-        );
-    }
-    if attachments {
-        tools.push(
-            Tool::new(
-                "email_list_attachments",
-                "List attachment metadata and reusable references without retrieving payloads.",
-                serde_json::Map::new(),
-            )
-            .with_input_schema::<crate::domain::ListAttachmentsInput>()
-            .with_output_schema::<Envelope<crate::domain::AttachmentList>>(),
-        );
-        tools.push(
-            Tool::new(
-                "email_get_attachment",
-                "Retrieve a bounded base64 chunk, or resume a transfer in this session.",
-                serde_json::Map::new(),
-            )
-            .with_input_schema::<crate::domain::GetAttachmentInput>()
-            .with_output_schema::<Envelope<crate::domain::AttachmentChunk>>(),
-        );
-    }
-    tools
+        tool::<ListMailboxesInput, MailboxDiscovery>(
+            "email_list_mailboxes",
+            "List approved mailboxes or resolve a reusable mailbox reference.",
+        ),
+        tool::<SearchMessagesInput, MessageSearch>(
+            "email_search_messages",
+            "Search one approved mailbox with AND predicates and bounded descending-UID pages.",
+        ),
+        tool::<GetMessageInput, MessageBody>(
+            "email_get_message",
+            "Read or continue bounded selected message text with representation and truncation metadata.",
+        ),
+        tool::<crate::domain::ListAttachmentsInput, crate::domain::AttachmentList>(
+            "email_list_attachments",
+            "List attachment metadata and reusable references without retrieving payloads.",
+        ),
+        tool::<crate::domain::GetAttachmentInput, crate::domain::AttachmentChunk>(
+            "email_get_attachment",
+            "Retrieve a bounded base64 chunk, or resume a transfer in this session.",
+        ),
+    ]
+    .into_iter()
+    .filter(|tool| {
+        matches!(tool.name.as_ref(), "email_list_accounts" | "email_capabilities")
+            || operations
+                .iter()
+                .any(|operation| tool.name.strip_prefix("email_") == Some(operation.as_str()))
+    })
+    .collect()
 }
 
 impl ServerHandler for EmailTools {
@@ -126,7 +103,7 @@ impl ServerHandler for EmailTools {
                     .map_err(|_| McpError::internal_error("Service unavailable", None))?,
         };
         Ok(ListToolsResult {
-            tools: definitions(self.mailboxes, self.search, self.read, self.attachments),
+            tools: self.tools.clone(),
             ..Default::default()
         })
     }
@@ -147,38 +124,13 @@ impl ServerHandler for EmailTools {
         let input = request.arguments.unwrap_or_default();
         let operation = match (admitted.as_ref(), request.name.as_ref()) {
             (Err(error), _) => Err(error.clone()),
-            (_, "email_list_attachments") if self.attachments => {
-                serde_json::from_value(Value::Object(input))
-                    .map(Operation::ListAttachments)
-                    .map_err(|_| Error::new(ErrorCode::InvalidRequest))
-            }
-            (_, "email_get_attachment") if self.attachments => {
-                serde_json::from_value(Value::Object(input))
-                    .map(Operation::GetAttachment)
-                    .map_err(|_| Error::new(ErrorCode::InvalidRequest))
-            }
-            (_, "email_get_message") if self.read => serde_json::from_value(Value::Object(input))
-                .map(Operation::GetMessage)
-                .map_err(|_| Error::new(ErrorCode::InvalidRequest)),
-            (_, "email_search_messages") if self.search => {
-                serde_json::from_value(Value::Object(input))
-                    .map(Operation::SearchMessages)
-                    .map_err(|_| Error::new(ErrorCode::InvalidRequest))
-            }
-            (_, "email_list_mailboxes") if self.mailboxes => {
-                serde_json::from_value(Value::Object(input))
-                    .map(Operation::ListMailboxes)
-                    .map_err(|_| Error::new(ErrorCode::InvalidRequest))
-            }
-            (_, "email_list_accounts") => serde_json::from_value(Value::Object(input))
-                .map(Operation::ListAccounts)
-                .map_err(|_| Error::new(ErrorCode::InvalidRequest)),
-            (_, "email_capabilities") => {
-                if input.is_empty() {
-                    Ok(Operation::Capabilities)
-                } else {
-                    Err(Error::new(ErrorCode::InvalidRequest))
+            (_, name) if self.tools.iter().any(|tool| tool.name == name) => {
+                let name = name.strip_prefix("email_").unwrap();
+                let mut wire = json!({"operation": name});
+                if name != "capabilities" || !input.is_empty() {
+                    wire["input"] = Value::Object(input);
                 }
+                serde_json::from_value(wire).map_err(|_| Error::new(ErrorCode::InvalidRequest))
             }
             _ => {
                 return Err(McpError::new(
@@ -229,22 +181,6 @@ pub(super) async fn run(application: Application) -> Result<(), Error> {
     else {
         return Err(Error::new(ErrorCode::InternalError));
     };
-    let mailboxes = capabilities
-        .operations
-        .iter()
-        .any(|operation| operation == "list_mailboxes");
-    let search = capabilities
-        .operations
-        .iter()
-        .any(|operation| operation == "search_messages");
-    let read = capabilities
-        .operations
-        .iter()
-        .any(|operation| operation == "get_message");
-    let attachments = capabilities
-        .operations
-        .iter()
-        .any(|operation| operation == "get_attachment");
     let limits = application.limits()?;
     let bounds = Bounds::new(limits, application.response_bound()?)?;
     let expires = tokio::time::Instant::now()
@@ -255,10 +191,7 @@ pub(super) async fn run(application: Application) -> Result<(), Error> {
     let shutdown = CancellationToken::new();
     let _cancel_on_exit = shutdown.clone().drop_guard();
     let handler = EmailTools {
-        attachments,
-        read,
-        search,
-        mailboxes,
+        tools: definitions(&capabilities.operations),
         active: Semaphore::new(limits.active_requests),
         envelope_limit: bounds.envelope,
         deadline: Duration::from_secs(limits.operation_seconds as u64),

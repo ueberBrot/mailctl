@@ -1,10 +1,10 @@
+mod host_support;
 use mailctl::{
     domain::{BodyText, GetMessageInput, MessageMetadata, Operation, OperationResult},
     service::{MemoryBodies, MemoryMailboxes, MemoryMessage, MemoryMessages, Service},
 };
 use serde_json::json;
 use std::sync::Arc;
-#[allow(dead_code)]
 mod imap_support;
 fn config() -> mailctl::config::Config {
     mailctl::config::Config::parse(&format!(
@@ -44,6 +44,12 @@ async fn setup_with_state(
     persistent: bool,
 ) -> (Service, String) {
     let name = config.accounts[0].mailboxes[0].clone();
+    let service = setup_service(config, persistent)
+        .unwrap()
+        .with_body_backend(backend);
+    setup_message(name, service).await
+}
+async fn setup_message(name: String, service: Service) -> (Service, String) {
     let inventory = Arc::new(MemoryMailboxes::default());
     inventory.set(
         "work",
@@ -68,11 +74,9 @@ async fn setup_with_state(
             text: "".into(),
         }],
     );
-    let service = setup_service(config, persistent)
-        .unwrap()
+    let service = service
         .with_mailbox_backend(inventory)
-        .with_search_backend(messages)
-        .with_body_backend(backend);
+        .with_search_backend(messages);
     let context = service.context("reader", &Default::default()).unwrap();
     let OperationResult::Mailboxes(page) = service
         .execute(&context, Operation::ListMailboxes(Default::default()))
@@ -185,18 +189,6 @@ async fn body_reads_preserve_identity_bound_text_and_reauthorize_references() {
     );
 }
 
-struct SyntheticSource;
-impl mailctl::credentials::SecretSource for SyntheticSource {
-    fn availability(&self, _: uuid::Uuid) -> mailctl::credentials::Availability {
-        mailctl::credentials::Availability::Available
-    }
-    fn resolve(
-        &self,
-        _: uuid::Uuid,
-    ) -> Result<mailctl::credentials::Secret, mailctl::credentials::SourceError> {
-        mailctl::credentials::Secret::new(b"disposable-password".to_vec())
-    }
-}
 async fn live(
     fixture: &imap_support::Fixture,
     mut config: mailctl::config::Config,
@@ -204,19 +196,14 @@ async fn live(
     config.accounts[0].server = "127.0.0.1".into();
     config.accounts[0].port = fixture.port;
     config.accounts[0].username = "fixture".into();
-    let runtime = Arc::new(
-        mailctl::authentication::Runtime::new(config.limits.clone(), fixture.roots.clone())
-            .unwrap(),
-    );
-    let sources = std::collections::BTreeMap::from([(
-        "work".into(),
-        Arc::new(SyntheticSource) as Arc<dyn mailctl::credentials::SecretSource>,
-    )]);
-    setup(
-        config,
-        Arc::new(mailctl::service::ImapBackend::new(runtime, sources)),
-    )
-    .await
+    let name = config.accounts[0].mailboxes[0].clone();
+    let service = Service::in_memory(config)
+        .unwrap()
+        .with_environment(host_support::Host::new(
+            fixture.roots.clone(),
+            b"disposable-password",
+        ));
+    setup_message(name, service).await
 }
 #[tokio::test]
 async fn application_reads_short_body_without_fetching_large_attachment() {
@@ -373,6 +360,10 @@ fn message_input_rejects_unknown_fields_and_oversized_references() {
         assert!(serde_json::from_value::<GetMessageInput>(input).is_err());
     }
     assert!(serde_json::from_value::<GetMessageInput>(json!({"message":"é".repeat(4096)})).is_ok());
+    assert!(
+        serde_json::from_value::<GetMessageInput>(json!({"message":"valid", "cursor":null}))
+            .is_ok()
+    );
 }
 
 #[tokio::test]

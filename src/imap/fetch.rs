@@ -198,7 +198,7 @@ impl Fetch {
         }
         match self {
             Self::Metadata { .. } => {
-                self.metadata(items)?;
+                Self::metadata(items)?;
             }
             Self::Bytes { .. } => {
                 self.data(items)?;
@@ -207,7 +207,6 @@ impl Fetch {
         Ok(())
     }
     pub(super) fn metadata<'a, 'b>(
-        &self,
         items: &'a [MessageDataItem<'b>],
     ) -> Result<(u32, &'a BodyStructure<'b>), Error> {
         if items.len() != 3 {

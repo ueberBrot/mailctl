@@ -1,10 +1,9 @@
-#[allow(dead_code)]
 mod attachment_support;
-#[allow(dead_code)]
 mod imap_support;
+use attachment_support::decoder;
 
 use imap_support::*;
-use mailctl::imap::{AttachmentRequest, Limits, TlsMode};
+use mailctl::imap::{Limits, TlsMode};
 use std::sync::{Arc, atomic::AtomicUsize};
 
 #[tokio::test]
@@ -26,12 +25,7 @@ async fn quoted_printable_discards_raw_line_padding_and_preserves_encoded_whites
     .await;
     let chunk = fixture
         .probe
-        .read_attachment(
-            "fixture",
-            "disposable-password",
-            "INBOX",
-            AttachmentRequest::new(4, 77, "2"),
-        )
+        .read_attachment("fixture", "disposable-password", &mut decoder())
         .await
         .unwrap();
     assert_eq!(chunk.bytes, b"first\r\nsecond \t\r\nthird \tline\r\nlast");
@@ -70,12 +64,7 @@ async fn quoted_printable_padding_escapes_and_line_endings_survive_split_wire_sl
         .await;
         let chunk = fixture
             .probe
-            .read_attachment(
-                "fixture",
-                "disposable-password",
-                "INBOX",
-                AttachmentRequest::new(4, 77, "2"),
-            )
+            .read_attachment("fixture", "disposable-password", &mut decoder())
             .await
             .unwrap();
         assert_eq!(

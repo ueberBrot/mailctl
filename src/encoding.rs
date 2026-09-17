@@ -1,7 +1,76 @@
 //! Shared allocation bounds for JSON parsing and serialization.
 use crate::domain::{Error, ErrorCode};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::fmt::Write as _;
 use std::io::{self, Write};
+
+/// Validate decoded UTF-8 byte length before allocating an owned input string.
+pub(crate) struct BoundedString<const MIN: usize, const MAX: usize>(pub(crate) String);
+impl<'de, const MIN: usize, const MAX: usize> Deserialize<'de> for BoundedString<MIN, MAX> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor<const MIN: usize, const MAX: usize>;
+        impl<const MIN: usize, const MAX: usize> serde::de::Visitor<'_> for Visitor<MIN, MAX> {
+            type Value = BoundedString<MIN, MAX>;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "a string of {MIN}..={MAX} UTF-8 bytes")
+            }
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                if !(MIN..=MAX).contains(&value.len()) {
+                    return Err(E::custom("string exceeds its bound"));
+                }
+                Ok(BoundedString(value.into()))
+            }
+        }
+        deserializer.deserialize_str(Visitor::<MIN, MAX>)
+    }
+}
+
+/// Stop at the element ceiling before deserializing an excess element.
+pub(crate) struct BoundedVec<T, const MAX: usize>(pub(crate) Vec<T>);
+impl<'de, T: Deserialize<'de>, const MAX: usize> Deserialize<'de> for BoundedVec<T, MAX> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor<T, const MAX: usize>(std::marker::PhantomData<T>);
+        impl<'de, T: Deserialize<'de>, const MAX: usize> serde::de::Visitor<'de> for Visitor<T, MAX> {
+            type Value = BoundedVec<T, MAX>;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "at most {MAX} elements")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut sequence: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut values = Vec::new();
+                for _ in 0..MAX {
+                    match sequence.next_element()? {
+                        Some(value) => values.push(value),
+                        None => return Ok(BoundedVec(values)),
+                    }
+                }
+                struct Excess;
+                impl<'de> serde::de::DeserializeSeed<'de> for Excess {
+                    type Value = ();
+                    fn deserialize<D: serde::Deserializer<'de>>(
+                        self,
+                        _: D,
+                    ) -> Result<(), D::Error> {
+                        Err(serde::de::Error::custom("sequence exceeds its bound"))
+                    }
+                }
+                sequence.next_element_seed(Excess)?;
+                Ok(BoundedVec(values))
+            }
+        }
+        deserializer.deserialize_seq(Visitor::<T, MAX>(std::marker::PhantomData))
+    }
+}
+
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded
+}
 
 pub(crate) fn request_buffer_bytes(length: usize) -> usize {
     let owned_strings = length.min(256 * 1024 + 2 * 64 + 256 + 16);

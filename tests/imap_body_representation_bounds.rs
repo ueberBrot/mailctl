@@ -1,5 +1,3 @@
-#![allow(dead_code)] // This route uses only part of the shared transcript fixture helpers.
-
 mod imap_support;
 
 use imap_support::*;
@@ -341,6 +339,7 @@ async fn malformed_transfer_tails_keep_the_decoded_prefix_and_mark_replacement()
         ("BASE64", b"SGVs%G8=".as_slice(), "\u{fffd}Hel"),
         ("BASE64", b"SGVsbG8=!".as_slice(), "\u{fffd}Hello"),
         ("BASE64", b"Zh==".as_slice(), "\u{fffd}f"),
+        ("BASE64", b"Zm9=".as_slice(), "\u{fffd}fo"),
         ("QUOTED-PRINTABLE", b"hello=".as_slice(), "\u{fffd}hello"),
         ("QUOTED-PRINTABLE", b"hello=A".as_slice(), "\u{fffd}hello"),
         ("QUOTED-PRINTABLE", b"hello=QZ".as_slice(), "\u{fffd}hello"),

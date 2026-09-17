@@ -28,6 +28,7 @@ pub struct LocatedMessage {
     pub uid: u32,
     pub metadata: MessageMetadata,
 }
+#[derive(Debug)]
 pub struct SearchBatch {
     pub position: SearchPosition,
     pub messages: Vec<LocatedMessage>,

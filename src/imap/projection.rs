@@ -1,5 +1,5 @@
 //! The envelope FETCH contract: requested fields, validation, and normalization.
-use super::{Address, Envelope, Error};
+use super::{Error, dot_atom};
 use io_imap::types::{
     core::NString,
     datetime::DateTime,
@@ -51,27 +51,6 @@ impl<'a, 'b> Projection<'a, 'b> {
             internal_date: internal_date.ok_or(Error::Protocol)?,
             size: size.ok_or(Error::Protocol)?,
         })
-    }
-    pub fn normalize(self) -> Envelope {
-        Envelope {
-            uid: self.uid.get(),
-            subject: string(&self.envelope.subject),
-            from: addresses(&self.envelope.from),
-            to: addresses(&self.envelope.to),
-            cc: addresses(&self.envelope.cc),
-            received_date: Some(self.internal_date.as_ref().to_rfc3339()),
-            sent_date: string(&self.envelope.date),
-            flags: self
-                .flags
-                .iter()
-                .map(|flag| match flag {
-                    FlagFetch::Flag(flag) => flag.to_string(),
-                    FlagFetch::Recent => "\\Recent".to_owned(),
-                })
-                .collect(),
-            message_id: string(&self.envelope.message_id),
-            size: Some(self.size),
-        }
     }
     /// Bound source field octets before malformed/encoded metadata can shrink or grow.
     pub(super) fn check_header_bytes(&self, maximum: usize) -> Result<(), Error> {
@@ -231,14 +210,6 @@ fn parsed_addresses(
         Metadata::Present(addresses)
     }
 }
-fn dot_atom(value: &str) -> bool {
-    value.split('.').all(|part| {
-        !part.is_empty()
-            && part
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-/=?^_`{|}~".contains(&b))
-    })
-}
 fn domain(value: &str) -> bool {
     dot_atom(value)
         || value
@@ -298,20 +269,4 @@ fn skip_comments(mut value: &str) -> Option<&str> {
         }
         value = &value[end?..];
     }
-}
-fn string(value: &NString<'_>) -> Option<String> {
-    value
-        .0
-        .as_ref()
-        .map(|s| String::from_utf8_lossy(s.as_ref()).into_owned())
-}
-fn addresses(values: &[io_imap::types::envelope::Address<'_>]) -> Vec<Address> {
-    values
-        .iter()
-        .map(|address| Address {
-            name: string(&address.name),
-            mailbox: string(&address.mailbox),
-            host: string(&address.host),
-        })
-        .collect()
 }

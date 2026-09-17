@@ -1,13 +1,9 @@
-#![allow(dead_code)] // This route uses only part of the shared transcript fixture helpers.
-
 mod attachment_support;
 mod imap_support;
 
-use attachment_support::{continuation, metadata, payload_session, structure};
+use attachment_support::{decoder, metadata, payload_session, structure};
 use imap_support::*;
-use mailctl::imap::{
-    AttachmentListRequest, AttachmentProgress, AttachmentRequest, Limits, TlsMode,
-};
+use mailctl::imap::{AttachmentListRequest, Limits, TlsMode};
 use sha2::{Digest, Sha256};
 use std::sync::{
     Arc,
@@ -153,7 +149,7 @@ fn full_attachment_transfers_have_payload_independent_memory_and_bounded_counter
                 })
             });
 
-        let mut request = AttachmentRequest::new(4, 77, "2");
+        let mut request = decoder();
         let mut reported_wire = 0usize;
         let mut reported_parser_steps = 0usize;
         let mut observed_offset = 0u64;
@@ -163,38 +159,39 @@ fn full_attachment_transfers_have_payload_independent_memory_and_bounded_counter
             runtime.block_on(async {
                 loop {
                     let chunk = probe
-                        .read_attachment("fixture", "disposable-password", "INBOX", request)
+                        .read_attachment("fixture", "disposable-password", &mut request)
                         .await
                         .unwrap();
                     transfers += 1;
                     assert_eq!(chunk.decoded_offset, observed_offset, "{}", encoding.name());
                     assert!(chunk.bytes.len() <= DECODED_CHUNK, "{}", encoding.name());
                     observed_offset += chunk.bytes.len() as u64;
-                    reported_wire += chunk.metrics.wire_bytes;
-                    reported_parser_steps += chunk.metrics.parser_steps;
+                    reported_wire += probe.metrics().wire_bytes;
+                    reported_parser_steps += probe.metrics().parser_steps;
                     assert!(
-                        chunk.metrics.max_literal_bytes <= WIRE_SLICE,
+                        probe.metrics().max_literal_bytes <= WIRE_SLICE,
                         "{}",
                         encoding.name()
                     );
                     assert!(
-                        chunk.metrics.max_response_bytes <= limits.max_response_bytes,
+                        probe.metrics().max_response_bytes <= limits.max_response_bytes,
                         "{}",
                         encoding.name()
                     );
                     assert!(
-                        chunk.metrics.parser_steps <= chunk.metrics.wire_bytes * 4 + 64,
+                        probe.metrics().parser_steps <= probe.metrics().wire_bytes * 4 + 64,
                         "{}: {:?}",
                         encoding.name(),
-                        chunk.metrics
+                        probe.metrics()
                     );
                     assert!(
-                        chunk.metrics.max_transfer_state_bytes <= WIRE_SLICE + DECODED_CHUNK + 128,
+                        probe.metrics().max_transfer_state_bytes
+                            <= WIRE_SLICE + DECODED_CHUNK + 128,
                         "{}: {:?}",
                         encoding.name(),
-                        chunk.metrics
+                        probe.metrics()
                     );
-                    if let AttachmentProgress::Complete(integrity) = chunk.progress {
+                    if let Some(integrity) = chunk.integrity {
                         assert_eq!(
                             integrity.total_decoded_bytes,
                             expected_len,
@@ -203,29 +200,27 @@ fn full_attachment_transfers_have_payload_independent_memory_and_bounded_counter
                         );
                         assert_eq!(integrity.sha256, expected_digest, "{}", encoding.name());
                         assert_eq!(
-                            chunk.metrics.transfer_wire_bytes,
+                            probe.metrics().transfer_wire_bytes,
                             payload_len,
                             "{}",
                             encoding.name()
                         );
                         assert_eq!(
-                            chunk.metrics.transfer_decoded_bytes,
+                            probe.metrics().transfer_decoded_bytes,
                             expected_len as usize,
                             "{}",
                             encoding.name()
                         );
                         assert_eq!(
-                            chunk.metrics.transfer_decode_steps,
+                            probe.metrics().transfer_decode_steps,
                             payload_len,
                             "{}",
                             encoding.name()
                         );
-                        assert_eq!(chunk.metrics.active_transfers, 0, "{}", encoding.name());
-                        final_metrics = Some(chunk.metrics);
+
+                        final_metrics = Some(probe.metrics());
                         break;
                     }
-                    assert_eq!(chunk.metrics.active_transfers, 1, "{}", encoding.name());
-                    request = AttachmentRequest::resume(continuation(chunk));
                 }
             });
         });
@@ -333,10 +328,10 @@ fn huge_declared_attachment_metadata_never_allocates_a_payload() {
                 )
                 .await
                 .unwrap();
-            reported_wire = listing.metrics.wire_bytes;
-            assert_eq!(listing.attachments[0].declared_size, Some(u32::MAX as u64));
-            assert_eq!(listing.metrics.max_literal_bytes, 0);
-            assert!(listing.metrics.wire_bytes < 4096, "{:?}", listing.metrics);
+            reported_wire = probe.metrics().wire_bytes;
+            assert_eq!(listing[0].declared_size, Some(u32::MAX as u64));
+            assert_eq!(probe.metrics().max_literal_bytes, 0);
+            assert!(probe.metrics().wire_bytes < 4096, "{:?}", probe.metrics());
         });
     });
     server.join().unwrap();

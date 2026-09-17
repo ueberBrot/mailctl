@@ -143,7 +143,7 @@ impl Fixture {
         {
             return Err("GreenMail synthetic message content/identity mismatch".into());
         }
-        self.verify_snapshot(&self.snapshot().await?)
+        Self::verify_snapshot(&self.snapshot().await?)
     }
 
     pub async fn verify_folder_path_encoding(&self) -> Result<()> {
@@ -229,7 +229,7 @@ impl Fixture {
         self.roots.clone()
     }
 
-    fn verify_snapshot(&self, snapshot: &MailboxSnapshot) -> Result<()> {
+    fn verify_snapshot(snapshot: &MailboxSnapshot) -> Result<()> {
         if snapshot.uid_validity == 0
             || snapshot.messages.len() != 2
             || snapshot.messages.iter().any(|message| message.uid == 0)

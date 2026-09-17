@@ -12,7 +12,6 @@ use std::{
     future::Future,
     pin::Pin,
     sync::{Arc, Mutex},
-    time::Duration,
 };
 
 /// A bounded backend page with an installation-independent continuation position.
@@ -126,19 +125,6 @@ impl Service {
         context: &RequestContext,
         input: GetMessageInput,
     ) -> Result<MessageBody, Error> {
-        let limits = &self.grant(context)?.limits;
-        tokio::time::timeout(
-            Duration::from_secs(limits.operation_seconds as u64),
-            self.read_message(context, input),
-        )
-        .await
-        .map_err(|_| Error::new(ErrorCode::Timeout))?
-    }
-    async fn read_message(
-        &self,
-        context: &RequestContext,
-        input: GetMessageInput,
-    ) -> Result<MessageBody, Error> {
         let grant = self.grant(context)?;
         if !context.permissions().contains(&Permission::ReadMessage) {
             return Err(super::denied());
@@ -153,9 +139,9 @@ impl Service {
             self.decode("ms1", &input.message, limits.token_bytes, stale)?;
         let name = mailbox_identity(&reference.mailbox);
         let target @ MailboxTarget {
-            config: account,
             account_id: id,
             generation,
+            ..
         } = self.authorize_message(context, &reference, stale)?;
 
         let resource = super::tokens::fingerprint(&reference)?;
@@ -176,7 +162,7 @@ impl Service {
         let backend: &dyn BodyBackend = match &self.body_backend {
             Some(backend) => backend.as_ref(),
             None => {
-                live = self.imap_backend(account).await?;
+                live = self.imap_backend(target).await?;
                 &live
             }
         };
