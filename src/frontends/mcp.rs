@@ -10,13 +10,11 @@ use rmcp::model::ErrorData as McpError;
 use rmcp::{RoleServer, ServerHandler, ServiceExt, model::*, service::RequestContext};
 use serde_json::{Value, json};
 use std::{borrow::Cow, time::Duration};
-use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 struct EmailTools {
     tools: Vec<Tool>,
     application: Application,
-    active: Semaphore,
     envelope_limit: usize,
     deadline: Duration,
     shutdown: CancellationToken,
@@ -95,13 +93,9 @@ impl ServerHandler for EmailTools {
         if request.is_some_and(|request| request.cursor.is_some()) {
             return Err(McpError::invalid_params("Invalid cursor", None));
         }
-        let _active = tokio::select! {
-            biased;
-            _ = context.ct.cancelled() => return Err(McpError::internal_error("Request cancelled", None)),
-            permit = tokio::time::timeout(self.deadline, self.active.acquire()) =>
-                permit.map_err(|_| McpError::internal_error("Request timed out", None))?
-                    .map_err(|_| McpError::internal_error("Service unavailable", None))?,
-        };
+        if context.ct.is_cancelled() || self.shutdown.is_cancelled() {
+            return Err(McpError::internal_error("Request cancelled", None));
+        }
         Ok(ListToolsResult {
             tools: self.tools.clone(),
             ..Default::default()
@@ -112,19 +106,9 @@ impl ServerHandler for EmailTools {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
-        let admitted = tokio::select! {
-            biased;
-            _ = context.ct.cancelled() => Err(Error::new(ErrorCode::Cancelled)),
-            _ = self.shutdown.cancelled() => Err(Error::new(ErrorCode::Cancelled)),
-            permit = tokio::time::timeout(self.deadline, self.active.acquire()) => {
-                permit.map_err(|_| Error::new(ErrorCode::Timeout))
-                    .and_then(|permit| permit.map_err(|_| Error::new(ErrorCode::Cancelled)))
-            },
-        };
         let input = request.arguments.unwrap_or_default();
-        let operation = match (admitted.as_ref(), request.name.as_ref()) {
-            (Err(error), _) => Err(error.clone()),
-            (_, name) if self.tools.iter().any(|tool| tool.name == name) => {
+        let operation = match request.name.as_ref() {
+            name if self.tools.iter().any(|tool| tool.name == name) => {
                 let name = name.strip_prefix("email_").unwrap();
                 let mut wire = json!({"operation": name});
                 if name != "capabilities" || !input.is_empty() {
@@ -192,7 +176,6 @@ pub(super) async fn run(application: Application) -> Result<(), Error> {
     let _cancel_on_exit = shutdown.clone().drop_guard();
     let handler = EmailTools {
         tools: definitions(&capabilities.operations),
-        active: Semaphore::new(limits.active_requests),
         envelope_limit: bounds.envelope,
         deadline: Duration::from_secs(limits.operation_seconds as u64),
         application: application.with_response_limit(bounds.envelope),

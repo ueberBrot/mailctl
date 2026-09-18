@@ -212,6 +212,7 @@ impl Service {
             return Err(Error::new(ErrorCode::ResponseTooLarge));
         }
         // Preserve canonical identity order for provider-row membership checks.
+        let _admission = self.requests.admit(id, limits).await?;
         let names = names.into_values().cloned().collect::<Vec<_>>();
         let rows = if names.is_empty() {
             Vec::new()
@@ -229,7 +230,7 @@ impl Service {
                     &live
                 }
             };
-            backend.discover(target, &names, limits).await?
+            self.observed(id, backend.discover(target, &names, limits).await)?
         };
         if rows.len() > limits.mailbox_inventory {
             return Err(Error::new(ErrorCode::ResponseTooLarge));

@@ -11,10 +11,16 @@ use crate::{
     encoding::serialized_size,
     policy::{Permission, RequestContext},
 };
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    sync::{Arc, OnceLock},
+    time::{SystemTime, UNIX_EPOCH},
+};
+use tokio::sync::watch;
 use uuid::Uuid;
+pub(super) type AuthenticationInitialization =
+    OnceLock<watch::Receiver<Option<Result<Arc<Runtime>, Error>>>>;
 #[cfg(any(feature = "cli", feature = "mcp"))]
-use {crate::credentials::SecretSource, std::sync::Arc};
+use crate::credentials::SecretSource;
 
 impl Service {
     /// Inspects authorized sources. Authentication requires one selected account
@@ -24,6 +30,7 @@ impl Service {
         context: &RequestContext,
         check_account: bool,
     ) -> Result<Doctor, Error> {
+        let _reservation = self.requests.reserve(self.limits(context)?)?;
         self.with_deadline(context, self.doctor_inner(context, check_account))
             .await
     }
@@ -74,6 +81,7 @@ impl Service {
         let runtime = self.authentication().await?;
         for configured in accounts {
             let (id, generation) = self.registry.identity(&configured.key);
+            let _admission = self.requests.admit(id, &grant.limits).await?;
             let id = Uuid::parse_str(id).map_err(|_| Error::new(ErrorCode::InternalError))?;
             let source = self.host.credential_source(&configured.credential);
             if let Some(prerequisite) = source.prerequisite()
@@ -140,19 +148,35 @@ impl Service {
         Ok(result)
     }
 
-    pub(super) async fn authentication(&self) -> Result<&std::sync::Arc<Runtime>, Error> {
-        self.authentication
-            .get_or_try_init(|| async {
+    pub(super) async fn authentication(&self) -> Result<Arc<Runtime>, Error> {
+        let mut receiver = self
+            .authentication
+            .get_or_init(|| {
                 let host = self.host.clone();
-                let roots = tokio::task::spawn_blocking(move || host.tls_roots())
-                    .await
-                    .map_err(|_| Error::new(ErrorCode::InternalError))?
-                    .map_err(credential_error)?;
-                Runtime::new(self.config.limits.clone(), roots)
-                    .map(std::sync::Arc::new)
-                    .map_err(authentication_error)
+                let limits = self.config.limits.clone();
+                let (sender, receiver) = watch::channel(None);
+                // Native trust loading cannot be interrupted. Keep one initialization
+                // alive across cancelled callers instead of starting another worker.
+                tokio::task::spawn_blocking(move || {
+                    let result = host
+                        .tls_roots()
+                        .map_err(credential_error)
+                        .and_then(|roots| {
+                            Runtime::new(limits, roots)
+                                .map(Arc::new)
+                                .map_err(authentication_error)
+                        });
+                    let _ = sender.send(Some(result));
+                });
+                receiver
             })
+            .clone();
+        receiver
+            .wait_for(Option::is_some)
             .await
+            .map_err(|_| Error::new(ErrorCode::InternalError))?
+            .clone()
+            .expect("completed trust initialization")
     }
 
     #[cfg(any(feature = "cli", feature = "mcp"))]

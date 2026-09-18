@@ -65,6 +65,7 @@ impl Service {
         )?;
         let name = domain::mailbox_identity(&reference.mailbox);
         let target = self.authorize_message(context, &reference, ErrorCode::StaleReference)?;
+        let _admission = self.requests.admit(target.account_id, limits).await?;
         let live;
         let backend = match &self.attachment_backend {
             Some(backend) => backend.as_ref(),
@@ -73,14 +74,17 @@ impl Service {
                 &live
             }
         };
-        let entries = backend
-            .list(
-                target,
-                name,
-                imap::AttachmentListRequest::new(reference.uid, reference.uid_validity),
-                limits,
-            )
-            .await?;
+        let entries = self.observed(
+            target.account_id,
+            backend
+                .list(
+                    target,
+                    name,
+                    imap::AttachmentListRequest::new(reference.uid, reference.uid_validity),
+                    limits,
+                )
+                .await,
+        )?;
         if entries.len() > limits.mime_parts {
             return Err(Error::new(ErrorCode::ResponseTooLarge));
         }
@@ -121,6 +125,18 @@ fn expired() -> Error {
 }
 impl Service {
     pub(super) async fn get_attachment(
+        &self,
+        context: &RequestContext,
+        input: domain::GetAttachmentInput,
+    ) -> Result<domain::AttachmentChunk, Error> {
+        let deadline = Duration::from_secs(self.limits(context)?.operation_seconds as u64);
+        tokio::select! {
+            biased;
+            result = self.get_attachment_inner(context, input) => result,
+            () = tokio::time::sleep(deadline) => Err(Error::new(ErrorCode::Timeout)),
+        }
+    }
+    async fn get_attachment_inner(
         &self,
         context: &RequestContext,
         input: domain::GetAttachmentInput,
@@ -213,7 +229,10 @@ impl Service {
                     Error::new(ErrorCode::Timeout)
                 });
             }
-            page = entry.reader.next(limits) => page?,
+            page = async {
+                let _admission = self.requests.admit(&entry.resource.account, limits).await?;
+                self.observed(&entry.resource.account, entry.reader.next(limits).await)
+            } => page?,
         };
         if Instant::now() >= expires {
             return Err(expired());

@@ -483,6 +483,7 @@ pub struct Cancellation {
 pub enum Availability {
     Unknown,
     Configured,
+    Available,
     Unavailable,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]

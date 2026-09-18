@@ -9,6 +9,7 @@ mod message;
 pub(crate) use attachments::TransferSession;
 pub use attachments::{AttachmentBackend, AttachmentReader, MemoryAttachments};
 pub use message::{BodyBackend, BodyRead, MemoryBodies};
+mod requests;
 mod search;
 mod state;
 mod tokens;
@@ -34,10 +35,12 @@ pub struct Service {
     context_id: Uuid,
     mailbox_backend: Option<std::sync::Arc<dyn MailboxBackend>>,
     transfers: attachments::Transfers,
+    requests: requests::Requests,
+    observations: std::sync::Mutex<std::collections::HashMap<String, Availability>>,
     attachment_backend: Option<std::sync::Arc<dyn AttachmentBackend>>,
     body_backend: Option<std::sync::Arc<dyn BodyBackend>>,
     search_backend: Option<std::sync::Arc<dyn SearchBackend>>,
-    authentication: tokio::sync::OnceCell<std::sync::Arc<crate::authentication::Runtime>>,
+    authentication: credentials::AuthenticationInitialization,
 }
 impl Service {
     pub fn open(config: Config) -> Result<Self, Error> {
@@ -86,7 +89,9 @@ impl Service {
             body_backend: None,
             attachment_backend: None,
             transfers: Default::default(),
-            authentication: tokio::sync::OnceCell::new(),
+            requests: Default::default(),
+            observations: Default::default(),
+            authentication: std::sync::OnceLock::new(),
         }
     }
     /// Select host dependencies during frontend initialization, before operations.
@@ -197,6 +202,7 @@ impl Service {
         context: &RequestContext,
         operation: Operation,
     ) -> Result<OperationResult, Error> {
+        let _reservation = self.requests.reserve(self.limits(context)?)?;
         let transfer = matches!(operation, Operation::GetAttachment(_));
         let execution = self.execute_inner(context, operation);
         // Transfers own the earlier of operation timeout and transfer expiry, including
@@ -225,6 +231,14 @@ impl Service {
     ) -> Result<OperationResult, Error> {
         let grant = self.grant(context)?;
         self.registry.check_revision()?;
+        let _local = if matches!(
+            operation,
+            Operation::ListAccounts(_) | Operation::Capabilities | Operation::Health
+        ) {
+            Some(self.requests.admit("", &grant.limits).await?)
+        } else {
+            None
+        };
         let operations = || {
             [
                 ("list_accounts", None),
@@ -286,7 +300,7 @@ impl Service {
                             generation,
                             from_identities: account.from_identities.clone(),
                             capabilities: operations(),
-                            availability: Availability::Unknown,
+                            availability: self.availability(account_id),
                         }
                     })
                     .collect::<Vec<_>>();
@@ -327,15 +341,60 @@ impl Service {
             accounts.push(AccountHealth {
                 account_id: account_id.to_owned(),
                 generation,
-                availability: Availability::Unknown,
+                availability: self.availability(account_id),
             });
         }
         accounts.sort_by(|a, b| a.account_id.cmp(&b.account_id));
+        let unavailable = accounts
+            .iter()
+            .filter(|account| account.availability == Availability::Unavailable)
+            .count();
         Ok(Health {
-            status: "ready".into(),
+            status: if unavailable == 0 {
+                "ready"
+            } else if unavailable == accounts.len() {
+                "unavailable"
+            } else {
+                "degraded"
+            }
+            .into(),
             grant: context.grant_name().into(),
             accounts,
         })
+    }
+    fn availability(&self, account: &str) -> Availability {
+        self.observations
+            .lock()
+            .unwrap()
+            .get(account)
+            .copied()
+            .unwrap_or(Availability::Unknown)
+    }
+    fn observed<T>(&self, account: &str, result: Result<T, Error>) -> Result<T, Error> {
+        match &result {
+            Ok(_) => {
+                self.observations
+                    .lock()
+                    .unwrap()
+                    .insert(account.into(), Availability::Available);
+            }
+            Err(error) => self.observe_failure(account, error),
+        }
+        result
+    }
+    fn observe_failure(&self, account: &str, error: &Error) {
+        if matches!(
+            error.code,
+            ErrorCode::ProviderUnavailable
+                | ErrorCode::AuthenticationFailed
+                | ErrorCode::CredentialUnavailable
+                | ErrorCode::TlsFailed
+        ) {
+            self.observations
+                .lock()
+                .unwrap()
+                .insert(account.into(), Availability::Unavailable);
+        }
     }
     fn visible_accounts<'a>(
         &'a self,

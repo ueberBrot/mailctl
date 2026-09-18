@@ -158,6 +158,7 @@ impl Service {
                 Ok(cursor.position)
             })
             .transpose()?;
+        let _admission = self.requests.admit(id, limits).await?;
         let live;
         let backend: &dyn BodyBackend = match &self.body_backend {
             Some(backend) => backend.as_ref(),
@@ -166,18 +167,22 @@ impl Service {
                 &live
             }
         };
-        let page = backend
-            .read(
-                target,
-                name,
-                BodyRequest {
-                    uid: reference.uid,
-                    uid_validity: reference.uid_validity,
-                    continuation: position,
-                },
-                limits,
+        let page = self
+            .observed(
+                id,
+                backend
+                    .read(
+                        target,
+                        name,
+                        BodyRequest {
+                            uid: reference.uid,
+                            uid_validity: reference.uid_validity,
+                            continuation: position,
+                        },
+                        limits,
+                    )
+                    .await,
             )
-            .await
             .map_err(|error| {
                 if input.cursor.is_some()
                     && matches!(

@@ -93,6 +93,7 @@ impl Service {
         }) {
             return Err(Error::new(ErrorCode::StaleCursor));
         }
+        let _admission = self.requests.admit(id, limits).await?;
         let live;
         let backend: &dyn SearchBackend = match &self.search_backend {
             Some(backend) => backend.as_ref(),
@@ -101,19 +102,22 @@ impl Service {
                 &live
             }
         };
-        let batch = backend
-            .search(
-                target,
-                SearchRequest {
-                    mailbox: name,
-                    criteria: &input.criteria,
-                    position: cursor.map(|cursor| cursor.position),
-                    limit,
-                    response_bytes: context.response_limit().saturating_sub(2048),
-                },
-                limits,
-            )
-            .await?;
+        let batch = self.observed(
+            id,
+            backend
+                .search(
+                    target,
+                    SearchRequest {
+                        mailbox: name,
+                        criteria: &input.criteria,
+                        position: cursor.map(|cursor| cursor.position),
+                        limit,
+                        response_bytes: context.response_limit().saturating_sub(2048),
+                    },
+                    limits,
+                )
+                .await,
+        )?;
         let complete = batch.position.next_uid == 0;
         let next_cursor = if complete {
             None

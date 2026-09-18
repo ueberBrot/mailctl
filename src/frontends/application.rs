@@ -101,15 +101,22 @@ impl Application {
             if chunk.decoded_offset != bytes.len() as u64 {
                 return Err(Error::new(ErrorCode::InternalError));
             }
-            STANDARD
-                .decode_vec(&chunk.bytes_base64, &mut bytes)
-                .map_err(|_| Error::new(ErrorCode::InternalError))?;
-            if bytes.len() > limits.attachment_decoded_bytes
-                || bytes.len().div_ceil(3) * 4 + 4096 + chunk.attachment_reference.len()
+            let encoded = &chunk.bytes_base64;
+            let padding = encoded.len() - encoded.trim_end_matches('=').len();
+            let decoded = (encoded.len() / 4 * 3).saturating_sub(padding);
+            let total = bytes.len().saturating_add(decoded);
+            if total > limits.attachment_decoded_bytes
+                || total.div_ceil(3) * 4 + 4096 + chunk.attachment_reference.len()
                     > limits.envelope_bytes
             {
                 return Err(Error::new(ErrorCode::ResponseTooLarge));
             }
+            bytes
+                .try_reserve_exact(decoded.saturating_add(2))
+                .map_err(|_| Error::new(ErrorCode::ResponseTooLarge))?;
+            STANDARD
+                .decode_vec(encoded, &mut bytes)
+                .map_err(|_| Error::new(ErrorCode::InternalError))?;
             if matches!(chunk.progress, AttachmentProgress::Complete { .. }) {
                 chunk.bytes_base64 = STANDARD.encode(&bytes);
                 chunk.decoded_offset = 0;
