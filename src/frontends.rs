@@ -8,16 +8,18 @@ mod diagnostics;
 mod mcp;
 #[cfg(feature = "mcp")]
 mod mcp_transport;
+mod presentation;
 
 use crate::{
-    domain::{Envelope, Error, ErrorCode, OperationResult},
+    domain::{Error, ErrorCode, OperationResult},
     policy::Narrowing,
 };
 use application::Application;
 use arguments::{Action, Invocation};
 use clap::FromArgMatches;
-use diagnostics::{Color, LogFormat, Options};
+use diagnostics::{Color, LogFormat, Options, Request};
 use std::{io::Write, process::ExitCode, time::Duration};
+use tracing::Instrument;
 
 #[derive(Clone, Copy)]
 pub enum Executable {
@@ -101,24 +103,28 @@ pub fn run_with_environment(
             return ExitCode::from(8);
         }
     };
-    let code = runtime.block_on(async {
-        let result = match initialized {
-            Err(error) => Err(error),
-            Ok(()) => match invocation {
-                Ok(invocation) => {
-                    diagnostics::started();
-                    let result = execute(invocation, host).await;
-                    diagnostics::stopped();
-                    result
-                }
-                Err(_) => Err(Error::new(ErrorCode::InvalidRequest)),
-            },
-        };
-        match result {
-            Ok(code) => code,
-            Err(error) => report(json, options.color, Err(error), (), 30).await,
+    let request = Request::new();
+    let code = runtime.block_on(
+        async {
+            let result = match initialized {
+                Err(error) => Err(error),
+                Ok(()) => match invocation {
+                    Ok(invocation) => {
+                        diagnostics::started();
+                        let result = execute(invocation, host, &request).await;
+                        diagnostics::stopped();
+                        result
+                    }
+                    Err(_) => Err(Error::new(ErrorCode::InvalidRequest)),
+                },
+            };
+            match result {
+                Ok(code) => code,
+                Err(error) => report(&request, json, options.color, Err(error), (), 30).await,
+            }
         }
-    });
+        .instrument(request.span()),
+    );
     // STDIO workers may remain blocked after cancellation; process exit releases their leases.
     runtime.shutdown_timeout(Duration::from_millis(250));
     code.into()
@@ -127,6 +133,7 @@ pub fn run_with_environment(
 async fn execute(
     invocation: Invocation,
     host: std::sync::Arc<dyn crate::host::HostEnvironment>,
+    request: &Request,
 ) -> Result<u8, Error> {
     let Invocation {
         mut options,
@@ -134,17 +141,26 @@ async fn execute(
     } = invocation;
     #[cfg(target_os = "macos")]
     if options.isolated {
-        return execute_isolated(options, action).await;
+        return execute_isolated(options, action, request).await;
     }
     if let Action::Setup(args) = action {
         let json = options.json;
         let color = options.diagnostics.color;
+        let span = tracing::Span::current();
         let setup = tokio::task::spawn_blocking(move || {
-            configuration::setup(&options.config, args, &options.accounts, json)
+            span.in_scope(|| configuration::setup(&options.config, args, &options.accounts, json))
         })
         .await
         .map_err(|_| Error::new(ErrorCode::InternalError))??;
-        return Ok(report(json, color, Ok(OperationResult::Setup(setup)), (), 30).await);
+        return Ok(report(
+            request,
+            json,
+            color,
+            Ok(OperationResult::Setup(setup)),
+            (),
+            30,
+        )
+        .await);
     }
     let config = configuration::load(&options.config)?;
     #[cfg(feature = "cli")]
@@ -161,8 +177,10 @@ async fn execute(
     let shutdown = termination_signal()?;
     tokio::pin!(shutdown);
     let config_path = options.config.clone();
-    let initialization =
-        tokio::task::spawn_blocking(move || configuration::open(&config_path, config));
+    let span = tracing::Span::current();
+    let initialization = tokio::task::spawn_blocking(move || {
+        span.in_scope(|| configuration::open(&config_path, config))
+    });
     let service = tokio::select! {
         _ = &mut shutdown => return Err(Error::new(ErrorCode::Cancelled)),
         result = initialization => result.map_err(|_| Error::new(ErrorCode::InternalError))??,
@@ -182,6 +200,7 @@ async fn execute(
             ) => result.map_err(|_| Error::new(ErrorCode::Timeout))??,
         };
         return Ok(report(
+            request,
             options.json,
             options.diagnostics.color,
             Ok(OperationResult::Credential(status)),
@@ -192,6 +211,7 @@ async fn execute(
     }
     let context = service.context(&selected, &narrowing)?;
     execute_application(
+        request,
         options,
         action,
         Application::Embedded {
@@ -205,7 +225,11 @@ async fn execute(
 }
 
 #[cfg(target_os = "macos")]
-async fn execute_isolated(mut options: arguments::Options, action: Action) -> Result<u8, Error> {
+async fn execute_isolated(
+    mut options: arguments::Options,
+    action: Action,
+    request: &Request,
+) -> Result<u8, Error> {
     #[cfg(feature = "cli")]
     if matches!(action, Action::Export { .. }) {
         return Err(Error::new(ErrorCode::UnsupportedCapability));
@@ -221,6 +245,7 @@ async fn execute_isolated(mut options: arguments::Options, action: Action) -> Re
         result = crate::isolation::Client::connect(narrowing) => result?,
     };
     execute_application(
+        request,
         options,
         action,
         Application::Isolated(Box::new(client)),
@@ -253,6 +278,7 @@ fn invocation_narrowing(
 }
 
 async fn execute_application(
+    request: &Request,
     options: arguments::Options,
     action: Action,
     application: Application,
@@ -312,6 +338,7 @@ async fn execute_application(
         .map_or(Ok(()), crate::export::ExportWriter::abort)
         .and(result);
     Ok(report(
+        request,
         options.json,
         options.diagnostics.color,
         result,
@@ -342,13 +369,14 @@ fn termination_signal() -> Result<impl Future<Output = ()>, Error> {
 }
 
 async fn report<O: Send + 'static>(
+    request: &Request,
     json: bool,
     color: Color,
     result: Result<OperationResult, Error>,
     owner: O,
     seconds: usize,
 ) -> u8 {
-    let envelope = Envelope::from_result(uuid::Uuid::new_v4().to_string(), result);
+    let envelope = request.envelope(result);
     let error = envelope.error().or_else(|| match envelope.result() {
         Some(OperationResult::Doctor(doctor)) => doctor.accounts.iter().find_map(|account| {
             match &account.authentication.as_ref()?.outcome {
@@ -364,7 +392,7 @@ async fn report<O: Send + 'static>(
         serde_json::to_string(&envelope)
     } else {
         match envelope.result() {
-            Some(result) => serde_json::to_string_pretty(result).map(|text| escape_bidi(&text)),
+            Some(result) => presentation::human(result),
             None => return code,
         }
     };
@@ -373,29 +401,16 @@ async fn report<O: Send + 'static>(
     };
     let write = tokio::task::spawn_blocking(move || {
         let _owner = owner;
-        writeln!(color.stdout(json), "{text}")
+        // Terminal filtering strips valid JSON string data such as DELETE.
+        if json {
+            return writeln!(std::io::stdout().lock(), "{text}");
+        }
+        let heading = anstyle::Style::new().bold();
+        writeln!(color.human_stdout(), "{heading}Result{heading:#}\n{text}")
     });
     match tokio::time::timeout(Duration::from_secs(seconds as u64), write).await {
         Ok(Ok(Ok(()))) => code,
         Err(_) => 5,
         _ => 8,
     }
-}
-
-fn escape_bidi(text: &str) -> String {
-    use std::fmt::Write;
-    let mut output = String::with_capacity(text.len());
-    for character in text.chars() {
-        match character {
-            '\u{061c}'
-            | '\u{200e}'
-            | '\u{200f}'
-            | '\u{202a}'..='\u{202e}'
-            | '\u{2066}'..='\u{2069}' => {
-                let _ = write!(output, "\\u{{{:04x}}}", character as u32);
-            }
-            _ => output.push(character),
-        }
-    }
-    output
 }

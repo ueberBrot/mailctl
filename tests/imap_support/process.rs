@@ -30,9 +30,10 @@ struct Expected {
 
 enum ExpectedOperation {
     Authenticate,
+    RejectAuthentication(bool),
     Mailboxes(Vec<&'static str>),
     Search(&'static str, Option<u32>),
-    Body(&'static str),
+    Body(&'static str, Vec<u8>),
     Attachment(&'static str, AttachmentPhase),
 }
 
@@ -98,10 +99,19 @@ impl ImapServer {
                             imap_support::write(&mut wire, "* OK synthetic server ready\r\n").await;
                             imap_support::capability(&mut wire, "IMAP4rev1").await;
                             let tag = imap_support::expect(&mut wire, &format!("LOGIN \"{username}\" \"{password}\"")).await;
+                            if let ExpectedOperation::RejectAuthentication(malformed) = operation {
+                                let payload = if malformed { "fixture-private-provider-secret \u{1b}]52;c;payload\u{7}\u{202e}" } else { "fixture-private-provider-secret" };
+                                imap_support::write(&mut wire, &format!("{tag} NO {payload}\r\n")).await;
+                                use tokio::io::AsyncReadExt;
+                                let end = wire.read(&mut [0]).await;
+                                assert!(matches!(end, Ok(0)) || end.is_err());
+                                return;
+                            }
                             imap_support::write(&mut wire, &format!("{tag} OK authenticated\r\n")).await;
                             imap_support::capability(&mut wire, "IMAP4rev1").await;
                             match operation {
                                 ExpectedOperation::Authenticate => {},
+                                ExpectedOperation::RejectAuthentication(_) => unreachable!(),
                                 ExpectedOperation::Mailboxes(mailboxes) => {
                                     for name in mailboxes {
                                         let tag = imap_support::expect(&mut wire, &format!("LIST \"\" {name}")).await;
@@ -110,7 +120,7 @@ impl ImapServer {
                                     }
                                 }
                                 ExpectedOperation::Search(mailbox, position) => search_page(&mut wire, mailbox, position).await,
-                                ExpectedOperation::Body(mailbox) => body_page(&mut wire, mailbox).await,
+                                ExpectedOperation::Body(mailbox, text) => body_page(&mut wire, mailbox, &text).await,
                                 ExpectedOperation::Attachment(mailbox, phase) => {
                                     attachment_page(&mut wire, mailbox, phase, &stalled).await;
                                     if phase == AttachmentPhase::Interrupted { return; }
@@ -142,6 +152,14 @@ impl ImapServer {
             username,
             password,
             operation: ExpectedOperation::Authenticate,
+        });
+    }
+
+    pub fn reject_authentication(&self, malformed: bool) {
+        self.expected.lock().unwrap().push_back(Expected {
+            username: "work@example.test",
+            password: "disposable-password",
+            operation: ExpectedOperation::RejectAuthentication(malformed),
         });
     }
 
@@ -181,7 +199,15 @@ impl ImapServer {
         self.expected.lock().unwrap().push_back(Expected {
             username,
             password,
-            operation: ExpectedOperation::Body(mailbox),
+            operation: ExpectedOperation::Body(mailbox, b"Short body.\r\n".to_vec()),
+        });
+    }
+
+    pub fn expect_body_bytes(&self, mailbox: &'static str, text: &[u8]) {
+        self.expected.lock().unwrap().push_back(Expected {
+            username: "work@example.test",
+            password: "disposable-password",
+            operation: ExpectedOperation::Body(mailbox, text.to_vec()),
         });
     }
 
@@ -255,8 +281,16 @@ async fn search_page(wire: &mut imap_support::Wire, mailbox: &str, position: Opt
     write(wire, &format!("* {uid} FETCH (UID {uid} ENVELOPE (NIL \"{subject}\" NIL NIL NIL NIL NIL NIL NIL \"<search-{uid}@example.test>\") FLAGS ({flags}) INTERNALDATE \"01-Sep-2026 12:00:00 +0000\" RFC822.SIZE 13000)\r\n{tag} OK fetched\r\n")).await;
 }
 
-async fn body_page(wire: &mut imap_support::Wire, mailbox: &str) {
+async fn body_page(wire: &mut imap_support::Wire, mailbox: &str, text: &[u8]) {
     use imap_support::{expect, write};
+    let encoded;
+    let (encoding, text) = if text == b"Short body.\r\n" {
+        ("7BIT", text)
+    } else {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        encoded = STANDARD.encode(text);
+        ("BASE64", encoded.as_bytes())
+    };
     let tag = expect(wire, &format!("EXAMINE {mailbox}")).await;
     write(
         wire,
@@ -264,14 +298,15 @@ async fn body_page(wire: &mut imap_support::Wire, mailbox: &str) {
     )
     .await;
     let tag = expect(wire, "UID FETCH 3 (UID RFC822.SIZE BODYSTRUCTURE)").await;
-    write(wire, &format!("* 3 FETCH (UID 3 RFC822.SIZE 3000300 BODYSTRUCTURE ((\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" 13 1 NIL NIL NIL NIL)(\"APPLICATION\" \"OCTET-STREAM\" NIL NIL NIL \"BASE64\" 3000000 NIL (\"ATTACHMENT\" NIL) NIL NIL) \"MIXED\" NIL NIL NIL NIL))\r\n{tag} OK fetched\r\n")).await;
+    write(wire, &format!("* 3 FETCH (UID 3 RFC822.SIZE 3000300 BODYSTRUCTURE ((\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"{encoding}\" {} 1 NIL NIL NIL NIL)(\"APPLICATION\" \"OCTET-STREAM\" NIL NIL NIL \"BASE64\" 3000000 NIL (\"ATTACHMENT\" NIL) NIL NIL) \"MIXED\" NIL NIL NIL NIL))\r\n{tag} OK fetched\r\n", text.len())).await;
     for (section, count, value) in [
         (
             "HEADER",
             16384,
-            "MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=fixture\r\n\r\n",
+            b"MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=fixture\r\n\r\n"
+                .as_slice(),
         ),
-        ("1", 14, "Short body.\r\n"),
+        ("1", text.len() + 1, text),
     ] {
         let tag = expect(
             wire,
@@ -281,11 +316,14 @@ async fn body_page(wire: &mut imap_support::Wire, mailbox: &str) {
         write(
             wire,
             &format!(
-                "* 3 FETCH (UID 3 BODY[{section}]<0> {{{}}}\r\n{value})\r\n{tag} OK fetched\r\n",
+                "* 3 FETCH (UID 3 BODY[{section}]<0> {{{}}}\r\n",
                 value.len()
             ),
         )
         .await;
+        use tokio::io::AsyncWriteExt;
+        wire.write_all(value).await.unwrap();
+        write(wire, &format!(")\r\n{tag} OK fetched\r\n")).await;
     }
 }
 

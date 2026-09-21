@@ -157,16 +157,19 @@ impl Service {
                 let (sender, receiver) = watch::channel(None);
                 // Native trust loading cannot be interrupted. Keep one initialization
                 // alive across cancelled callers instead of starting another worker.
+                let span = tracing::Span::current();
                 tokio::task::spawn_blocking(move || {
-                    let result = host
-                        .tls_roots()
-                        .map_err(credential_error)
-                        .and_then(|roots| {
-                            Runtime::new(limits, roots)
-                                .map(Arc::new)
-                                .map_err(authentication_error)
-                        });
-                    let _ = sender.send(Some(result));
+                    span.in_scope(|| {
+                        let result = host
+                            .tls_roots()
+                            .map_err(credential_error)
+                            .and_then(|roots| {
+                                Runtime::new(limits, roots)
+                                    .map(Arc::new)
+                                    .map_err(authentication_error)
+                            });
+                        let _ = sender.send(Some(result));
+                    })
                 });
                 receiver
             })

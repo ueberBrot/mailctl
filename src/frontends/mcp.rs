@@ -11,6 +11,7 @@ use rmcp::{RoleServer, ServerHandler, ServiceExt, model::*, service::RequestCont
 use serde_json::{Value, json};
 use std::{borrow::Cow, time::Duration};
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
 struct EmailTools {
     tools: Vec<Tool>,
@@ -124,13 +125,17 @@ impl ServerHandler for EmailTools {
                 ));
             }
         };
+        let diagnostic_request = super::diagnostics::Request::new();
         let result = match operation {
             Err(error) => Err(error),
             Ok(operation) => tokio::select! {
                 biased;
                 _ = context.ct.cancelled() => Err(Error::new(ErrorCode::Cancelled)),
                 _ = self.shutdown.cancelled() => Err(Error::new(ErrorCode::Cancelled)),
-                result = tokio::time::timeout(self.deadline, self.application.execute(operation)) =>
+                result = tokio::time::timeout(
+                    self.deadline,
+                    self.application.execute(operation).instrument(diagnostic_request.span()),
+                ) =>
                     result.map_err(|_| Error::new(ErrorCode::Timeout)).flatten(),
             },
         };
@@ -140,13 +145,14 @@ impl ServerHandler for EmailTools {
         {
             self.shutdown.cancel();
         }
-        let mut envelope = Envelope::from_result(uuid::Uuid::new_v4().to_string(), result);
+        let mut envelope = diagnostic_request.envelope(result);
         if crate::encoding::serialized_size(&envelope, self.envelope_limit).is_err() {
             envelope = Envelope::from_result(
                 envelope.request_id().to_owned(),
                 Err(Error::new(ErrorCode::ResponseTooLarge)),
             );
         }
+        super::diagnostics::result(envelope.request_id(), envelope.error());
         let success = envelope.is_success();
         let value = serde_json::to_value(envelope)
             .map_err(|_| McpError::internal_error("Result unavailable", None))?;

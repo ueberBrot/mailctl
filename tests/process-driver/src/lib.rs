@@ -36,6 +36,10 @@ impl HostEnvironment for FixtureHost {
 struct FixtureSecret;
 impl SecretSource for FixtureSecret {
     fn availability(&self, _: uuid::Uuid) -> Availability {
+        assert!(
+            !tracing::Span::current().is_disabled(),
+            "credential availability must retain the request span"
+        );
         Availability::Available
     }
     fn resolve(&self, _: uuid::Uuid) -> Result<Secret, SourceError> {

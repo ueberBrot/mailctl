@@ -35,30 +35,33 @@ pub(super) async fn execute(
         }
         Credential::Delete | Credential::Status => None,
     };
+    let span = tracing::Span::current();
     // Retain the installation lease until blocking work finishes, even after cancellation.
     tokio::task::spawn_blocking(move || {
-        match command {
-            Credential::Set => source
-                .mutable_store()
-                .expect("credential store was validated before prompting")
-                .set(id, secret.as_ref().expect("prompt supplied a credential")),
-            Credential::Delete => source
-                .mutable_store()
-                .expect("credential store was validated before deletion")
-                .delete(id),
-            Credential::Status => Ok(()),
-        }
-        .map_err(credential_error)?;
-        let status = CredentialStatus {
-            account_id: id.to_string(),
-            availability: source.availability(id),
-            provisioning: if mutable {
-                Provisioning::Operator
-            } else {
-                Provisioning::External
-            },
-        };
-        Ok((status, service))
+        span.in_scope(|| {
+            match command {
+                Credential::Set => source
+                    .mutable_store()
+                    .expect("credential store was validated before prompting")
+                    .set(id, secret.as_ref().expect("prompt supplied a credential")),
+                Credential::Delete => source
+                    .mutable_store()
+                    .expect("credential store was validated before deletion")
+                    .delete(id),
+                Credential::Status => Ok(()),
+            }
+            .map_err(credential_error)?;
+            let status = CredentialStatus {
+                account_id: id.to_string(),
+                availability: source.availability(id),
+                provisioning: if mutable {
+                    Provisioning::Operator
+                } else {
+                    Provisioning::External
+                },
+            };
+            Ok((status, service))
+        })
     })
     .await
     .map_err(|_| Error::new(ErrorCode::InternalError))?

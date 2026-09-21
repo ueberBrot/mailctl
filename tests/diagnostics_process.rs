@@ -90,6 +90,10 @@ fn every_log_level_keeps_request_content_and_dependency_filters_out_of_diagnosti
             .unwrap();
         assert_eq!(failure["request_id"], envelope["request_id"]);
         assert_eq!(failure["code"], "invalid_request");
+        if matches!(level, "info" | "debug" | "trace") {
+            assert_eq!(events[0]["event"], "request_started");
+            assert_eq!(events[0]["request_id"], envelope["request_id"]);
+        }
         let started = events
             .iter()
             .any(|event| event["event"] == "process_started");
@@ -152,4 +156,132 @@ fn human_compact_diagnostics_remain_plain_on_redirected_streams() {
         assert!(text.contains("operation_failed") && text.contains("invalid_request"));
         assert!(!text.contains('\u{1b}'));
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn color_is_resolved_for_each_terminal_stream_and_respects_no_color() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let installation = support::Installation::two_accounts();
+    let mut setup = installation.cli();
+    setup.args(["--json", "setup"]);
+    support::assert_success(&support::run_bounded(setup));
+    for stdout_terminal in [false, true] {
+        for stderr_terminal in [false, true] {
+            for (color, no_color) in [("auto", ""), ("always", ""), ("never", ""), ("always", "1")]
+            {
+                let request = serde_json::json!({
+                    "command": [MAILCTL, "--config", installation.config().to_str().unwrap(), "--color", color,
+                        "--log-format", "compact", "--log-level", "info", "account", "list"],
+                    "stdout": stdout_terminal, "stderr": stderr_terminal,
+                });
+                let mut child = Command::new("python3")
+                    .arg(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/tests/support/output_terminal.py"
+                    ))
+                    .env("NO_COLOR", no_color)
+                    .env("TERM", "xterm-256color")
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                child
+                    .stdin
+                    .take()
+                    .unwrap()
+                    .write_all(&serde_json::to_vec(&request).unwrap())
+                    .unwrap();
+                let output = child.wait_with_output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let captured: Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(captured["exit"], 0);
+                assert!(captured["stdout"].as_str().unwrap().contains("Result"));
+                assert_eq!(
+                    captured["stdout"].as_str().unwrap().contains('\u{1b}'),
+                    stdout_terminal && color != "never" && no_color.is_empty()
+                );
+                assert_eq!(
+                    captured["stderr"].as_str().unwrap().contains('\u{1b}'),
+                    stderr_terminal && color != "never" && no_color.is_empty()
+                );
+            }
+        }
+    }
+}
+
+#[cfg(feature = "mcp")]
+#[test]
+fn mcp_startup_and_administration_keep_machine_streams_clean() {
+    for administration in [false, true] {
+        for format in ["off", "json", "compact"] {
+            let mut command = Command::new(support::MAILCTL_MCP);
+            command.arg("--config").arg(missing_config()).args([
+                "--color",
+                "always",
+                "--log-format",
+                format,
+            ]);
+            if administration {
+                command.args(["--json", "doctor"]);
+            }
+            let output = command.output().unwrap();
+            assert_eq!(output.status.code(), Some(2));
+            if administration {
+                let _: Value = serde_json::from_slice(&output.stdout).unwrap();
+            } else {
+                assert!(output.stdout.is_empty());
+            }
+            assert!(!output.stderr.contains(&0x1b));
+            if format == "off" {
+                assert!(output.stderr.is_empty());
+            } else {
+                for line in String::from_utf8(output.stderr).unwrap().lines() {
+                    let event: Value = serde_json::from_str(line).unwrap();
+                    assert_eq!(event["code"], "invalid_request");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn invalid_configuration_payloads_stay_private_and_schema_guidance_survives() {
+    let installation = support::Installation::two_accounts();
+    for level in ["error", "warn", "info", "debug", "trace"] {
+        std::fs::write(
+            installation.config(),
+            "fixture-private-config-secret\u{1b}]52;c;payload\u{7}".repeat(3000),
+        )
+        .unwrap();
+        let mut command = installation.cli();
+        command.args(["--json", "--log-level", level, "account", "list"]);
+        let output = support::run_bounded(command);
+        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(
+            support::envelope(&output)["error"]["code"],
+            "invalid_request"
+        );
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(!stderr.contains("fixture-private") && !stderr.contains("payload"));
+        for line in stderr.lines() {
+            assert!(line.len() < 2048);
+            let _: Value = serde_json::from_str(line).unwrap();
+        }
+    }
+    std::fs::write(installation.config(), "version = 999\n").unwrap();
+    let mut command = installation.cli();
+    command.args(["--log-format", "json", "account", "list"]);
+    let output = support::run_bounded(command);
+    let event: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(
+        event["message"],
+        mailctl::domain::Error::incompatible_schema().message
+    );
 }

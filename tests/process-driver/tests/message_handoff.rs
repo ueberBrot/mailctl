@@ -75,6 +75,8 @@ async fn cli_mcp_and_restarted_sessions_continue_under_fresh_authorization() {
         .unwrap()
         .to_owned();
     text_handoffs(&installation, &server, &message).await;
+    hostile_presentation(&installation, &server, &message).await;
+    hostile_failures(&installation, &server);
     server.finish();
 }
 
@@ -179,4 +181,121 @@ async fn mcp_message(
     })
     .await
     .expect("MCP message request and shutdown finish within the deadline")
+}
+
+async fn hostile_presentation(
+    installation: &Installation,
+    server: &server::ImapServer,
+    message: &str,
+) {
+    let mut bytes = "Private café\r\n\r\nNext\tcolumn\u{1b}]52;c;clipboard-secret\u{7}end\u{1b}[31mred\u{1b}[0m\u{202e}\u{0000}\u{007f}".as_bytes().to_vec();
+    bytes.extend_from_slice(&[0xff]);
+    bytes.extend_from_slice("界".repeat(300).as_bytes());
+    // The existing MIME representation prefixes a marker when decoding replaces bytes.
+    let semantic = format!("�{}", String::from_utf8_lossy(&bytes));
+    for level in ["error", "warn", "info", "debug", "trace"] {
+        for json in [false, true] {
+            server.expect_body_bytes("Archive", &bytes);
+            let mut command = installation.cli();
+            command
+                .env("MAILCTL_FIXTURE_CA", &server.certificate)
+                .env("RUST_LOG", "trace")
+                .args([
+                    "--log-format",
+                    "json",
+                    "--log-level",
+                    level,
+                    "--color",
+                    "always",
+                    "message",
+                    "get",
+                    "--message",
+                    message,
+                ]);
+            if json {
+                command.arg("--json");
+            }
+            let output = run_bounded(command);
+            assert_success(&output);
+            let diagnostics = std::str::from_utf8(&output.stderr).unwrap();
+            for secret in [
+                "Private",
+                "café",
+                "clipboard-secret",
+                "界",
+                "disposable-password",
+                "work@example.test",
+                message,
+            ] {
+                assert!(!diagnostics.contains(secret));
+            }
+            for line in diagnostics.lines() {
+                assert!(line.len() < 2048);
+                let _: serde_json::Value = serde_json::from_str(line).unwrap();
+            }
+            if json {
+                assert_eq!(
+                    envelope(&output)["result"]["body"]["text"],
+                    semantic.as_str()
+                );
+            } else {
+                let text = String::from_utf8(output.stdout).unwrap();
+                assert!(
+                    text.contains(
+                        "Private café\n\nNext    columnendred\\u{202e}\\u{0000}\\u{007f}�"
+                    )
+                );
+                assert!(!text.contains('\u{1b}') && !text.contains('\u{202e}'));
+                assert!(!text.contains("clipboard-secret"));
+            }
+        }
+    }
+    server.expect_body_bytes("Archive", &bytes);
+    let mut command = installation.mcp();
+    command.env("MAILCTL_FIXTURE_CA", &server.certificate);
+    let response = mcp_message(command, message, None).await;
+    assert_eq!(response["result"]["body"]["text"], semantic.as_str());
+}
+
+fn hostile_failures(installation: &Installation, server: &server::ImapServer) {
+    for level in ["error", "warn", "info", "debug", "trace"] {
+        for (malformed, exit, code) in [
+            (false, 4, "authentication_failed"),
+            (true, 5, "provider_unavailable"),
+        ] {
+            server.reject_authentication(malformed);
+            let mut command = installation.cli();
+            command
+                .env("MAILCTL_FIXTURE_CA", &server.certificate)
+                .env("RUST_LOG", "trace")
+                .args([
+                    "--json",
+                    "--log-format",
+                    "json",
+                    "--log-level",
+                    level,
+                    "doctor",
+                    "--check-account",
+                ]);
+            let output = run_bounded(command);
+            assert_eq!(output.status.code(), Some(exit));
+            let stderr = std::str::from_utf8(&output.stderr).unwrap();
+            assert!(
+                !stderr.contains("fixture-private")
+                    && !stderr.contains("payload")
+                    && !stderr.contains('\u{1b}')
+            );
+            let mut failed = false;
+            for line in stderr.lines() {
+                assert!(line.len() < 2048);
+                let event: serde_json::Value = serde_json::from_str(line).unwrap();
+                if event["event"] == "operation_failed" {
+                    failed = true;
+                    assert_eq!(event["code"], code);
+                    assert_eq!(event["request_id"], envelope(&output)["request_id"]);
+                }
+            }
+            assert!(failed, "provider failure must emit a diagnostic");
+        }
+    }
 }

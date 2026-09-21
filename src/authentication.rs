@@ -15,6 +15,7 @@ use tokio::{
     time::Instant,
 };
 use tokio_rustls::rustls::RootCertStore;
+use tracing::Instrument;
 use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -555,35 +556,41 @@ impl Runtime {
                 let deadline = Duration::from_secs(limits.operation_seconds as u64);
                 let active = limits.credential_workers;
                 let running = flight.clone();
-                tokio::spawn(async move {
-                    let admission = tokio::select! {
-                        _ = running.cancelled() => return,
-                        result = tokio::time::timeout(deadline, admission.wait(active)) => result,
-                    };
-                    let admission = match admission {
-                        Ok(admission) => admission,
-                        Err(_) => {
-                            let _ = sender.send(Some(Err(Error::Timeout)));
+                tokio::spawn(
+                    async move {
+                        let admission = tokio::select! {
+                            _ = running.cancelled() => return,
+                            result = tokio::time::timeout(deadline, admission.wait(active)) => result,
+                        };
+                        let admission = match admission {
+                            Ok(admission) => admission,
+                            Err(_) => {
+                                let _ = sender.send(Some(Err(Error::Timeout)));
+                                return;
+                            }
+                        };
+                        if running.abandon_if_unobserved() {
                             return;
                         }
-                    };
-                    if running.abandon_if_unobserved() {
-                        return;
+                        let span = tracing::Span::current();
+                        let result = tokio::task::spawn_blocking(move || {
+                            span.in_scope(|| {
+                                let _worker = admission;
+                                match kind {
+                                    WorkKind::Inspect => Ok(Work::Availability(source.availability(id))),
+                                    WorkKind::Resolve => source
+                                        .resolve(id)
+                                        .map(|secret| Work::Secret(Arc::new(secret)))
+                                        .map_err(Error::Source),
+                                }
+                            })
+                        })
+                        .await
+                        .unwrap_or(Err(Error::Source(SourceError::Internal)));
+                        let _ = sender.send(Some(result));
                     }
-                    let result = tokio::task::spawn_blocking(move || {
-                        let _worker = admission;
-                        match kind {
-                            WorkKind::Inspect => Ok(Work::Availability(source.availability(id))),
-                            WorkKind::Resolve => source
-                                .resolve(id)
-                                .map(|secret| Work::Secret(Arc::new(secret)))
-                                .map_err(Error::Source),
-                        }
-                    })
-                    .await
-                    .unwrap_or(Err(Error::Source(SourceError::Internal)));
-                    let _ = sender.send(Some(result));
-                });
+                    .in_current_span(),
+                );
                 flight
             }
         };

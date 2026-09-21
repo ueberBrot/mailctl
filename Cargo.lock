@@ -1741,6 +1741,7 @@ version = "0.1.0"
 dependencies = [
  "allocation-counter",
  "anstream",
+ "anstyle",
  "apple-native-keyring-store",
  "base64 0.22.1",
  "cargo_metadata",
@@ -1781,6 +1782,7 @@ dependencies = [
 name = "mailctl-process-tests"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "io-imap",
  "mailctl",
  "rcgen",
@@ -1789,6 +1791,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "toml",
+ "tracing",
  "uuid",
 ]
 
