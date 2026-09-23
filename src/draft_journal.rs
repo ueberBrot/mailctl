@@ -12,15 +12,9 @@ use std::{fmt, path::Path, time::Duration};
 use uuid::Uuid;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
-/// The immutable identity of a draft operation.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DraftOperationIdentity {
-    pub account_id: Uuid,
-    pub account_generation: u64,
-    pub operation_id: Uuid,
-}
+pub use crate::domain::DraftIdentity as DraftOperationIdentity;
 
 /// The immutable facts that allow a prepared operation to be dispatched.
 ///
@@ -32,6 +26,18 @@ pub struct PreparedDraftOperation {
     pub identity: DraftOperationIdentity,
     pub mailbox_identity: String,
     pub content_sha256: [u8; 32],
+    pub reconstruction: Option<DraftReconstruction>,
+}
+
+/// Frozen, content-free parameters for deterministic reconstruction.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DraftReconstruction {
+    pub uid_validity: u32,
+    pub input_sha256: [u8; 32],
+    pub from_configuration_sha256: [u8; 32],
+    pub date_unix: i64,
+    pub encoder_version: u32,
 }
 
 /// A server-provided identity for a created message, when APPENDUID was present.
@@ -68,6 +74,7 @@ pub struct PersistedDraftOperation {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DraftJournalError {
     Unavailable,
+    Full,
     InvalidDatabase,
     InvalidOperation,
     OperationConflict,
@@ -79,6 +86,7 @@ impl fmt::Display for DraftJournalError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let message = match self {
             Self::Unavailable => "The draft journal is unavailable",
+            Self::Full => "The draft journal is full",
             Self::InvalidDatabase => "The draft journal is invalid",
             Self::InvalidOperation => "The draft operation is invalid",
             Self::OperationConflict => "The draft operation conflicts with its recorded input",
@@ -119,7 +127,30 @@ impl DraftJournal {
     /// Opens a local journal and verifies WAL, FULL synchronous mode, and a
     /// finite SQLite busy timeout before exposing it.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, DraftJournalError> {
-        let mut connection = Connection::open(path).map_err(unavailable)?;
+        Self::connect(path.as_ref(), true, BUSY_TIMEOUT)
+    }
+    /// Opens existing history without creating or migrating a database.
+    pub fn open_existing(path: impl AsRef<Path>) -> Result<Self, DraftJournalError> {
+        Self::connect(path.as_ref(), false, BUSY_TIMEOUT)
+    }
+    /// Runtime calls fail immediately on SQLite contention; async account leases
+    /// own waiting, and SQLite must not sleep inside an async executor poll.
+    pub fn open_existing_nowait(path: impl AsRef<Path>) -> Result<Self, DraftJournalError> {
+        Self::connect(path.as_ref(), false, Duration::ZERO)
+    }
+    fn connect(
+        path: &Path,
+        initialize: bool,
+        busy_timeout: Duration,
+    ) -> Result<Self, DraftJournalError> {
+        let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+            | if initialize {
+                rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+            } else {
+                rusqlite::OpenFlags::empty()
+            };
+        let mut connection = Connection::open_with_flags(path, flags).map_err(unavailable)?;
+        connection.busy_timeout(busy_timeout).map_err(unavailable)?;
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .map_err(unavailable)?;
@@ -131,12 +162,10 @@ impl DraftJournal {
             )
             .map_err(unavailable)?;
         match (version, tables) {
-            (0, 0) => initialize_schema(&mut connection)?,
+            (0, 0) if initialize => initialize_schema(&mut connection)?,
             (SCHEMA_VERSION, _) if schema_is_current(&connection)? => {}
             _ => return Err(DraftJournalError::InvalidDatabase),
         }
-
-        connection.busy_timeout(BUSY_TIMEOUT).map_err(unavailable)?;
 
         let journal_mode: String = connection
             .query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))
@@ -166,17 +195,39 @@ impl DraftJournal {
         &mut self,
         operation: PreparedDraftOperation,
     ) -> Result<PersistedDraftOperation, DraftJournalError> {
+        self.prepare_with_limit(operation, 1_000_000)
+    }
+    pub fn prepare_with_limit(
+        &mut self,
+        operation: PreparedDraftOperation,
+        maximum: usize,
+    ) -> Result<PersistedDraftOperation, DraftJournalError> {
         validate_operation(&operation)?;
         let account_generation = sqlite_generation(operation.identity.account_generation)?;
-        let transaction = self.connection.transaction().map_err(unavailable)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(unavailable)?;
+        if let Some(persisted) = read_by_identity(&transaction, &operation.identity)? {
+            if persisted.operation != operation {
+                return Err(DraftJournalError::OperationConflict);
+            }
+            transaction.commit().map_err(unavailable)?;
+            return Ok(persisted);
+        }
+        let count: i64 = transaction
+            .query_row("SELECT COUNT(*) FROM draft_operations", [], |r| r.get(0))
+            .map_err(unavailable)?;
+        if count >= maximum as i64 {
+            return Err(DraftJournalError::Full);
+        }
         transaction
             .execute(
                 "
                 INSERT INTO draft_operations (
                     operation_id, account_id, account_generation, mailbox_identity,
-                    content_sha256, state, appended_uid_validity, appended_uid
-                ) VALUES (?1, ?2, ?3, ?4, ?5, 'prepared', NULL, NULL)
-                ON CONFLICT(account_id, account_generation, operation_id) DO NOTHING
+                    content_sha256, reconstruction, state, appended_uid_validity, appended_uid
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'prepared', NULL, NULL)
                 ",
                 params![
                     operation.identity.operation_id.as_bytes().as_slice(),
@@ -184,16 +235,20 @@ impl DraftJournal {
                     account_generation,
                     operation.mailbox_identity,
                     operation.content_sha256.as_slice(),
+                    operation
+                        .reconstruction
+                        .as_ref()
+                        .map(serde_json::to_string)
+                        .transpose()
+                        .map_err(|_| DraftJournalError::InvalidOperation)?,
                 ],
             )
             .map_err(unavailable)?;
-        let persisted = read_by_identity(&transaction, &operation.identity)?
-            .ok_or(DraftJournalError::InvalidDatabase)?;
-        if persisted.operation != operation {
-            return Err(DraftJournalError::OperationConflict);
-        }
         transaction.commit().map_err(unavailable)?;
-        Ok(persisted)
+        Ok(PersistedDraftOperation {
+            operation,
+            state: DraftOperationState::Prepared,
+        })
     }
 
     /// Atomically marks a prepared operation as in flight before APPEND bytes
@@ -341,6 +396,7 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), DraftJournalErro
                         length(mailbox_identity) > 0 AND length(mailbox_identity) <= 4096
                     ),
                     content_sha256 BLOB NOT NULL CHECK(length(content_sha256) = 32),
+                    reconstruction TEXT,
                     state TEXT NOT NULL CHECK(state IN (
                         'prepared', 'in_flight', 'created', 'rejected', 'outcome_unknown'
                     )),
@@ -357,7 +413,7 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), DraftJournalErro
                     ),
                     PRIMARY KEY (account_id, account_generation, operation_id)
                 );
-                PRAGMA user_version = 1;
+                PRAGMA user_version = 2;
             ",
         )
         .map_err(unavailable)?;
@@ -370,6 +426,7 @@ struct DatabaseRow {
     account_generation: i64,
     mailbox_identity: String,
     content_sha256: Vec<u8>,
+    reconstruction: Option<String>,
     state: String,
     appended_uid_validity: Option<i64>,
     appended_uid: Option<i64>,
@@ -382,6 +439,7 @@ fn schema_is_current(connection: &Connection) -> Result<bool, DraftJournalError>
         ("account_generation", "INTEGER", 1, 2),
         ("mailbox_identity", "TEXT", 1, 0),
         ("content_sha256", "BLOB", 1, 0),
+        ("reconstruction", "TEXT", 0, 0),
         ("state", "TEXT", 1, 0),
         ("appended_uid_validity", "INTEGER", 0, 0),
         ("appended_uid", "INTEGER", 0, 0),
@@ -417,7 +475,7 @@ fn read_by_identity(
         .query_row(
             "
             SELECT operation_id, account_id, account_generation, mailbox_identity,
-                   content_sha256, state, appended_uid_validity, appended_uid
+                   content_sha256, reconstruction, state, appended_uid_validity, appended_uid
             FROM draft_operations
             WHERE account_id = ?1 AND account_generation = ?2 AND operation_id = ?3
             ",
@@ -433,9 +491,10 @@ fn read_by_identity(
                     account_generation: row.get(2)?,
                     mailbox_identity: row.get(3)?,
                     content_sha256: row.get(4)?,
-                    state: row.get(5)?,
-                    appended_uid_validity: row.get(6)?,
-                    appended_uid: row.get(7)?,
+                    reconstruction: row.get(5)?,
+                    state: row.get(6)?,
+                    appended_uid_validity: row.get(7)?,
+                    appended_uid: row.get(8)?,
                 })
             },
         )
@@ -488,6 +547,10 @@ fn decode_row(row: DatabaseRow) -> Result<PersistedDraftOperation, DraftJournalE
             },
             mailbox_identity: row.mailbox_identity,
             content_sha256,
+            reconstruction: row
+                .reconstruction
+                .map(|s| serde_json::from_str(&s).map_err(|_| DraftJournalError::InvalidDatabase))
+                .transpose()?,
         },
         state,
     })

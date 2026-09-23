@@ -237,3 +237,33 @@ impl super::AttachmentReader for ImapAttachment {
         })
     }
 }
+
+impl super::DraftTargets for ImapBackend {
+    fn inspect<'a>(
+        &'a self,
+        _: MailboxTarget<'a>,
+        mailbox: &'a str,
+        limits: &'a Limits,
+    ) -> Pin<Box<dyn Future<Output = Result<u32, Error>> + Send + 'a>> {
+        Box::pin(async move {
+            self.acquire(limits)
+                .await?
+                .with_connection(async |connection| {
+                    connection
+                        .inspect_draft_target(
+                            mailbox,
+                            &crate::imap::Limits::body(limits),
+                            &mut crate::imap::Metrics::default(),
+                        )
+                        .await
+                })
+                .await
+                .map_err(|error| match error {
+                    crate::imap::Error::UnsafeSelection => {
+                        Error::new(ErrorCode::DraftMailboxUnavailable)
+                    }
+                    error => error.into(),
+                })
+        })
+    }
+}

@@ -1,5 +1,6 @@
 //! The envelope FETCH contract: requested fields, validation, and normalization.
-use super::{Error, dot_atom};
+use super::Error;
+use crate::domain::dot_atom;
 use io_imap::types::{
     core::NString,
     datetime::DateTime,

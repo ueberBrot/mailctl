@@ -102,8 +102,25 @@ impl Service {
         if generation != expected_generation {
             return Err(Error::new(ErrorCode::StaleReference));
         }
+        Self::authorize_mailbox_scope(
+            grant,
+            MailboxTarget {
+                config: account,
+                account_id: id,
+                generation,
+            },
+            mailbox,
+        )
+    }
+
+    pub(super) fn authorize_mailbox_scope<'a>(
+        grant: &crate::config::AccessGrant,
+        target: MailboxTarget<'a>,
+        mailbox: &str,
+    ) -> Result<MailboxTarget<'a>, Error> {
         let name = mailbox_identity(mailbox);
-        if !account
+        if !target
+            .config
             .mailboxes
             .iter()
             .any(|allowed| mailbox_identity(allowed) == name)
@@ -114,11 +131,7 @@ impl Service {
         {
             return Err(Error::new(ErrorCode::MailboxNotAllowed));
         }
-        Ok(MailboxTarget {
-            config: account,
-            account_id: id,
-            generation,
-        })
+        Ok(target)
     }
 
     /// Select a provider adapter when composing the application, before accepting requests.

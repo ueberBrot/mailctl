@@ -33,6 +33,12 @@ fn tool<I: schemars::JsonSchema + 'static, O: schemars::JsonSchema + 'static>(
 fn definitions(operations: &[String]) -> Vec<Tool> {
     let empty = json!({"type":"object","properties":{},"additionalProperties":false});
     [
+        tool::<crate::domain::SaveDraftInput, crate::domain::DraftReceipt>(
+            "email_save_draft", "Record a prepared, undispatched draft using caller-retained identity and composition.",
+        ),
+        tool::<crate::domain::DraftStatusInput, crate::domain::DraftReceipt>(
+            "email_draft_status", "Inspect an authorized draft operation without provider work; reconciliation is not yet supported.",
+        ),
         tool::<ListAccountsInput, AccountDiscovery>(
             "email_list_accounts",
             "List authorized email accounts with explicit completion.",
@@ -139,10 +145,10 @@ impl ServerHandler for EmailTools {
                     result.map_err(|_| Error::new(ErrorCode::Timeout)).flatten(),
             },
         };
-        if result
-            .as_ref()
-            .is_err_and(|error| error.code == ErrorCode::OperationConflict)
-        {
+        if result.as_ref().is_err_and(|error| {
+            error.code == ErrorCode::OperationConflict
+                && error.conflict_kind == Some(crate::domain::ConflictKind::Configuration)
+        }) {
             self.shutdown.cancel();
         }
         let mut envelope = diagnostic_request.envelope(result);
@@ -172,7 +178,11 @@ pub(super) async fn run(application: Application) -> Result<(), Error> {
         return Err(Error::new(ErrorCode::InternalError));
     };
     let limits = application.limits()?;
-    let bounds = Bounds::new(limits, application.response_bound()?)?;
+    let bounds = Bounds::new(
+        limits,
+        application.response_bound()?,
+        capabilities.operations.iter().any(|op| op == "save_draft"),
+    )?;
     let expires = tokio::time::Instant::now()
         + Duration::from_secs(limits.connection_lifetime_seconds as u64);
     let initialization_expires = expires.min(

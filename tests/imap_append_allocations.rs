@@ -2,7 +2,10 @@ mod append_support;
 mod imap_support;
 use append_support::*;
 use imap_support::*;
-use mailctl::imap::{AppendOutcome, Limits, PreparedDraft, TlsMode};
+use mailctl::{
+    draft::PreparedDraft,
+    imap::{AppendOutcome, Limits, TlsMode},
+};
 
 #[test]
 fn streamed_append_keeps_backend_allocations_independent_of_mime_size() {

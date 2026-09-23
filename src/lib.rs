@@ -3,6 +3,7 @@ pub mod authentication;
 pub mod config;
 pub mod credentials;
 pub mod domain;
+pub mod draft;
 pub mod draft_journal;
 mod encoding;
 #[cfg(feature = "cli")]

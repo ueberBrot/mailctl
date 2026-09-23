@@ -1,7 +1,9 @@
 //! Account discovery and access-grant authorization through one application interface.
 mod credentials;
+mod drafts;
 #[cfg(any(feature = "cli", feature = "mcp"))]
 pub(crate) use credentials::credential_error;
+pub use drafts::{DraftTargets, MemoryDraftTargets};
 mod attachments;
 mod imap;
 mod mailboxes;
@@ -29,6 +31,7 @@ use state::AccountRegistry;
 use uuid::Uuid;
 
 pub struct Service {
+    draft_targets: Option<std::sync::Arc<dyn DraftTargets>>,
     config: Config,
     host: std::sync::Arc<dyn crate::host::HostEnvironment>,
     registry: AccountRegistry,
@@ -85,6 +88,7 @@ impl Service {
             registry,
             context_id: Uuid::new_v4(),
             mailbox_backend: None,
+            draft_targets: None,
             search_backend: None,
             body_backend: None,
             attachment_backend: None,
@@ -155,7 +159,15 @@ impl Service {
         if context.permissions().contains(&Permission::SearchMessages) {
             return Ok(maximum);
         }
-        let mut size = 2048usize.min(maximum);
+        let mut size = if context
+            .permissions()
+            .contains(&Permission::InspectDraftOperation)
+        {
+            16 * 1024
+        } else {
+            2048usize
+        }
+        .min(maximum);
         for account in self.visible_accounts(context) {
             // Covers account identity, generation, operation names and envelope
             // fields; capability/health entries are smaller than this discovery entry.
@@ -168,6 +180,12 @@ impl Service {
                 return Ok(maximum);
             };
             size += identities;
+            if context.permissions().contains(&Permission::AppendDraft) {
+                let Ok(target) = serialized_size(&account.drafts_mailbox, maximum - size) else {
+                    return Ok(maximum);
+                };
+                size += target;
+            }
         }
         if context.permissions().contains(&Permission::ListMailboxes) {
             let grant = self.grant(context)?;
@@ -241,6 +259,8 @@ impl Service {
         };
         let operations = || {
             [
+                ("save_draft", Some(Permission::AppendDraft)),
+                ("draft_status", Some(Permission::InspectDraftOperation)),
                 ("list_accounts", None),
                 ("capabilities", None),
                 ("health", None),
@@ -258,6 +278,12 @@ impl Service {
             .collect()
         };
         let result = match operation {
+            Operation::SaveDraft(input) => {
+                OperationResult::Draft(self.save_draft(context, input).await?)
+            }
+            Operation::DraftStatus(input) => {
+                OperationResult::Draft(self.draft_status(context, input).await?)
+            }
             Operation::ListAttachments(input) => {
                 OperationResult::Attachments(self.list_attachments(context, input).await?)
             }
@@ -283,18 +309,27 @@ impl Service {
                 ordered.sort_by_key(|account| self.registry.identity(&account.key).0);
                 let complete = ordered.len() <= limit;
                 ordered.truncate(limit);
+                let can_save_drafts = context.permissions().contains(&Permission::AppendDraft);
                 let mut budget = OutputBudget::new(context.response_limit().saturating_sub(512));
                 budget.reserve(32)?;
                 for account in &ordered {
                     budget.reserve(256)?;
                     budget.count(&account.alias)?;
                     budget.count(&account.from_identities)?;
+                    if can_save_drafts {
+                        budget.count(&account.drafts_mailbox)?;
+                    }
                 }
                 let visible = ordered
                     .into_iter()
                     .map(|account| {
                         let (account_id, generation) = self.registry.identity(&account.key);
                         Account {
+                            drafts_mailbox: if can_save_drafts {
+                                account.drafts_mailbox.clone()
+                            } else {
+                                None
+                            },
                             alias: account.alias.clone(),
                             account_id: account_id.to_owned(),
                             generation,
@@ -349,8 +384,21 @@ impl Service {
             .iter()
             .filter(|account| account.availability == Availability::Unavailable)
             .count();
+        let draft_journal = context
+            .permissions()
+            .contains(&Permission::InspectDraftOperation)
+            .then(|| {
+                if self.registry.draft_journal().is_ok() {
+                    Availability::Available
+                } else {
+                    Availability::Unavailable
+                }
+            });
         Ok(Health {
-            status: if unavailable == 0 {
+            draft_journal,
+            status: if draft_journal == Some(Availability::Unavailable) {
+                "degraded"
+            } else if unavailable == 0 {
                 "ready"
             } else if unavailable == accounts.len() {
                 "unavailable"

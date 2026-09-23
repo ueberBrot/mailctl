@@ -5,11 +5,12 @@ mod support;
 use append_support::{draft, receive};
 use imap_support::*;
 use mailctl::{
+    draft::PreparedDraft,
     draft_journal::{
         DraftJournal, DraftJournalError, DraftOperationIdentity, DraftOperationState,
         PreparedDraftOperation,
     },
-    imap::{AppendOutcome, Limits, PreparedDraft, TlsMode},
+    imap::{AppendOutcome, Limits, TlsMode},
 };
 use uuid::Uuid;
 
@@ -22,6 +23,7 @@ fn operation(draft: &PreparedDraft) -> PreparedDraftOperation {
         },
         mailbox_identity: "Drafts".into(),
         content_sha256: draft.sha256(),
+        reconstruction: None,
     }
 }
 

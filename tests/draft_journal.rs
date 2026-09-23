@@ -54,6 +54,7 @@ fn operation(
         },
         mailbox_identity: "mailbox-opaque-id".into(),
         content_sha256: [hash; 32],
+        reconstruction: None,
     }
 }
 
@@ -213,6 +214,35 @@ fn full_identity_tuple_allows_the_same_operation_uuid_for_distinct_history() {
     assert_eq!(
         journal.prepare(conflicting),
         Err(DraftJournalError::OperationConflict)
+    );
+}
+
+#[test]
+fn full_journal_retries_preserve_outcomes_and_still_reject_conflicting_input() {
+    let temporary = TemporaryJournal::new();
+    let prepared = operation(Uuid::new_v4(), 1, Uuid::new_v4(), 15);
+    let mut journal = DraftJournal::open(&temporary.path).unwrap();
+    journal.prepare_with_limit(prepared.clone(), 1).unwrap();
+    journal.begin_dispatch(&prepared).unwrap();
+    let recorded = journal.record_created(&prepared.identity, None).unwrap();
+
+    assert_eq!(
+        journal.prepare_with_limit(prepared.clone(), 0).unwrap(),
+        recorded
+    );
+    let mut conflicting = prepared;
+    conflicting.content_sha256 = [16; 32];
+    assert_eq!(
+        journal.prepare_with_limit(conflicting, 0),
+        Err(DraftJournalError::OperationConflict)
+    );
+    assert_eq!(
+        journal.prepare_with_limit(operation(Uuid::new_v4(), 1, Uuid::new_v4(), 17), 1),
+        Err(DraftJournalError::Full)
+    );
+    assert_eq!(
+        journal.inspect(&recorded.operation.identity).unwrap(),
+        Some(recorded)
     );
 }
 

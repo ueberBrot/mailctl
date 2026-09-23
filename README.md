@@ -3,7 +3,8 @@
 Email tools for the command line and MCP. It supports account and mailbox
 discovery, bounded message search and body reads, attachment retrieval, reusable
 resource references, capability reporting, macOS credential provisioning, and
-authentication diagnostics.
+authentication diagnostics. It also prepares durable, undispatched drafts
+and inspects their status through either interface.
 
 Build both executables:
 

@@ -597,6 +597,27 @@ fn capabilities_include_the_same_grant_filtered_safe_health_as_doctor() {
 }
 
 #[test]
+fn hidden_draft_mailbox_does_not_consume_the_discovery_response_budget() {
+    let mut config = Config::parse(&configuration()).unwrap();
+    let mailbox = "D".repeat(1024);
+    config.accounts[0].mailboxes.push(mailbox.clone());
+    config.accounts[0].drafts_mailbox = Some(mailbox);
+    let service = Service::in_memory(config).unwrap();
+    let context = service
+        .context("reader", &Narrowing::default())
+        .unwrap()
+        .with_response_limit(1024);
+    let discovery = execute(
+        &service,
+        &context,
+        Operation::ListAccounts(ListAccountsInput::default()),
+    )
+    .unwrap();
+    assert_eq!(discovery["accounts"].as_array().unwrap().len(), 1);
+    assert!(discovery["accounts"][0].get("drafts_mailbox").is_none());
+}
+
+#[test]
 fn repeated_grant_account_keys_do_not_inflate_health_response_budgets() {
     let mut config = Config::parse(&configuration()).unwrap();
     config.grants[0].accounts = vec!["primary".into(); config.limits.accounts];

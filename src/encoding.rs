@@ -1,6 +1,7 @@
 //! Shared allocation bounds for JSON parsing and serialization.
 use crate::domain::{Error, ErrorCode};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
 use std::io::{self, Write};
 
@@ -111,6 +112,31 @@ pub(crate) fn serialized_size<T: Serialize>(value: &T, maximum: usize) -> Result
     let mut budget = OutputBudget::new(maximum);
     budget.count(value)?;
     Ok(maximum - budget.remaining)
+}
+
+pub(crate) fn json_sha256(value: &impl Serialize, maximum: usize) -> Result<[u8; 32], Error> {
+    let mut writer = JsonHash {
+        digest: Sha256::new(),
+        budget: OutputBudget::new(maximum),
+    };
+    serde_json::to_writer(&mut writer, value)
+        .map_err(|_| Error::new(ErrorCode::ResponseTooLarge))?;
+    Ok(writer.digest.finalize().into())
+}
+
+struct JsonHash {
+    digest: Sha256,
+    budget: OutputBudget,
+}
+impl Write for JsonHash {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.budget.reserve(bytes.len()).map_err(io::Error::other)?;
+        self.digest.update(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 pub(crate) fn serialize_bounded<T: Serialize>(value: &T, maximum: usize) -> Result<Vec<u8>, Error> {

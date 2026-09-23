@@ -30,6 +30,7 @@ struct Expected {
 
 enum ExpectedOperation {
     Authenticate,
+    DraftTarget,
     RejectAuthentication(bool),
     Mailboxes(Vec<&'static str>),
     Search(&'static str, Option<u32>),
@@ -111,6 +112,10 @@ impl ImapServer {
                             imap_support::capability(&mut wire, "IMAP4rev1").await;
                             match operation {
                                 ExpectedOperation::Authenticate => {},
+                                ExpectedOperation::DraftTarget => {
+                                    let tag = imap_support::expect(&mut wire, "EXAMINE Drafts").await;
+                                    imap_support::write(&mut wire, &format!("* 0 EXISTS\r\n* OK [UIDVALIDITY 77] incarnation\r\n{tag} OK [READ-ONLY] selected\r\n")).await;
+                                },
                                 ExpectedOperation::RejectAuthentication(_) => unreachable!(),
                                 ExpectedOperation::Mailboxes(mailboxes) => {
                                     for name in mailboxes {
@@ -141,6 +146,14 @@ impl ImapServer {
             stop,
             task: Some(task),
         }
+    }
+
+    pub fn expect_draft_target(&self) {
+        self.expected.lock().unwrap().push_back(Expected {
+            username: "work@example.test",
+            password: "disposable-password",
+            operation: ExpectedOperation::DraftTarget,
+        });
     }
 
     pub fn interrupted(&self) -> usize {

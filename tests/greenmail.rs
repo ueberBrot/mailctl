@@ -532,7 +532,10 @@ fn imap_attachment_listing_and_chunks_preserve_exact_base64_decoded_data() {
 #[test]
 fn imap_append_creates_exact_draft_in_existing_target_without_changing_inbox() {
     greenmail_support::run(async {
-        use mailctl::imap::{AppendOutcome, DraftInput, Limits, PreparedDraft, TlsMode};
+        use mailctl::{
+            draft::{DraftInput, PreparedDraft},
+            imap::{AppendOutcome, Limits, TlsMode},
+        };
 
         const TARGET: &str = "fixture folder/child";
         const ID: &str = "append-proof@example.test";
@@ -686,6 +689,103 @@ mailboxes = ["INBOX"]
         );
         assert_eq!(fixture.snapshot().await?, snapshot);
         assert_eq!(fixture.contents().await?, contents);
+        fixture.shutdown().await?;
+        Ok(())
+    });
+}
+
+mod support;
+#[test]
+fn application_draft_preparation_preserves_independently_observed_target_and_inbox() {
+    greenmail_support::run(async {
+        use mailctl::{
+            config::Config,
+            domain::{DraftContent, DraftStatusInput, Operation, OperationResult, SaveDraftInput},
+            service::Service,
+        };
+        const TARGET: &str = "fixture folder/child";
+        let fixture = greenmail_support::Fixture::start().await?;
+        fixture.verify_folder_path_encoding().await?;
+        let inbox = fixture.snapshot().await?;
+        let inbox_contents = fixture.contents().await?;
+        let target = fixture.snapshot_mailbox(TARGET).await?;
+        let target_contents = fixture.contents_mailbox(TARGET).await?;
+        let installation = support::Installation::two_accounts();
+        let mut config = Config::parse(&std::fs::read_to_string(installation.config())?)?;
+        config.accounts[0].server = "localhost".into();
+        config.accounts[0].port = fixture.imaps_port();
+        config.accounts[0].username = "fixture+smoke@example.test".into();
+        config.accounts[0].from_identities = vec!["sender@example.test".into()];
+        config.accounts[0].mailboxes = vec!["INBOX".into(), TARGET.into()];
+        config.accounts[0].drafts_mailbox = Some(TARGET.into());
+        config
+            .grants
+            .iter_mut()
+            .find(|g| g.name == "writer")
+            .unwrap()
+            .mailboxes = vec![TARGET.into()];
+        Service::setup(config.clone())?;
+        let service = Service::open(config.clone())?.with_environment(host_support::Host::new(
+            fixture.tls_roots(),
+            b"disposable-fixture-password",
+        ));
+        let context = service.context("writer", &Default::default())?;
+        let OperationResult::Accounts(accounts) = service
+            .execute(&context, Operation::ListAccounts(Default::default()))
+            .await?
+        else {
+            panic!()
+        };
+        let input = SaveDraftInput {
+            mailbox: TARGET.into(),
+            account_id: accounts.accounts[0].account_id.parse()?,
+            account_generation: accounts.accounts[0].generation,
+            operation_id: uuid::Uuid::new_v4(),
+            draft: Box::new(DraftContent {
+                subject: "Synthetic undispatched draft".into(),
+                body: "The provider must not receive this content.".into(),
+                ..Default::default()
+            }),
+        };
+        let prepared = serde_json::to_value(
+            service
+                .execute(&context, Operation::SaveDraft(input.clone()))
+                .await?,
+        )?;
+        assert_eq!(prepared["state"], "prepared");
+        assert_eq!(prepared["dispatched"], false);
+        drop(service);
+        // Restart with no provider credentials: status and identical retry remain local.
+        let service = Service::open(config)?;
+        let context = service.context("writer", &Default::default())?;
+        let status = DraftStatusInput {
+            mailbox: TARGET.into(),
+            account_id: input.account_id,
+            account_generation: input.account_generation,
+            operation_id: input.operation_id,
+            reconcile: false,
+        };
+        assert_eq!(
+            serde_json::to_value(
+                service
+                    .execute(&context, Operation::DraftStatus(status))
+                    .await?
+            )?,
+            prepared
+        );
+        assert_eq!(
+            serde_json::to_value(
+                service
+                    .execute(&context, Operation::SaveDraft(input))
+                    .await?
+            )?,
+            prepared
+        );
+        assert_eq!(fixture.snapshot().await?, inbox);
+        assert_eq!(fixture.contents().await?, inbox_contents);
+        assert_eq!(fixture.snapshot_mailbox(TARGET).await?, target);
+        assert_eq!(fixture.contents_mailbox(TARGET).await?, target_contents);
+        drop(service);
         fixture.shutdown().await?;
         Ok(())
     });

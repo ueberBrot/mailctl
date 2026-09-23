@@ -5,7 +5,7 @@
 
 use crate::imap_support::{Wire, write};
 use io_imap::codec::{CommandCodec, decode::Decoder};
-use mailctl::imap::{DraftInput, PreparedDraft};
+use mailctl::draft::{DraftInput, PreparedDraft};
 use tokio::io::AsyncReadExt;
 
 pub fn input() -> DraftInput {

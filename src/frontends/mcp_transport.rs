@@ -35,21 +35,27 @@ pub(super) struct Bounds {
     deadline: Duration,
 }
 impl Bounds {
-    pub(super) fn new(limits: &Limits, response_bound: usize) -> Result<Self, Error> {
+    pub(super) fn new(limits: &Limits, response_bound: usize, drafts: bool) -> Result<Self, Error> {
         // Cover the SDK/codec's initial buffers, duplex, and bounded task metadata.
         const FIXED: usize = 64 * 1024;
         let available = limits
             .buffered_bytes
             .checked_sub(FIXED)
             .ok_or_else(Error::setup_required)?;
+        let draft_mime = if drafts { limits.draft_mime_bytes } else { 0 };
         let fits = |input, envelope| {
-            let (_, control, request) = Self::reservations(input, envelope, limits.accounts);
+            let (_, control, request) =
+                Self::reservations(input, envelope, limits.accounts, draft_mime);
             control + request <= available
         };
-        // A full search can contain 32 four-KiB strings, each JSON-escaped to six
-        // bytes per source byte. Reserve its frame before sizing the response.
+        // Draft bodies and search predicates can expand sixfold in JSON.
+        // Reserve bounded input and composition storage before sizing responses.
         let mut input = 1024;
-        let mut upper = limits.envelope_bytes.min(1024 * 1024);
+        let mut upper = limits.envelope_bytes.min(if drafts {
+            6 * limits.draft_mime_bytes + 256 * 1024
+        } else {
+            1024 * 1024
+        });
         while input < upper {
             let candidate = input + (upper - input).div_ceil(2);
             if fits(candidate, 1024) {
@@ -71,7 +77,8 @@ impl Bounds {
         if envelope < 1024 {
             return Err(Error::setup_required());
         }
-        let (output, control, request) = Self::reservations(input, envelope, limits.accounts);
+        let (output, control, request) =
+            Self::reservations(input, envelope, limits.accounts, draft_mime);
         let requests = (available - control) / request;
         Ok(Self {
             input,
@@ -83,7 +90,12 @@ impl Bounds {
         })
     }
 
-    fn reservations(input: usize, envelope: usize, accounts: usize) -> (usize, usize, usize) {
+    fn reservations(
+        input: usize,
+        envelope: usize,
+        accounts: usize,
+        draft_mime: usize,
+    ) -> (usize, usize, usize) {
         // Nonempty identity strings occupy at least three encoded bytes, with
         // at most 100 per discovered account. Count both String/Value descriptors
         // and account/BTree overhead, rather than multiplying all field bytes by
@@ -111,7 +123,7 @@ impl Bounds {
         // The input/metadata survives to output completion. Domain-to-Value
         // conversion holds at most two copies of field bytes; Value plus text
         // holds at most three, including String capacity growth.
-        let request = request_input + 3 * envelope + structure;
+        let request = request_input + 3 * envelope + structure + 2 * draft_mime;
         (output, control, request)
     }
 }

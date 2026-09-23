@@ -153,6 +153,7 @@ pub(super) fn result(request_id: &str, error: Option<&Error>) {
             Error::setup_required,
             Error::obsolete_runtime_capacity,
             Error::incompatible_schema,
+            Error::draft_conflict,
         ]
         .into_iter()
         .map(|known| known())

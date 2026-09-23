@@ -72,6 +72,8 @@ struct Mailctl {
 #[derive(Subcommand)]
 enum Email {
     #[command(subcommand)]
+    Draft(Draft),
+    #[command(subcommand)]
     Message(Message),
     #[command(subcommand)]
     Attachment(Attachment),
@@ -84,6 +86,81 @@ enum Email {
     #[command(flatten)]
     Administration(Administration),
 }
+#[cfg(feature = "cli")]
+#[derive(Args)]
+pub(super) struct DraftIdentity {
+    #[arg(long)]
+    mailbox: String,
+    #[arg(long)]
+    account_id: uuid::Uuid,
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=i64::MAX as u64))]
+    account_generation: u64,
+    #[arg(long)]
+    operation_id: uuid::Uuid,
+}
+#[cfg(feature = "cli")]
+impl DraftIdentity {
+    pub(super) fn save(self, draft: crate::domain::DraftContent) -> Operation {
+        Operation::SaveDraft(crate::domain::SaveDraftInput {
+            mailbox: self.mailbox,
+            account_id: self.account_id,
+            account_generation: self.account_generation,
+            operation_id: self.operation_id,
+            draft: Box::new(draft),
+        })
+    }
+}
+#[cfg(feature = "cli")]
+#[derive(Subcommand)]
+enum Draft {
+    /// Record a prepared, undispatched draft. Retain the identity and original input.
+    Save {
+        #[command(flatten)]
+        identity: DraftIdentity,
+        /// JSON composition file with from, to, cc, bcc, subject, body and reply metadata.
+        #[arg(long)]
+        input: PathBuf,
+    },
+    /// Inspect durable status without contacting the provider.
+    Status {
+        #[command(flatten)]
+        identity: DraftIdentity,
+        /// Request reconciliation (not yet supported).
+        #[arg(long)]
+        reconcile: bool,
+    },
+}
+#[cfg(feature = "cli")]
+pub(super) fn draft_content(
+    path: &std::path::Path,
+    maximum: usize,
+    nesting: usize,
+) -> Result<crate::domain::DraftContent, crate::domain::Error> {
+    use std::io::Read;
+    let invalid = || crate::domain::Error::new(crate::domain::ErrorCode::InvalidRequest);
+    let oversized = || crate::domain::Error::new(crate::domain::ErrorCode::ResponseTooLarge);
+    if !std::fs::metadata(path).map_err(|_| invalid())?.is_file() {
+        return Err(invalid());
+    }
+    let file = std::fs::File::open(path).map_err(|_| invalid())?;
+    let metadata = file.metadata().map_err(|_| invalid())?;
+    if !metadata.is_file() {
+        return Err(invalid());
+    }
+    if metadata.len() > maximum as u64 {
+        return Err(oversized());
+    }
+    let mut bytes = Vec::new();
+    file.take(maximum as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| invalid())?;
+    if bytes.len() > maximum {
+        return Err(oversized());
+    }
+    crate::encoding::validate_json_bounds(&bytes, nesting, 4096).map_err(|_| invalid())?;
+    serde_json::from_slice(&bytes).map_err(|_| invalid())
+}
+
 #[cfg(feature = "cli")]
 #[derive(Subcommand)]
 enum Attachment {
@@ -190,6 +267,11 @@ pub(super) struct Invocation {
 }
 pub(super) enum Action {
     #[cfg(feature = "cli")]
+    DraftSave {
+        identity: DraftIdentity,
+        input: PathBuf,
+    },
+    #[cfg(feature = "cli")]
     Export {
         attachment: String,
         root: PathBuf,
@@ -234,6 +316,19 @@ impl Invocation {
             Executable::Cli => {
                 let parsed = Mailctl::from_arg_matches(matches)?;
                 let action = match parsed.command {
+                    Email::Draft(Draft::Save { identity, input }) => {
+                        Action::DraftSave { identity, input }
+                    }
+                    Email::Draft(Draft::Status {
+                        identity,
+                        reconcile,
+                    }) => Action::Email(Operation::DraftStatus(crate::domain::DraftStatusInput {
+                        mailbox: identity.mailbox,
+                        account_id: identity.account_id,
+                        account_generation: identity.account_generation,
+                        operation_id: identity.operation_id,
+                        reconcile,
+                    })),
                     Email::Attachment(Attachment::Export {
                         attachment,
                         root,

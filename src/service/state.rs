@@ -1,4 +1,5 @@
 //! Shared installation identity, configuration revision, and maintenance leases.
+mod drafts;
 mod storage;
 use crate::{
     config::{AccountConfig, Config, CredentialSource, TlsMode},
@@ -29,6 +30,8 @@ struct Generation {
     port: u16,
     tls: TlsMode,
     username: String,
+    #[serde(default)]
+    drafts_mailbox: Option<String>,
     credential: Option<CredentialSource>,
 }
 impl Generation {
@@ -37,6 +40,14 @@ impl Generation {
             && self.port == account.port
             && self.tls == account.tls
             && self.username == account.username
+            && self
+                .drafts_mailbox
+                .as_deref()
+                .map(crate::domain::mailbox_identity)
+                == account
+                    .drafts_mailbox
+                    .as_deref()
+                    .map(crate::domain::mailbox_identity)
     }
     fn from_account(account: &AccountConfig, generation: u64) -> Self {
         Self {
@@ -45,6 +56,7 @@ impl Generation {
             port: account.port,
             tls: account.tls,
             username: account.username.clone(),
+            drafts_mailbox: account.drafts_mailbox.clone(),
             credential: Some(account.credential.clone()),
         }
     }
@@ -170,11 +182,18 @@ impl<'a> Initialization<'a> {
         if persisted.is_none() && !marker.is_empty() {
             return Err(invalid());
         }
-        let changed = persisted
-            .as_ref()
-            .is_none_or(|registry| registry.configuration_revision != revision);
+        let changed = persisted.as_ref().is_none_or(|registry| {
+            registry.configuration_revision != revision
+                || config.accounts.iter().any(|account| {
+                    registry
+                        .accounts
+                        .get(&account.key)
+                        .and_then(|history| history.generations.last())
+                        .is_some_and(|generation| !generation.matches(account))
+                })
+        });
         let maintenance = storage::open_lock(&directory, "maintenance.lock")?;
-        let exclusive = exclusive || changed;
+        let exclusive = exclusive || changed || drafts::needs_initialization(config, &directory);
         storage::lock(
             &maintenance,
             if exclusive {
@@ -234,6 +253,9 @@ impl<'a> Initialization<'a> {
         }
         if self.marker.len() != self.registry.installation.len() {
             storage::mark_initialized(&mut self.initialization, &self.registry.installation)?;
+        }
+        if self.exclusive {
+            drafts::initialize(&self.config, &self.directory);
         }
         Ok(updated)
     }

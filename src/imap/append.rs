@@ -1,171 +1,5 @@
-use super::{AuthenticatedConnection, Error, Limits, Metrics, dot_atom, mailbox};
-use mail_builder::MessageBuilder;
-use sha2::{Digest, Sha256};
-use std::io::{self, Write};
-
-/// Plain-text composition for the route proof. Addresses use ASCII addr-spec syntax.
-/// Message-ID and reply identifiers use ASCII dot-atoms on both sides of `@`,
-/// without angle brackets. Quoted identifiers and domain literals remain unsupported.
-#[derive(Clone, Default)]
-pub struct DraftInput {
-    pub from: String,
-    pub to: Vec<String>,
-    pub cc: Vec<String>,
-    pub bcc: Vec<String>,
-    pub subject: String,
-    pub body: String,
-    /// Message-ID without angle brackets; frozen by the draft operation owner.
-    pub message_id: String,
-    pub date_unix: i64,
-    pub in_reply_to: Option<String>,
-    pub references: Vec<String>,
-}
-
-/// Frozen bounded MIME; composition never contacts a provider.
-pub struct PreparedDraft {
-    bytes: Vec<u8>,
-    sha256: [u8; 32],
-    header_bytes: usize,
-}
-impl PreparedDraft {
-    pub fn compose(input: DraftInput, max_mime_bytes: usize) -> Result<Self, Error> {
-        if max_mime_bytes == 0 || max_mime_bytes > 8 * 1024 * 1024 {
-            return Err(Error::InvalidInput);
-        }
-        if input
-            .to
-            .len()
-            .saturating_add(input.cc.len())
-            .saturating_add(input.bcc.len())
-            > 100
-            || input.subject.len() > 8 * 1024
-            || input.body.len() > max_mime_bytes
-            || input.references.len() > 50
-        {
-            return Err(Error::Limit);
-        }
-        address(&input.from)?;
-        for value in input.to.iter().chain(&input.cc).chain(&input.bcc) {
-            address(value)?;
-        }
-        identifier(&input.message_id)?;
-        for value in input.in_reply_to.iter().chain(&input.references) {
-            identifier(value)?;
-        }
-        if input.subject.chars().any(char::is_control)
-            || !(0..=253_402_300_799).contains(&input.date_unix)
-            || input.body.contains('\0')
-        {
-            return Err(Error::InvalidInput);
-        }
-        let normalized = if input.body.contains('\r') {
-            input.body.replace("\r\n", "\n").replace('\r', "\n")
-        } else {
-            input.body
-        };
-        let mut builder = MessageBuilder::new()
-            .from(input.from)
-            .subject(input.subject)
-            .message_id(input.message_id)
-            .date(input.date_unix)
-            .text_body(normalized);
-        if !input.to.is_empty() {
-            builder = builder.to(input.to);
-        }
-        if !input.cc.is_empty() {
-            builder = builder.cc(input.cc);
-        }
-        if !input.bcc.is_empty() {
-            builder = builder.bcc(input.bcc);
-        }
-        if let Some(value) = input.in_reply_to {
-            builder = builder.in_reply_to(value);
-        }
-        if !input.references.is_empty() {
-            builder = builder.references(input.references);
-        }
-        let mut output = BoundedMime {
-            bytes: Vec::with_capacity(max_mime_bytes),
-            limit: max_mime_bytes,
-        };
-        builder.write_to(&mut output).map_err(|_| Error::Limit)?;
-        let header_bytes = output
-            .bytes
-            .windows(4)
-            .position(|bytes| bytes == b"\r\n\r\n")
-            .ok_or(Error::Protocol)?
-            + 4;
-        if header_bytes > 256 * 1024 {
-            return Err(Error::Limit);
-        }
-        let sha256 = Sha256::digest(&output.bytes).into();
-        Ok(Self {
-            bytes: output.bytes,
-            sha256,
-            header_bytes,
-        })
-    }
-    pub fn bytes(&self) -> &[u8] {
-        &self.bytes
-    }
-    pub fn sha256(&self) -> [u8; 32] {
-        self.sha256
-    }
-}
-
-fn address(value: &str) -> Result<(), Error> {
-    if value.len() > 254 {
-        return Err(Error::Limit);
-    }
-    let Some((local, domain)) = value.split_once('@') else {
-        return Err(Error::InvalidInput);
-    };
-    if local.len() > 64
-        || !dot_atom(local)
-        || domain.is_empty()
-        || !domain.split('.').all(|label| {
-            !label.is_empty()
-                && label.len() <= 63
-                && !label.starts_with('-')
-                && !label.ends_with('-')
-                && label
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-        })
-    {
-        return Err(Error::InvalidInput);
-    }
-    Ok(())
-}
-fn identifier(value: &str) -> Result<(), Error> {
-    if value.len() > 998 {
-        return Err(Error::Limit);
-    }
-    let Some((left, right)) = value.split_once('@') else {
-        return Err(Error::InvalidInput);
-    };
-    if !dot_atom(left) || !dot_atom(right) {
-        return Err(Error::InvalidInput);
-    }
-    Ok(())
-}
-struct BoundedMime {
-    bytes: Vec<u8>,
-    limit: usize,
-}
-impl Write for BoundedMime {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if bytes.len() > self.limit.saturating_sub(self.bytes.len()) {
-            return Err(io::Error::other("MIME limit exceeded"));
-        }
-        self.bytes.extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
+use super::{AuthenticatedConnection, Error, Limits, Metrics, mailbox};
+use crate::draft::PreparedDraft;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AppendUid {
     pub uid_validity: u32,
@@ -181,6 +15,24 @@ pub enum AppendOutcome {
     Unknown,
 }
 impl AuthenticatedConnection {
+    /// Capture the existing target incarnation without reading messages or creating a mailbox.
+    pub async fn inspect_draft_target(
+        self,
+        mailbox: &str,
+        limits: &Limits,
+        metrics: &mut Metrics,
+    ) -> Result<u32, Error> {
+        super::mailbox(mailbox)?;
+        limits.validate()?;
+        let mut connection = self.session.resume(metrics);
+        connection.limit_body(limits);
+        let (validity, _) = connection.examine_selection(mailbox).await?;
+        connection
+            .drive(io_imap::rfc3501::logout::ImapLogout::new())
+            .await?;
+        Ok(validity)
+    }
+
     /// Append frozen MIME with the initial Draft flag. The caller owns authorization
     /// and durable draft coordination. Progress retains the outcome after cancellation.
     pub async fn append_draft(
@@ -195,9 +47,9 @@ impl AuthenticatedConnection {
         metrics.mime_bytes = 0;
         mailbox(target)?;
         limits.validate()?;
-        if draft.header_bytes > limits.max_header_bytes
+        if draft.header_bytes() > limits.max_header_bytes
             || draft
-                .bytes
+                .bytes()
                 .len()
                 .saturating_add(target.len())
                 .saturating_add(128)
@@ -205,11 +57,11 @@ impl AuthenticatedConnection {
         {
             return Err(Error::Limit);
         }
-        metrics.mime_bytes = draft.bytes.len();
+        metrics.mime_bytes = draft.bytes().len();
         let result = tokio::time::timeout(limits.operation_timeout, async {
             let mut conn = self.session.resume(metrics);
             conn.limit_body(limits);
-            conn.append(target, &draft.bytes).await
+            conn.append(target, draft.bytes()).await
         })
         .await
         .unwrap_or(Err(Error::Timeout));

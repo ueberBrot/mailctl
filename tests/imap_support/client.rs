@@ -1,9 +1,10 @@
 use mailctl::{
     config, domain,
+    draft::PreparedDraft,
     imap::{
         AppendOutcome, AttachmentData, AttachmentDecoder, AttachmentListRequest,
         AttachmentMetadata, AuthenticatedConnection, BodyPage, BodyRequest, Error, ImapEndpoint,
-        Limits, Mailbox, Metrics, PreparedDraft, TlsMode,
+        Limits, Mailbox, Metrics, TlsMode,
     },
     service::{SearchBatch, SearchRequest},
 };

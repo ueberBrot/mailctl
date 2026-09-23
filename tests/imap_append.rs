@@ -2,7 +2,10 @@ mod append_support;
 mod imap_support;
 use append_support::*;
 use imap_support::*;
-use mailctl::imap::{AppendOutcome, AppendUid, Error, Limits, PreparedDraft, TlsMode};
+use mailctl::{
+    draft::PreparedDraft,
+    imap::{AppendOutcome, AppendUid, Error, Limits, TlsMode},
+};
 use std::time::Duration;
 
 #[tokio::test]
@@ -61,7 +64,7 @@ fn composition_rejects_malformed_ids_before_mime_encoding() {
         assert!(
             matches!(
                 PreparedDraft::compose(input, 1024 * 1024),
-                Err(Error::InvalidInput)
+                Err(mailctl::draft::Error::InvalidInput)
             ),
             "invalid message ID accepted"
         );
@@ -94,7 +97,7 @@ fn composition_accepts_only_dot_atom_message_ids_in_all_id_headers() {
             assert!(
                 matches!(
                     PreparedDraft::compose(input, 1024 * 1024),
-                    Err(Error::InvalidInput)
+                    Err(mailctl::draft::Error::InvalidInput)
                 ),
                 "invalid identifier accepted in header {header}: {id}"
             );
@@ -245,7 +248,7 @@ fn frozen_composition_preserves_bcc_body_and_reply_metadata_with_exact_size_limi
     assert_eq!(draft.sha256(), exact.sha256());
     assert!(matches!(
         PreparedDraft::compose(input, draft.bytes().len() - 1),
-        Err(Error::Limit)
+        Err(mailctl::draft::Error::Limit)
     ));
     let message = mail_parser::MessageParser::default()
         .parse(draft.bytes())
@@ -297,18 +300,18 @@ fn composition_bounds_recipient_count_subject_body_and_header_injection() {
     too_many.to.push("extra@example.test".into());
     assert!(matches!(
         PreparedDraft::compose(too_many, 1024 * 1024),
-        Err(Error::Limit)
+        Err(mailctl::draft::Error::Limit)
     ));
     accepted.subject.push('s');
     assert!(matches!(
         PreparedDraft::compose(accepted, 1024 * 1024),
-        Err(Error::Limit)
+        Err(mailctl::draft::Error::Limit)
     ));
     let mut huge_body = input();
     huge_body.body = "x".repeat(1025);
     assert!(matches!(
         PreparedDraft::compose(huge_body, 1024),
-        Err(Error::Limit)
+        Err(mailctl::draft::Error::Limit)
     ));
     for value in [
         "victim@example.test\r\nBcc: other@example.test",
@@ -322,7 +325,7 @@ fn composition_bounds_recipient_count_subject_body_and_header_injection() {
         invalid.from = value.into();
         assert!(matches!(
             PreparedDraft::compose(invalid, 1024 * 1024),
-            Err(Error::InvalidInput)
+            Err(mailctl::draft::Error::InvalidInput)
         ));
     }
     let mut empty = input();
@@ -480,4 +483,42 @@ async fn rejected_input_cannot_reuse_an_earlier_append_acknowledgement() {
     assert_eq!(metrics.append_outcome, None);
     assert_eq!(metrics.append_wire_bytes, 0);
     fixture.task.await.unwrap();
+}
+
+#[test]
+fn structured_recipients_and_reply_metadata_have_deterministic_mime() {
+    let mut composition = input();
+    composition.to = vec![
+        mailctl::domain::DraftAddress {
+            address: "first@example.test".into(),
+            name: Some("First recipient".into()),
+        },
+        "second@example.test".into(),
+    ];
+    composition.bcc = vec!["hidden@example.test".into()];
+    composition.in_reply_to = Some("original@example.test".into());
+    composition.references = vec!["first@example.test".into(), "original@example.test".into()];
+    let first = PreparedDraft::compose(composition.clone(), 1024 * 1024).unwrap();
+    let second = PreparedDraft::compose(composition, 1024 * 1024).unwrap();
+    assert_eq!(first.bytes(), second.bytes());
+    let parsed = mail_parser::MessageParser::default()
+        .parse(first.bytes())
+        .unwrap();
+    let recipients = parsed.to().unwrap().as_list().unwrap();
+    assert_eq!(recipients[0].address.as_deref(), Some("first@example.test"));
+    assert_eq!(recipients[0].name.as_deref(), Some("First recipient"));
+    assert_eq!(
+        recipients[1].address.as_deref(),
+        Some("second@example.test")
+    );
+    assert_eq!(
+        parsed.bcc().unwrap().as_list().unwrap()[0]
+            .address
+            .as_deref(),
+        Some("hidden@example.test")
+    );
+    assert_eq!(
+        parsed.in_reply_to().as_text(),
+        Some("original@example.test")
+    );
 }

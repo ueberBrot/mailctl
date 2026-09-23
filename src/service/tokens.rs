@@ -2,13 +2,11 @@
 use super::{MailboxTarget, Service};
 use crate::{
     domain::{Error, ErrorCode},
-    encoding::OutputBudget,
     policy::RequestContext,
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ring::hmac;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use sha2::{Digest, Sha256};
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -96,29 +94,5 @@ impl Service {
     }
 }
 pub(super) fn fingerprint(value: &impl Serialize) -> Result<String, Error> {
-    let mut writer = Fingerprint {
-        digest: Sha256::new(),
-        budget: OutputBudget::new(4 * 1024 * 1024),
-    };
-    serde_json::to_writer(&mut writer, value)
-        .map_err(|_| Error::new(ErrorCode::ResponseTooLarge))?;
-    Ok(crate::encoding::hex(writer.digest.finalize().as_slice()))
-}
-
-struct Fingerprint {
-    digest: Sha256,
-    budget: OutputBudget,
-}
-impl std::io::Write for Fingerprint {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.budget
-            .reserve(bytes.len())
-            .map_err(std::io::Error::other)?;
-        self.digest.update(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
+    crate::encoding::json_sha256(value, 4 * 1024 * 1024).map(|digest| crate::encoding::hex(&digest))
 }

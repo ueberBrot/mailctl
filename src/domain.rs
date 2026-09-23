@@ -2,6 +2,8 @@
 use crate::encoding::BoundedString;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+mod draft;
+pub use draft::*;
 mod message;
 pub use message::*;
 mod attachment;
@@ -45,6 +47,13 @@ pub enum ErrorCode {
     OperationNotFound,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConflictKind {
+    Configuration,
+    DraftInput,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Error {
@@ -53,14 +62,23 @@ pub struct Error {
     pub retryable: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_failure: Option<CredentialFailure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conflict_kind: Option<ConflictKind>,
 }
 impl Error {
+    pub fn draft_conflict() -> Self {
+        let mut error = Self::new(ErrorCode::OperationConflict);
+        error.message = "Draft operation input conflicts with its recorded input".into();
+        error.conflict_kind = Some(ConflictKind::DraftInput);
+        error
+    }
     pub fn incompatible_schema() -> Self {
         Self {
             code: ErrorCode::InvalidRequest,
             message: "Unsupported configuration or state schema; install compatible CLI/MCP versions and restart active processes. Preserve existing configuration and history".into(),
             retryable: false,
             credential_failure: None,
+            conflict_kind: None,
         }
     }
     pub fn setup_required() -> Self {
@@ -71,6 +89,7 @@ impl Error {
                     .into(),
             retryable: false,
             credential_failure: None,
+            conflict_kind: None,
         }
     }
     pub fn obsolete_runtime_capacity() -> Self {
@@ -79,6 +98,7 @@ impl Error {
             message: "Configuration uses removed shared runtime capacity settings; remove runtimes, runtime_slots, and shared permit settings. Limits now apply per process; run this executable's setup subcommand to migrate".into(),
             retryable: false,
             credential_failure: None,
+            conflict_kind: None,
         }
     }
     pub fn new(code: ErrorCode) -> Self {
@@ -102,6 +122,14 @@ impl Error {
             ErrorCode::OperationConflict => {
                 "Configuration changed; restart the command or MCP session"
             }
+            ErrorCode::JournalUnavailable => {
+                "Draft history is unavailable; preserve installation state for recovery"
+            }
+            ErrorCode::JournalFull => {
+                "Draft history is full; existing operation status remains available"
+            }
+            ErrorCode::DraftMailboxUnavailable => "The approved draft mailbox is unavailable",
+            ErrorCode::OperationNotFound => "No operation was found in the authorized draft target",
             ErrorCode::RateLimited => {
                 "Capacity is busy; retry after active commands or MCP sessions finish"
             }
@@ -118,6 +146,8 @@ impl Error {
                     | ErrorCode::Timeout
             ),
             credential_failure: None,
+            conflict_kind: (code == ErrorCode::OperationConflict)
+                .then_some(ConflictKind::Configuration),
         }
     }
     pub fn exit_code(&self) -> u8 {
@@ -167,6 +197,8 @@ pub struct ListAccountsInput {
     deny_unknown_fields
 )]
 pub enum Operation {
+    SaveDraft(SaveDraftInput),
+    DraftStatus(DraftStatusInput),
     ListAccounts(ListAccountsInput),
     ListMailboxes(ListMailboxesInput),
     SearchMessages(SearchMessagesInput),
@@ -200,6 +232,12 @@ impl<'de> Deserialize<'de> for Operation {
         let wire = Wire::deserialize(deserializer)?;
         let invalid = || serde::de::Error::custom("invalid operation input");
         match (wire.operation.as_str(), wire.input) {
+            ("save_draft", Input::Present(input)) => {
+                serde_json::from_value(input).map(Self::SaveDraft)
+            }
+            ("draft_status", Input::Present(input)) => {
+                serde_json::from_value(input).map(Self::DraftStatus)
+            }
             ("list_attachments", Input::Present(input)) => {
                 serde_json::from_value(input).map(Self::ListAttachments)
             }
@@ -381,6 +419,7 @@ impl<T> Envelope<T> {
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(untagged)]
 pub enum OperationResult {
+    Draft(DraftReceipt),
     Accounts(AccountDiscovery),
     Mailboxes(MailboxDiscovery),
     Messages(MessageSearch),
@@ -489,6 +528,8 @@ pub enum Availability {
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Account {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drafts_mailbox: Option<String>,
     pub alias: String,
     pub account_id: String,
     pub generation: u64,
@@ -513,6 +554,8 @@ pub struct Capabilities {
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Health {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft_journal: Option<Availability>,
     pub status: String,
     pub grant: String,
     pub accounts: Vec<AccountHealth>,

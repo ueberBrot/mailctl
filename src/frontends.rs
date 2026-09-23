@@ -307,6 +307,26 @@ async fn execute_application(
     let operation = async {
         match action {
             #[cfg(feature = "cli")]
+            Action::DraftSave { identity, input } => {
+                let limits = application.limits()?;
+                // Charge JSON input/decoding, frozen MIME and the response independently.
+                let maximum = (16 * 1024 * 1024)
+                    .min(limits.envelope_bytes.saturating_sub(512))
+                    .min(
+                        limits
+                            .buffered_bytes
+                            .saturating_sub(limits.envelope_bytes + 2 * limits.draft_mime_bytes)
+                            / 4,
+                    );
+                let nesting = limits.json_nesting;
+                let draft = tokio::task::spawn_blocking(move || {
+                    arguments::draft_content(&input, maximum, nesting)
+                })
+                .await
+                .map_err(|_| Error::new(ErrorCode::InternalError))??;
+                application.execute(identity.save(draft)).await
+            }
+            #[cfg(feature = "cli")]
             Action::Export { attachment, .. } => {
                 application
                     .export_attachment(

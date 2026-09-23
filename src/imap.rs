@@ -9,7 +9,7 @@ mod projection;
 mod search;
 mod wire;
 
-pub use append::{AppendOutcome, AppendUid, DraftInput, PreparedDraft};
+pub use append::{AppendOutcome, AppendUid};
 
 pub use attachment::{
     AttachmentData, AttachmentDecoder, AttachmentIntegrity, AttachmentListRequest,
@@ -374,15 +374,6 @@ pub(crate) fn mailbox(name: &str) -> Result<(), Error> {
         return Err(Error::Unsupported);
     }
     Ok(())
-}
-
-fn dot_atom(value: &str) -> bool {
-    value.split('.').all(|atom| {
-        !atom.is_empty()
-            && atom
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-/=?^_`{|}~".contains(&byte))
-    })
 }
 
 // io-imap encodes mailbox arguments but leaves LIST patterns in wire form.
