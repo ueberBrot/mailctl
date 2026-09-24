@@ -26,6 +26,45 @@ Run `./target/debug/mailctl-mcp` to serve MCP over STDIO using the same configur
 Use `--grant` to select an access grant, `--account` to narrow accounts, or `--help`
 for available commands.
 
+## Draft history after account changes
+
+Keep the original account UUID, generation, operation UUID, mailbox, and input
+when retrying a draft. Alias changes preserve the account identity. Changes to
+the server, TLS settings, username, credential source reference, or Drafts mailbox
+advance its generation. Restart MCP after changing configuration.
+
+To inspect or resume an operation from an older generation, add its exact target
+to the selected draft-capable grant. Replace the example UUID with the original
+account UUID returned by discovery:
+
+```toml
+[[grants.historical_drafts]]
+account_id = "11111111-1111-4111-8111-111111111111"
+account_generation = 1
+mailbox = "Drafts"
+```
+
+Place this table under the relevant `[[grants]]` entry. The grant must still
+include that account's stable configuration key; account narrowing and read-only
+narrowing also apply. Historical scope authorizes only draft history and retries
+of existing prepared operations. It grants no message reads or new draft creation
+in an old generation. Removing the scope revokes historical access.
+
+Set `retain_history = true` on the account **before** repointing it to retain its
+original server, TLS, username, and credential source reference for prepared
+retries. Retention stores no secret values and grants no authority by itself.
+Disabling retention or removing the account removes historical credential routing;
+re-enabling retention cannot reconstruct removed routes. Completed status and
+same-input replay use the journal without provider access, even after routing or
+From identities are removed. The account must remain configured and authorized.
+
+A prepared retry uses its original Drafts mailbox and UIDVALIDITY, frozen date,
+From identity, and encoder parameters. Its From identity must still be approved.
+Missing routing, a renamed or recreated mailbox, revoked From permission, or
+unsupported reconstruction fails before APPEND. Retrying an uncertain operation
+returns its uncertainty and never creates another draft. Older reconstruction
+versions remain inspectable but cannot be dispatched by this version.
+
 ## Commit conventions
 
 Use [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/) for PR

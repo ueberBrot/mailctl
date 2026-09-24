@@ -12,8 +12,8 @@ use tokio_rustls::rustls::{
 
 pub struct FixtureHost;
 impl HostEnvironment for FixtureHost {
-    fn credential_source(&self, _: &CredentialSource) -> Arc<dyn SecretSource> {
-        Arc::new(FixtureSecret)
+    fn credential_source(&self, source: &CredentialSource) -> Arc<dyn SecretSource> {
+        Arc::new(FixtureSecret(matches!(source, CredentialSource::Native {})))
     }
     fn tls_roots(&self) -> Result<RootCertStore, SourceError> {
         let path = std::env::var_os("MAILCTL_FIXTURE_CA").ok_or(SourceError::Unavailable)?;
@@ -33,16 +33,23 @@ impl HostEnvironment for FixtureHost {
         Ok(roots)
     }
 }
-struct FixtureSecret;
+struct FixtureSecret(bool);
 impl SecretSource for FixtureSecret {
     fn availability(&self, _: uuid::Uuid) -> Availability {
         assert!(
             !tracing::Span::current().is_disabled(),
             "credential availability must retain the request span"
         );
-        Availability::Available
+        if self.0 {
+            Availability::Available
+        } else {
+            Availability::Unavailable
+        }
     }
     fn resolve(&self, _: uuid::Uuid) -> Result<Secret, SourceError> {
+        if !self.0 {
+            return Err(SourceError::Unavailable);
+        }
         Secret::new(b"disposable-password".to_vec())
     }
 }

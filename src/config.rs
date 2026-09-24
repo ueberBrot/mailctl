@@ -159,7 +159,16 @@ pub struct AccessGrant {
     pub profile: Profile,
     pub accounts: Vec<String>,
     pub mailboxes: Vec<String>,
+    pub historical_drafts: Vec<HistoricalDraftScope>,
     pub limits: Limits,
+}
+/// Explicit journal and prepared-retry authority for one original draft target.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HistoricalDraftScope {
+    pub account_id: uuid::Uuid,
+    pub account_generation: u64,
+    pub mailbox: String,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -169,6 +178,8 @@ struct RawGrant {
     profile: Profile,
     accounts: Vec<String>,
     mailboxes: Vec<String>,
+    #[serde(default)]
+    historical_drafts: Vec<HistoricalDraftScope>,
     #[serde(default)]
     limits: LimitOverrides,
 }
@@ -233,6 +244,7 @@ impl Config {
                     profile: grant.profile,
                     accounts: grant.accounts,
                     mailboxes: grant.mailboxes,
+                    historical_drafts: grant.historical_drafts,
                     limits: grant.limits.resolve(&raw.limits)?,
                 })
             })
@@ -317,6 +329,13 @@ impl Config {
                 || grant.accounts.len() > self.limits.accounts
                 || !unique_labels(&grant.mailboxes, self.limits.mailbox_inventory)
                 || grant.accounts.iter().any(|key| !keys.contains(key))
+                || grant.historical_drafts.len() > self.limits.mailbox_inventory
+                || grant.historical_drafts.iter().any(|scope| {
+                    scope.account_id.is_nil()
+                        || scope.account_generation == 0
+                        || scope.account_generation > i64::MAX as u64
+                        || !label(&scope.mailbox)
+                })
             {
                 return Err(invalid());
             }

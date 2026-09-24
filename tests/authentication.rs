@@ -199,10 +199,8 @@ async fn pooled_connections_reuse_authentication_and_expire_at_clean_boundaries(
     first.acquire(&account, &limits).await.unwrap().release();
     assert_eq!(source.calls.load(Ordering::SeqCst), 4);
     account.generation -= 1;
-    assert!(matches!(
-        first.acquire(&account, &limits).await,
-        Err(Error::InvalidInput)
-    ));
+    first.acquire(&account, &limits).await.unwrap().release();
+    assert_eq!(source.calls.load(Ordering::SeqCst), 4);
     drop((first, second));
     fixture.await.unwrap();
 }
@@ -542,7 +540,7 @@ async fn account_queue_deadline_releases_capacity_without_authenticating() {
 }
 
 #[tokio::test]
-async fn generation_changes_reject_queued_old_work_and_dispose_old_leases() {
+async fn generations_share_capacity_but_never_reuse_each_others_connections() {
     let (port, roots, fixture) = fixture(2, false).await;
     let limits = Limits {
         account_connections: 1,
@@ -565,7 +563,7 @@ async fn generation_changes_reject_queued_old_work_and_dispose_old_leases() {
     let new = acquire(current);
     tokio::time::sleep(Duration::from_millis(20)).await;
     active.release();
-    assert!(matches!(old.await.unwrap(), Err(Error::InvalidInput)));
+    old.await.unwrap().unwrap().release();
     drop(new.await.unwrap().unwrap());
     assert_eq!(source.calls.load(Ordering::SeqCst), 2);
     fixture.await.unwrap();

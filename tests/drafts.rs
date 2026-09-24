@@ -241,6 +241,59 @@ async fn changing_draft_routing_advances_generation_and_never_redirects_old_oper
 }
 
 #[tokio::test]
+async fn completed_retry_preserves_its_receipt_after_alias_and_from_changes() {
+    let (_installation, mut config, service, identity) = fixture().await;
+    let request = save(&identity, uuid::Uuid::new_v4());
+    let receipt = execute(&service, request.clone()).await;
+    drop(service);
+    config.accounts[0].alias = "renamed".into();
+    config.accounts[0].from_identities = vec!["replacement@example.test".into()];
+    Service::setup(config.clone()).unwrap();
+    let service = Service::open(config).unwrap();
+    assert_eq!(execute(&service, status(request.clone())).await, receipt);
+    assert_eq!(execute(&service, request).await, receipt);
+}
+
+#[tokio::test]
+async fn explicit_historical_scope_recovers_completed_operations_after_repointing() {
+    let (_installation, mut config, service, identity) = fixture().await;
+    let request = save(&identity, uuid::Uuid::new_v4());
+    let receipt = execute(&service, request.clone()).await;
+    drop(service);
+    config.accounts[0].server = "replacement.example.test".into();
+    config.accounts[0].drafts_mailbox = Some("New Drafts".into());
+    config.accounts[0].mailboxes.push("New Drafts".into());
+    config.accounts[0].from_identities = vec!["replacement@example.test".into()];
+    let writer = config
+        .grants
+        .iter_mut()
+        .find(|g| g.name == "writer")
+        .unwrap();
+    writer.mailboxes = vec!["New Drafts".into()];
+    writer.historical_drafts = vec![mailctl::config::HistoricalDraftScope {
+        account_id: identity["account_id"].as_str().unwrap().parse().unwrap(),
+        account_generation: 1,
+        mailbox: "Drafts".into(),
+    }];
+    let config = Config::parse(&toml::to_string(&config).unwrap()).unwrap();
+    Service::setup(config.clone()).unwrap();
+    let service = Service::open(config).unwrap();
+    assert_eq!(account(&service).await["generation"], 2);
+    assert_eq!(execute(&service, status(request.clone())).await, receipt);
+    assert_eq!(execute(&service, request).await, receipt);
+    assert_eq!(
+        failure(
+            &service,
+            save(&identity, uuid::Uuid::new_v4()),
+            "writer",
+            false
+        )
+        .await,
+        mailctl::domain::ErrorCode::OperationNotFound
+    );
+}
+
+#[tokio::test]
 async fn schema_and_application_enforce_independent_composition_bounds() {
     use mailctl::domain::ErrorCode::*;
     let (_installation, config, service, identity) = fixture().await;
@@ -397,7 +450,15 @@ async fn application_enforces_exact_frozen_mime_and_header_limits() {
     use mailctl::domain::ErrorCode::*;
     let (_installation, config, service, identity) = fixture().await;
     let request = save(&identity, uuid::Uuid::new_v4());
-    let expected = execute(&service, request.clone()).await;
+    let database = rusqlite::Connection::open(config.state_dir.join("drafts.sqlite")).unwrap();
+    database.execute_batch("CREATE TRIGGER stop_dispatch BEFORE UPDATE ON draft_operations BEGIN SELECT RAISE(ABORT, 'synthetic'); END;").unwrap();
+    assert_eq!(
+        failure(&service, request.clone(), "writer", false).await,
+        JournalUnavailable
+    );
+    database
+        .execute_batch("DROP TRIGGER stop_dispatch")
+        .unwrap();
     let input: mailctl::domain::SaveDraftInput =
         serde_json::from_value(request["input"].clone()).unwrap();
     let record =
@@ -424,9 +485,9 @@ async fn application_enforces_exact_frozen_mime_and_header_limits() {
     .unwrap();
     drop(service);
     for (mime_limit, header_limit, passes) in [
-        (mime.bytes().len(), mime.header_bytes(), true),
         (mime.bytes().len() - 1, mime.header_bytes(), false),
         (mime.bytes().len(), mime.header_bytes() - 1, false),
+        (mime.bytes().len(), mime.header_bytes(), true),
     ] {
         let mut config = config.clone();
         config.limits.draft_mime_bytes = mime_limit;
@@ -435,9 +496,14 @@ async fn application_enforces_exact_frozen_mime_and_header_limits() {
             grant.limits = config.limits.clone();
         }
         Service::setup(config.clone()).unwrap();
-        let service = Service::open(config).unwrap();
+        let targets = Arc::new(MemoryDrafts::default());
+        targets.set("work", "Drafts", 77);
+        let service = Service::open(config).unwrap().with_draft_backend(targets);
         if passes {
-            assert_eq!(execute(&service, request.clone()).await, expected);
+            assert_eq!(
+                execute(&service, request.clone()).await["state"],
+                "created_reference_unavailable"
+            );
         } else {
             assert_eq!(
                 failure(&service, request.clone(), "writer", false).await,

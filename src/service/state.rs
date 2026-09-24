@@ -40,6 +40,7 @@ impl Generation {
             && self.port == account.port
             && self.tls == account.tls
             && self.username == account.username
+            && self.credential.as_ref() == Some(&account.credential)
             && self
                 .drafts_mailbox
                 .as_deref()
@@ -129,19 +130,21 @@ impl Registry {
                         account_id: Uuid::new_v4().to_string(),
                         generations: Vec::new(),
                     });
-            if !account.retain_history {
-                for generation in &mut history.generations {
-                    generation.credential = None;
-                }
-            }
-            match history.generations.last_mut() {
-                Some(current) if current.matches(account) => {
-                    current.credential = Some(account.credential.clone())
-                }
-                _ => history.generations.push(Generation::from_account(
+            if history
+                .generations
+                .last()
+                .is_none_or(|current| !current.matches(account))
+            {
+                history.generations.push(Generation::from_account(
                     account,
                     history.generations.len() as u64 + 1,
-                )),
+                ));
+            }
+            if !account.retain_history {
+                let historical = history.generations.len() - 1;
+                for generation in &mut history.generations[..historical] {
+                    generation.credential = None;
+                }
             }
         }
         Ok(())
@@ -332,6 +335,46 @@ impl AccountRegistry {
     pub(super) fn identity(&self, key: &str) -> (&str, u64) {
         let account = &self.registry.accounts[key];
         (&account.account_id, account.generations.len() as u64)
+    }
+    pub(super) fn draft_route<'a>(
+        &self,
+        current: &'a AccountConfig,
+        generation: u64,
+        mailbox: &str,
+    ) -> Result<Cow<'a, AccountConfig>, Error> {
+        let route = self.registry.accounts[&current.key]
+            .generations
+            .iter()
+            .find(|route| route.generation == generation)
+            .ok_or_else(|| Error::new(ErrorCode::DraftMailboxUnavailable))?;
+        if route
+            .drafts_mailbox
+            .as_deref()
+            .map(crate::domain::mailbox_identity)
+            != Some(crate::domain::mailbox_identity(mailbox))
+        {
+            return Err(Error::new(ErrorCode::DraftMailboxUnavailable));
+        }
+        if route.matches(current) && route.drafts_mailbox == current.drafts_mailbox {
+            return Ok(Cow::Borrowed(current));
+        }
+        let credential = route
+            .credential
+            .as_ref()
+            .ok_or_else(|| Error::new(ErrorCode::DraftMailboxUnavailable))?;
+        Ok(Cow::Owned(AccountConfig {
+            key: current.key.clone(),
+            alias: current.alias.clone(),
+            server: route.server.clone(),
+            port: route.port,
+            tls: route.tls,
+            username: route.username.clone(),
+            mailboxes: current.mailboxes.clone(),
+            from_identities: current.from_identities.clone(),
+            drafts_mailbox: route.drafts_mailbox.clone(),
+            credential: credential.clone(),
+            retain_history: current.retain_history,
+        }))
     }
     pub(super) fn reference_key(&self) -> &[u8; 32] {
         &self.registry.installation_key

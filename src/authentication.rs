@@ -134,11 +134,11 @@ impl Pool {
     }
 }
 struct PoolState {
-    generation: u64,
     idle: Vec<Idle>,
     last_doctor: Option<Instant>,
 }
 struct Idle {
+    generation: u64,
     connection: AuthenticatedConnection,
     established: Instant,
     expires_at: Instant,
@@ -149,7 +149,6 @@ pub struct Lease {
     idle: Idle,
     admission: Admission,
     pool: Arc<Pool>,
-    generation: u64,
     capacity: usize,
 }
 impl Lease {
@@ -179,8 +178,7 @@ impl Lease {
     }
     pub fn release(self) {
         let mut state = self.pool.state.lock().unwrap();
-        if state.generation == self.generation
-            && self.idle.expires_at > Instant::now()
+        if self.idle.expires_at > Instant::now()
             && state.idle.len() + self.admission.gate.state.lock().unwrap().active <= self.capacity
         {
             state.idle.push(self.idle);
@@ -307,7 +305,7 @@ impl Runtime {
     /// Checks one explicitly authorized email account, then disconnects without mailbox work.
     pub async fn doctor(&self, account: &Account, limits: &Limits) -> Result<(), Error> {
         self.validate_limits(limits)?;
-        let pool = self.pool(account.id, account.generation)?;
+        let pool = self.pool(account.id)?;
         {
             let mut state = pool.state.lock().unwrap();
             let interval = Duration::from_secs_f64(60.0 / limits.doctor_checks_per_minute as f64);
@@ -347,7 +345,7 @@ impl Runtime {
         for name in names {
             imap::mailbox(name).map_err(Error::Imap)?;
         }
-        let pool = self.pool(account.id, account.generation)?;
+        let pool = self.pool(account.id)?;
         tokio::time::timeout(
             Duration::from_secs(limits.operation_seconds as u64),
             async {
@@ -375,7 +373,7 @@ impl Runtime {
 
     pub async fn acquire(&self, account: &Account, limits: &Limits) -> Result<Lease, Error> {
         self.validate_limits(limits)?;
-        let pool = self.pool(account.id, account.generation)?;
+        let pool = self.pool(account.id)?;
         tokio::time::timeout(
             Duration::from_secs(limits.operation_seconds as u64),
             self.acquire_inner(account, limits, pool, false),
@@ -415,17 +413,9 @@ impl Runtime {
         Ok(())
     }
 
-    fn pool(&self, id: Uuid, generation: u64) -> Result<Arc<Pool>, Error> {
+    fn pool(&self, id: Uuid) -> Result<Arc<Pool>, Error> {
         let mut accounts = self.accounts.lock().unwrap();
         if let Some(pool) = accounts.get(&id) {
-            let mut state = pool.state.lock().unwrap();
-            if generation < state.generation {
-                return Err(Error::InvalidInput);
-            }
-            if generation != state.generation {
-                state.generation = generation;
-                state.idle.clear();
-            }
             return Ok(pool.clone());
         }
         if accounts.len() == self.limits.accounts {
@@ -433,7 +423,6 @@ impl Runtime {
         }
         let pool = Arc::new(Pool {
             state: Mutex::new(PoolState {
-                generation,
                 idle: Vec::new(),
                 last_doctor: None,
             }),
@@ -463,17 +452,24 @@ impl Runtime {
         let lifetime = Duration::from_secs(limits.connection_lifetime_seconds as u64);
         let idle = {
             let mut state = pool.state.lock().unwrap();
-            if state.generation != account.generation {
-                return Err(Error::InvalidInput);
-            }
             state.idle.retain(|idle| {
                 idle.expires_at > Instant::now() && idle.established.elapsed() < lifetime
             });
             let spare = limits
                 .account_connections
                 .saturating_sub(pool.gate.state.lock().unwrap().active);
-            state.idle.truncate(spare + usize::from(!fresh));
-            if fresh { None } else { state.idle.pop() }
+            let selected = if fresh {
+                None
+            } else {
+                state
+                    .idle
+                    .iter()
+                    .rposition(|idle| idle.generation == account.generation)
+                    .map(|position| state.idle.swap_remove(position))
+            };
+            // A new connection also consumes capacity when no matching lease exists.
+            state.idle.truncate(spare);
+            selected
         };
         let idle = match idle {
             Some(mut idle) => {
@@ -521,6 +517,7 @@ impl Runtime {
                     .map_err(Error::Imap)?;
                 let established = Instant::now();
                 Idle {
+                    generation: account.generation,
                     connection,
                     established,
                     expires_at: established + lifetime,
@@ -531,7 +528,6 @@ impl Runtime {
             idle,
             admission,
             pool,
-            generation: account.generation,
             capacity: limits.account_connections,
         })
     }

@@ -36,6 +36,8 @@ pub struct DraftReconstruction {
     pub uid_validity: u32,
     pub input_sha256: [u8; 32],
     pub from_configuration_sha256: [u8; 32],
+    #[serde(default)]
+    pub selected_from_sha256: Option<[u8; 32]>,
     pub date_unix: i64,
     pub encoder_version: u32,
 }

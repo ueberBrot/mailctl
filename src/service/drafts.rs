@@ -118,14 +118,26 @@ impl Service {
                 (id == requested_account).then_some((account, id, generation))
             })
             .ok_or_else(|| Error::new(ErrorCode::AccountNotAllowed))?;
-        if generation != identity.account_generation {
-            return Err(super::denied());
-        }
         if identity.operation_id.is_nil() {
             return Err(Error::new(ErrorCode::InvalidRequest));
         }
         if mailbox.is_empty() || mailbox.len() > 1024 {
             return Err(Error::new(ErrorCode::InvalidRequest));
+        }
+        if generation != identity.account_generation {
+            if !grant.historical_drafts.iter().any(|scope| {
+                scope.account_id == identity.account_id
+                    && scope.account_generation == identity.account_generation
+                    && crate::domain::mailbox_identity(&scope.mailbox)
+                        == crate::domain::mailbox_identity(mailbox)
+            }) {
+                return Err(super::denied());
+            }
+            return Ok(MailboxTarget {
+                config,
+                account_id,
+                generation: identity.account_generation,
+            });
         }
         let target = Self::authorize_mailbox_scope(
             grant,
@@ -212,49 +224,69 @@ impl Service {
                     .map_err(|_| Error::draft_outcome(ErrorCode::OutcomeUnknown, operation))?,
             );
         }
+        if prior.is_none()
+            && self.registry.identity(&target.config.key).1 != identity.account_generation
+        {
+            return Err(Error::new(ErrorCode::OperationNotFound));
+        }
         let mailbox = crate::domain::mailbox_identity(&input.mailbox);
         let mut content = *input.draft;
-        let from = match content.from.take() {
-            Some(from) if target.config.from_identities.contains(&from) => from,
-            None if target.config.from_identities.len() == 1 => {
-                target.config.from_identities[0].clone()
-            }
-            _ => return Err(Error::new(ErrorCode::InvalidRequest)),
-        };
-        content.from = Some(from.clone());
-        // Bound direct application callers before normalization or hashing.
+        // Hash caller input before resolving a default From identity. Replays must
+        // remain inspectable when the operator changes or removes that default.
         validate_size(&content, limits)?;
         content.body = crate::draft::normalize_body(content.body);
         let input_sha256 = hash(&content)?;
-        let from_configuration_sha256 = hash(&target.config.from_identities)?;
-        let frozen = match &prior {
+        let (frozen, expected_content_sha256) = match prior {
             Some(prior) => {
                 let frozen = prior
                     .operation
                     .reconstruction
                     .as_ref()
                     .ok_or_else(|| Error::new(ErrorCode::JournalUnavailable))?;
+                if frozen.encoder_version != 2 {
+                    return Err(Error::new(ErrorCode::UnsupportedCapability));
+                }
                 if frozen.input_sha256 != input_sha256 {
                     return Err(Error::draft_conflict());
                 }
-                frozen.clone()
+                if prior.state != DraftOperationState::Prepared {
+                    return self.draft_receipt(prior, limits);
+                }
+                (
+                    prior.operation.reconstruction,
+                    Some(prior.operation.content_sha256),
+                )
             }
+            None => (None, None),
+        };
+        let from = match (frozen.as_ref(), content.from) {
+            (Some(frozen), _) => target
+                .config
+                .from_identities
+                .iter()
+                .find(|from| hash(from).ok() == frozen.selected_from_sha256)
+                .cloned()
+                .ok_or_else(super::denied)?,
+            (None, Some(from)) if target.config.from_identities.contains(&from) => from,
+            (None, None) if target.config.from_identities.len() == 1 => {
+                target.config.from_identities[0].clone()
+            }
+            _ => return Err(Error::new(ErrorCode::InvalidRequest)),
+        };
+        let frozen = match frozen {
+            Some(frozen) => frozen,
             None => DraftReconstruction {
                 uid_validity: 0,
                 input_sha256,
-                from_configuration_sha256,
+                from_configuration_sha256: hash(&target.config.from_identities)?,
+                selected_from_sha256: Some(hash(&from)?),
                 date_unix: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_err(|_| Error::new(ErrorCode::InternalError))?
                     .as_secs() as i64,
-                encoder_version: 1,
+                encoder_version: 2,
             },
         };
-        if frozen.encoder_version != 1
-            || frozen.from_configuration_sha256 != from_configuration_sha256
-        {
-            return Err(Error::new(ErrorCode::UnsupportedCapability));
-        }
         let mime = crate::draft::PreparedDraft::compose(
             crate::draft::DraftInput {
                 from,
@@ -276,16 +308,15 @@ impl Service {
         if mime.header_bytes() > limits.header_bytes {
             return Err(Error::new(ErrorCode::ResponseTooLarge));
         }
-        let resuming = if let Some(prior) = prior {
-            if prior.operation.content_sha256 != mime.sha256() {
-                return Err(Error::draft_conflict());
-            }
-            if prior.state != DraftOperationState::Prepared {
-                return self.draft_receipt(prior, limits);
-            }
-            true
-        } else {
-            false
+        if expected_content_sha256.is_some_and(|expected| expected != mime.sha256()) {
+            return Err(Error::draft_conflict());
+        }
+        let route = self
+            .registry
+            .draft_route(target.config, target.generation, mailbox)?;
+        let target = MailboxTarget {
+            config: &route,
+            ..target
         };
         let live;
         let backend: &dyn DraftBackend = match &self.draft_backend {
@@ -295,12 +326,15 @@ impl Service {
                 &live
             }
         };
-        let append = self.observed(
-            target.account_id,
-            backend.prepare(target, mailbox, limits).await,
-        )?;
+        let append = backend.prepare(target, mailbox, limits).await;
+        // Discovery and health describe the current account generation only.
+        let append = if self.registry.identity(&target.config.key).1 == target.generation {
+            self.observed(target.account_id, append)
+        } else {
+            append
+        }?;
         let validity = append.uid_validity();
-        if validity == 0 || (resuming && validity != frozen.uid_validity) {
+        if validity == 0 || (expected_content_sha256.is_some() && validity != frozen.uid_validity) {
             return Err(Error::new(ErrorCode::DraftMailboxUnavailable));
         }
         let operation = PreparedDraftOperation {

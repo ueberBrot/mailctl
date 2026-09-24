@@ -13,10 +13,11 @@ impl Service {
         target: MailboxTarget<'_>,
     ) -> Result<ImapBackend, Error> {
         Ok(ImapBackend {
-            runtime: self
-                .authentication()
-                .await
-                .inspect_err(|error| self.observe_failure(target.account_id, error))?,
+            runtime: self.authentication().await.inspect_err(|error| {
+                if self.registry.identity(&target.config.key).1 == target.generation {
+                    self.observe_failure(target.account_id, error);
+                }
+            })?,
             account: Arc::new(crate::authentication::Account {
                 id: uuid::Uuid::parse_str(target.account_id)
                     .map_err(|_| Error::new(ErrorCode::InternalError))?,

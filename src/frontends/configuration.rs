@@ -89,6 +89,7 @@ pub(super) fn setup(
                 profile: Profile::ReadOnly,
                 accounts: Vec::new(),
                 mailboxes: vec!["INBOX".into()],
+                historical_drafts: Vec::new(),
                 limits: Limits::default(),
             }],
         },

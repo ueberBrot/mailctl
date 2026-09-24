@@ -31,6 +31,7 @@ struct Expected {
 enum ExpectedOperation {
     Authenticate,
     Append(DraftReply),
+    DraftTarget(u32),
     RejectAuthentication(bool),
     Mailboxes(Vec<&'static str>),
     Search(&'static str, Option<u32>),
@@ -60,6 +61,7 @@ pub struct ImapServer {
     expected: Arc<Mutex<VecDeque<Expected>>>,
     accepted: Arc<AtomicUsize>,
     interrupted: Arc<AtomicUsize>,
+    drafts: Arc<Mutex<Vec<Vec<u8>>>>,
     stop: watch::Sender<bool>,
     task: Option<thread::JoinHandle<()>>,
 }
@@ -90,6 +92,8 @@ impl ImapServer {
         let count = accepted.clone();
         let interrupted = Arc::new(AtomicUsize::new(0));
         let stalled = interrupted.clone();
+        let drafts = Arc::new(Mutex::new(Vec::new()));
+        let captured = drafts.clone();
         let task = thread::spawn(move || {
             tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
                 let listener = tokio::net::TcpListener::from_std(listener).unwrap();
@@ -123,7 +127,13 @@ impl ImapServer {
                                 ExpectedOperation::Append(reply) => {
                                     let tag = imap_support::expect(&mut wire, "EXAMINE Drafts").await;
                                     imap_support::write(&mut wire, &format!("* 0 EXISTS\r\n* OK [UIDVALIDITY 77] incarnation\r\n{tag} OK [READ-ONLY] selected\r\n")).await;
-                                    append_draft(&mut wire, reply, &stalled).await;
+                                    append_draft(&mut wire, reply, &stalled, &captured).await;
+                                    return;
+                                },
+                                ExpectedOperation::DraftTarget(validity) => {
+                                    let tag = imap_support::expect(&mut wire, "EXAMINE Drafts").await;
+                                    imap_support::write(&mut wire, &format!("* 0 EXISTS\r\n* OK [UIDVALIDITY {validity}] incarnation\r\n{tag} OK [READ-ONLY] selected\r\n")).await;
+                                    imap_support::dropped(&mut wire).await;
                                     return;
                                 },
                                 ExpectedOperation::RejectAuthentication(_) => unreachable!(),
@@ -153,6 +163,7 @@ impl ImapServer {
             expected,
             accepted,
             interrupted,
+            drafts,
             stop,
             task: Some(task),
         }
@@ -164,6 +175,17 @@ impl ImapServer {
             password: "disposable-password",
             operation: ExpectedOperation::Append(reply),
         });
+    }
+
+    pub fn expect_draft_target(&self, validity: u32) {
+        self.expected.lock().unwrap().push_back(Expected {
+            username: "work@example.test",
+            password: "disposable-password",
+            operation: ExpectedOperation::DraftTarget(validity),
+        });
+    }
+    pub fn drafts(&self) -> Vec<Vec<u8>> {
+        self.drafts.lock().unwrap().clone()
     }
 
     pub fn interrupted(&self) -> usize {
@@ -397,7 +419,12 @@ async fn attachment_page(
     }
 }
 
-async fn append_draft(wire: &mut imap_support::Wire, reply: DraftReply, observed: &AtomicUsize) {
+async fn append_draft(
+    wire: &mut imap_support::Wire,
+    reply: DraftReply,
+    observed: &AtomicUsize,
+    captured: &Mutex<Vec<Vec<u8>>>,
+) {
     use io_imap::codec::{CommandCodec, decode::Decoder};
     use tokio::io::AsyncReadExt;
     let mut header = Vec::new();
@@ -427,6 +454,7 @@ async fn append_draft(wire: &mut imap_support::Wire, reply: DraftReply, observed
     assert!(text.contains("Message-ID: <"));
     assert!(text.contains("@mailctl.invalid>"));
     assert!(text.contains("Content-Type: text/plain"));
+    captured.lock().unwrap().push(literal);
     observed.fetch_add(1, Ordering::SeqCst);
     match reply {
         DraftReply::Created(uid) => {

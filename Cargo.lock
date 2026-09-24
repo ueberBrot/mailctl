@@ -1787,6 +1787,7 @@ dependencies = [
  "mailctl",
  "rcgen",
  "rmcp",
+ "rusqlite",
  "serde_json",
  "tokio",
  "tokio-rustls",

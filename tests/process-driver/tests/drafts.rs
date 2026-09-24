@@ -181,6 +181,35 @@ impl DraftFixture {
             composition,
         }
     }
+    fn configuration(&self) -> mailctl::config::Config {
+        mailctl::config::Config::parse(
+            &std::fs::read_to_string(self.installation.config()).unwrap(),
+        )
+        .unwrap()
+    }
+    fn configure(&self, config: &mailctl::config::Config) {
+        std::fs::write(self.installation.config(), toml::to_string(config).unwrap()).unwrap();
+        let mut setup = self.installation.cli();
+        setup.args(["--json", "setup"]);
+        assert_success(&run_bounded(setup));
+    }
+    fn repoint(&self, config: &mut mailctl::config::Config) {
+        config.accounts[0].alias = "renamed".into();
+        config.accounts[0].server = "unreachable.example.test".into();
+        config.accounts[0].from_identities = vec!["changed@example.test".into()];
+        config.accounts[0].mailboxes = vec!["New Drafts".into()];
+        config.accounts[0].drafts_mailbox = Some("New Drafts".into());
+        for grant in &mut config.grants {
+            if grant.name == "writer" || grant.name == "other-writer" {
+                grant.mailboxes = vec!["New Drafts".into()];
+                grant.historical_drafts = vec![mailctl::config::HistoricalDraftScope {
+                    account_id: self.input["account_id"].as_str().unwrap().parse().unwrap(),
+                    account_generation: 1,
+                    mailbox: "Drafts".into(),
+                }];
+            }
+        }
+    }
     fn save(&self) -> std::process::Command {
         let mut command = self.installation.cli();
         command
@@ -408,5 +437,138 @@ async fn authentication_rejection_precedes_dispatch_and_keeps_absent_history_abs
     );
     assert_eq!(f.server.interrupted(), 0);
     client.cancel().await.unwrap();
+    f.server.finish();
+}
+
+#[tokio::test]
+async fn historical_cli_and_mcp_recover_lost_responses_without_provider_access() {
+    for reply in [
+        server::DraftReply::Created(true),
+        server::DraftReply::Rejected,
+        server::DraftReply::Disconnect,
+    ] {
+        let mut f = DraftFixture::new();
+        f.server.expect_append(reply);
+        // The caller retained the original tuple and input, but loses the first result.
+        let output = run_bounded(f.save());
+        let expected = envelope(&output);
+        let mut config = f.configuration();
+        f.repoint(&mut config);
+        f.configure(&config);
+        let client = f.mcp().await;
+        for name in ["email_draft_status", "email_save_draft"] {
+            let recovered = call(
+                &client,
+                name,
+                if name == "email_save_draft" {
+                    f.input.clone()
+                } else {
+                    f.status()
+                },
+            )
+            .await;
+            assert_eq!(recovered["result"], expected["result"]);
+            assert_eq!(recovered["error"], expected["error"]);
+        }
+        let recovered = envelope(&run_bounded(f.save()));
+        assert_eq!(recovered["result"], expected["result"]);
+        assert_eq!(recovered["error"], expected["error"]);
+        client.cancel().await.unwrap();
+        // Revoke historical scope: both a known conflict and an unknown ID stay private.
+        for grant in &mut config.grants {
+            grant.historical_drafts.clear();
+        }
+        f.configure(&config);
+        let client = f.mcp().await;
+        let mut denied = f.input.clone();
+        denied["draft"]["body"] = json!("Conflicting synthetic content");
+        for known in [true, false] {
+            if !known {
+                denied["operation_id"] = json!(uuid::Uuid::new_v4());
+            }
+            assert_eq!(
+                call(&client, "email_save_draft", denied.clone()).await["error"]["code"],
+                "permission_denied"
+            );
+        }
+        assert_eq!(
+            envelope(&run_bounded(f.save()))["error"]["code"],
+            "permission_denied"
+        );
+        client.cancel().await.unwrap();
+        assert_eq!(f.server.accepted(), 1);
+        assert_eq!(f.server.interrupted(), 1);
+        f.server.finish();
+    }
+}
+
+#[tokio::test]
+async fn historical_prepared_retry_checks_incarnation_and_appends_frozen_mime_once() {
+    let mut f = DraftFixture::new();
+    let mut config = f.configuration();
+    config.accounts[0].retain_history = true;
+    f.configure(&config);
+    let database = rusqlite::Connection::open(config.state_dir.join("drafts.sqlite")).unwrap();
+    database.execute_batch("CREATE TRIGGER stop_dispatch BEFORE UPDATE ON draft_operations BEGIN SELECT RAISE(ABORT, 'synthetic'); END;").unwrap();
+    f.server.expect_draft_target(77);
+    assert_eq!(
+        envelope(&run_bounded(f.save()))["error"]["code"],
+        "journal_unavailable"
+    );
+    database
+        .execute_batch("DROP TRIGGER stop_dispatch")
+        .unwrap();
+    let input: mailctl::domain::SaveDraftInput = serde_json::from_value(f.input.clone()).unwrap();
+    let original =
+        mailctl::draft_journal::DraftJournal::open_existing(config.state_dir.join("drafts.sqlite"))
+            .unwrap()
+            .inspect(&input.identity())
+            .unwrap()
+            .unwrap()
+            .operation;
+    f.repoint(&mut config);
+    config.accounts[0]
+        .from_identities
+        .push("work@example.test".into());
+    config.accounts[0].credential = mailctl::config::CredentialSource::Session {};
+    f.configure(&config);
+    let client = f.mcp().await;
+    f.server.expect_draft_target(88);
+    assert_eq!(
+        call(&client, "email_save_draft", f.input.clone()).await["error"]["code"],
+        "draft_mailbox_unavailable"
+    );
+    assert!(f.server.drafts().is_empty());
+    assert_eq!(
+        call(&client, "email_draft_status", f.status()).await["result"]["state"],
+        "prepared"
+    );
+    f.server.expect_append(server::DraftReply::Created(true));
+    let resumed = call(&client, "email_save_draft", f.input.clone()).await;
+    assert_eq!(resumed["result"]["state"], "created");
+    assert_eq!(resumed["result"]["account_generation"], 1);
+    assert_eq!(resumed["result"]["mailbox"], "Drafts");
+    let drafts = f.server.drafts();
+    assert_eq!(drafts.len(), 1);
+    let expected = mailctl::draft::PreparedDraft::compose(
+        mailctl::draft::DraftInput {
+            from: "work@example.test".into(),
+            body: "Synthetic body".into(),
+            message_id: format!(
+                "{}.1.{}@mailctl.invalid",
+                input.account_id, input.operation_id
+            ),
+            date_unix: original.reconstruction.unwrap().date_unix,
+            ..Default::default()
+        },
+        config.limits.draft_mime_bytes,
+    )
+    .unwrap();
+    assert_eq!(drafts[0], expected.bytes());
+    assert_eq!(expected.sha256(), original.content_sha256);
+    let replay = envelope(&run_bounded(f.save()));
+    assert_eq!(replay["result"], resumed["result"]);
+    client.cancel().await.unwrap();
+    assert_eq!(f.server.accepted(), 3);
     f.server.finish();
 }
