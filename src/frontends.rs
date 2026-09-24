@@ -386,6 +386,13 @@ async fn execute_application(
     .await)
 }
 
+#[cfg_attr(
+    not(unix),
+    allow(
+        clippy::unnecessary_wraps,
+        reason = "Unix signal registration can fail through this shared interface"
+    )
+)]
 fn termination_signal() -> Result<impl Future<Output = ()>, Error> {
     #[cfg(unix)]
     {

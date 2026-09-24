@@ -73,6 +73,10 @@ mod prompt;
 use prompt::prompt;
 
 #[cfg(not(unix))]
+#[allow(
+    clippy::unused_async,
+    reason = "Matches the asynchronous Unix credential prompt interface"
+)]
 async fn prompt(_: usize) -> Result<Secret, SourceError> {
     Err(SourceError::InteractionRequired)
 }

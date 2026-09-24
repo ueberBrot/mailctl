@@ -15,6 +15,13 @@ pub const SERVICE_NAME: &str = "mailctl";
 pub const MAX_SECRET_BYTES: usize = 64 * 1024;
 
 /// Suppress native dialogs before credential or TLS trust-store access.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        clippy::unnecessary_wraps,
+        reason = "macOS setup can fail through this shared interface"
+    )
+)]
 pub(crate) fn prepare_native_access() -> Result<(), SourceError> {
     #[cfg(target_os = "macos")]
     return native::disable_interaction();
