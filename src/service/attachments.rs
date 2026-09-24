@@ -129,17 +129,21 @@ impl Service {
         context: &RequestContext,
         input: domain::GetAttachmentInput,
     ) -> Result<domain::AttachmentChunk, Error> {
-        let deadline = Duration::from_secs(self.limits(context)?.operation_seconds as u64);
+        let started = Instant::now();
+        let deadline =
+            started + Duration::from_secs(self.limits(context)?.operation_seconds as u64);
         tokio::select! {
             biased;
-            result = self.get_attachment_inner(context, input) => result,
-            () = tokio::time::sleep(deadline) => Err(Error::new(ErrorCode::Timeout)),
+            result = self.get_attachment_inner(context, input, started, deadline) => result,
+            () = tokio::time::sleep_until(deadline) => Err(Error::new(ErrorCode::Timeout)),
         }
     }
     async fn get_attachment_inner(
         &self,
         context: &RequestContext,
         input: domain::GetAttachmentInput,
+        started: Instant,
+        operation_deadline: Instant,
     ) -> Result<domain::AttachmentChunk, Error> {
         let limits = &self.grant(context)?.limits;
         if !context.permissions().contains(&Permission::ReadAttachment) {
@@ -163,9 +167,12 @@ impl Service {
                 )?;
                 let target =
                     self.authorize_message(context, &resource, ErrorCode::StaleReference)?;
-                let reservation =
-                    self.transfers
-                        .reserve(context.session_id(), &resource.account, limits)?;
+                let reservation = self.transfers.reserve(
+                    context.session_id(),
+                    &resource.account,
+                    limits,
+                    started,
+                )?;
                 let live;
                 let backend = match &self.attachment_backend {
                     Some(backend) => backend.as_ref(),
@@ -216,8 +223,6 @@ impl Service {
             }
         };
         let expires = reservation.expires();
-        let operation_deadline =
-            Instant::now() + Duration::from_secs(limits.operation_seconds as u64);
         let deadline = operation_deadline.min(expires);
         let page = tokio::select! {
             // Preserve expiry precedence when a nested reader timeout is also ready.

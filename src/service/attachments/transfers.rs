@@ -67,6 +67,7 @@ impl Transfers {
         session: Uuid,
         account: &str,
         limits: &Limits,
+        started: Instant,
     ) -> Result<Reservation, Error> {
         let mut store = self.live();
         if store
@@ -78,7 +79,8 @@ impl Transfers {
             return Err(Error::new(ErrorCode::RateLimited));
         }
         let id = Uuid::new_v4();
-        let expires = Instant::now() + Duration::from_secs(limits.transfer_seconds as u64);
+        // Equal operation and transfer limits must share an exact deadline.
+        let expires = started + Duration::from_secs(limits.transfer_seconds as u64);
         store.insert(
             id,
             Slot {
