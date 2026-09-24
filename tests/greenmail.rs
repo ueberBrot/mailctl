@@ -696,7 +696,7 @@ mailboxes = ["INBOX"]
 
 mod support;
 #[test]
-fn application_draft_preparation_preserves_independently_observed_target_and_inbox() {
+fn application_draft_retries_create_one_exact_draft_and_preserve_existing_mail() {
     greenmail_support::run(async {
         use mailctl::{
             config::Config,
@@ -742,8 +742,9 @@ fn application_draft_preparation_preserves_independently_observed_target_and_inb
             account_generation: accounts.accounts[0].generation,
             operation_id: uuid::Uuid::new_v4(),
             draft: Box::new(DraftContent {
-                subject: "Synthetic undispatched draft".into(),
-                body: "The provider must not receive this content.".into(),
+                subject: "Synthetic unsent draft".into(),
+                body: "Synthetic draft body.".into(),
+                bcc: vec!["hidden@example.test".into()],
                 ..Default::default()
             }),
         };
@@ -752,8 +753,36 @@ fn application_draft_preparation_preserves_independently_observed_target_and_inb
                 .execute(&context, Operation::SaveDraft(input.clone()))
                 .await?,
         )?;
-        assert_eq!(prepared["state"], "prepared");
-        assert_eq!(prepared["dispatched"], false);
+        assert!(matches!(
+            prepared["state"].as_str(),
+            Some("created" | "created_reference_unavailable")
+        ));
+        assert_eq!(prepared["dispatched"], true);
+        let journal = mailctl::draft_journal::DraftJournal::open_existing(
+            config.state_dir.join("drafts.sqlite"),
+        )?;
+        let record = journal.inspect(&input.identity())?.unwrap();
+        assert!(matches!(
+            record.state,
+            mailctl::draft_journal::DraftOperationState::Created { .. }
+        ));
+        let id = format!(
+            "{}.{}.{}@mailctl.invalid",
+            input.account_id, input.account_generation, input.operation_id
+        );
+        let expected = mailctl::draft::PreparedDraft::compose(
+            mailctl::draft::DraftInput {
+                from: "sender@example.test".into(),
+                subject: input.draft.subject.clone(),
+                body: input.draft.body.clone(),
+                bcc: input.draft.bcc.clone(),
+                message_id: id.clone(),
+                date_unix: record.operation.reconstruction.unwrap().date_unix,
+                ..Default::default()
+            },
+            config.limits.draft_mime_bytes,
+        )?;
+        drop(journal);
         drop(service);
         // Restart with no provider credentials: status and identical retry remain local.
         let service = Service::open(config)?;
@@ -783,8 +812,29 @@ fn application_draft_preparation_preserves_independently_observed_target_and_inb
         );
         assert_eq!(fixture.snapshot().await?, inbox);
         assert_eq!(fixture.contents().await?, inbox_contents);
-        assert_eq!(fixture.snapshot_mailbox(TARGET).await?, target);
-        assert_eq!(fixture.contents_mailbox(TARGET).await?, target_contents);
+        let after = fixture.snapshot_mailbox(TARGET).await?;
+        assert_eq!(after.messages.len(), target.messages.len() + 1);
+        assert_eq!(after.uid_validity, target.uid_validity);
+        for original in target.messages {
+            assert!(after.messages.contains(&original));
+        }
+        let observed = after
+            .messages
+            .iter()
+            .find(|m| m.message_id == format!("<{id}>"))
+            .unwrap();
+        assert!(observed.draft);
+        assert!(!observed.seen);
+        let contents = fixture.contents_mailbox(TARGET).await?;
+        assert_eq!(contents.len(), target_contents.len() + 1);
+        for original in target_contents {
+            assert!(contents.contains(&original));
+        }
+        let stored = contents
+            .iter()
+            .find(|m| m.message_id == format!("<{id}>"))
+            .unwrap();
+        assert_eq!(stored.mime_message.as_bytes(), expected.bytes());
         drop(service);
         fixture.shutdown().await?;
         Ok(())

@@ -255,6 +255,13 @@ async fn execute_isolated(
     .await
 }
 
+#[cfg_attr(
+    not(feature = "mcp"),
+    allow(
+        clippy::unnecessary_wraps,
+        reason = "MCP builds can reject invocation options through this shared interface"
+    )
+)]
 fn invocation_narrowing(
     options: &mut arguments::Options,
     _action: &Action,
@@ -304,6 +311,10 @@ async fn execute_application(
         )?),
         _ => None,
     };
+    #[cfg(feature = "cli")]
+    let mut draft_identity = None;
+    #[cfg(not(feature = "cli"))]
+    let draft_identity: Option<crate::domain::DraftOperationDetails> = None;
     let operation = async {
         match action {
             #[cfg(feature = "cli")]
@@ -324,6 +335,7 @@ async fn execute_application(
                 })
                 .await
                 .map_err(|_| Error::new(ErrorCode::InternalError))??;
+                draft_identity = Some(identity.operation_details());
                 application.execute(identity.save(draft)).await
             }
             #[cfg(feature = "cli")]
@@ -348,10 +360,16 @@ async fn execute_application(
         }
     };
     let result = tokio::select! {
-        _ = &mut shutdown => Err(Error::new(ErrorCode::Cancelled)),
+        _ = &mut shutdown => Err(ErrorCode::Cancelled),
         result = tokio::time::timeout(Duration::from_secs(deadline as u64), operation) =>
-            result.map_err(|_| Error::new(ErrorCode::Timeout)).flatten(),
-    };
+            result.map_err(|_| ErrorCode::Timeout),
+    }
+    .unwrap_or_else(|code| {
+        Err(match draft_identity {
+            Some(identity) => Error::draft_outcome(ErrorCode::OutcomeUnknown, identity),
+            None => Error::new(code),
+        })
+    });
     #[cfg(feature = "cli")]
     let result = export
         .as_mut()

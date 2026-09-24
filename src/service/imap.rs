@@ -238,32 +238,67 @@ impl super::AttachmentReader for ImapAttachment {
     }
 }
 
-impl super::DraftTargets for ImapBackend {
-    fn inspect<'a>(
+impl super::DraftBackend for ImapBackend {
+    fn prepare<'a>(
         &'a self,
         _: MailboxTarget<'a>,
         mailbox: &'a str,
         limits: &'a Limits,
-    ) -> Pin<Box<dyn Future<Output = Result<u32, Error>> + Send + 'a>> {
+    ) -> super::DraftPreparation<'a> {
         Box::pin(async move {
-            self.acquire(limits)
+            let (lease, validity) = self
+                .acquire(limits)
                 .await?
-                .with_connection(async |connection| {
-                    connection
-                        .inspect_draft_target(
-                            mailbox,
-                            &crate::imap::Limits::body(limits),
-                            &mut crate::imap::Metrics::default(),
-                        )
-                        .await
-                })
+                .draft_target(mailbox, &crate::imap::Limits::body(limits))
                 .await
                 .map_err(|error| match error {
                     crate::imap::Error::UnsafeSelection => {
                         Error::new(ErrorCode::DraftMailboxUnavailable)
                     }
                     error => error.into(),
+                })?;
+            Ok(Box::new(ImapDraft {
+                lease,
+                mailbox,
+                validity,
+            }) as Box<dyn super::DraftAppend>)
+        })
+    }
+}
+struct ImapDraft<'a> {
+    lease: crate::authentication::Lease,
+    mailbox: &'a str,
+    validity: u32,
+}
+impl super::DraftAppend for ImapDraft<'_> {
+    fn uid_validity(&self) -> u32 {
+        self.validity
+    }
+    fn append<'a>(
+        self: Box<Self>,
+        draft: &'a crate::draft::PreparedDraft,
+        limits: &'a Limits,
+    ) -> Pin<Box<dyn Future<Output = Result<crate::imap::AppendOutcome, Error>> + Send + 'a>>
+    where
+        Self: 'a,
+    {
+        Box::pin(async move {
+            self.lease
+                .with_connection(async |connection| {
+                    let mut bounds = crate::imap::Limits::body(limits);
+                    bounds.max_operation_bytes =
+                        limits.draft_mime_bytes.saturating_add(1024 * 1024);
+                    connection
+                        .append_draft(
+                            self.mailbox,
+                            draft,
+                            &bounds,
+                            &mut crate::imap::Metrics::default(),
+                        )
+                        .await
                 })
+                .await
+                .map_err(Into::into)
         })
     }
 }

@@ -100,6 +100,17 @@ pub(super) struct DraftIdentity {
 }
 #[cfg(feature = "cli")]
 impl DraftIdentity {
+    pub(super) fn operation_details(&self) -> crate::domain::DraftOperationDetails {
+        crate::domain::DraftOperationDetails {
+            mailbox: self.mailbox.clone(),
+            uid_validity: None,
+            identity: crate::domain::DraftIdentity {
+                account_id: self.account_id,
+                account_generation: self.account_generation,
+                operation_id: self.operation_id,
+            },
+        }
+    }
     pub(super) fn save(self, draft: crate::domain::DraftContent) -> Operation {
         Operation::SaveDraft(crate::domain::SaveDraftInput {
             mailbox: self.mailbox,
@@ -113,7 +124,7 @@ impl DraftIdentity {
 #[cfg(feature = "cli")]
 #[derive(Subcommand)]
 enum Draft {
-    /// Record a prepared, undispatched draft. Retain the identity and original input.
+    /// Create one unsent draft. Retain the identity and original input for retries.
     Save {
         #[command(flatten)]
         identity: DraftIdentity,

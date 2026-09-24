@@ -30,12 +30,20 @@ struct Expected {
 
 enum ExpectedOperation {
     Authenticate,
-    DraftTarget,
+    Append(DraftReply),
     RejectAuthentication(bool),
     Mailboxes(Vec<&'static str>),
     Search(&'static str, Option<u32>),
     Body(&'static str, Vec<u8>),
     Attachment(&'static str, AttachmentPhase),
+}
+
+#[derive(Clone)]
+pub enum DraftReply {
+    Created(bool),
+    Rejected,
+    Disconnect,
+    Hold(Arc<AtomicUsize>),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -112,9 +120,11 @@ impl ImapServer {
                             imap_support::capability(&mut wire, "IMAP4rev1").await;
                             match operation {
                                 ExpectedOperation::Authenticate => {},
-                                ExpectedOperation::DraftTarget => {
+                                ExpectedOperation::Append(reply) => {
                                     let tag = imap_support::expect(&mut wire, "EXAMINE Drafts").await;
                                     imap_support::write(&mut wire, &format!("* 0 EXISTS\r\n* OK [UIDVALIDITY 77] incarnation\r\n{tag} OK [READ-ONLY] selected\r\n")).await;
+                                    append_draft(&mut wire, reply, &stalled).await;
+                                    return;
                                 },
                                 ExpectedOperation::RejectAuthentication(_) => unreachable!(),
                                 ExpectedOperation::Mailboxes(mailboxes) => {
@@ -148,11 +158,11 @@ impl ImapServer {
         }
     }
 
-    pub fn expect_draft_target(&self) {
+    pub fn expect_append(&self, reply: DraftReply) {
         self.expected.lock().unwrap().push_back(Expected {
             username: "work@example.test",
             password: "disposable-password",
-            operation: ExpectedOperation::DraftTarget,
+            operation: ExpectedOperation::Append(reply),
         });
     }
 
@@ -385,4 +395,70 @@ async fn attachment_page(
         )
         .await;
     }
+}
+
+async fn append_draft(wire: &mut imap_support::Wire, reply: DraftReply, observed: &AtomicUsize) {
+    use io_imap::codec::{CommandCodec, decode::Decoder};
+    use tokio::io::AsyncReadExt;
+    let mut header = Vec::new();
+    while !header.ends_with(b"\r\n") {
+        header.push(wire.read_u8().await.unwrap());
+        assert!(header.len() < 4096);
+    }
+    let text = std::str::from_utf8(&header).unwrap();
+    let (prefix, length) = text.rsplit_once('{').unwrap();
+    let length: usize = length.strip_suffix("}\r\n").unwrap().parse().unwrap();
+    assert!(length < 1024 * 1024);
+    let command = format!("{prefix}{{0}}\r\n\r\n");
+    let codec = CommandCodec::new();
+    let (_, actual) = codec.decode(command.as_bytes()).unwrap();
+    let (_, expected) = codec
+        .decode(b"expected APPEND Drafts (\\Draft) {0}\r\n\r\n")
+        .unwrap();
+    assert_eq!(actual.body, expected.body);
+    let tag = actual.tag.as_ref().to_owned();
+    imap_support::write(wire, "+ continue\r\n").await;
+    let mut literal = vec![0; length];
+    wire.read_exact(&mut literal).await.unwrap();
+    let mut ending = [0; 2];
+    wire.read_exact(&mut ending).await.unwrap();
+    assert_eq!(&ending, b"\r\n");
+    let text = std::str::from_utf8(&literal).unwrap();
+    assert!(text.contains("Message-ID: <"));
+    assert!(text.contains("@mailctl.invalid>"));
+    assert!(text.contains("Content-Type: text/plain"));
+    observed.fetch_add(1, Ordering::SeqCst);
+    match reply {
+        DraftReply::Created(uid) => {
+            imap_support::write(
+                wire,
+                &format!(
+                    "{tag} OK{} accepted\r\n",
+                    if uid { " [APPENDUID 77 4]" } else { "" }
+                ),
+            )
+            .await
+        }
+        DraftReply::Rejected => {
+            imap_support::write(wire, &format!("{tag} NO synthetic rejection\r\n")).await
+        }
+        DraftReply::Disconnect => return,
+        DraftReply::Hold(release) => {
+            let mut byte = [0];
+            loop {
+                tokio::select! {
+                    result = wire.read(&mut byte) => { assert!(matches!(result, Ok(0)) || result.is_err()); return; },
+                    _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                        if release.load(Ordering::SeqCst) > 0 { break; }
+                    }
+                }
+            }
+            imap_support::write(wire, &format!("{tag} OK accepted\r\n")).await;
+        }
+    }
+    let end = wire.read(&mut [0]).await;
+    assert!(
+        matches!(end, Ok(0)) || end.is_err(),
+        "APPEND connection must close without optional work"
+    );
 }

@@ -35,7 +35,12 @@ pub(super) struct Bounds {
     deadline: Duration,
 }
 impl Bounds {
-    pub(super) fn new(limits: &Limits, response_bound: usize, drafts: bool) -> Result<Self, Error> {
+    pub(super) fn new(
+        limits: &Limits,
+        response_bound: usize,
+        drafts: bool,
+        schema_bytes: usize,
+    ) -> Result<Self, Error> {
         // Cover the SDK/codec's initial buffers, duplex, and bounded task metadata.
         const FIXED: usize = 64 * 1024;
         let available = limits
@@ -45,7 +50,7 @@ impl Bounds {
         let draft_mime = if drafts { limits.draft_mime_bytes } else { 0 };
         let fits = |input, envelope| {
             let (_, control, request) =
-                Self::reservations(input, envelope, limits.accounts, draft_mime);
+                Self::reservations(input, envelope, limits.accounts, draft_mime, schema_bytes);
             control + request <= available
         };
         // Draft bodies and search predicates can expand sixfold in JSON.
@@ -78,7 +83,7 @@ impl Bounds {
             return Err(Error::setup_required());
         }
         let (output, control, request) =
-            Self::reservations(input, envelope, limits.accounts, draft_mime);
+            Self::reservations(input, envelope, limits.accounts, draft_mime, schema_bytes);
         let requests = (available - control) / request;
         Ok(Self {
             input,
@@ -95,6 +100,7 @@ impl Bounds {
         envelope: usize,
         accounts: usize,
         draft_mime: usize,
+        schema_bytes: usize,
     ) -> (usize, usize, usize) {
         // Nonempty identity strings occupy at least three encoded bytes, with
         // at most 100 per discovered account. Count both String/Value descriptors
@@ -107,8 +113,11 @@ impl Bounds {
             + 1024 * 256.min(envelope / 160);
         // MCP contains the envelope once as a Value and once as JSON text.
         // Escaping that already serialized text adds at most one byte per byte.
-        // Account for the caller's JSON-RPC id and fixed protocol/tool schemas.
-        let output = (3 * envelope + input + 1024).max(32 * 1024);
+        // Tool schemas can exceed a small result budget. Reserve their measured size,
+        // plus the caller's JSON-RPC id, before admitting the session.
+        let output = (3 * envelope + input + 1024)
+            .max(schema_bytes + input + 1024)
+            .max(32 * 1024);
         // The permanent control allocation covers one decoder, retained client
         // initialization data and ingress scratch. SDK/Tokio encoder capacities
         // remain allocated after a response: each can grow to twice its payload;
@@ -142,10 +151,12 @@ pub(super) struct BoundedStdio {
 }
 
 impl BoundedStdio {
-    pub(super) fn new(bounds: Bounds) -> Self {
+    pub(super) fn new(bounds: Bounds, shutdown: tokio_util::sync::CancellationToken) -> Self {
         let (reader, mut writer) = tokio::io::duplex(8192);
         // Validate complete, bounded lines before the SDK can buffer or parse them.
         let ingress = tokio::spawn(async move {
+            // The SDK may drain requests after EOF; cancel active work as soon as input closes.
+            let _cancel_on_exit = shutdown.drop_guard();
             let mut lines = FramedRead::new(
                 tokio::io::stdin(),
                 LinesCodec::new_with_max_length(bounds.input),

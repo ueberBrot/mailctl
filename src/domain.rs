@@ -64,8 +64,16 @@ pub struct Error {
     pub credential_failure: Option<CredentialFailure>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conflict_kind: Option<ConflictKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft_operation: Option<Box<DraftOperationDetails>>,
 }
 impl Error {
+    pub fn draft_outcome(code: ErrorCode, operation: DraftOperationDetails) -> Self {
+        Self {
+            draft_operation: Some(Box::new(operation)),
+            ..Self::new(code)
+        }
+    }
     pub fn draft_conflict() -> Self {
         let mut error = Self::new(ErrorCode::OperationConflict);
         error.message = "Draft operation input conflicts with its recorded input".into();
@@ -77,6 +85,7 @@ impl Error {
             code: ErrorCode::InvalidRequest,
             message: "Unsupported configuration or state schema; install compatible CLI/MCP versions and restart active processes. Preserve existing configuration and history".into(),
             retryable: false,
+            draft_operation: None,
             credential_failure: None,
             conflict_kind: None,
         }
@@ -88,6 +97,7 @@ impl Error {
                 "Configuration is unavailable or invalid; run this executable's setup subcommand"
                     .into(),
             retryable: false,
+            draft_operation: None,
             credential_failure: None,
             conflict_kind: None,
         }
@@ -97,6 +107,7 @@ impl Error {
             code: ErrorCode::InvalidRequest,
             message: "Configuration uses removed shared runtime capacity settings; remove runtimes, runtime_slots, and shared permit settings. Limits now apply per process; run this executable's setup subcommand to migrate".into(),
             retryable: false,
+            draft_operation: None,
             credential_failure: None,
             conflict_kind: None,
         }
@@ -109,6 +120,10 @@ impl Error {
             | ErrorCode::AccountNotAllowed
             | ErrorCode::MailboxNotAllowed => "Access denied",
             ErrorCode::BrokerUnavailable => "Broker unavailable",
+            ErrorCode::OutcomeUnknown => {
+                "Draft acceptance is uncertain; inspect this operation and never append it again"
+            }
+            ErrorCode::OperationInProgress => "Draft operation is pending; inspect its status",
             ErrorCode::Timeout => "Request deadline exceeded",
             ErrorCode::ResponseTooLarge => "Result exceeds the configured limit",
             ErrorCode::UnsupportedCapability => "Operation is not supported",
@@ -145,6 +160,7 @@ impl Error {
                     | ErrorCode::RateLimited
                     | ErrorCode::Timeout
             ),
+            draft_operation: None,
             credential_failure: None,
             conflict_kind: (code == ErrorCode::OperationConflict)
                 .then_some(ConflictKind::Configuration),

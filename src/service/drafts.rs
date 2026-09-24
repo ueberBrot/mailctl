@@ -1,10 +1,10 @@
-//! Authorized draft preparation and journal-only inspection.
+//! Authorized draft creation and journal-only inspection.
 use super::{MailboxTarget, Service};
 use crate::{
     config::Limits,
     domain::{
-        DraftContent, DraftIdentity, DraftReceipt, DraftState, DraftStatusInput, Error, ErrorCode,
-        SaveDraftInput,
+        DraftContent, DraftIdentity, DraftOperationDetails, DraftReceipt, DraftState,
+        DraftStatusInput, Error, ErrorCode, SaveDraftInput,
     },
     draft_journal::{
         DraftJournalError, DraftOperationState, DraftReconstruction, PersistedDraftOperation,
@@ -19,18 +19,32 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-/// Verifies that the exact existing target is selectable, without fetching messages.
-pub trait DraftTargets: Send + Sync {
-    fn inspect<'a>(
+pub type DraftPreparation<'a> =
+    Pin<Box<dyn Future<Output = Result<Box<dyn DraftAppend + 'a>, Error>> + Send + 'a>>;
+
+/// Authenticates and verifies the exact existing target before dispatch eligibility.
+pub trait DraftBackend: Send + Sync {
+    fn prepare<'a>(
         &'a self,
         target: MailboxTarget<'a>,
         mailbox: &'a str,
         limits: &'a Limits,
-    ) -> Pin<Box<dyn Future<Output = Result<u32, Error>> + Send + 'a>>;
+    ) -> DraftPreparation<'a>;
+}
+/// Owns the verified target and its connection capacity until APPEND or cancellation.
+pub trait DraftAppend: Send {
+    fn uid_validity(&self) -> u32;
+    fn append<'a>(
+        self: Box<Self>,
+        draft: &'a crate::draft::PreparedDraft,
+        limits: &'a Limits,
+    ) -> Pin<Box<dyn Future<Output = Result<crate::imap::AppendOutcome, Error>> + Send + 'a>>
+    where
+        Self: 'a;
 }
 #[derive(Default)]
-pub struct MemoryDraftTargets(RwLock<BTreeMap<(String, String), u32>>);
-impl MemoryDraftTargets {
+pub struct MemoryDrafts(RwLock<BTreeMap<(String, String), u32>>);
+impl MemoryDrafts {
     pub fn set(&self, account: &str, mailbox: &str, uid_validity: u32) {
         self.0.write().unwrap().insert(
             (
@@ -41,15 +55,32 @@ impl MemoryDraftTargets {
         );
     }
 }
-impl DraftTargets for MemoryDraftTargets {
-    fn inspect<'a>(
+struct MemoryAppend(u32);
+impl DraftAppend for MemoryAppend {
+    fn uid_validity(&self) -> u32 {
+        self.0
+    }
+    fn append<'a>(
+        self: Box<Self>,
+        _: &'a crate::draft::PreparedDraft,
+        _: &'a Limits,
+    ) -> Pin<Box<dyn Future<Output = Result<crate::imap::AppendOutcome, Error>> + Send + 'a>>
+    where
+        Self: 'a,
+    {
+        Box::pin(async { Ok(crate::imap::AppendOutcome::Created { uid: None }) })
+    }
+}
+impl DraftBackend for MemoryDrafts {
+    fn prepare<'a>(
         &'a self,
         target: MailboxTarget<'a>,
         mailbox: &'a str,
         _: &'a Limits,
-    ) -> Pin<Box<dyn Future<Output = Result<u32, Error>> + Send + 'a>> {
+    ) -> DraftPreparation<'a> {
         Box::pin(async move {
-            self.0
+            let validity = self
+                .0
                 .read()
                 .unwrap()
                 .get(&(
@@ -58,13 +89,14 @@ impl DraftTargets for MemoryDraftTargets {
                 ))
                 .copied()
                 .filter(|v| *v != 0)
-                .ok_or_else(|| Error::new(ErrorCode::DraftMailboxUnavailable))
+                .ok_or_else(|| Error::new(ErrorCode::DraftMailboxUnavailable))?;
+            Ok(Box::new(MemoryAppend(validity)) as Box<dyn DraftAppend>)
         })
     }
 }
 impl Service {
-    pub fn with_draft_targets(mut self, backend: Arc<dyn DraftTargets>) -> Self {
-        self.draft_targets = Some(backend);
+    pub fn with_draft_backend(mut self, backend: Arc<dyn DraftBackend>) -> Self {
+        self.draft_backend = Some(backend);
         self
     }
     fn authorize_draft<'a>(
@@ -120,18 +152,66 @@ impl Service {
         context: &RequestContext,
         input: SaveDraftInput,
     ) -> Result<DraftReceipt, Error> {
+        let mut dispatched = None;
+        let duration =
+            std::time::Duration::from_secs(self.limits(context)?.operation_seconds as u64);
+        tokio::time::timeout(
+            duration,
+            self.save_draft_inner(context, input, &mut dispatched),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(if let Some(operation) = dispatched {
+                Error::draft_outcome(ErrorCode::OutcomeUnknown, operation)
+            } else {
+                Error::new(ErrorCode::Timeout)
+            })
+        })
+    }
+    async fn save_draft_inner(
+        &self,
+        context: &RequestContext,
+        input: SaveDraftInput,
+        dispatched: &mut Option<DraftOperationDetails>,
+    ) -> Result<DraftReceipt, Error> {
         let identity = input.identity();
         let target =
             self.authorize_draft(context, &identity, &input.mailbox, Permission::AppendDraft)?;
         let limits = self.limits(context)?;
         let _admission = self.requests.admit(target.account_id, limits).await?;
-        // Ownership covers inspection, target verification and the durable prepare.
-        let _writer = self
+        // Ownership spans recovery, target verification, APPEND and durable completion.
+        let _writer = match self
             .registry
             .draft_writer(identity.account_id, limits.initialization_seconds)
-            .await?;
+            .await
+        {
+            Ok(writer) => writer,
+            Err(error) if error.code == ErrorCode::RateLimited => {
+                let journal = self.registry.draft_journal()?;
+                if let Some(prior) = authorized_operation(&journal, &identity, &input.mailbox)?
+                    && prior.state == DraftOperationState::InFlight
+                {
+                    return Err(Error::draft_outcome(
+                        ErrorCode::OperationInProgress,
+                        operation_details(&prior.operation),
+                    ));
+                }
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
         let mut journal = self.registry.draft_journal()?;
-        let prior = authorized_operation(&journal, &identity, &input.mailbox)?;
+        let mut prior = authorized_operation(&journal, &identity, &input.mailbox)?;
+        if let Some(pending) = &prior
+            && pending.state == DraftOperationState::InFlight
+        {
+            let operation = operation_details(&pending.operation);
+            prior = Some(
+                journal
+                    .record_outcome_unknown(&identity)
+                    .map_err(|_| Error::draft_outcome(ErrorCode::OutcomeUnknown, operation))?,
+            );
+        }
         let mailbox = crate::domain::mailbox_identity(&input.mailbox);
         let mut content = *input.draft;
         let from = match content.from.take() {
@@ -192,30 +272,35 @@ impl Service {
                 date_unix: frozen.date_unix,
             },
             limits.draft_mime_bytes,
-        )
-        .map_err(Error::from)?;
+        )?;
         if mime.header_bytes() > limits.header_bytes {
             return Err(Error::new(ErrorCode::ResponseTooLarge));
         }
-        if let Some(prior) = prior {
+        let resuming = if let Some(prior) = prior {
             if prior.operation.content_sha256 != mime.sha256() {
                 return Err(Error::draft_conflict());
             }
-            return receipt(prior);
-        }
+            if prior.state != DraftOperationState::Prepared {
+                return self.draft_receipt(prior, limits);
+            }
+            true
+        } else {
+            false
+        };
         let live;
-        let backend: &dyn DraftTargets = match &self.draft_targets {
+        let backend: &dyn DraftBackend = match &self.draft_backend {
             Some(backend) => backend.as_ref(),
             None => {
                 live = self.imap_backend(target).await?;
                 &live
             }
         };
-        let validity = self.observed(
+        let append = self.observed(
             target.account_id,
-            backend.inspect(target, mailbox, limits).await,
+            backend.prepare(target, mailbox, limits).await,
         )?;
-        if validity == 0 {
+        let validity = append.uid_validity();
+        if validity == 0 || (resuming && validity != frozen.uid_validity) {
             return Err(Error::new(ErrorCode::DraftMailboxUnavailable));
         }
         let operation = PreparedDraftOperation {
@@ -227,11 +312,14 @@ impl Service {
                 ..frozen
             }),
         };
-        receipt(
-            journal
-                .prepare_with_limit(operation, self.config.limits.journal_records)
-                .map_err(journal_error)?,
-        )
+        let prepared = journal
+            .prepare_with_limit(operation, self.config.limits.journal_records)
+            .map_err(journal_error)?;
+        let dispatch = Dispatch::start(&mut journal, &prepared.operation)?;
+        *dispatched = Some(operation_details(&prepared.operation));
+        let outcome = append.append(&mime, limits).await;
+        let recorded = dispatch.complete(outcome)?;
+        self.draft_receipt(recorded, limits)
     }
     pub(super) async fn draft_status(
         &self,
@@ -254,7 +342,10 @@ impl Service {
         if input.reconcile {
             return Err(Error::new(ErrorCode::UnsupportedCapability));
         }
-        receipt(prior.ok_or_else(|| Error::new(ErrorCode::OperationNotFound))?)
+        self.draft_receipt(
+            prior.ok_or_else(|| Error::new(ErrorCode::OperationNotFound))?,
+            self.limits(context)?,
+        )
     }
 }
 // The caller authorizes the requested mailbox before opening the journal. A row
@@ -304,33 +395,130 @@ fn hash(value: &impl serde::Serialize) -> Result<[u8; 32], Error> {
     crate::encoding::json_sha256(value, usize::MAX)
         .map_err(|_| Error::new(ErrorCode::InvalidRequest))
 }
-fn receipt(persisted: PersistedDraftOperation) -> Result<DraftReceipt, Error> {
-    let operation = persisted.operation;
-    let reconstruction = operation
-        .reconstruction
-        .ok_or_else(|| Error::new(ErrorCode::JournalUnavailable))?;
-    let state = match persisted.state {
-        DraftOperationState::Prepared => DraftState::Prepared,
-        DraftOperationState::InFlight => DraftState::InFlight,
-        DraftOperationState::Created { .. } => DraftState::Created,
-        DraftOperationState::Rejected => DraftState::Rejected,
-        DraftOperationState::OutcomeUnknown => DraftState::OutcomeUnknown,
-    };
-    Ok(DraftReceipt {
-        account_id: operation.identity.account_id,
-        account_generation: operation.identity.account_generation,
-        operation_id: operation.identity.operation_id,
-        mailbox: operation.mailbox_identity,
-        uid_validity: reconstruction.uid_validity,
-        state,
-        dispatched: state != DraftState::Prepared,
-        content_sha256: crate::encoding::hex(&operation.content_sha256),
-    })
+impl Service {
+    fn draft_receipt(
+        &self,
+        persisted: PersistedDraftOperation,
+        limits: &Limits,
+    ) -> Result<DraftReceipt, Error> {
+        let operation = persisted.operation;
+        let message_reference = match persisted.state {
+            DraftOperationState::Created {
+                appended_message: Some(uid),
+            } => self
+                .encode(
+                    "ms1",
+                    &super::tokens::MessageReference {
+                        account: &operation.identity.account_id.to_string(),
+                        generation: operation.identity.account_generation,
+                        mailbox: &operation.mailbox_identity,
+                        uid_validity: uid.uid_validity,
+                        uid: uid.uid,
+                    },
+                    limits.token_bytes,
+                )
+                .ok(),
+            _ => None,
+        };
+        let reconstruction = operation
+            .reconstruction
+            .as_ref()
+            .ok_or_else(|| Error::new(ErrorCode::JournalUnavailable))?;
+        let state = match persisted.state {
+            DraftOperationState::Prepared => DraftState::Prepared,
+            DraftOperationState::InFlight => {
+                return Err(Error::draft_outcome(
+                    ErrorCode::OperationInProgress,
+                    operation_details(&operation),
+                ));
+            }
+            DraftOperationState::Created { .. } if message_reference.is_some() => {
+                DraftState::Created
+            }
+            DraftOperationState::Created { .. } => DraftState::CreatedReferenceUnavailable,
+            DraftOperationState::Rejected => DraftState::Rejected,
+            DraftOperationState::OutcomeUnknown => {
+                return Err(Error::draft_outcome(
+                    ErrorCode::OutcomeUnknown,
+                    operation_details(&operation),
+                ));
+            }
+        };
+        Ok(DraftReceipt {
+            account_id: operation.identity.account_id,
+            account_generation: operation.identity.account_generation,
+            operation_id: operation.identity.operation_id,
+            mailbox: operation.mailbox_identity,
+            uid_validity: reconstruction.uid_validity,
+            state,
+            message_reference,
+            dispatched: state != DraftState::Prepared,
+            content_sha256: crate::encoding::hex(&operation.content_sha256),
+        })
+    }
+}
+struct Dispatch<'a> {
+    journal: &'a mut crate::draft_journal::DraftJournal,
+    operation: &'a PreparedDraftOperation,
+    finished: bool,
+}
+impl<'a> Dispatch<'a> {
+    fn start(
+        journal: &'a mut crate::draft_journal::DraftJournal,
+        operation: &'a PreparedDraftOperation,
+    ) -> Result<Self, Error> {
+        journal.begin_dispatch(operation).map_err(journal_error)?;
+        Ok(Self {
+            journal,
+            operation,
+            finished: false,
+        })
+    }
+    fn complete(
+        mut self,
+        outcome: Result<crate::imap::AppendOutcome, Error>,
+    ) -> Result<PersistedDraftOperation, Error> {
+        let identity = &self.operation.identity;
+        let recorded = match outcome {
+            Ok(crate::imap::AppendOutcome::Created { uid }) => self.journal.record_created(
+                identity,
+                uid.map(|uid| crate::draft_journal::AppendedMessageIdentity {
+                    uid_validity: uid.uid_validity,
+                    uid: uid.uid,
+                }),
+            ),
+            Ok(crate::imap::AppendOutcome::Rejected) => self.journal.record_rejected(identity),
+            _ => self.journal.record_outcome_unknown(identity),
+        }
+        .map_err(|_| {
+            Error::draft_outcome(ErrorCode::OutcomeUnknown, operation_details(self.operation))
+        })?;
+        self.finished = true;
+        Ok(recorded)
+    }
+}
+impl Drop for Dispatch<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            // Cancellation is uncertainty. If storage fails, recovery retains in_flight.
+            let _ = self
+                .journal
+                .record_outcome_unknown(&self.operation.identity);
+        }
+    }
 }
 fn journal_error(error: DraftJournalError) -> Error {
     match error {
         DraftJournalError::OperationConflict => Error::draft_conflict(),
         DraftJournalError::Full => Error::new(ErrorCode::JournalFull),
         _ => Error::new(ErrorCode::JournalUnavailable),
+    }
+}
+
+fn operation_details(operation: &PreparedDraftOperation) -> DraftOperationDetails {
+    DraftOperationDetails {
+        identity: operation.identity.clone(),
+        mailbox: operation.mailbox_identity.clone(),
+        uid_validity: operation.reconstruction.as_ref().map(|r| r.uid_validity),
     }
 }

@@ -22,15 +22,29 @@ impl AuthenticatedConnection {
         limits: &Limits,
         metrics: &mut Metrics,
     ) -> Result<u32, Error> {
+        let (connection, validity) = self.select_draft_target(mailbox, limits, metrics).await?;
+        connection.disconnect().await?;
+        Ok(validity)
+    }
+
+    pub(crate) async fn select_draft_target(
+        self,
+        mailbox: &str,
+        limits: &Limits,
+        metrics: &mut Metrics,
+    ) -> Result<(Self, u32), Error> {
         super::mailbox(mailbox)?;
         limits.validate()?;
         let mut connection = self.session.resume(metrics);
         connection.limit_body(limits);
         let (validity, _) = connection.examine_selection(mailbox).await?;
-        connection
-            .drive(io_imap::rfc3501::logout::ImapLogout::new())
-            .await?;
-        Ok(validity)
+        Ok((
+            Self {
+                session: connection.into_session(),
+                identity: self.identity,
+            },
+            validity,
+        ))
     }
 
     /// Append frozen MIME with the initial Draft flag. The caller owns authorization

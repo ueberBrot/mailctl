@@ -224,21 +224,36 @@ impl Client {
     }
 
     async fn exchange(&self, request: ClientFrame) -> Result<OperationResult, Error> {
+        let expires =
+            tokio::time::Instant::now() + Duration::from_secs(self.limits.operation_seconds as u64);
+        let bytes = serialize_bounded(&request, REQUEST_BYTES)?;
+        let draft_identity = match &request {
+            ClientFrame::Operation {
+                operation: Operation::SaveDraft(input),
+                ..
+            } => Some(input.operation_details()),
+            _ => None,
+        };
+        drop(request);
         // Cancellation drops the taken stream, so no subsequent operation can
         // receive a response that belonged to the cancelled request.
-        let mut retained = self.stream.lock().await;
+        let mut retained = tokio::time::timeout_at(expires, self.stream.lock())
+            .await
+            .map_err(|_| Error::new(ErrorCode::Timeout))?;
         let mut stream = retained
             .take()
             .ok_or_else(|| Error::new(ErrorCode::BrokerUnavailable))?;
-        let response = timeout(
-            Duration::from_secs(self.limits.operation_seconds as u64),
-            async {
-                write_frame(&mut stream, &request, REQUEST_BYTES).await?;
-                read_frame(&mut stream, self.response_bound, 32).await
-            },
-        )
+        let response = tokio::time::timeout_at(expires, async {
+            write_bytes(&mut stream, &bytes).await?;
+            read_frame(&mut stream, self.response_bound, 32).await
+        })
         .await
-        .map_err(|_| Error::new(ErrorCode::Timeout))??;
+        .map_err(|_| Error::new(ErrorCode::Timeout))
+        .flatten()
+        .map_err(|error| match draft_identity {
+            Some(identity) => Error::draft_outcome(ErrorCode::OutcomeUnknown, identity),
+            None => error,
+        })?;
         match response {
             ServerFrame::Result { envelope } => {
                 *retained = Some(stream);
@@ -406,20 +421,30 @@ async fn serve_session(
                 .clone()
                 .with_response_limit(client_bound.saturating_sub(256));
             let operation_deadline = Duration::from_secs(limits.operation_seconds as u64);
-            let result = timeout(operation_deadline, async {
-                match request {
-                    ClientFrame::Operation { operation, .. } => {
-                        service.execute(&narrowed, operation).await
-                    }
-                    ClientFrame::Doctor { check_account, .. } => service
-                        .doctor(&narrowed, check_account)
+            let result = match request {
+                ClientFrame::Operation {
+                    operation: Operation::SaveDraft(input),
+                    ..
+                } => {
+                    service
+                        .execute(&narrowed, Operation::SaveDraft(input))
                         .await
-                        .map(OperationResult::Doctor),
-                    ClientFrame::Hello { .. } => Err(Error::new(ErrorCode::ProtocolMismatch)),
                 }
-            })
-            .await
-            .map_err(|_| Error::new(ErrorCode::Timeout))?;
+                request => timeout(operation_deadline, async {
+                    match request {
+                        ClientFrame::Operation { operation, .. } => {
+                            service.execute(&narrowed, operation).await
+                        }
+                        ClientFrame::Doctor { check_account, .. } => service
+                            .doctor(&narrowed, check_account)
+                            .await
+                            .map(OperationResult::Doctor),
+                        ClientFrame::Hello { .. } => Err(Error::new(ErrorCode::ProtocolMismatch)),
+                    }
+                })
+                .await
+                .map_err(|_| Error::new(ErrorCode::Timeout))?,
+            };
             timeout(
                 operation_deadline,
                 write_result(
@@ -715,6 +740,105 @@ async fn shutdown_signal() {
 #[cfg(all(test, feature = "isolated"))]
 mod tests {
     use super::*;
+
+    fn client_pair() -> (Client, UnixStream) {
+        let (stream, peer) = UnixStream::pair().unwrap();
+        (
+            Client {
+                stream: Mutex::new(Some(stream)),
+                limits: Limits {
+                    operation_seconds: 1,
+                    ..Limits::default()
+                },
+                response_bound: REQUEST_BYTES,
+            },
+            peer,
+        )
+    }
+
+    fn draft(body: String) -> Operation {
+        Operation::SaveDraft(crate::domain::SaveDraftInput {
+            account_id: uuid::Uuid::new_v4(),
+            account_generation: 1,
+            operation_id: uuid::Uuid::new_v4(),
+            mailbox: "Drafts".into(),
+            draft: Box::new(crate::domain::DraftContent {
+                body,
+                ..Default::default()
+            }),
+        })
+    }
+
+    #[tokio::test]
+    async fn oversized_draft_is_rejected_before_writing_and_preserves_the_session() {
+        let (client, mut peer) = client_pair();
+        let error = client
+            .execute(draft("x".repeat(REQUEST_BYTES)))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ResponseTooLarge);
+        assert!(error.draft_operation.is_none());
+        let reply = async {
+            let request: ClientFrame = read_frame(&mut peer, REQUEST_BYTES, 32).await.unwrap();
+            assert!(matches!(request, ClientFrame::Doctor { .. }));
+            write_frame(
+                &mut peer,
+                &ServerFrame::Result {
+                    envelope: Envelope::from_result(
+                        "fixture".into(),
+                        Err(Error::new(ErrorCode::UnsupportedCapability)),
+                    ),
+                },
+                REQUEST_BYTES,
+            )
+            .await
+            .unwrap();
+        };
+        let (result, ()) = tokio::join!(client.doctor(false), reply);
+        assert_eq!(result.unwrap_err().code, ErrorCode::UnsupportedCapability);
+    }
+
+    #[tokio::test]
+    async fn draft_waiting_for_the_session_times_out_without_claiming_dispatch() {
+        let (client, _peer) = client_pair();
+        let retained = client.stream.lock().await;
+        let error = timeout(Duration::from_secs(2), client.execute(draft(String::new())))
+            .await
+            .expect("queue acquisition exceeded the operation deadline")
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Timeout);
+        assert!(error.draft_operation.is_none());
+        assert!(retained.is_some());
+    }
+
+    #[tokio::test]
+    async fn queued_time_counts_toward_the_draft_response_deadline() {
+        let (client, mut peer) = client_pair();
+        let retained = client.stream.lock().await;
+        let release = async {
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            drop(retained);
+            let request: ClientFrame = read_frame(&mut peer, REQUEST_BYTES, 32).await.unwrap();
+            assert!(matches!(
+                request,
+                ClientFrame::Operation {
+                    operation: Operation::SaveDraft(_),
+                    ..
+                }
+            ));
+        };
+        let operation = timeout(
+            Duration::from_millis(1500),
+            client.execute(draft(String::new())),
+        );
+        let (result, ()) = tokio::join!(operation, release);
+        let error = result
+            .expect("dispatch restarted the operation deadline")
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::OutcomeUnknown);
+        assert!(error.draft_operation.is_some());
+        assert!(client.stream.lock().await.is_none());
+    }
 
     #[test]
     fn rejected_tagged_json_fits_the_session_request_reservation() {

@@ -14,7 +14,9 @@ const _: fn(Envelope<AccountDiscovery>) -> Result<AccountDiscovery, Error> = Env
 const _: fn(Envelope<Capabilities>) -> Result<Capabilities, Error> = Envelope::into_result;
 const _: fn(OperationResult) = |result| match result {
     OperationResult::Draft(value) => {
-        let _: mailctl::domain::DraftReceipt = value;
+        let _: Option<String> = value.message_reference;
+        let _: mailctl::domain::DraftState = value.state;
+        let _: uuid::Uuid = value.operation_id;
     }
     OperationResult::Attachments(value) => {
         let _: mailctl::domain::AttachmentList = value;
@@ -90,3 +92,11 @@ const _: fn(
     mailctl::frontends::Executable,
     std::sync::Arc<dyn mailctl::host::HostEnvironment>,
 ) -> std::process::ExitCode = mailctl::frontends::run_with_environment;
+
+const _: fn(Error) = |error| {
+    if let Some(operation) = error.draft_operation {
+        let _: mailctl::domain::DraftIdentity = operation.identity;
+        let _: String = operation.mailbox;
+        let _: Option<u32> = operation.uid_validity;
+    }
+};

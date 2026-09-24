@@ -3,7 +3,7 @@ mod support;
 use mailctl::{
     config::Config,
     domain::{ListAccountsInput, Operation, OperationResult},
-    service::{MemoryDraftTargets, Service},
+    service::{MemoryDrafts, Service},
 };
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -39,30 +39,17 @@ async fn execute(service: &Service, request: Value) -> Value {
     .unwrap()
 }
 #[tokio::test]
-async fn prepared_draft_survives_restart_and_status_never_contacts_provider() {
-    let installation = support::Installation::two_accounts();
-    let mut config =
-        Config::parse(&std::fs::read_to_string(installation.config()).unwrap()).unwrap();
-    config.accounts[0].from_identities = vec!["work@example.test".into()];
-    Service::setup(config.clone()).unwrap();
-    let provider = Arc::new(MemoryDraftTargets::default());
-    provider.set("work", "Drafts", 77);
-    let service = Service::open(config.clone())
-        .unwrap()
-        .with_draft_targets(provider);
-    let identity = account(&service).await;
+async fn created_draft_survives_restart_and_status_never_contacts_provider() {
+    let (_installation, config, service, identity) = fixture().await;
     let input = save(&identity, uuid::Uuid::new_v4());
     let result = execute(&service, input.clone()).await;
-    assert_eq!(result["state"], "prepared");
-    assert_eq!(result["dispatched"], false);
+    assert_eq!(result["state"], "created_reference_unavailable");
+    assert_eq!(result["dispatched"], true);
     assert_eq!(result["mailbox"], "Drafts");
     assert_eq!(result["uid_validity"], 77);
     drop(service);
     let service = Service::open(config).unwrap();
-    let mut status = input.clone();
-    status["operation"] = json!("draft_status");
-    status["input"].as_object_mut().unwrap().remove("draft");
-    assert_eq!(execute(&service, status).await, result);
+    assert_eq!(execute(&service, status(input.clone())).await, result);
     assert_eq!(execute(&service, input).await, result);
 }
 
@@ -72,11 +59,11 @@ async fn fixture() -> (support::Installation, Config, Service, Value) {
         Config::parse(&std::fs::read_to_string(installation.config()).unwrap()).unwrap();
     config.accounts[0].from_identities = vec!["work@example.test".into()];
     Service::setup(config.clone()).unwrap();
-    let provider = Arc::new(MemoryDraftTargets::default());
+    let provider = Arc::new(MemoryDrafts::default());
     provider.set("work", "Drafts", 77);
     let service = Service::open(config.clone())
         .unwrap()
-        .with_draft_targets(provider);
+        .with_draft_backend(provider);
     let identity = account(&service).await;
     (installation, config, service, identity)
 }
@@ -272,7 +259,7 @@ async fn schema_and_application_enforce_independent_composition_bounds() {
     request["input"]["draft"]["to"] = json!(vec![json!({"address":"to@example.test"}); 50]);
     request["input"]["draft"]["cc"] = json!(vec![json!({"address":"cc@example.test"}); 50]);
     let result = execute(&service, request.clone()).await;
-    assert_eq!(result["state"], "prepared");
+    assert_eq!(result["state"], "created_reference_unavailable");
     request["input"]["operation_id"] = json!(uuid::Uuid::new_v4());
     request["input"]["draft"]["bcc"] = json!([{"address":"bcc@example.test"}]);
     assert_eq!(
@@ -296,7 +283,7 @@ async fn schema_and_application_enforce_independent_composition_bounds() {
 async fn missing_target_is_not_created_and_no_journal_entry_is_prepared() {
     use mailctl::domain::ErrorCode::*;
     let (_installation, _config, service, identity) = fixture().await;
-    let service = service.with_draft_targets(Arc::new(MemoryDraftTargets::default()));
+    let service = service.with_draft_backend(Arc::new(MemoryDrafts::default()));
     let request = save(&identity, uuid::Uuid::new_v4());
     assert_eq!(
         failure(&service, request.clone(), "writer", false).await,
@@ -317,11 +304,11 @@ async fn journal_quota_preserves_existing_status_and_read_only_health() {
         grant.limits.journal_records = 1;
     }
     Service::setup(config.clone()).unwrap();
-    let provider = Arc::new(MemoryDraftTargets::default());
+    let provider = Arc::new(MemoryDrafts::default());
     provider.set("work", "Drafts", 77);
     let service = Service::open(config.clone())
         .unwrap()
-        .with_draft_targets(provider);
+        .with_draft_backend(provider);
     let request = save(&identity, uuid::Uuid::new_v4());
     let expected = execute(&service, request.clone()).await;
     assert_eq!(
@@ -471,11 +458,11 @@ async fn sqlite_contention_never_blocks_the_async_executor_for_its_busy_timeout(
         grant.limits = config.limits.clone();
     }
     Service::setup(config.clone()).unwrap();
-    let targets = Arc::new(MemoryDraftTargets::default());
+    let targets = Arc::new(MemoryDrafts::default());
     targets.set("work", "Drafts", 77);
     let service = Service::open(config.clone())
         .unwrap()
-        .with_draft_targets(targets);
+        .with_draft_backend(targets);
     let writer = rusqlite::Connection::open(config.state_dir.join("drafts.sqlite")).unwrap();
     writer.execute_batch("BEGIN IMMEDIATE").unwrap();
     let started = std::time::Instant::now();

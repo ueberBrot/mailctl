@@ -61,7 +61,7 @@ async fn status_ignores_live_writer_and_process_death_releases_ownership() {
     use mailctl::{
         config::Config,
         domain::{Operation, OperationResult},
-        service::{MemoryDraftTargets, Service},
+        service::{MemoryDrafts, Service},
     };
     use serde_json::json;
     let installation = Installation::two_accounts();
@@ -78,11 +78,11 @@ async fn status_ignores_live_writer_and_process_death_releases_ownership() {
     }
     std::fs::write(installation.config(), toml::to_string(&config).unwrap()).unwrap();
     Service::setup(config.clone()).unwrap();
-    let targets = std::sync::Arc::new(MemoryDraftTargets::default());
+    let targets = std::sync::Arc::new(MemoryDrafts::default());
     targets.set("work", "Drafts", 77);
     let service = Service::open(config.clone())
         .unwrap()
-        .with_draft_targets(targets);
+        .with_draft_backend(targets);
     let context = service.context("writer", &Default::default()).unwrap();
     let OperationResult::Accounts(accounts) = service
         .execute(&context, Operation::ListAccounts(Default::default()))

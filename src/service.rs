@@ -3,7 +3,7 @@ mod credentials;
 mod drafts;
 #[cfg(any(feature = "cli", feature = "mcp"))]
 pub(crate) use credentials::credential_error;
-pub use drafts::{DraftTargets, MemoryDraftTargets};
+pub use drafts::{DraftAppend, DraftBackend, DraftPreparation, MemoryDrafts};
 mod attachments;
 mod imap;
 mod mailboxes;
@@ -31,7 +31,7 @@ use state::AccountRegistry;
 use uuid::Uuid;
 
 pub struct Service {
-    draft_targets: Option<std::sync::Arc<dyn DraftTargets>>,
+    draft_backend: Option<std::sync::Arc<dyn DraftBackend>>,
     config: Config,
     host: std::sync::Arc<dyn crate::host::HostEnvironment>,
     registry: AccountRegistry,
@@ -88,7 +88,7 @@ impl Service {
             registry,
             context_id: Uuid::new_v4(),
             mailbox_backend: None,
-            draft_targets: None,
+            draft_backend: None,
             search_backend: None,
             body_backend: None,
             attachment_backend: None,
@@ -221,11 +221,14 @@ impl Service {
         operation: Operation,
     ) -> Result<OperationResult, Error> {
         let _reservation = self.requests.reserve(self.limits(context)?)?;
-        let transfer = matches!(operation, Operation::GetAttachment(_));
+        let own_deadline = matches!(
+            operation,
+            Operation::GetAttachment(_) | Operation::SaveDraft(_)
+        );
         let execution = self.execute_inner(context, operation);
-        // Transfers own the earlier of operation timeout and transfer expiry, including
-        // which error to return when both deadlines coincide.
-        if transfer {
+        // Transfers choose between operation timeout and transfer expiry; drafts
+        // distinguish a safe timeout from uncertainty after dispatch.
+        if own_deadline {
             execution.await
         } else {
             self.with_deadline(context, execution).await

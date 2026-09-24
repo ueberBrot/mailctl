@@ -153,6 +153,19 @@ pub struct Lease {
     capacity: usize,
 }
 impl Lease {
+    pub(crate) async fn draft_target(
+        mut self,
+        mailbox: &str,
+        limits: &crate::imap::Limits,
+    ) -> Result<(Self, u32), crate::imap::Error> {
+        let (connection, validity) = self
+            .idle
+            .connection
+            .select_draft_target(mailbox, limits, &mut crate::imap::Metrics::default())
+            .await?;
+        self.idle.connection = connection;
+        Ok((self, validity))
+    }
     pub(crate) async fn with_connection<T>(
         self,
         operation: impl AsyncFnOnce(AuthenticatedConnection) -> T,

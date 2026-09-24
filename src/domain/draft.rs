@@ -12,6 +12,15 @@ pub struct DraftIdentity {
     pub operation_id: Uuid,
 }
 
+/// Authorized operation and original target, including its incarnation when known.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DraftOperationDetails {
+    pub identity: DraftIdentity,
+    pub mailbox: String,
+    pub uid_validity: Option<u32>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DraftAddress {
@@ -90,6 +99,13 @@ pub struct SaveDraftInput {
     pub draft: Box<DraftContent>,
 }
 impl SaveDraftInput {
+    pub fn operation_details(&self) -> DraftOperationDetails {
+        DraftOperationDetails {
+            identity: self.identity(),
+            mailbox: self.mailbox.clone(),
+            uid_validity: None,
+        }
+    }
     pub fn identity(&self) -> DraftIdentity {
         DraftIdentity {
             account_id: self.account_id,
@@ -125,6 +141,7 @@ pub enum DraftState {
     Prepared,
     InFlight,
     Created,
+    CreatedReferenceUnavailable,
     Rejected,
     OutcomeUnknown,
 }
@@ -138,6 +155,7 @@ pub struct DraftReceipt {
     pub uid_validity: u32,
     pub state: DraftState,
     pub dispatched: bool,
+    pub message_reference: Option<String>,
     pub content_sha256: String,
 }
 

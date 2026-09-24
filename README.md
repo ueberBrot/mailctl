@@ -3,8 +3,11 @@
 Email tools for the command line and MCP. It supports account and mailbox
 discovery, bounded message search and body reads, attachment retrieval, reusable
 resource references, capability reporting, macOS credential provisioning, and
-authentication diagnostics. It also prepares durable, undispatched drafts
-and inspects their status through either interface.
+authentication diagnostics. It also creates unsent drafts and inspects their
+durable outcomes through either interface. Retain the account UUID, generation,
+operation UUID, and original input before saving. Identical retries share the
+recorded outcome. An uncertain outcome never permits another APPEND;
+reconciliation is not yet available.
 
 Build both executables:
 

@@ -17,7 +17,6 @@ struct EmailTools {
     tools: Vec<Tool>,
     application: Application,
     envelope_limit: usize,
-    deadline: Duration,
     shutdown: CancellationToken,
 }
 
@@ -34,7 +33,7 @@ fn definitions(operations: &[String]) -> Vec<Tool> {
     let empty = json!({"type":"object","properties":{},"additionalProperties":false});
     [
         tool::<crate::domain::SaveDraftInput, crate::domain::DraftReceipt>(
-            "email_save_draft", "Record a prepared, undispatched draft using caller-retained identity and composition.",
+            "email_save_draft", "Create one unsent draft using caller-retained identity and composition; replay the recorded outcome on retry.",
         ),
         tool::<crate::domain::DraftStatusInput, crate::domain::DraftReceipt>(
             "email_draft_status", "Inspect an authorized draft operation without provider work; reconciliation is not yet supported.",
@@ -134,16 +133,23 @@ impl ServerHandler for EmailTools {
         let diagnostic_request = super::diagnostics::Request::new();
         let result = match operation {
             Err(error) => Err(error),
-            Ok(operation) => tokio::select! {
-                biased;
-                _ = context.ct.cancelled() => Err(Error::new(ErrorCode::Cancelled)),
-                _ = self.shutdown.cancelled() => Err(Error::new(ErrorCode::Cancelled)),
-                result = tokio::time::timeout(
-                    self.deadline,
-                    self.application.execute(operation).instrument(diagnostic_request.span()),
-                ) =>
-                    result.map_err(|_| Error::new(ErrorCode::Timeout)).flatten(),
-            },
+            Ok(operation) => {
+                let draft_identity = match &operation {
+                    Operation::SaveDraft(input) => Some(input.operation_details()),
+                    _ => None,
+                };
+                // Both application adapters own the operation deadline.
+                tokio::select! {
+                    biased;
+                    _ = context.ct.cancelled() => None,
+                    _ = self.shutdown.cancelled() => None,
+                    result = self.application.execute(operation).instrument(diagnostic_request.span()) => Some(result),
+                }
+                .unwrap_or_else(|| Err(match draft_identity {
+                    Some(identity) => Error::draft_outcome(ErrorCode::OutcomeUnknown, identity),
+                    None => Error::new(ErrorCode::Cancelled),
+                }))
+            }
         };
         if result.as_ref().is_err_and(|error| {
             error.code == ErrorCode::OperationConflict
@@ -178,10 +184,14 @@ pub(super) async fn run(application: Application) -> Result<(), Error> {
         return Err(Error::new(ErrorCode::InternalError));
     };
     let limits = application.limits()?;
+    let tools = definitions(&capabilities.operations);
+    let schema_bytes = crate::encoding::serialized_size(&tools, limits.buffered_bytes)
+        .map_err(|_| Error::setup_required())?;
     let bounds = Bounds::new(
         limits,
         application.response_bound()?,
         capabilities.operations.iter().any(|op| op == "save_draft"),
+        schema_bytes,
     )?;
     let expires = tokio::time::Instant::now()
         + Duration::from_secs(limits.connection_lifetime_seconds as u64);
@@ -191,15 +201,14 @@ pub(super) async fn run(application: Application) -> Result<(), Error> {
     let shutdown = CancellationToken::new();
     let _cancel_on_exit = shutdown.clone().drop_guard();
     let handler = EmailTools {
-        tools: definitions(&capabilities.operations),
+        tools,
         envelope_limit: bounds.envelope,
-        deadline: Duration::from_secs(limits.operation_seconds as u64),
         application: application.with_response_limit(bounds.envelope),
         shutdown: shutdown.clone(),
     };
     let service = tokio::time::timeout_at(
         initialization_expires,
-        handler.serve_with_ct(BoundedStdio::new(bounds), shutdown),
+        handler.serve_with_ct(BoundedStdio::new(bounds, shutdown.clone()), shutdown),
     )
     .await
     .map_err(|_| Error::new(ErrorCode::Timeout))?
