@@ -1,5 +1,8 @@
 //! Shared installation identity, configuration revision, and maintenance leases.
 mod drafts;
+pub(super) use drafts::DraftHistory;
+mod maintenance;
+pub(super) use maintenance::{backup, restore, verify};
 mod storage;
 use crate::{
     config::{AccountConfig, Config, CredentialSource, TlsMode},
@@ -66,6 +69,7 @@ impl Generation {
 #[serde(deny_unknown_fields)]
 struct Registry {
     version: u32,
+    draft_history_initialized: bool,
     installation: String,
     installation_key: [u8; 32],
     configuration_revision: String,
@@ -76,7 +80,8 @@ impl Registry {
         let mut installation_key = [0; 32];
         getrandom::fill(&mut installation_key).map_err(|_| invalid())?;
         Ok(Self {
-            version: 1,
+            version: 2,
+            draft_history_initialized: false,
             installation: Uuid::new_v4().to_string(),
             installation_key,
             configuration_revision,
@@ -84,7 +89,7 @@ impl Registry {
         })
     }
     fn validate(&self) -> Result<(), Error> {
-        if self.version != 1 {
+        if self.version != 2 {
             return Err(Error::incompatible_schema());
         }
         if Uuid::parse_str(&self.installation).is_err()
@@ -166,6 +171,7 @@ struct Initialization<'a> {
     initialization: File,
     exclusive: bool,
     changed: bool,
+    initialize_drafts: bool,
 }
 
 impl<'a> Initialization<'a> {
@@ -196,7 +202,11 @@ impl<'a> Initialization<'a> {
                 })
         });
         let maintenance = storage::open_lock(&directory, "maintenance.lock")?;
-        let exclusive = exclusive || changed || drafts::needs_initialization(config, &directory);
+        let initialize_drafts = drafts::enabled(config)
+            && persisted
+                .as_ref()
+                .is_none_or(|registry| !registry.draft_history_initialized);
+        let exclusive = exclusive || changed || initialize_drafts;
         storage::lock(
             &maintenance,
             if exclusive {
@@ -232,6 +242,7 @@ impl<'a> Initialization<'a> {
             initialization,
             exclusive,
             changed,
+            initialize_drafts,
         })
     }
 
@@ -240,7 +251,8 @@ impl<'a> Initialization<'a> {
         update_configuration: impl FnOnce() -> Result<T, Error>,
     ) -> Result<T, Error> {
         // Prepare bounded state before allowing the configuration to be replaced.
-        let bytes = if self.changed {
+        let bytes = if self.changed || self.initialize_drafts {
+            self.registry.draft_history_initialized |= self.initialize_drafts;
             self.registry.configuration_revision = self.revision.clone();
             self.registry.reconcile(&self.config)?;
             Some(
@@ -257,8 +269,9 @@ impl<'a> Initialization<'a> {
         if self.marker.len() != self.registry.installation.len() {
             storage::mark_initialized(&mut self.initialization, &self.registry.installation)?;
         }
-        if self.exclusive {
-            drafts::initialize(&self.config, &self.directory);
+        if self.initialize_drafts {
+            // Draft storage degradation must leave healthy reads available.
+            let _ = drafts::initialize(&self.directory);
         }
         Ok(updated)
     }
@@ -277,7 +290,7 @@ impl<'a> Initialization<'a> {
 
 pub(super) struct AccountRegistry {
     registry: Registry,
-    lease: Option<Lease>,
+    lease: Option<std::sync::Arc<Lease>>,
 }
 impl AccountRegistry {
     pub(super) fn in_memory(config: &Config) -> Result<Self, Error> {
@@ -303,10 +316,10 @@ impl AccountRegistry {
         } = initialization;
         Ok(Self {
             registry,
-            lease: Some(Lease {
+            lease: Some(std::sync::Arc::new(Lease {
                 directory,
                 _maintenance: maintenance,
-            }),
+            })),
         })
     }
     pub(super) fn maintain<T>(
@@ -400,7 +413,7 @@ fn load(directory: &Path) -> Result<Option<Registry>, Error> {
         version: u32,
     }
     let schema: SchemaVersion = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
-    if schema.version != 1 {
+    if schema.version != 2 {
         return Err(Error::incompatible_schema());
     }
     let registry: Registry = serde_json::from_slice(&bytes).map_err(|_| invalid())?;

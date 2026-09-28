@@ -124,3 +124,46 @@ fn partial_frames_expire_and_process_death_allows_restart() {
     setup(&installation);
     independent(&installation);
 }
+
+#[test]
+fn live_mcp_excludes_snapshot_restore_and_upgrade_verification_until_process_death() {
+    let installation = installation();
+    let mut config =
+        mailctl::config::Config::parse(&std::fs::read_to_string(installation.config()).unwrap())
+            .unwrap();
+    config.limits.operation_seconds = 30;
+    for grant in &mut config.grants {
+        grant.limits.operation_seconds = 30;
+    }
+    std::fs::write(installation.config(), toml::to_string(&config).unwrap()).unwrap();
+    mailctl::service::Service::setup(config.clone()).unwrap();
+    let backup = config
+        .state_dir
+        .parent()
+        .unwrap()
+        .join("maintenance-backup");
+    mailctl::service::Service::backup(&config, &backup).unwrap();
+    let (mut child, _reader) = session(&installation);
+    for (action, path_flag) in [
+        ("backup", Some("--destination")),
+        ("restore", Some("--source")),
+        ("verify", None),
+    ] {
+        let mut command = installation.mcp();
+        command.args(["--json", "state", action]);
+        if let Some(flag) = path_flag {
+            command.arg(flag).arg(&backup);
+        }
+        assert_eq!(
+            support::envelope(&run_bounded(command))["error"]["code"],
+            "rate_limited"
+        );
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let mut command = installation.mcp();
+    command
+        .args(["--json", "state", "restore", "--source"])
+        .arg(&backup);
+    assert_success(&run_bounded(command));
+}

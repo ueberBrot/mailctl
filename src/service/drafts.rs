@@ -293,6 +293,8 @@ impl Service {
         let target =
             self.authorize_draft(context, &identity, &input.mailbox, Permission::AppendDraft)?;
         let limits = self.limits(context)?;
+        let verification_deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(limits.operation_seconds as u64);
         let _admission = self.requests.admit(target.account_id, limits).await?;
         // Ownership spans recovery, target verification, APPEND and durable completion.
         let _writer = match self
@@ -302,8 +304,8 @@ impl Service {
         {
             Ok(writer) => writer,
             Err(error) if error.code == ErrorCode::RateLimited => {
-                let journal = self.registry.draft_journal()?;
-                if let Some(prior) = authorized_operation(&journal, &identity, &input.mailbox)?
+                let mut journal = self.registry.draft_journal()?;
+                if let Some(prior) = authorized_operation(&mut journal, &identity, &input.mailbox)?
                     && prior.state == DraftOperationState::InFlight
                 {
                     return Err(Error::draft_outcome(
@@ -316,21 +318,27 @@ impl Service {
             Err(error) => return Err(error),
         };
         let mut journal = self.registry.draft_journal()?;
-        let mut prior = authorized_operation(&journal, &identity, &input.mailbox)?;
+        let mut prior = authorized_operation(&mut journal, &identity, &input.mailbox)?;
         if let Some(pending) = &prior
             && pending.state == DraftOperationState::InFlight
         {
             let operation = operation_details(&pending.operation);
             prior = Some(
                 journal
-                    .record_outcome_unknown(&identity)
+                    .access(|journal| journal.record_outcome_unknown(&identity))
                     .map_err(|_| Error::draft_outcome(ErrorCode::OutcomeUnknown, operation))?,
             );
         }
         if prior.is_none()
             && self.registry.identity(&target.config.key).1 != identity.account_generation
         {
-            return Err(Error::new(ErrorCode::OperationNotFound));
+            return Err(self.registry.absent_draft());
+        }
+        if prior.is_none() {
+            self.registry.draft_creation_allowed()?;
+            journal
+                .access(|journal| journal.check_capacity(self.config.limits.journal_records))
+                .map_err(journal_error)?;
         }
         let mailbox = crate::domain::mailbox_identity(&input.mailbox);
         let mut content = *input.draft;
@@ -346,7 +354,7 @@ impl Service {
                     .reconstruction
                     .as_ref()
                     .ok_or_else(|| Error::new(ErrorCode::JournalUnavailable))?;
-                if frozen.encoder_version != 2 {
+                if frozen.encoder_version != crate::draft::ENCODER_VERSION {
                     return Err(Error::new(ErrorCode::UnsupportedCapability));
                 }
                 if frozen.input_sha256 != input_sha256 {
@@ -362,6 +370,20 @@ impl Service {
             }
             None => (None, None),
         };
+        self.registry.draft_creation_allowed()?;
+        // Revisit retained rows before dispatch even if a previous storage failure
+        // prevented recording a corruption fence. Status and reads skip this scan.
+        let (verified, result, _writer) = tokio::task::spawn_blocking(move || {
+            let result = journal.access(|journal| {
+                journal.verify_for_dispatch(verification_deadline, Limits::MAXIMUM.journal_records)
+            });
+            (journal, result, _writer)
+        })
+        .await
+        .map_err(|_| Error::new(ErrorCode::JournalUnavailable))?;
+        journal = verified;
+        result.map_err(journal_error)?;
+        self.registry.draft_creation_allowed()?;
         let from = match (frozen.as_ref(), content.from) {
             (Some(frozen), _) => target
                 .config
@@ -387,7 +409,7 @@ impl Service {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_err(|_| Error::new(ErrorCode::InternalError))?
                     .as_secs() as i64,
-                encoder_version: 2,
+                encoder_version: crate::draft::ENCODER_VERSION,
             },
         };
         let mime = crate::draft::PreparedDraft::compose(
@@ -446,8 +468,11 @@ impl Service {
                 ..frozen
             }),
         };
+        self.registry.draft_creation_allowed()?;
         let prepared = journal
-            .prepare_with_limit(operation, self.config.limits.journal_records)
+            .access(|journal| {
+                journal.prepare_with_limit(operation, self.config.limits.journal_records)
+            })
             .map_err(journal_error)?;
         let dispatch = Dispatch::start(&mut journal, &prepared.operation)?;
         *dispatched = Some(operation_details(&prepared.operation));
@@ -509,8 +534,9 @@ impl Service {
             {
                 Ok(writer) => Some(writer),
                 Err(error) if error.code == ErrorCode::RateLimited => {
-                    let journal = self.registry.draft_journal()?;
-                    if let Some(prior) = authorized_operation(&journal, &identity, &input.mailbox)?
+                    let mut journal = self.registry.draft_journal()?;
+                    if let Some(prior) =
+                        authorized_operation(&mut journal, &identity, &input.mailbox)?
                         && prior.state == DraftOperationState::InFlight
                     {
                         return self.draft_receipt(prior, limits);
@@ -523,16 +549,18 @@ impl Service {
             None
         };
         let mut journal = self.registry.draft_journal()?;
-        let mut prior = authorized_operation(&journal, &identity, &input.mailbox)?
-            .ok_or_else(|| Error::new(ErrorCode::OperationNotFound))?;
+        let mut prior = authorized_operation(&mut journal, &identity, &input.mailbox)?
+            .ok_or_else(|| self.registry.absent_draft())?;
         if input.reconcile {
             if prior.state == DraftOperationState::InFlight {
-                prior = journal.record_outcome_unknown(&identity).map_err(|_| {
-                    uncertain(
-                        &prior.operation,
-                        "Draft recovery could not be recorded; acceptance remains uncertain",
-                    )
-                })?;
+                prior = journal
+                    .access(|journal| journal.record_outcome_unknown(&identity))
+                    .map_err(|_| {
+                        uncertain(
+                            &prior.operation,
+                            "Draft recovery could not be recorded; acceptance remains uncertain",
+                        )
+                    })?;
             }
             if prior.state == DraftOperationState::OutcomeUnknown {
                 *uncertain_operation = Some(operation_details(&prior.operation));
@@ -547,7 +575,7 @@ impl Service {
     async fn reconcile_draft(
         &self,
         target: MailboxTarget<'_>,
-        journal: &mut crate::draft_journal::DraftJournal,
+        journal: &mut super::state::DraftHistory,
         operation: &PreparedDraftOperation,
         limits: &Limits,
     ) -> Result<DraftReceipt, Error> {
@@ -619,12 +647,14 @@ impl Service {
                 "Draft identity could not be verified; acceptance remains uncertain",
             ));
         }
-        let verified = journal.record_duplicate(identity, uid).map_err(|_| {
-            uncertain(
-                operation,
-                "Verified draft could not be recorded; acceptance remains uncertain",
-            )
-        })?;
+        let verified = journal
+            .access(|journal| journal.record_duplicate(identity, uid))
+            .map_err(|_| {
+                uncertain(
+                    operation,
+                    "Verified draft could not be recorded; acceptance remains uncertain",
+                )
+            })?;
         self.draft_receipt(verified, limits)
     }
 }
@@ -637,11 +667,13 @@ fn uncertain(operation: &PreparedDraftOperation, message: &str) -> Error {
 // The caller authorizes the requested mailbox before opening the journal. A row
 // outside that scope is absent from the authorized lookup; never compare its input.
 fn authorized_operation(
-    journal: &crate::draft_journal::DraftJournal,
+    journal: &mut super::state::DraftHistory,
     identity: &DraftIdentity,
     mailbox: &str,
 ) -> Result<Option<PersistedDraftOperation>, Error> {
-    let prior = journal.inspect(identity).map_err(journal_error)?;
+    let prior = journal
+        .access(|journal| journal.inspect(identity))
+        .map_err(journal_error)?;
     if prior
         .as_ref()
         .is_some_and(|p| p.operation.mailbox_identity != crate::domain::mailbox_identity(mailbox))
@@ -748,16 +780,18 @@ impl Service {
     }
 }
 struct Dispatch<'a> {
-    journal: &'a mut crate::draft_journal::DraftJournal,
+    journal: &'a mut super::state::DraftHistory,
     operation: &'a PreparedDraftOperation,
     finished: bool,
 }
 impl<'a> Dispatch<'a> {
     fn start(
-        journal: &'a mut crate::draft_journal::DraftJournal,
+        journal: &'a mut super::state::DraftHistory,
         operation: &'a PreparedDraftOperation,
     ) -> Result<Self, Error> {
-        journal.begin_dispatch(operation).map_err(journal_error)?;
+        journal
+            .access(|journal| journal.begin_dispatch(operation))
+            .map_err(journal_error)?;
         Ok(Self {
             journal,
             operation,
@@ -769,16 +803,18 @@ impl<'a> Dispatch<'a> {
         outcome: Result<crate::imap::AppendOutcome, Error>,
     ) -> Result<PersistedDraftOperation, Error> {
         let identity = &self.operation.identity;
-        let recorded = match outcome {
-            Ok(crate::imap::AppendOutcome::Created { uid }) => {
-                self.journal.record_created(identity, uid)
-            }
-            Ok(crate::imap::AppendOutcome::Rejected) => self.journal.record_rejected(identity),
-            _ => self.journal.record_outcome_unknown(identity),
-        }
-        .map_err(|_| {
-            Error::draft_outcome(ErrorCode::OutcomeUnknown, operation_details(self.operation))
-        })?;
+        let recorded = self
+            .journal
+            .access(|journal| match outcome {
+                Ok(crate::imap::AppendOutcome::Created { uid }) => {
+                    journal.record_created(identity, uid)
+                }
+                Ok(crate::imap::AppendOutcome::Rejected) => journal.record_rejected(identity),
+                _ => journal.record_outcome_unknown(identity),
+            })
+            .map_err(|_| {
+                Error::draft_outcome(ErrorCode::OutcomeUnknown, operation_details(self.operation))
+            })?;
         self.finished = true;
         Ok(recorded)
     }
@@ -789,7 +825,7 @@ impl Drop for Dispatch<'_> {
             // Cancellation is uncertainty. If storage fails, recovery retains in_flight.
             let _ = self
                 .journal
-                .record_outcome_unknown(&self.operation.identity);
+                .access(|journal| journal.record_outcome_unknown(&self.operation.identity));
         }
     }
 }

@@ -204,6 +204,23 @@ async fn journal_excludes_composition_and_missing_history_does_not_reinitialize(
         .unwrap();
 }
 #[tokio::test]
+async fn losing_the_journal_and_its_marker_never_recreates_empty_history() {
+    let (_installation, config, service, identity) = fixture().await;
+    let request = save(&identity, uuid::Uuid::new_v4());
+    execute(&service, request.clone()).await;
+    drop(service);
+    for name in ["drafts.sqlite", "drafts.initialized"] {
+        std::fs::remove_file(config.state_dir.join(name)).unwrap();
+    }
+    let service = Service::open(config.clone()).unwrap();
+    assert_eq!(
+        failure(&service, status(request), "writer", false).await,
+        mailctl::domain::ErrorCode::JournalUnavailable
+    );
+    assert!(!config.state_dir.join("drafts.sqlite").exists());
+}
+
+#[tokio::test]
 async fn changing_draft_routing_advances_generation_and_never_redirects_old_operations() {
     use mailctl::domain::ErrorCode::*;
     let (_installation, mut config, service, identity) = fixture().await;
@@ -375,6 +392,12 @@ async fn journal_quota_preserves_existing_status_and_read_only_health() {
         JournalFull
     );
     assert_eq!(execute(&service, status(request.clone())).await, expected);
+    let context = service.context("writer", &Default::default()).unwrap();
+    let health =
+        serde_json::to_value(service.execute(&context, Operation::Health).await.unwrap()).unwrap();
+    assert_eq!(health["draft_journal"], "available");
+    assert_eq!(health["draft_creation"], "unavailable");
+    assert_eq!(health["status"], "degraded");
     drop(service);
     std::fs::write(config.state_dir.join("drafts.sqlite"), b"corrupt fixture").unwrap();
     let service = Service::open(config).unwrap();
@@ -636,6 +659,175 @@ async fn journal_inspection_rejects_redirection_links_and_public_permissions() {
         let service = Service::open(config).unwrap();
         assert_eq!(
             failure(&service, status(request), "writer", false).await,
+            mailctl::domain::ErrorCode::JournalUnavailable
+        );
+    }
+}
+
+#[tokio::test]
+async fn detected_history_loss_stays_suspended_after_an_unannounced_file_replacement() {
+    let (_installation, config, service, identity) = fixture().await;
+    let request = save(&identity, uuid::Uuid::new_v4());
+    execute(&service, request.clone()).await;
+    drop(service);
+    let database = config.state_dir.join("drafts.sqlite");
+    let retained = config.state_dir.join("retained.sqlite");
+    std::fs::copy(&database, &retained).unwrap();
+    std::fs::remove_file(&database).unwrap();
+    let service = Service::open(config.clone()).unwrap();
+    assert_eq!(
+        failure(&service, status(request.clone()), "writer", false).await,
+        mailctl::domain::ErrorCode::JournalUnavailable
+    );
+    drop(service);
+    std::fs::copy(&retained, &database).unwrap();
+    let provider = Arc::new(MemoryDrafts::default());
+    provider.set("work", "Drafts", 77);
+    let service = Service::open(config).unwrap().with_draft_backend(provider);
+    execute(&service, status(request)).await;
+    assert_eq!(
+        failure(
+            &service,
+            save(&identity, uuid::Uuid::new_v4()),
+            "writer",
+            false
+        )
+        .await,
+        mailctl::domain::ErrorCode::JournalUnavailable
+    );
+}
+
+#[tokio::test]
+async fn unusable_writer_reports_scoped_degradation_without_blocking_reads_or_status() {
+    let (_installation, config, service, identity) = fixture().await;
+    let request = save(&identity, uuid::Uuid::new_v4());
+    execute(&service, request.clone()).await;
+    let writer = config.state_dir.join(format!(
+        "draft-{}.lock",
+        identity["account_id"].as_str().unwrap()
+    ));
+    std::fs::remove_file(&writer).unwrap();
+    std::fs::create_dir(&writer).unwrap();
+    assert_eq!(
+        failure(
+            &service,
+            save(&identity, uuid::Uuid::new_v4()),
+            "writer",
+            false
+        )
+        .await,
+        mailctl::domain::ErrorCode::JournalUnavailable
+    );
+    execute(&service, status(request)).await;
+    for (grant, expected) in [("writer", "degraded"), ("default", "ready")] {
+        let context = service.context(grant, &Default::default()).unwrap();
+        let health =
+            serde_json::to_value(service.execute(&context, Operation::Health).await.unwrap())
+                .unwrap();
+        assert_eq!(health["status"], expected);
+    }
+}
+
+#[tokio::test]
+async fn detected_row_corruption_suspends_new_drafts_across_restarts() {
+    for detector in ["status", "verification", "invalid_utf8"] {
+        let (_installation, config, service, identity) = fixture().await;
+        let request = save(&identity, uuid::Uuid::new_v4());
+        execute(&service, request.clone()).await;
+        drop(service);
+        let database = rusqlite::Connection::open(config.state_dir.join("drafts.sqlite")).unwrap();
+        database
+            .execute(
+                if detector == "invalid_utf8" {
+                    "UPDATE draft_operations SET reconstruction = CAST(X'ff' AS TEXT)"
+                } else {
+                    "UPDATE draft_operations SET reconstruction = '{'"
+                },
+                [],
+            )
+            .unwrap();
+        drop(database);
+        if detector != "verification" {
+            let service = Service::open(config.clone()).unwrap();
+            assert_eq!(
+                failure(&service, status(request), "writer", false).await,
+                mailctl::domain::ErrorCode::JournalUnavailable
+            );
+        } else {
+            assert_eq!(
+                Service::verify_state(&config).unwrap_err().code,
+                mailctl::domain::ErrorCode::JournalUnavailable
+            );
+        }
+        let provider = Arc::new(MemoryDrafts::default());
+        provider.set("work", "Drafts", 77);
+        let service = Service::open(config).unwrap().with_draft_backend(provider);
+        assert_eq!(
+            failure(
+                &service,
+                save(&identity, uuid::Uuid::new_v4()),
+                "writer",
+                false
+            )
+            .await,
+            mailctl::domain::ErrorCode::JournalUnavailable
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn corrupt_history_when_suspension_cannot_be_created_still_blocks_later_dispatch() {
+    use std::os::unix::fs::PermissionsExt;
+    for marker_writable in [true, false] {
+        let (_installation, config, service, identity) = fixture().await;
+        let request = save(&identity, uuid::Uuid::new_v4());
+        execute(&service, request.clone()).await;
+        let database = rusqlite::Connection::open(config.state_dir.join("drafts.sqlite")).unwrap();
+        let original: String = database
+            .query_row("SELECT reconstruction FROM draft_operations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        database
+            .execute("UPDATE draft_operations SET reconstruction = '{'", [])
+            .unwrap();
+        let marker = config.state_dir.join("drafts.initialized");
+        if !marker_writable {
+            std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o400)).unwrap();
+        }
+        std::fs::set_permissions(&config.state_dir, std::fs::Permissions::from_mode(0o500))
+            .unwrap();
+        let error = failure(&service, status(request.clone()), "writer", false).await;
+        std::fs::set_permissions(&config.state_dir, std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(error, mailctl::domain::ErrorCode::JournalUnavailable);
+        if marker_writable {
+            // Repairing a row is not proof that all earlier operations are accounted for.
+            database
+                .execute(
+                    "UPDATE draft_operations SET reconstruction = ?1",
+                    [original],
+                )
+                .unwrap();
+        }
+        drop(database);
+        drop(service);
+        let provider = Arc::new(MemoryDrafts::default());
+        provider.set("work", "Drafts", 77);
+        let service = Service::open(config).unwrap().with_draft_backend(provider);
+        if marker_writable {
+            execute(&service, status(request)).await;
+        }
+        assert_eq!(
+            failure(
+                &service,
+                save(&identity, uuid::Uuid::new_v4()),
+                "writer",
+                false
+            )
+            .await,
             mailctl::domain::ErrorCode::JournalUnavailable
         );
     }

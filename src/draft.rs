@@ -3,6 +3,8 @@ use crate::domain::dot_atom;
 use mail_builder::MessageBuilder;
 use sha2::{Digest, Sha256};
 
+pub(crate) const ENCODER_VERSION: u32 = 2;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     InvalidInput,

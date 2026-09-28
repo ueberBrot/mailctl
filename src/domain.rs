@@ -447,6 +447,7 @@ pub enum OperationResult {
     Health(Health),
     Cancelled(Cancellation),
     Setup(Setup),
+    StateMaintenance(StateMaintenance),
     Credential(CredentialStatus),
     Doctor(Doctor),
 }
@@ -571,6 +572,8 @@ pub struct Capabilities {
 #[serde(deny_unknown_fields)]
 pub struct Health {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft_creation: Option<Availability>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draft_journal: Option<Availability>,
     pub status: String,
     pub grant: String,
@@ -584,6 +587,13 @@ pub struct AccountHealth {
     pub availability: Availability,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StateMaintenance {
+    pub action: String,
+    pub draft_creation_suspended: bool,
+    pub installation: Setup,
+}
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Setup {

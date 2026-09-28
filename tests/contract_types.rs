@@ -64,7 +64,12 @@ const _: fn(OperationResult) = |result| match result {
         let _: mailctl::domain::ProcessCapacity = capabilities.capacity.per_process;
     }
     OperationResult::Health(health) => {
+        let _: Option<mailctl::domain::Availability> = health.draft_creation;
         let _: Vec<mailctl::domain::AccountHealth> = health.accounts;
+    }
+    OperationResult::StateMaintenance(value) => {
+        let _: bool = value.draft_creation_suspended;
+        let _: mailctl::domain::Setup = value.installation;
     }
     OperationResult::Setup(setup) => {
         let _: String = setup.installation_id;

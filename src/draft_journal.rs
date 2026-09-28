@@ -9,7 +9,11 @@
 
 use crate::draft::DraftMessageIdentity;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
-use std::{fmt, path::Path, time::Duration};
+use std::{
+    fmt,
+    path::Path,
+    time::{Duration, Instant},
+};
 use uuid::Uuid;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -188,6 +192,80 @@ impl DraftJournal {
         Ok(Self { connection })
     }
 
+    /// Check admission for a new record without changing retained outcomes.
+    pub fn check_capacity(&self, maximum: usize) -> Result<(), DraftJournalError> {
+        check_capacity(&self.connection, maximum)
+    }
+    /// Check all retained rows and the reconstruction needed by prepared work.
+    /// Run offline under exclusive installation maintenance before an upgrade.
+    pub fn verify(&self) -> Result<(), DraftJournalError> {
+        let integrity: String = self
+            .connection
+            .query_row("PRAGMA quick_check(1)", [], |row| row.get(0))
+            .map_err(unavailable)?;
+        if integrity != "ok" {
+            return Err(DraftJournalError::InvalidDatabase);
+        }
+        self.verify_rows(None, usize::MAX)
+    }
+    /// Bound pre-dispatch verification by time and the supported history ceiling.
+    /// Call on a blocking worker; inspection alone never needs a full scan.
+    pub fn verify_for_dispatch(
+        &self,
+        deadline: Instant,
+        maximum: usize,
+    ) -> Result<(), DraftJournalError> {
+        self.verify_rows(Some(deadline), maximum)
+    }
+    fn verify_rows(
+        &self,
+        deadline: Option<Instant>,
+        maximum: usize,
+    ) -> Result<(), DraftJournalError> {
+        let mut statement = self.connection.prepare("SELECT operation_id, account_id, account_generation, mailbox_identity, content_sha256, reconstruction, state, appended_uid_validity, appended_uid FROM draft_operations").map_err(unavailable)?;
+        let mut rows = statement.query([]).map_err(unavailable)?;
+        let mut count = 0;
+        loop {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err(DraftJournalError::Unavailable);
+            }
+            let Some(row) = rows.next().map_err(unavailable)? else {
+                break;
+            };
+            count += 1;
+            if count > maximum {
+                return Err(DraftJournalError::Unavailable);
+            }
+            let operation = decode_row(database_row(row).map_err(unavailable)?)?;
+            if operation.state == DraftOperationState::Prepared
+                && operation
+                    .operation
+                    .reconstruction
+                    .as_ref()
+                    .is_none_or(|frozen| {
+                        frozen.encoder_version != crate::draft::ENCODER_VERSION
+                            || frozen.uid_validity == 0
+                            || frozen.selected_from_sha256.is_none()
+                    })
+            {
+                return Err(DraftJournalError::InvalidOperation);
+            }
+        }
+        Ok(())
+    }
+
+    /// Copies a consistent database, including committed WAL state. The caller
+    /// holds exclusive installation maintenance and supplies a new private file.
+    pub fn snapshot(&self, destination: &Path) -> Result<(), DraftJournalError> {
+        self.connection
+            .execute(
+                "VACUUM main INTO ?1",
+                [destination.to_str().ok_or(DraftJournalError::Unavailable)?],
+            )
+            .map_err(unavailable)?;
+        Ok(())
+    }
+
     /// Persists a dispatchable operation, or returns its exact prior state.
     ///
     /// Reusing an operation UUID is permitted only when every frozen fact is
@@ -216,12 +294,7 @@ impl DraftJournal {
             transaction.commit().map_err(unavailable)?;
             return Ok(persisted);
         }
-        let count: i64 = transaction
-            .query_row("SELECT COUNT(*) FROM draft_operations", [], |r| r.get(0))
-            .map_err(unavailable)?;
-        if count >= maximum as i64 {
-            return Err(DraftJournalError::Full);
-        }
+        check_capacity(&transaction, maximum)?;
         transaction
             .execute(
                 "
@@ -404,6 +477,19 @@ impl DraftJournal {
     }
 }
 
+fn check_capacity(connection: &Connection, maximum: usize) -> Result<(), DraftJournalError> {
+    let count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM draft_operations", [], |row| {
+            row.get(0)
+        })
+        .map_err(unavailable)?;
+    if u64::try_from(count).map_err(|_| DraftJournalError::InvalidDatabase)? >= maximum as u64 {
+        Err(DraftJournalError::Full)
+    } else {
+        Ok(())
+    }
+}
+
 fn initialize_schema(connection: &mut Connection) -> Result<(), DraftJournalError> {
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -507,23 +593,25 @@ fn read_by_identity(
                 account_generation,
                 identity.operation_id.as_bytes().as_slice(),
             ],
-            |row| {
-                Ok(DatabaseRow {
-                    operation_id: row.get(0)?,
-                    account_id: row.get(1)?,
-                    account_generation: row.get(2)?,
-                    mailbox_identity: row.get(3)?,
-                    content_sha256: row.get(4)?,
-                    reconstruction: row.get(5)?,
-                    state: row.get(6)?,
-                    appended_uid_validity: row.get(7)?,
-                    appended_uid: row.get(8)?,
-                })
-            },
+            database_row,
         )
         .optional()
         .map_err(unavailable)?;
     row.map(decode_row).transpose()
+}
+
+fn database_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DatabaseRow> {
+    Ok(DatabaseRow {
+        operation_id: row.get(0)?,
+        account_id: row.get(1)?,
+        account_generation: row.get(2)?,
+        mailbox_identity: row.get(3)?,
+        content_sha256: row.get(4)?,
+        reconstruction: row.get(5)?,
+        state: row.get(6)?,
+        appended_uid_validity: row.get(7)?,
+        appended_uid: row.get(8)?,
+    })
 }
 
 fn decode_row(row: DatabaseRow) -> Result<PersistedDraftOperation, DraftJournalError> {
@@ -593,6 +681,20 @@ fn sqlite_generation(generation: u64) -> Result<i64, DraftJournalError> {
     i64::try_from(generation).map_err(|_| DraftJournalError::InvalidDatabase)
 }
 
-fn unavailable(_: rusqlite::Error) -> DraftJournalError {
-    DraftJournalError::Unavailable
+fn unavailable(error: rusqlite::Error) -> DraftJournalError {
+    match error {
+        rusqlite::Error::InvalidColumnType(..)
+        | rusqlite::Error::FromSqlConversionFailure(..)
+        | rusqlite::Error::IntegralValueOutOfRange(..)
+        | rusqlite::Error::Utf8Error(..) => DraftJournalError::InvalidDatabase,
+        rusqlite::Error::SqliteFailure(error, _)
+            if matches!(
+                error.code,
+                rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
+            ) =>
+        {
+            DraftJournalError::InvalidDatabase
+        }
+        _ => DraftJournalError::Unavailable,
+    }
 }

@@ -453,10 +453,14 @@ async fn historical_denials_hide_existence_and_conflicts_and_obey_narrowing() {
 }
 
 #[tokio::test]
-async fn historical_reconciliation_persists_duplicate_without_reconstructing_or_appending() {
+async fn full_journal_reconciles_historical_work_and_replays_without_another_append() {
     let mut f = Fixture::new(DraftOperationState::OutcomeUnknown).await;
     f.repoint();
     f.config.accounts[0].from_identities = vec!["replacement@example.test".into()];
+    f.config.limits.journal_records = 1;
+    for grant in &mut f.config.grants {
+        grant.limits.journal_records = 1;
+    }
     let service = f.open();
     let mut status = f.status();
     if let Operation::DraftStatus(input) = &mut status {
@@ -598,4 +602,174 @@ async fn reconciliation_retains_uncertainty_when_the_original_target_is_unavaila
         assert_eq!(f.record().state, DraftOperationState::OutcomeUnknown);
         assert_eq!(f.backend.bytes.lock().unwrap().len(), 1);
     }
+}
+
+#[tokio::test]
+async fn restored_history_preserves_receipts_but_never_dispatches_post_backup_operations() {
+    let f = Fixture::new(DraftOperationState::Created {
+        appended_message: None,
+    })
+    .await;
+    let original = f.record();
+    let backup = f.config.state_dir.parent().unwrap().join("backup");
+    Service::backup(&f.config, &backup).unwrap();
+    let mut later = f.input.clone();
+    later.operation_id = uuid::Uuid::new_v4();
+    {
+        let service = f.open();
+        run(&service, Operation::SaveDraft(later.clone()))
+            .await
+            .unwrap();
+    }
+    Service::restore(&f.config, &backup).unwrap();
+    assert_eq!(f.record(), original);
+    let appends = f.backend.bytes.lock().unwrap().len();
+    let service = f.open();
+    run(&service, f.status()).await.unwrap();
+    let health = serde_json::to_value(run(&service, Operation::Health).await.unwrap()).unwrap();
+    assert_eq!(health["status"], "degraded");
+    for operation in [
+        Operation::SaveDraft(later.clone()),
+        Operation::DraftStatus(DraftStatusInput {
+            account_id: later.account_id,
+            account_generation: later.account_generation,
+            operation_id: later.operation_id,
+            mailbox: later.mailbox,
+            reconcile: false,
+        }),
+    ] {
+        assert_eq!(
+            run(&service, operation).await.unwrap_err().code,
+            ErrorCode::JournalUnavailable
+        );
+    }
+    assert_eq!(f.backend.bytes.lock().unwrap().len(), appends);
+    let read = service.context("default", &Default::default()).unwrap();
+    service
+        .execute(&read, Operation::ListAccounts(Default::default()))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn snapshots_preserve_all_outcomes_original_targets_and_reconstruction() {
+    for state in [
+        "prepared",
+        "in_flight",
+        "created",
+        "rejected",
+        "outcome_unknown",
+        "duplicate",
+    ] {
+        let initial = match state {
+            "prepared" | "in_flight" => DraftOperationState::Prepared,
+            "rejected" => DraftOperationState::Rejected,
+            "outcome_unknown" | "duplicate" => DraftOperationState::OutcomeUnknown,
+            _ => DraftOperationState::Created {
+                appended_message: None,
+            },
+        };
+        let mut f = Fixture::new(initial).await;
+        if state == "in_flight" {
+            DraftJournal::open_existing(f.config.state_dir.join("drafts.sqlite"))
+                .unwrap()
+                .begin_dispatch(&f.record().operation)
+                .unwrap();
+        }
+        if state == "duplicate" {
+            let service = f.open();
+            let Operation::DraftStatus(mut input) = f.status() else {
+                panic!()
+            };
+            input.reconcile = true;
+            run(&service, Operation::DraftStatus(input)).await.unwrap();
+        }
+        f.repoint();
+        Service::setup(f.config.clone()).unwrap();
+        let expected = f.record();
+        let registry = std::fs::read(f.config.state_dir.join("accounts.json")).unwrap();
+        Service::verify_state(&f.config).unwrap();
+        let backup = f.config.state_dir.parent().unwrap().join("history-backup");
+        Service::backup(&f.config, &backup).unwrap();
+        Service::restore(&f.config, &backup).unwrap();
+        assert_eq!(f.record(), expected, "{state}");
+        assert_eq!(
+            std::fs::read(f.config.state_dir.join("accounts.json")).unwrap(),
+            registry
+        );
+        let service = f.open();
+        let appends = f.backend.bytes.lock().unwrap().len();
+        let replay = run(&service, Operation::SaveDraft(f.input.clone())).await;
+        match state {
+            "prepared" => assert_eq!(replay.unwrap_err().code, ErrorCode::JournalUnavailable),
+            "in_flight" | "outcome_unknown" => {
+                assert_eq!(replay.unwrap_err().code, ErrorCode::OutcomeUnknown)
+            }
+            _ => {
+                replay.unwrap();
+            }
+        }
+        assert_eq!(f.backend.bytes.lock().unwrap().len(), appends);
+        if state == "outcome_unknown" {
+            let Operation::DraftStatus(mut input) = f.status() else {
+                panic!()
+            };
+            input.reconcile = true;
+            run(&service, Operation::DraftStatus(input)).await.unwrap();
+            assert!(matches!(
+                f.record().state,
+                DraftOperationState::Duplicate { .. }
+            ));
+        }
+    }
+}
+
+#[tokio::test]
+async fn upgrade_verification_refuses_incompatible_prepared_reconstruction_without_changes() {
+    let f = Fixture::new(DraftOperationState::Prepared).await;
+    f.mutate_reconstruction("encoder_version", 999.into());
+    let before = f.record();
+    assert_eq!(
+        Service::verify_state(&f.config).unwrap_err().code,
+        ErrorCode::UnsupportedCapability
+    );
+    assert_eq!(f.record(), before);
+    assert!(f.backend.bytes.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn coherent_local_rollback_cannot_prove_absence_against_an_external_witness() {
+    let f = Fixture::new(DraftOperationState::Created {
+        appended_message: None,
+    })
+    .await;
+    let backup = f.config.state_dir.parent().unwrap().join("rollback-backup");
+    Service::backup(&f.config, &backup).unwrap();
+    let mut later = f.input.clone();
+    later.operation_id = uuid::Uuid::new_v4();
+    {
+        let service = f.open();
+        run(&service, Operation::SaveDraft(later.clone()))
+            .await
+            .unwrap();
+    }
+    Service::restore(&f.config, &backup).unwrap();
+    // Simulate rollback of *all* local state, including the restore fence, to
+    // the healthy backup. The independent provider still retains both APPENDs.
+    std::fs::remove_file(f.config.state_dir.join("drafts.suspended")).unwrap();
+    Service::verify_state(&f.config).unwrap();
+    let service = f.open();
+    let result = run(
+        &service,
+        Operation::DraftStatus(DraftStatusInput {
+            account_id: later.account_id,
+            account_generation: later.account_generation,
+            operation_id: later.operation_id,
+            mailbox: later.mailbox,
+            reconcile: false,
+        }),
+    )
+    .await;
+    assert_eq!(result.unwrap_err().code, ErrorCode::OperationNotFound);
+    assert_eq!(f.backend.bytes.lock().unwrap().len(), 2);
 }

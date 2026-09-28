@@ -76,6 +76,25 @@ impl Service {
             updated,
         ))
     }
+    /// Capture installation history while all email runtimes are stopped.
+    pub fn backup(
+        config: &Config,
+        destination: &std::path::Path,
+    ) -> Result<crate::domain::StateMaintenance, Error> {
+        state::backup(config, destination)
+    }
+    /// Restore a snapshot of this installation. Draft creation stays suspended
+    /// until the operator completes offline recovery of post-backup history.
+    pub fn restore(
+        config: &Config,
+        source: &std::path::Path,
+    ) -> Result<crate::domain::StateMaintenance, Error> {
+        state::restore(config, source)
+    }
+    /// Verify retained history and prepared reconstruction before changing binaries.
+    pub fn verify_state(config: &Config) -> Result<crate::domain::StateMaintenance, Error> {
+        state::verify(config)
+    }
     pub fn in_memory(config: Config) -> Result<Self, Error> {
         config.validate()?;
         let registry = AccountRegistry::in_memory(&config)?;
@@ -387,11 +406,36 @@ impl Service {
             .iter()
             .filter(|account| account.availability == Availability::Unavailable)
             .count();
-        let draft_journal = context
+        let inspect_drafts = context
             .permissions()
-            .contains(&Permission::InspectDraftOperation)
+            .contains(&Permission::InspectDraftOperation);
+        let mut history = inspect_drafts
+            .then(|| self.registry.draft_journal().ok())
+            .flatten();
+        let draft_journal = inspect_drafts.then(|| {
+            if history.is_some() {
+                Availability::Available
+            } else {
+                Availability::Unavailable
+            }
+        });
+        let draft_creation = context
+            .permissions()
+            .contains(&Permission::AppendDraft)
             .then(|| {
-                if self.registry.draft_journal().is_ok() {
+                let capacity = history.as_mut().is_some_and(|journal| {
+                    journal
+                        .access(|journal| {
+                            journal.check_capacity(self.config.limits.journal_records)
+                        })
+                        .is_ok()
+                });
+                if capacity
+                    && self.registry.draft_creation_allowed().is_ok()
+                    && accounts
+                        .iter()
+                        .all(|account| self.registry.draft_writer_available(&account.account_id))
+                {
                     Availability::Available
                 } else {
                     Availability::Unavailable
@@ -399,7 +443,10 @@ impl Service {
             });
         Ok(Health {
             draft_journal,
-            status: if draft_journal == Some(Availability::Unavailable) {
+            draft_creation,
+            status: if draft_journal == Some(Availability::Unavailable)
+                || draft_creation == Some(Availability::Unavailable)
+            {
                 "degraded"
             } else if unavailable == 0 {
                 "ready"

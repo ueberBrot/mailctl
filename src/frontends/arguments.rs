@@ -29,6 +29,9 @@ pub(super) struct Options {
 }
 #[derive(Subcommand)]
 enum Administration {
+    /// Back up, restore, or verify installation history with all runtimes stopped.
+    #[command(subcommand, long_about = STATE_RECOVERY_HELP)]
+    State(State),
     /// Validate configuration, or add/update one named account without replacing others.
     Setup(Setup),
     #[command(subcommand)]
@@ -38,6 +41,69 @@ enum Administration {
         #[arg(long)]
         check_account: bool,
     },
+}
+const STATE_RECOVERY_HELP: &str = "Back up, restore, or verify installation history.
+
+Stop all CLI commands, MCP sessions, and isolated runtimes using this installation.
+Maintenance requires exclusive access; rate_limited means a runtime still holds
+its lease. Stop it and retry. Never remove live lock files.
+
+BACKUP AND UPGRADE
+  mailctl --config /absolute/config.toml state backup --destination /absolute/new-backup
+  mailctl --config /absolute/config.toml state verify
+The same commands work with mailctl-mcp. The backup destination must be new and
+outside installation state. Keep the complete private snapshot, including its
+manifest, unchanged. It preserves the journal, reference key, account history,
+configuration, and reconstruction metadata. Back up credentials separately through
+their configured source; callers must retain operation identities and draft input.
+Run verify before replacing binaries. Unknown schemas and unsupported prepared
+encoders fail safely. This unreleased package uses registry schema 2, journal
+schema 3, and encoder 2; earlier development formats have no automatic migration.
+Preserve incompatible files and use a compatible executable for offline inspection.
+
+RESTORE
+  mailctl --config /absolute/config.toml state restore --source /absolute/backup
+First preserve the newer or damaged state, including SQLite WAL files, while all
+runtimes are stopped. Restore requires the original installation and exact snapshot
+configuration. It never recreates lost installation identity. Interrupted restore
+keeps creation suspended; investigate the failure and repeat with a valid snapshot.
+Successful restore also keeps creation suspended. Reads and known history remain
+available; uncertain operations can be reconciled against their original targets.
+
+OFFLINE RECOVERY
+Account for every possible post-backup operation using surviving journals, caller
+records, and independent provider evidence. Preserve all outcomes, original account
+UUIDs and generations, mailbox and UIDVALIDITY, keys, hashes, frozen dates, From
+selection, and encoder parameters. Never reconstruct these from current routing.
+Any prepared or in_flight record that might have dispatched must become
+outcome_unknown before creation resumes. Absence never proves no prior APPEND.
+A coherent rollback of all local state cannot be detected without an external
+witness. Checksums and successful verification do not prove history is current.
+
+Only after complete, independently supported recovery: run state verify, record
+the evidence outside the installation, restore drafts.initialized from ! to 2 if
+needed, and durably remove drafts.suspended before restarting. Keep recovery copies.
+If completeness cannot be established, keep creation suspended. There is no agent
+journal editor or force-retry command. If every suspension write fails and files
+are later replaced outside these commands, local state cannot prove that failure.
+
+CAPACITY
+journal_full rejects new operations while retaining existing status, reconciliation,
+and healthy reads. Raise journal_records through normal exclusive configuration
+update; never delete tombstones to free capacity. Investigate journal or writer
+storage failures before resuming creation.";
+
+#[derive(Subcommand)]
+pub(super) enum State {
+    Backup {
+        #[arg(long)]
+        destination: PathBuf,
+    },
+    Restore {
+        #[arg(long)]
+        source: PathBuf,
+    },
+    Verify,
 }
 #[derive(Args, Default)]
 pub(super) struct Setup {
@@ -277,6 +343,7 @@ pub(super) struct Invocation {
     pub action: Action,
 }
 pub(super) enum Action {
+    State(State),
     #[cfg(feature = "cli")]
     DraftSave {
         identity: DraftIdentity,
@@ -303,6 +370,7 @@ pub(super) enum Action {
 impl From<Administration> for Action {
     fn from(value: Administration) -> Self {
         match value {
+            Administration::State(command) => Self::State(command),
             Administration::Setup(args) => Self::Setup(args),
             Administration::Credential(command) => Self::Credential(command),
             Administration::Doctor { check_account } => Self::Doctor { check_account },

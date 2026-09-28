@@ -65,7 +65,7 @@ pub fn run_with_environment(
     let administration = preliminary.as_ref().is_some_and(|matches| {
         matches!(
             matches.subcommand_name(),
-            Some("setup" | "credential" | "doctor")
+            Some("setup" | "credential" | "doctor" | "state")
         )
     });
     let serving = executable.is_mcp() && !administration;
@@ -162,6 +162,35 @@ async fn execute(
         )
         .await);
     }
+    if let Action::State(command) = action {
+        if options.read_only || options.grant.is_some() || !options.accounts.is_empty() {
+            return Err(Error::new(ErrorCode::InvalidRequest));
+        }
+        let path = options.config;
+        let result = tokio::task::spawn_blocking(move || {
+            let config = configuration::load(&path)?;
+            match command {
+                arguments::State::Backup { destination } => {
+                    crate::service::Service::backup(&config, &destination)
+                }
+                arguments::State::Restore { source } => {
+                    crate::service::Service::restore(&config, &source)
+                }
+                arguments::State::Verify => crate::service::Service::verify_state(&config),
+            }
+        })
+        .await
+        .map_err(|_| Error::new(ErrorCode::InternalError))??;
+        return Ok(report(
+            request,
+            options.json,
+            options.diagnostics.color,
+            Ok(OperationResult::StateMaintenance(result)),
+            (),
+            30,
+        )
+        .await);
+    }
     let config = configuration::load(&options.config)?;
     #[cfg(feature = "cli")]
     let export_roots = match action {
@@ -234,7 +263,10 @@ async fn execute_isolated(
     if matches!(action, Action::Export { .. }) {
         return Err(Error::new(ErrorCode::UnsupportedCapability));
     }
-    if matches!(action, Action::Setup(_) | Action::Credential(_)) {
+    if matches!(
+        action,
+        Action::Setup(_) | Action::Credential(_) | Action::State(_)
+    ) {
         return Err(Error::new(ErrorCode::InvalidRequest));
     }
     let narrowing = invocation_narrowing(&mut options, &action)?;
@@ -356,7 +388,7 @@ async fn execute_application(
             Action::Email(operation) => application.execute(operation).await,
             #[cfg(feature = "mcp")]
             Action::Mcp { .. } => unreachable!(),
-            Action::Setup(_) | Action::Credential(_) => unreachable!(),
+            Action::Setup(_) | Action::Credential(_) | Action::State(_) => unreachable!(),
         }
     };
     let result = tokio::select! {

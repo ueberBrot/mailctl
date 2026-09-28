@@ -518,3 +518,23 @@ fn verified_duplicate_is_durable_and_never_dispatchable() {
     ));
     assert!(journal.record_outcome_unknown(&operation.identity).is_err());
 }
+
+#[test]
+fn dispatch_verification_refuses_expired_time_and_excess_history_without_changes() {
+    let temporary = TemporaryJournal::new();
+    let mut journal = DraftJournal::open(&temporary.path).unwrap();
+    let operation = child_operation();
+    let original = journal.prepare(operation.clone()).unwrap();
+    assert_eq!(
+        journal.verify_for_dispatch(Instant::now(), 1),
+        Err(DraftJournalError::Unavailable)
+    );
+    assert_eq!(
+        journal.verify_for_dispatch(Instant::now() + Duration::from_secs(1), 0),
+        Err(DraftJournalError::Unavailable)
+    );
+    assert_eq!(
+        journal.inspect(&operation.identity).unwrap(),
+        Some(original)
+    );
+}
