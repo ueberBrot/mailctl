@@ -2,9 +2,9 @@ mod support;
 use mailctl::{
     config::{Config, Limits},
     domain::{Error, ErrorCode, Operation, OperationResult, SaveDraftInput},
-    draft::PreparedDraft,
+    draft::{DraftMessageIdentity, PreparedDraft},
     draft_journal::{DraftJournal, DraftOperationState},
-    imap::{AppendOutcome, AppendUid},
+    imap::AppendOutcome,
     service::{DraftAppend, DraftBackend, MailboxTarget, Service},
 };
 use std::{
@@ -28,6 +28,16 @@ struct Backend {
     entered: Notify,
 }
 impl DraftBackend for Backend {
+    fn reconcile<'a>(
+        &'a self,
+        _: MailboxTarget<'a>,
+        _: &'a str,
+        _: &'a mailctl::draft::DraftVerification,
+        _: &'a Limits,
+    ) -> Pin<Box<dyn Future<Output = Result<mailctl::draft::DraftEvidence, Error>> + Send + 'a>>
+    {
+        Box::pin(async { Err(Error::new(ErrorCode::UnsupportedCapability)) })
+    }
     fn prepare<'a>(
         &'a self,
         _: MailboxTarget<'a>,
@@ -170,7 +180,7 @@ fn uncertain(error: Error, input: &SaveDraftInput) {
 async fn recorded_creation_and_rejection_replay_without_another_append() {
     for outcome in [
         AppendOutcome::Created {
-            uid: Some(AppendUid {
+            uid: Some(DraftMessageIdentity {
                 uid_validity: 77,
                 uid: 4,
             }),
@@ -305,4 +315,61 @@ async fn prepared_operation_refuses_a_recreated_target() {
     );
     assert_eq!(f.state(), DraftOperationState::Prepared);
     assert_eq!(f.backend.appends.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn reconciliation_deadline_includes_admission_waiting() {
+    let f = Fixture::new(AppendOutcome::Unknown, false, true).await;
+    let Fixture {
+        _installation,
+        mut config,
+        service,
+        backend,
+        input,
+    } = f;
+    drop(service);
+    config.limits.account_connections = 1;
+    for grant in &mut config.grants {
+        grant.limits.account_connections = 1;
+    }
+    let mut quick = config
+        .grants
+        .iter()
+        .find(|grant| grant.name == "writer")
+        .unwrap()
+        .clone();
+    quick.name = "quick".into();
+    quick.limits.operation_seconds = 1;
+    config.grants.push(quick);
+    Service::setup(config.clone()).unwrap();
+    let service = Arc::new(
+        Service::open(config)
+            .unwrap()
+            .with_draft_backend(backend.clone()),
+    );
+    let owner = {
+        let service = service.clone();
+        let input = input.clone();
+        tokio::spawn(async move { save(&service, input).await })
+    };
+    backend.entered.notified().await;
+    let context = service.context("quick", &Default::default()).unwrap();
+    let status = Operation::DraftStatus(mailctl::domain::DraftStatusInput {
+        account_id: input.account_id,
+        account_generation: 1,
+        operation_id: input.operation_id,
+        mailbox: "Drafts".into(),
+        reconcile: true,
+    });
+    let result = tokio::time::timeout(
+        std::time::Duration::from_millis(1500),
+        service.execute(&context, status),
+    )
+    .await
+    .expect("admission exceeded the caller's deadline");
+    assert_eq!(result.unwrap_err().code, ErrorCode::Timeout);
+    assert!(!owner.is_finished());
+    owner.abort();
+    let _ = owner.await;
+    assert_eq!(backend.appends.load(Ordering::SeqCst), 1);
 }

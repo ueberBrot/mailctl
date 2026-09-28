@@ -549,3 +549,94 @@ async fn sqlite_contention_never_blocks_the_async_executor_for_its_busy_timeout(
     writer.execute_batch("ROLLBACK").unwrap();
     execute(&service, save(&identity, uuid::Uuid::new_v4())).await;
 }
+
+#[tokio::test]
+async fn explicit_reconciliation_never_dispatches_prepared_or_completed_work() {
+    let (_installation, config, service, identity) = fixture().await;
+    let request = save(&identity, uuid::Uuid::new_v4());
+    let receipt = execute(&service, request.clone()).await;
+    drop(service);
+    let service = Service::open(config).unwrap();
+    let mut lookup = status(request);
+    lookup["input"]["reconcile"] = json!(true);
+    assert_eq!(execute(&service, lookup).await, receipt);
+}
+
+#[tokio::test]
+async fn memory_reconciliation_obeys_header_limits_and_preserves_later_verification() {
+    let (_installation, mut config, service, identity) = fixture().await;
+    drop(service);
+    let mut narrow = config
+        .grants
+        .iter()
+        .find(|grant| grant.name == "writer")
+        .unwrap()
+        .clone();
+    narrow.name = "narrow_headers".into();
+    narrow.limits.header_bytes = 1;
+    config.grants.push(narrow);
+    Service::setup(config.clone()).unwrap();
+    let provider = Arc::new(MemoryDrafts::default());
+    provider.set("work", "Drafts", 77);
+    let service = Service::open(config.clone())
+        .unwrap()
+        .with_draft_backend(provider);
+    let database = rusqlite::Connection::open(config.state_dir.join("drafts.sqlite")).unwrap();
+    database.execute_batch("CREATE TRIGGER lose_ack BEFORE UPDATE ON draft_operations WHEN NEW.state != 'in_flight' BEGIN SELECT RAISE(ABORT, 'synthetic'); END;").unwrap();
+    let request = save(&identity, uuid::Uuid::new_v4());
+    assert_eq!(
+        failure(&service, request.clone(), "writer", false).await,
+        mailctl::domain::ErrorCode::OutcomeUnknown
+    );
+    database.execute_batch("DROP TRIGGER lose_ack").unwrap();
+    let mut lookup = status(request.clone());
+    lookup["input"]["reconcile"] = json!(true);
+    let context = service
+        .context("narrow_headers", &Default::default())
+        .unwrap();
+    let error = service
+        .execute(&context, serde_json::from_value(lookup.clone()).unwrap())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, mailctl::domain::ErrorCode::OutcomeUnknown);
+    assert!(!error.retryable);
+    let input: mailctl::domain::SaveDraftInput =
+        serde_json::from_value(request["input"].clone()).unwrap();
+    assert_eq!(error.draft_operation.unwrap().identity, input.identity());
+    assert_eq!(
+        failure(&service, status(request.clone()), "writer", false).await,
+        mailctl::domain::ErrorCode::OutcomeUnknown
+    );
+    let duplicate = execute(&service, lookup).await;
+    assert_eq!(duplicate["state"], "duplicate");
+    assert!(duplicate["message_reference"].is_string());
+    assert_eq!(execute(&service, request).await, duplicate);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn journal_inspection_rejects_redirection_links_and_public_permissions() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    for fault in ["symlink", "hardlink", "permissions"] {
+        let (_installation, config, service, identity) = fixture().await;
+        let request = save(&identity, uuid::Uuid::new_v4());
+        execute(&service, request.clone()).await;
+        drop(service);
+        let path = config.state_dir.join("drafts.sqlite");
+        let backup = config.state_dir.join("original.sqlite");
+        match fault {
+            "symlink" => {
+                std::fs::rename(&path, &backup).unwrap();
+                symlink(&backup, &path).unwrap();
+                assert!(mailctl::draft_journal::DraftJournal::open_existing(&path).is_err());
+            }
+            "hardlink" => std::fs::hard_link(&path, &backup).unwrap(),
+            _ => std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap(),
+        }
+        let service = Service::open(config).unwrap();
+        assert_eq!(
+            failure(&service, status(request), "writer", false).await,
+            mailctl::domain::ErrorCode::JournalUnavailable
+        );
+    }
+}

@@ -10,7 +10,7 @@ use super::{
     },
     wire::Connection,
 };
-use decoder::{Decoder, TransferEncoding, WIRE_SLICE_BYTES};
+use decoder::{Decoder, TransferEncoding};
 use io_imap::{
     rfc3501::logout::ImapLogout,
     types::{
@@ -98,13 +98,7 @@ impl TransferState {
                 .max_attachment_wire_bytes
                 .checked_sub(self.wire_bytes)
                 .ok_or(Error::Limit)?;
-            let count = WIRE_SLICE_BYTES
-                .min(limits.max_literal_bytes)
-                .min(limits.max_response_bytes / 2)
-                .min(remaining.saturating_add(1));
-            if count == 0 {
-                return Err(Error::InvalidInput);
-            }
+            let count = limits.fetch_chunk_bytes()?.min(remaining.saturating_add(1));
             let fetch = Fetch::Bytes {
                 uid: self.uid,
                 section: Some(Section::Part(self.part.clone())),

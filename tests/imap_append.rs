@@ -3,8 +3,8 @@ mod imap_support;
 use append_support::*;
 use imap_support::*;
 use mailctl::{
-    draft::PreparedDraft,
-    imap::{AppendOutcome, AppendUid, Error, Limits, TlsMode},
+    draft::{DraftMessageIdentity, PreparedDraft},
+    imap::{AppendOutcome, Error, Limits, TlsMode},
 };
 use std::time::Duration;
 
@@ -14,7 +14,7 @@ async fn tagged_acknowledgement_survives_missing_uid_and_connection_close() {
         (
             "IMAP4rev1 UIDPLUS",
             " [APPENDUID 77 4]",
-            Some(AppendUid {
+            Some(DraftMessageIdentity {
                 uid_validity: 77,
                 uid: 4,
             }),

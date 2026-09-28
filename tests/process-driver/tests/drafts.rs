@@ -272,6 +272,12 @@ async fn startup_during_live_append_keeps_pending_and_owner_death_releases_lock(
     let client = f.mcp().await;
     let pending = call(&client, "email_draft_status", f.status()).await;
     assert_eq!(pending["error"]["code"], "operation_in_progress");
+    let mut reconciliation = f.status();
+    reconciliation["reconcile"] = json!(true);
+    assert_eq!(
+        call(&client, "email_draft_status", reconciliation.clone()).await["error"]["code"],
+        "operation_in_progress"
+    );
     let input = f.input.clone();
     let waiting = call(&client, "email_save_draft", input).await;
     assert_eq!(waiting["error"]["code"], "operation_in_progress");
@@ -293,8 +299,14 @@ async fn startup_during_live_append_keeps_pending_and_owner_death_releases_lock(
         call(&client, "email_draft_status", f.status()).await["error"]["code"],
         "outcome_unknown"
     );
+    f.server.expect_reconciliation();
+    assert_eq!(
+        call(&client, "email_draft_status", reconciliation).await["result"]["state"],
+        "duplicate"
+    );
     client.cancel().await.unwrap();
-    assert_eq!(f.server.accepted(), 1);
+    assert_eq!(f.server.accepted(), 2);
+    assert_eq!(f.server.drafts().len(), 1);
     f.server.finish();
 }
 
@@ -570,5 +582,64 @@ async fn historical_prepared_retry_checks_incarnation_and_appends_frozen_mime_on
     assert_eq!(replay["result"], resumed["result"]);
     client.cancel().await.unwrap();
     assert_eq!(f.server.accepted(), 3);
+    f.server.finish();
+}
+
+#[tokio::test]
+async fn concurrent_historical_cli_mcp_reconciliation_resolves_once_without_append() {
+    let mut f = DraftFixture::new();
+    f.server.expect_append(server::DraftReply::Disconnect);
+    let uncertain = run_bounded(f.save());
+    assert_eq!(uncertain.status.code(), Some(7));
+    assert_eq!(envelope(&uncertain)["error"]["code"], "outcome_unknown");
+    let mut config = f.configuration();
+    config.accounts[0].retain_history = true;
+    f.configure(&config);
+    f.repoint(&mut config);
+    f.configure(&config);
+    f.server.expect_reconciliation();
+    let client = f.mcp().await;
+    let mut status = f.status();
+    status["reconcile"] = json!(true);
+    let mut command = f.installation.cli();
+    command
+        .env("MAILCTL_FIXTURE_CA", &f.server.certificate)
+        .args([
+            "--json",
+            "--grant",
+            "writer",
+            "draft",
+            "status",
+            "--mailbox",
+            "Drafts",
+            "--account-id",
+            f.input["account_id"].as_str().unwrap(),
+            "--account-generation",
+            "1",
+            "--operation-id",
+            f.input["operation_id"].as_str().unwrap(),
+            "--reconcile",
+        ]);
+    let cli = tokio::task::spawn_blocking(move || run_bounded(command));
+    let (cli, mcp) = tokio::join!(cli, call(&client, "email_draft_status", status));
+    let cli = cli.unwrap();
+    assert_success(&cli);
+    let receipt = envelope(&cli)["result"].clone();
+    assert_eq!(mcp["result"], receipt);
+    assert_eq!(receipt["state"], "duplicate");
+    assert_eq!(receipt["account_generation"], 1);
+    assert_eq!(receipt["uid_validity"], 77);
+    assert!(receipt["message_reference"].as_str().is_some());
+    assert_eq!(
+        call(&client, "email_save_draft", f.input.clone()).await["result"],
+        receipt
+    );
+    assert_eq!(
+        call(&client, "email_draft_status", f.status()).await["result"],
+        receipt
+    );
+    client.cancel().await.unwrap();
+    assert_eq!(f.server.accepted(), 2);
+    assert_eq!(f.server.drafts().len(), 1);
     f.server.finish();
 }

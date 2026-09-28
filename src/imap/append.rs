@@ -1,14 +1,9 @@
 use super::{AuthenticatedConnection, Error, Limits, Metrics, mailbox};
-use crate::draft::PreparedDraft;
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AppendUid {
-    pub uid_validity: u32,
-    pub uid: u32,
-}
+use crate::draft::{DraftMessageIdentity, PreparedDraft};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AppendOutcome {
     Created {
-        uid: Option<AppendUid>,
+        uid: Option<DraftMessageIdentity>,
     },
     Rejected,
     /// APPEND may have reached the provider. This outcome never permits automatic retry.

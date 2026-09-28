@@ -1,5 +1,5 @@
-//! Typed bounded FETCH requests and response validation, shared by body and attachment reads.
-use super::{Error, mime::part_name, wire::Connection};
+//! Bounded FETCH requests and validation for body reads, attachments, and draft verification.
+use super::{Error, Limits, mime::part_name, wire::Connection};
 use io_imap::{
     rfc3501::fetch::{ImapMessageFetch, ImapMessageFetchOptions},
     types::{
@@ -10,6 +10,20 @@ use io_imap::{
     },
 };
 use std::num::NonZeroU32;
+
+pub(super) const MAX_CHUNK_BYTES: usize = 16 * 1024;
+
+impl Limits {
+    pub(super) fn fetch_chunk_bytes(&self) -> Result<usize, Error> {
+        match MAX_CHUNK_BYTES
+            .min(self.max_literal_bytes)
+            .min(self.max_response_bytes / 2)
+        {
+            0 => Err(Error::InvalidInput),
+            count => Ok(count),
+        }
+    }
+}
 
 /// Request and response validation stay together; the wire driver applies this
 /// contract before the backend can accumulate or merge FETCH rows.

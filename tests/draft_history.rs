@@ -2,9 +2,9 @@ mod support;
 use mailctl::{
     config::{Config, CredentialSource, HistoricalDraftScope, Limits},
     domain::{DraftStatusInput, Error, ErrorCode, Operation, OperationResult, SaveDraftInput},
-    draft::PreparedDraft,
+    draft::{DraftMessageIdentity, PreparedDraft},
     draft_journal::{DraftJournal, DraftOperationState},
-    imap::{AppendOutcome, AppendUid},
+    imap::AppendOutcome,
     service::{DraftAppend, DraftBackend, DraftPreparation, MailboxTarget, Service},
 };
 use std::{
@@ -17,9 +17,26 @@ struct Backend {
     routes: Mutex<Vec<(u64, String, CredentialSource, String)>>,
     bytes: Mutex<Vec<Vec<u8>>>,
     outcome: AppendOutcome,
+    evidence: Mutex<Result<mailctl::draft::DraftEvidence, ErrorCode>>,
     validity: Mutex<Result<u32, ErrorCode>>,
 }
 impl DraftBackend for Backend {
+    fn reconcile<'a>(
+        &'a self,
+        target: MailboxTarget<'a>,
+        mailbox: &'a str,
+        expected: &'a mailctl::draft::DraftVerification,
+        limits: &'a Limits,
+    ) -> Pin<Box<dyn Future<Output = Result<mailctl::draft::DraftEvidence, Error>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let selection = self.prepare(target, mailbox, limits).await?;
+            if selection.uid_validity() != expected.uid_validity {
+                return Err(Error::new(ErrorCode::StaleReference));
+            }
+            self.evidence.lock().unwrap().map_err(Error::new)
+        })
+    }
     fn prepare<'a>(
         &'a self,
         target: MailboxTarget<'a>,
@@ -75,11 +92,17 @@ impl Fixture {
             routes: Mutex::new(Vec::new()),
             bytes: Mutex::new(Vec::new()),
             validity: Mutex::new(Ok(77)),
+            evidence: Mutex::new(Ok(mailctl::draft::DraftEvidence::Verified(
+                DraftMessageIdentity {
+                    uid_validity: 77,
+                    uid: 4,
+                },
+            ))),
             outcome: match state {
                 DraftOperationState::Rejected => AppendOutcome::Rejected,
                 DraftOperationState::OutcomeUnknown => AppendOutcome::Unknown,
                 _ => AppendOutcome::Created {
-                    uid: Some(AppendUid {
+                    uid: Some(DraftMessageIdentity {
                         uid_validity: 77,
                         uid: 4,
                     }),
@@ -426,5 +449,153 @@ async fn historical_denials_hide_existence_and_conflicts_and_obey_narrowing() {
             }
         }
         assert!(f.backend.bytes.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn historical_reconciliation_persists_duplicate_without_reconstructing_or_appending() {
+    let mut f = Fixture::new(DraftOperationState::OutcomeUnknown).await;
+    f.repoint();
+    f.config.accounts[0].from_identities = vec!["replacement@example.test".into()];
+    let service = f.open();
+    let mut status = f.status();
+    if let Operation::DraftStatus(input) = &mut status {
+        input.reconcile = true;
+    }
+    let OperationResult::Draft(receipt) = run(&service, status.clone()).await.unwrap() else {
+        panic!()
+    };
+    assert_eq!(receipt.state, mailctl::domain::DraftState::Duplicate);
+    assert_eq!(receipt.account_generation, 1);
+    assert!(receipt.message_reference.is_some());
+    assert_eq!(f.backend.bytes.lock().unwrap().len(), 1);
+    assert_eq!(f.backend.routes.lock().unwrap().len(), 2);
+    assert_eq!(f.backend.routes.lock().unwrap()[1].1, "imap.example.test");
+    drop(service);
+    let service = f.open();
+    for request in [status, Operation::SaveDraft(f.input.clone())] {
+        let OperationResult::Draft(replayed) = run(&service, request).await.unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            serde_json::to_value(replayed).unwrap(),
+            serde_json::to_value(&receipt).unwrap()
+        );
+    }
+    assert_eq!(f.backend.routes.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn reconciliation_keeps_safe_uncertainty_for_insufficient_evidence_and_failed_commit() {
+    use mailctl::draft::DraftEvidence;
+    for evidence in [
+        Ok(DraftEvidence::Absent),
+        Ok(DraftEvidence::Ambiguous),
+        Ok(DraftEvidence::ContentMismatch),
+        Err(ErrorCode::ResponseTooLarge),
+        Err(ErrorCode::CredentialUnavailable),
+        Err(ErrorCode::StaleReference),
+        Ok(DraftEvidence::Verified(DraftMessageIdentity {
+            uid_validity: 77,
+            uid: 4,
+        })),
+    ] {
+        let f = Fixture::new(DraftOperationState::OutcomeUnknown).await;
+        *f.backend.evidence.lock().unwrap() = evidence;
+        if matches!(evidence, Ok(DraftEvidence::Verified(_))) {
+            let database =
+                rusqlite::Connection::open(f.config.state_dir.join("drafts.sqlite")).unwrap();
+            database.execute_batch("CREATE TRIGGER stop_verification BEFORE UPDATE ON draft_operations BEGIN SELECT RAISE(ABORT, 'synthetic private data'); END;").unwrap();
+        }
+        let service = f.open();
+        let mut status = f.status();
+        if let Operation::DraftStatus(input) = &mut status {
+            input.reconcile = true;
+        }
+        let error = run(&service, status).await.unwrap_err();
+        assert_eq!(error.code, ErrorCode::OutcomeUnknown);
+        assert!(!error.retryable);
+        assert_eq!(error.draft_operation.unwrap().identity, f.input.identity());
+        assert!(!error.message.contains("synthetic private data"));
+        assert_eq!(f.record().state, DraftOperationState::OutcomeUnknown);
+        assert_eq!(f.backend.bytes.lock().unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn reconciliation_of_prepared_work_is_journal_only_and_denials_hide_existence() {
+    let mut f = Fixture::new(DraftOperationState::Prepared).await;
+    let service = f.open();
+    let mut status = f.status();
+    if let Operation::DraftStatus(input) = &mut status {
+        input.reconcile = true;
+    }
+    let OperationResult::Draft(receipt) = run(&service, status.clone()).await.unwrap() else {
+        panic!()
+    };
+    assert_eq!(receipt.state, mailctl::domain::DraftState::Prepared);
+    assert!(f.backend.bytes.lock().unwrap().is_empty());
+    assert_eq!(f.backend.routes.lock().unwrap().len(), 1);
+    drop(service);
+    f.repoint();
+    f.config
+        .grants
+        .iter_mut()
+        .find(|grant| grant.name == "writer")
+        .unwrap()
+        .historical_drafts
+        .clear();
+    let service = f.open();
+    for known in [true, false] {
+        if !known && let Operation::DraftStatus(input) = &mut status {
+            input.operation_id = uuid::Uuid::new_v4();
+        }
+        let error = run(&service, status.clone()).await.unwrap_err();
+        assert_eq!(error.code, ErrorCode::PermissionDenied);
+        assert!(error.draft_operation.is_none());
+    }
+}
+
+#[tokio::test]
+async fn failed_owner_death_recovery_retains_uncertainty_and_original_identity() {
+    let f = Fixture::new(DraftOperationState::OutcomeUnknown).await;
+    let database = rusqlite::Connection::open(f.config.state_dir.join("drafts.sqlite")).unwrap();
+    database.execute_batch("UPDATE draft_operations SET state = 'in_flight'; CREATE TRIGGER stop_recovery BEFORE UPDATE ON draft_operations BEGIN SELECT RAISE(ABORT, 'synthetic'); END;").unwrap();
+    let service = f.open();
+    let mut status = f.status();
+    if let Operation::DraftStatus(input) = &mut status {
+        input.reconcile = true;
+    }
+    let error = run(&service, status).await.unwrap_err();
+    assert_eq!(error.code, ErrorCode::OutcomeUnknown);
+    assert!(!error.retryable);
+    assert_eq!(error.draft_operation.unwrap().identity, f.input.identity());
+    assert_eq!(f.backend.routes.lock().unwrap().len(), 1);
+    assert_eq!(f.backend.bytes.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn reconciliation_retains_uncertainty_when_the_original_target_is_unavailable() {
+    for fault in ["routing", "missing", "incarnation"] {
+        let mut f = Fixture::new(DraftOperationState::OutcomeUnknown).await;
+        f.repoint();
+        match fault {
+            "routing" => f.config.accounts[0].retain_history = false,
+            "missing" => {
+                *f.backend.validity.lock().unwrap() = Err(ErrorCode::DraftMailboxUnavailable)
+            }
+            _ => *f.backend.validity.lock().unwrap() = Ok(88),
+        }
+        let service = f.open();
+        let mut status = f.status();
+        if let Operation::DraftStatus(input) = &mut status {
+            input.reconcile = true;
+        }
+        let error = run(&service, status).await.unwrap_err();
+        assert_eq!(error.code, ErrorCode::OutcomeUnknown, "{fault}");
+        assert!(!error.retryable);
+        assert_eq!(error.draft_operation.unwrap().identity, f.input.identity());
+        assert_eq!(f.record().state, DraftOperationState::OutcomeUnknown);
+        assert_eq!(f.backend.bytes.lock().unwrap().len(), 1);
     }
 }

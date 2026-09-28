@@ -6,8 +6,8 @@ resource references, capability reporting, macOS credential provisioning, and
 authentication diagnostics. It also creates unsent drafts and inspects their
 durable outcomes through either interface. Retain the account UUID, generation,
 operation UUID, and original input before saving. Identical retries share the
-recorded outcome. An uncertain outcome never permits another APPEND;
-reconciliation is not yet available.
+recorded outcome. Explicit reconciliation can verify an uncertain draft against
+its original target; uncertainty never permits another APPEND.
 
 Build both executables:
 
@@ -52,7 +52,8 @@ in an old generation. Removing the scope revokes historical access.
 
 Set `retain_history = true` on the account **before** repointing it to retain its
 original server, TLS, username, and credential source reference for prepared
-retries. Retention stores no secret values and grants no authority by itself.
+retries and reconciliation. Retention stores no secret values and grants no
+authority by itself.
 Disabling retention or removing the account removes historical credential routing;
 re-enabling retention cannot reconstruct removed routes. Completed status and
 same-input replay use the journal without provider access, even after routing or
@@ -62,8 +63,34 @@ A prepared retry uses its original Drafts mailbox and UIDVALIDITY, frozen date,
 From identity, and encoder parameters. Its From identity must still be approved.
 Missing routing, a renamed or recreated mailbox, revoked From permission, or
 unsupported reconstruction fails before APPEND. Retrying an uncertain operation
-returns its uncertainty and never creates another draft. Older reconstruction
-versions remain inspectable but cannot be dispatched by this version.
+returns its uncertainty and never creates another draft.
+
+## Reconcile an uncertain draft
+
+Ordinary `draft status` and `email_draft_status` calls read only the journal. To
+check an uncertain operation against the provider, add `--reconcile` to the CLI
+status command or set `reconcile: true` in the MCP input. Retain the original
+account UUID, generation, operation UUID, and mailbox:
+
+```sh
+mailctl --grant writer draft status --account-id "$account_id" \
+  --account-generation "$generation" --operation-id "$operation_id" \
+  --mailbox Drafts --reconcile --json
+```
+
+The grant must permit both journal inspection and draft creation at that original
+target. Read-only narrowing removes both permissions. Reconciliation uses the
+shared account writer lock and bounded, read-only IMAP requests. A single candidate
+with the exact generated Message-ID and frozen MIME hash produces a durable
+`duplicate` receipt, including its message reference when representable. Later
+status calls and identical saves replay that receipt without provider work.
+
+No match, multiple candidates, changed content, a recreated mailbox, missing
+historical routing, unavailable credentials, or exhausted work limits leave the
+operation uncertain. The error retains the original identity, a safe reason, and
+`retryable: false`. Neither reconciliation nor an uncertain save issues APPEND.
+Reconciliation of a prepared operation returns its recorded status without
+creating it. Drafts-only grants receive the receipt or error, never message content.
 
 ## Commit conventions
 

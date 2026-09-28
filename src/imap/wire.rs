@@ -1,5 +1,5 @@
 use super::{
-    AppendOutcome, AppendUid, Error, Limits, Metrics, TlsMode, fetch::Fetch as BodyFetch,
+    AppendOutcome, Error, Limits, Metrics, TlsMode, fetch::Fetch as BodyFetch,
     projection::Projection,
 };
 use io_imap::{
@@ -114,6 +114,18 @@ impl<'a> Connection<'a> {
         // must apply the selected operation's frame ceiling.
         self.session.fragmentizer =
             Fragmentizer::new(self.session.limits.max_response_bytes as u32);
+    }
+    pub(super) async fn upper_uid(&mut self, uid_next: Option<u32>) -> Result<u32, Error> {
+        if let Some(next) = uid_next {
+            return next.checked_sub(1).ok_or(Error::Protocol);
+        }
+        let uids = self
+            .search(vec![SearchKey::Uid("*".try_into().unwrap())], false)
+            .await?;
+        if uids.len() > 1 {
+            return Err(Error::Protocol);
+        }
+        Ok(uids.first().map_or(0, |uid| uid.get()))
     }
     pub async fn examine(&mut self, name: &str) -> Result<u32, Error> {
         self.examine_selection(name)
@@ -743,7 +755,7 @@ impl CommandState {
                                 StatusKind::Ok if *streamed => AppendOutcome::Created {
                                     uid: match tagged.body.code {
                                         Some(Code::AppendUid { uid_validity, uid }) => {
-                                            Some(AppendUid {
+                                            Some(crate::draft::DraftMessageIdentity {
                                                 uid_validity: uid_validity.get(),
                                                 uid: uid.get(),
                                             })

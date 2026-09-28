@@ -1,4 +1,4 @@
-//! Bounded deterministic MIME shared by draft preparation and the IMAP adapter.
+//! Draft composition and verification types shared by provider adapters and the journal.
 use crate::domain::dot_atom;
 use mail_builder::MessageBuilder;
 use sha2::{Digest, Sha256};
@@ -192,4 +192,26 @@ fn identifier(value: &str) -> Result<(), Error> {
         return Err(Error::InvalidInput);
     }
     Ok(())
+}
+
+/// A message UID within the verified incarnation of its original Drafts mailbox.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DraftMessageIdentity {
+    pub uid_validity: u32,
+    pub uid: u32,
+}
+
+/// Frozen evidence required to identify an uncertain draft without composing it again.
+pub struct DraftVerification {
+    pub uid_validity: u32,
+    pub message_id: String,
+    pub content_sha256: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DraftEvidence {
+    Verified(DraftMessageIdentity),
+    Absent,
+    Ambiguous,
+    ContentMismatch,
 }

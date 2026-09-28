@@ -32,6 +32,7 @@ enum ExpectedOperation {
     Authenticate,
     Append(DraftReply),
     DraftTarget(u32),
+    Reconcile,
     RejectAuthentication(bool),
     Mailboxes(Vec<&'static str>),
     Search(&'static str, Option<u32>),
@@ -130,6 +131,11 @@ impl ImapServer {
                                     append_draft(&mut wire, reply, &stalled, &captured).await;
                                     return;
                                 },
+                                ExpectedOperation::Reconcile => {
+                                    let bytes = captured.lock().unwrap().last().unwrap().clone();
+                                    reconcile_draft(&mut wire, &bytes).await;
+                                    return;
+                                },
                                 ExpectedOperation::DraftTarget(validity) => {
                                     let tag = imap_support::expect(&mut wire, "EXAMINE Drafts").await;
                                     imap_support::write(&mut wire, &format!("* 0 EXISTS\r\n* OK [UIDVALIDITY {validity}] incarnation\r\n{tag} OK [READ-ONLY] selected\r\n")).await;
@@ -167,6 +173,14 @@ impl ImapServer {
             stop,
             task: Some(task),
         }
+    }
+
+    pub fn expect_reconciliation(&self) {
+        self.expected.lock().unwrap().push_back(Expected {
+            username: "work@example.test",
+            password: "disposable-password",
+            operation: ExpectedOperation::Reconcile,
+        });
     }
 
     pub fn expect_append(&self, reply: DraftReply) {
@@ -489,4 +503,32 @@ async fn append_draft(
         matches!(end, Ok(0)) || end.is_err(),
         "APPEND connection must close without optional work"
     );
+}
+
+async fn reconcile_draft(wire: &mut imap_support::Wire, bytes: &[u8]) {
+    use tokio::io::AsyncWriteExt;
+    {
+        let tag = imap_support::expect(wire, "EXAMINE Drafts").await;
+        imap_support::write(wire, &format!("* 1 EXISTS\r\n* OK [UIDVALIDITY 77] incarnation\r\n* OK [UIDNEXT 5] next\r\n{tag} OK [READ-ONLY] selected\r\n")).await;
+    }
+    let text = std::str::from_utf8(bytes).unwrap();
+    let id = text
+        .split("Message-ID: <")
+        .nth(1)
+        .unwrap()
+        .split('>')
+        .next()
+        .unwrap();
+    let tag =
+        imap_support::expect(wire, &format!("UID SEARCH UID 1:4 HEADER Message-ID {id}")).await;
+    imap_support::write(wire, &format!("* SEARCH 4\r\n{tag} OK found\r\n")).await;
+    let tag = imap_support::expect(wire, "UID FETCH 4 (UID BODY.PEEK[]<0.16384>)").await;
+    imap_support::write(
+        wire,
+        &format!("* 1 FETCH (UID 4 BODY[]<0> {{{}}}\r\n", bytes.len()),
+    )
+    .await;
+    wire.write_all(bytes).await.unwrap();
+    imap_support::write(wire, &format!(")\r\n{tag} OK fetched\r\n")).await;
+    imap_support::dropped(wire).await;
 }

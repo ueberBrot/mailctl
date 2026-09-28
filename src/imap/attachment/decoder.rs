@@ -1,9 +1,7 @@
 //! Strict incremental transfer decoding owns carry, output limits, and integrity.
-use crate::imap::{Error, Limits};
+use crate::imap::{Error, Limits, fetch::MAX_CHUNK_BYTES};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use sha2::{Digest, Sha256};
-
-pub(super) const WIRE_SLICE_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum TransferEncoding {
@@ -239,7 +237,7 @@ impl Decoder {
     }
 
     fn state_limit(limits: &Limits) -> usize {
-        WIRE_SLICE_BYTES.saturating_add(limits.max_attachment_chunk_bytes)
+        MAX_CHUNK_BYTES.saturating_add(limits.max_attachment_chunk_bytes)
     }
 
     fn retained_bytes(&self) -> usize {

@@ -12,6 +12,15 @@ pub struct DraftIdentity {
     pub operation_id: Uuid,
 }
 
+impl DraftIdentity {
+    pub(crate) fn message_id(&self) -> String {
+        format!(
+            "{}.{}.{}@mailctl.invalid",
+            self.account_id, self.account_generation, self.operation_id
+        )
+    }
+}
+
 /// Authorized operation and original target, including its incarnation when known.
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -142,6 +151,7 @@ pub enum DraftState {
     InFlight,
     Created,
     CreatedReferenceUnavailable,
+    Duplicate,
     Rejected,
     OutcomeUnknown,
 }

@@ -240,6 +240,31 @@ impl super::AttachmentReader for ImapAttachment {
 }
 
 impl super::DraftBackend for ImapBackend {
+    fn reconcile<'a>(
+        &'a self,
+        _: MailboxTarget<'a>,
+        mailbox: &'a str,
+        expected: &'a crate::draft::DraftVerification,
+        limits: &'a Limits,
+    ) -> Pin<Box<dyn Future<Output = Result<crate::draft::DraftEvidence, Error>> + Send + 'a>> {
+        Box::pin(async move {
+            self.acquire(limits)
+                .await?
+                .with_connection(async |connection| {
+                    connection
+                        .reconcile_draft(
+                            mailbox,
+                            expected,
+                            limits,
+                            &mut crate::imap::Metrics::default(),
+                        )
+                        .await
+                })
+                .await
+                .map_err(Into::into)
+        })
+    }
+
     fn prepare<'a>(
         &'a self,
         _: MailboxTarget<'a>,

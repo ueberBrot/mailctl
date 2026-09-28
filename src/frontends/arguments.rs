@@ -132,11 +132,11 @@ enum Draft {
         #[arg(long)]
         input: PathBuf,
     },
-    /// Inspect durable status without contacting the provider.
+    /// Inspect durable status; optionally verify an uncertain draft with the provider.
     Status {
         #[command(flatten)]
         identity: DraftIdentity,
-        /// Request reconciliation (not yet supported).
+        /// Verify uncertain creation against the original target without another APPEND.
         #[arg(long)]
         reconcile: bool,
     },

@@ -7,12 +7,13 @@
 //! durable state, but cannot own the network side effect or recover a live
 //! writer safely.
 
+use crate::draft::DraftMessageIdentity;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::{fmt, path::Path, time::Duration};
 use uuid::Uuid;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 pub use crate::domain::DraftIdentity as DraftOperationIdentity;
 
@@ -42,20 +43,16 @@ pub struct DraftReconstruction {
     pub encoder_version: u32,
 }
 
-/// A server-provided identity for a created message, when APPENDUID was present.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AppendedMessageIdentity {
-    pub uid_validity: u32,
-    pub uid: u32,
-}
-
 /// The durable acknowledgement state of a draft operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DraftOperationState {
     Prepared,
     InFlight,
     Created {
-        appended_message: Option<AppendedMessageIdentity>,
+        appended_message: Option<DraftMessageIdentity>,
+    },
+    Duplicate {
+        appended_message: DraftMessageIdentity,
     },
     Rejected,
     OutcomeUnknown,
@@ -96,9 +93,9 @@ impl fmt::Display for DraftJournalError {
             Self::NotDispatchable(DraftOperationState::InFlight) => {
                 "The draft operation is already in progress"
             }
-            Self::NotDispatchable(DraftOperationState::Created { .. }) => {
-                "The draft operation was already acknowledged"
-            }
+            Self::NotDispatchable(
+                DraftOperationState::Created { .. } | DraftOperationState::Duplicate { .. },
+            ) => "The draft operation was already acknowledged",
             Self::NotDispatchable(DraftOperationState::Rejected) => {
                 "The draft operation was rejected"
             }
@@ -121,6 +118,7 @@ impl std::error::Error for DraftJournalError {}
 /// that lock across `prepare`, `begin_dispatch`, network I/O, and the matching
 /// outcome method. Do not call the transition methods during recovery without
 /// proving that the previous writer no longer owns the account.
+/// Journal paths must not contain symbolic links, including parent directories.
 pub struct DraftJournal {
     connection: Connection,
 }
@@ -146,6 +144,7 @@ impl DraftJournal {
         busy_timeout: Duration,
     ) -> Result<Self, DraftJournalError> {
         let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+            | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW
             | if initialize {
                 rusqlite::OpenFlags::SQLITE_OPEN_CREATE
             } else {
@@ -298,7 +297,7 @@ impl DraftJournal {
     pub fn record_created(
         &mut self,
         identity: &DraftOperationIdentity,
-        appended_message: Option<AppendedMessageIdentity>,
+        appended_message: Option<DraftMessageIdentity>,
     ) -> Result<PersistedDraftOperation, DraftJournalError> {
         self.record_outcome(identity, DraftOperationState::Created { appended_message })
     }
@@ -309,6 +308,18 @@ impl DraftJournal {
         identity: &DraftOperationIdentity,
     ) -> Result<PersistedDraftOperation, DraftJournalError> {
         self.record_outcome(identity, DraftOperationState::Rejected)
+    }
+
+    /// Records independent verification while the caller holds the account writer lock.
+    pub fn record_duplicate(
+        &mut self,
+        identity: &DraftOperationIdentity,
+        appended_message: DraftMessageIdentity,
+    ) -> Result<PersistedDraftOperation, DraftJournalError> {
+        self.record_outcome(
+            identity,
+            DraftOperationState::Duplicate { appended_message },
+        )
     }
 
     /// Records an uncertain result, including local disconnect or cancellation.
@@ -335,6 +346,9 @@ impl DraftJournal {
     ) -> Result<PersistedDraftOperation, DraftJournalError> {
         let (state, appended_message) = match outcome {
             DraftOperationState::Created { appended_message } => ("created", appended_message),
+            DraftOperationState::Duplicate { appended_message } => {
+                ("duplicate", Some(appended_message))
+            }
             DraftOperationState::Rejected => ("rejected", None),
             DraftOperationState::OutcomeUnknown => ("outcome_unknown", None),
             DraftOperationState::Prepared | DraftOperationState::InFlight => {
@@ -349,7 +363,13 @@ impl DraftJournal {
         let transaction = self.connection.transaction().map_err(unavailable)?;
         let persisted = read_by_identity(&transaction, identity)?
             .ok_or(DraftJournalError::OperationNotPrepared)?;
-        if persisted.state != DraftOperationState::InFlight {
+        let (expected, expected_name) = if matches!(outcome, DraftOperationState::Duplicate { .. })
+        {
+            (DraftOperationState::OutcomeUnknown, "outcome_unknown")
+        } else {
+            (DraftOperationState::InFlight, "in_flight")
+        };
+        if persisted.state != expected {
             return Err(DraftJournalError::NotDispatchable(persisted.state));
         }
         let changed = transaction
@@ -358,7 +378,7 @@ impl DraftJournal {
                 UPDATE draft_operations
                 SET state = ?4, appended_uid_validity = ?5, appended_uid = ?6
                 WHERE account_id = ?1 AND account_generation = ?2 AND operation_id = ?3
-                  AND state = 'in_flight'
+                  AND state = ?7
                 ",
                 params![
                     identity.account_id.as_bytes().as_slice(),
@@ -367,6 +387,7 @@ impl DraftJournal {
                     state,
                     appended_message.map(|identity| i64::from(identity.uid_validity)),
                     appended_message.map(|identity| i64::from(identity.uid)),
+                    expected_name,
                 ],
             )
             .map_err(unavailable)?;
@@ -400,7 +421,7 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), DraftJournalErro
                     content_sha256 BLOB NOT NULL CHECK(length(content_sha256) = 32),
                     reconstruction TEXT,
                     state TEXT NOT NULL CHECK(state IN (
-                        'prepared', 'in_flight', 'created', 'rejected', 'outcome_unknown'
+                        'prepared', 'in_flight', 'created', 'rejected', 'outcome_unknown', 'duplicate'
                     )),
                     appended_uid_validity INTEGER,
                     appended_uid INTEGER,
@@ -408,14 +429,14 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), DraftJournalErro
                     CHECK(
                         appended_uid_validity IS NULL
                         OR (
-                            state = 'created'
+                            state IN ('created', 'duplicate')
                             AND appended_uid_validity > 0
                             AND appended_uid > 0
                         )
                     ),
                     PRIMARY KEY (account_id, account_generation, operation_id)
                 );
-                PRAGMA user_version = 2;
+                PRAGMA user_version = 3;
             ",
         )
         .map_err(unavailable)?;
@@ -525,7 +546,7 @@ fn decode_row(row: DatabaseRow) -> Result<PersistedDraftOperation, DraftJournalE
             if uid_validity == 0 || uid == 0 {
                 return Err(DraftJournalError::InvalidDatabase);
             }
-            Some(AppendedMessageIdentity { uid_validity, uid })
+            Some(DraftMessageIdentity { uid_validity, uid })
         }
         _ => return Err(DraftJournalError::InvalidDatabase),
     };
@@ -536,6 +557,9 @@ fn decode_row(row: DatabaseRow) -> Result<PersistedDraftOperation, DraftJournalE
         "prepared" if appended_message.is_none() => DraftOperationState::Prepared,
         "in_flight" if appended_message.is_none() => DraftOperationState::InFlight,
         "created" => DraftOperationState::Created { appended_message },
+        "duplicate" => DraftOperationState::Duplicate {
+            appended_message: appended_message.ok_or(DraftJournalError::InvalidDatabase)?,
+        },
         "rejected" if appended_message.is_none() => DraftOperationState::Rejected,
         "outcome_unknown" if appended_message.is_none() => DraftOperationState::OutcomeUnknown,
         _ => return Err(DraftJournalError::InvalidDatabase),

@@ -6,10 +6,11 @@ mod body;
 mod fetch;
 mod mime;
 mod projection;
+mod reconcile;
 mod search;
 mod wire;
 
-pub use append::{AppendOutcome, AppendUid};
+pub use append::AppendOutcome;
 
 pub use attachment::{
     AttachmentData, AttachmentDecoder, AttachmentIntegrity, AttachmentListRequest,

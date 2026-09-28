@@ -286,12 +286,7 @@ async fn bytes(
     if ceiling > budget {
         return Err(Error::Limit);
     }
-    let chunk = (16 * 1024)
-        .min(limits.max_literal_bytes)
-        .min(limits.max_response_bytes / 2);
-    if chunk == 0 {
-        return Err(Error::InvalidInput);
-    }
+    let chunk = limits.fetch_chunk_bytes()?;
     let mut result = Vec::new();
     loop {
         let count = chunk.min(ceiling + 1 - result.len());

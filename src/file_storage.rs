@@ -53,7 +53,16 @@ pub(crate) fn open(path: &Path, options: &mut OpenOptions) -> io::Result<File> {
     }
     let file = options.open(path)?;
     let metadata = file.metadata()?;
-    if !metadata.is_file() || redirected(&metadata) {
+    validate_file(&metadata)?;
+    Ok(file)
+}
+
+/// Inspect private state without opening descriptors owned by another storage module.
+pub(crate) fn inspect(path: &Path) -> io::Result<()> {
+    validate_file(&fs::symlink_metadata(path)?)
+}
+fn validate_file(metadata: &fs::Metadata) -> io::Result<()> {
+    if !metadata.is_file() || redirected(metadata) {
         return Err(io::ErrorKind::InvalidData.into());
     }
     #[cfg(unix)]
@@ -66,7 +75,7 @@ pub(crate) fn open(path: &Path, options: &mut OpenOptions) -> io::Result<File> {
             return Err(io::ErrorKind::InvalidData.into());
         }
     }
-    Ok(file)
+    Ok(())
 }
 
 pub(crate) fn read(path: &Path, maximum: usize) -> io::Result<Option<Vec<u8>>> {

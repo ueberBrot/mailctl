@@ -53,6 +53,22 @@ impl Client {
         .await
         .map_err(|_| E::from(Error::Timeout))?
     }
+    pub async fn reconcile_draft(
+        &mut self,
+        expected: &mailctl::draft::DraftVerification,
+        limits: &config::Limits,
+    ) -> Result<mailctl::draft::DraftEvidence, Error> {
+        self.run(
+            "fixture",
+            "disposable-password",
+            async |connection, _, metrics| {
+                connection
+                    .reconcile_draft("Drafts", expected, limits, metrics)
+                    .await
+            },
+        )
+        .await
+    }
     pub async fn discover(
         &mut self,
         username: &str,

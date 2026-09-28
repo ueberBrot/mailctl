@@ -36,7 +36,7 @@ fn definitions(operations: &[String]) -> Vec<Tool> {
             "email_save_draft", "Create one unsent draft using caller-retained identity and composition; replay the recorded outcome on retry.",
         ),
         tool::<crate::domain::DraftStatusInput, crate::domain::DraftReceipt>(
-            "email_draft_status", "Inspect an authorized draft operation without provider work; reconciliation is not yet supported.",
+            "email_draft_status", "Inspect an authorized draft operation. Set reconcile to verify uncertain creation against the original target without another APPEND.",
         ),
         tool::<ListAccountsInput, AccountDiscovery>(
             "email_list_accounts",

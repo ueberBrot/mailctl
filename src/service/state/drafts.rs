@@ -41,7 +41,9 @@ fn unavailable() -> Error {
 }
 fn private_files(directory: &Path) -> Result<(), Error> {
     for name in [JOURNAL, "drafts.sqlite-wal", "drafts.sqlite-shm", MARKER] {
-        match crate::file_storage::open(&directory.join(name), OpenOptions::new().read(true)) {
+        // Closing an extra descriptor can release SQLite's process-scoped Unix locks,
+        // including the shared-memory lock that prevents another process truncating WAL state.
+        match crate::file_storage::inspect(&directory.join(name)) {
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => return Err(unavailable()),

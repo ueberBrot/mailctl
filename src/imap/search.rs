@@ -8,7 +8,6 @@ use io_imap::{
     rfc3501::{
         fetch::{ImapMessageFetch, ImapMessageFetchOptions},
         logout::ImapLogout,
-        search::{ImapMessageSearch, ImapMessageSearchOptions},
     },
     types::search::SearchKey,
 };
@@ -59,23 +58,10 @@ impl SelectedMailbox for Selection<'_, '_> {
         self.validity
     }
     async fn upper_uid(&mut self) -> Result<u32, Error> {
-        if let Some(next) = self.uid_next {
-            return Ok(next - 1);
-        }
-        let uids = self
-            .connection
-            .drive(ImapMessageSearch::new(
-                vec![SearchKey::Uid("*".try_into().unwrap())]
-                    .try_into()
-                    .unwrap(),
-                ImapMessageSearchOptions { uid: true },
-            ))
+        self.connection
+            .upper_uid(self.uid_next)
             .await
-            .map_err(Error::from)?;
-        if uids.len() > 1 {
-            return Err(Error::new(ErrorCode::ProviderUnavailable));
-        }
-        Ok(uids.first().map_or(0, |uid| uid.get()))
+            .map_err(Error::from)
     }
     async fn matches(
         &mut self,

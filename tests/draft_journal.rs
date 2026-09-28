@@ -1,6 +1,7 @@
+use mailctl::draft::DraftMessageIdentity;
 use mailctl::draft_journal::{
-    AppendedMessageIdentity, DraftJournal, DraftJournalError, DraftOperationIdentity,
-    DraftOperationState, PreparedDraftOperation,
+    DraftJournal, DraftJournalError, DraftOperationIdentity, DraftOperationState,
+    PreparedDraftOperation,
 };
 use rusqlite::{Connection, params};
 use std::{
@@ -22,6 +23,8 @@ impl TemporaryJournal {
     fn new() -> Self {
         Self {
             path: std::env::temp_dir()
+                .canonicalize()
+                .unwrap()
                 .join(format!("mailctl-draft-journal-{}.sqlite", Uuid::new_v4())),
         }
     }
@@ -259,7 +262,7 @@ fn every_recorded_non_prepared_state_refuses_another_dispatch() {
     journal
         .record_created(
             &created.identity,
-            Some(AppendedMessageIdentity {
+            Some(DraftMessageIdentity {
                 uid_validity: 10,
                 uid: 11,
             }),
@@ -275,7 +278,7 @@ fn every_recorded_non_prepared_state_refuses_another_dispatch() {
         journal.begin_dispatch(&created),
         Err(DraftJournalError::NotDispatchable(
             DraftOperationState::Created {
-                appended_message: Some(AppendedMessageIdentity {
+                appended_message: Some(DraftMessageIdentity {
                     uid_validity: 10,
                     uid: 11,
                 })
@@ -481,4 +484,37 @@ fn subprocess_death_preserves_committed_journal_state() {
             Err(DraftJournalError::NotDispatchable(expected))
         );
     }
+}
+
+#[test]
+fn verified_duplicate_is_durable_and_never_dispatchable() {
+    let temporary = TemporaryJournal::new();
+    let operation = child_operation();
+    let uid = DraftMessageIdentity {
+        uid_validity: 77,
+        uid: 4,
+    };
+    let mut journal = DraftJournal::open(&temporary.path).unwrap();
+    journal.prepare(operation.clone()).unwrap();
+    assert!(journal.record_duplicate(&operation.identity, uid).is_err());
+    journal.begin_dispatch(&operation).unwrap();
+    assert!(journal.record_duplicate(&operation.identity, uid).is_err());
+    journal.record_outcome_unknown(&operation.identity).unwrap();
+    let receipt = journal.record_duplicate(&operation.identity, uid).unwrap();
+    assert_eq!(
+        receipt.state,
+        DraftOperationState::Duplicate {
+            appended_message: uid
+        }
+    );
+    drop(journal);
+    let mut journal = DraftJournal::open_existing(&temporary.path).unwrap();
+    assert_eq!(journal.inspect(&operation.identity).unwrap(), Some(receipt));
+    assert!(matches!(
+        journal.begin_dispatch(&operation),
+        Err(DraftJournalError::NotDispatchable(
+            DraftOperationState::Duplicate { .. }
+        ))
+    ));
+    assert!(journal.record_outcome_unknown(&operation.identity).is_err());
 }

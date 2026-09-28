@@ -223,7 +223,7 @@ impl Service {
         let _reservation = self.requests.reserve(self.limits(context)?)?;
         let own_deadline = matches!(
             operation,
-            Operation::GetAttachment(_) | Operation::SaveDraft(_)
+            Operation::GetAttachment(_) | Operation::SaveDraft(_) | Operation::DraftStatus(_)
         );
         let execution = self.execute_inner(context, operation);
         // Transfers choose between operation timeout and transfer expiry; drafts
