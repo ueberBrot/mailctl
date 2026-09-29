@@ -5,6 +5,20 @@ use std::{
     path::Path,
 };
 
+#[cfg(windows)]
+mod windows;
+
+#[cfg(windows)]
+pub(crate) fn inspect_directory(path: &Path) -> io::Result<()> {
+    windows::directory(path)
+}
+
+#[cfg(windows)]
+pub(crate) fn create_directory(path: &Path) -> io::Result<()> {
+    windows::create_directory(path)
+}
+
+#[cfg(not(windows))]
 pub(crate) fn create_directory(path: &Path) -> io::Result<()> {
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true);
@@ -54,11 +68,18 @@ pub(crate) fn open(path: &Path, options: &mut OpenOptions) -> io::Result<File> {
     let file = options.open(path)?;
     let metadata = file.metadata()?;
     validate_file(&metadata)?;
+    #[cfg(windows)]
+    windows::inspect(&file)?;
     Ok(file)
 }
 
 /// Inspect private state without opening descriptors owned by another storage module.
 pub(crate) fn inspect(path: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        open(path, OpenOptions::new().read(true)).map(|_| ())
+    }
+    #[cfg(not(windows))]
     validate_file(&fs::symlink_metadata(path)?)
 }
 fn validate_file(metadata: &fs::Metadata) -> io::Result<()> {

@@ -80,12 +80,14 @@ pub(in crate::service) fn backup(
     if !destination.is_absolute() || destination.starts_with(&maintenance.directory) {
         return Err(invalid());
     }
-    let mut builder = fs::DirBuilder::new();
+    let builder = fs::DirBuilder::new();
     #[cfg(unix)]
-    {
+    let builder = {
         use std::os::unix::fs::DirBuilderExt;
+        let mut builder = builder;
         builder.mode(0o700);
-    }
+        builder
+    };
     builder.create(destination).map_err(|_| invalid())?;
     let result = (|| {
         if storage::directory(destination, false)?.starts_with(&maintenance.directory) {
@@ -154,6 +156,13 @@ fn digest(path: &Path) -> Result<String, Error> {
     }
     Ok(crate::encoding::hex(&hash.finalize()))
 }
+#[cfg_attr(
+    not(unix),
+    allow(
+        clippy::unnecessary_wraps,
+        reason = "Unix directory synchronization can fail through this shared interface"
+    )
+)]
 fn sync_directory(path: &Path) -> Result<(), Error> {
     #[cfg(unix)]
     File::open(path)

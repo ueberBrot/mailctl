@@ -147,7 +147,7 @@ async fn execute(
                 crate::credentials::SourceError::InteractionRequired,
             ));
         }
-        #[cfg(all(unix, feature = "cli"))]
+        #[cfg(all(any(unix, windows), feature = "cli"))]
         {
             let (host, prompts) = credentials::session::environment(host)
                 .map_err(crate::service::credential_error)?;
@@ -156,7 +156,7 @@ async fn execute(
                 () = prompts => unreachable!(),
             };
         }
-        #[cfg(not(all(unix, feature = "cli")))]
+        #[cfg(not(all(any(unix, windows), feature = "cli")))]
         return Err(crate::service::credential_error(
             crate::credentials::SourceError::InteractionRequired,
         ));

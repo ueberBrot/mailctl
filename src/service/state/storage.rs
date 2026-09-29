@@ -38,6 +38,8 @@ pub(super) fn directory(path: &Path, create: bool) -> Result<PathBuf, Error> {
             return Err(invalid());
         }
     }
+    #[cfg(windows)]
+    file_storage::inspect_directory(path).map_err(|_| invalid())?;
     let canonical = fs::canonicalize(path).map_err(|_| invalid())?;
     #[cfg(unix)]
     if canonical != path {

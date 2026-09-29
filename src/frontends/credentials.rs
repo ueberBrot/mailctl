@@ -1,6 +1,6 @@
 //! Explicit operator credential commands shared by both executables.
 use super::arguments::Credential;
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 use crate::credentials::Secret;
 use crate::{
     credentials::SourceError,
@@ -69,13 +69,16 @@ pub(super) async fn execute(
 
 #[cfg(unix)]
 mod prompt;
-#[cfg(unix)]
+#[cfg(windows)]
+#[path = "credentials/windows_prompt.rs"]
+mod prompt;
+#[cfg(any(unix, windows))]
 use prompt::prompt;
 
-#[cfg(all(unix, feature = "cli"))]
+#[cfg(all(any(unix, windows), feature = "cli"))]
 pub(super) mod session;
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 #[allow(
     clippy::unused_async,
     reason = "Matches the asynchronous Unix credential prompt interface"

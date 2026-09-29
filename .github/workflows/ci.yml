@@ -95,6 +95,31 @@ jobs:
             if test -f "$binary"; then sha256sum "$binary"; fi
           done
 
+  windows-native-credentials:
+    strategy:
+      fail-fast: false
+      matrix:
+        features: [cli, mcp, 'cli,mcp']
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f  # v2.0.0
+      - name: Qualify Credential Manager on the disposable hosted Windows identity
+        shell: pwsh
+        env:
+          MAILCTL_FEATURES: ${{ matrix.features }}
+          MAILCTL_DISPOSABLE_WINDOWS: '1'
+        run: |
+          cargo test --locked --no-default-features --features "$env:MAILCTL_FEATURES" `
+            --test windows_credentials native_windows_credentials_cross_processes_and_rotate `
+            -- --ignored --nocapture --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-CimInstance Win32_OperatingSystem | Select-Object Caption, Version, OSArchitecture
+          Get-ChildItem target/debug/mailctl*.exe | Get-FileHash -Algorithm SHA256
+
   native-credentials:
     runs-on: macos-latest
     timeout-minutes: 20

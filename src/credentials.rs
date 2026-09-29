@@ -14,7 +14,10 @@ mod systemd;
 
 #[cfg(target_os = "macos")]
 mod native;
-#[cfg(target_os = "macos")]
+#[cfg(windows)]
+#[path = "credentials/windows.rs"]
+mod native;
+#[cfg(any(target_os = "macos", windows))]
 pub use native::NativeSource;
 
 pub const SERVICE_NAME: &str = "mailctl";
@@ -188,16 +191,16 @@ pub fn source_for(source: &CredentialSource) -> Arc<dyn SecretSource> {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 fn native_source() -> Arc<dyn SecretSource> {
     NativeSource::shared()
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 fn native_source() -> Arc<dyn SecretSource> {
     Arc::new(DeferredSource {
         failure: SourceError::Unavailable,
-        prerequisite: "Native credential resolution in this build requires macOS",
+        prerequisite: "Native credential resolution in this build requires macOS or Windows",
     })
 }
 
@@ -218,5 +221,29 @@ impl SecretSource for DeferredSource {
 
     fn resolve(&self, _: Uuid) -> Result<Secret, SourceError> {
         Err(self.failure)
+    }
+}
+
+#[cfg(any(target_os = "macos", windows))]
+fn keyring_error(
+    error: keyring_core::Error,
+    platform: impl FnOnce(&(dyn std::error::Error + Send + Sync + 'static)) -> SourceError,
+) -> SourceError {
+    match error {
+        keyring_core::Error::NoEntry => SourceError::Missing,
+        keyring_core::Error::PlatformFailure(error)
+        | keyring_core::Error::NoStorageAccess(error) => platform(error.as_ref()),
+        keyring_core::Error::BadEncoding(mut bytes)
+        | keyring_core::Error::BadDataFormat(mut bytes, _) => {
+            bytes.zeroize();
+            SourceError::InvalidSecret
+        }
+        keyring_core::Error::TooLong(..) | keyring_core::Error::Invalid(..) => {
+            SourceError::InvalidSecret
+        }
+        keyring_core::Error::NoDefaultStore | keyring_core::Error::NotSupportedByStore(_) => {
+            SourceError::Unavailable
+        }
+        _ => SourceError::Internal,
     }
 }
