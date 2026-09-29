@@ -135,9 +135,44 @@ async fn execute(
     host: std::sync::Arc<dyn crate::host::HostEnvironment>,
     request: &Request,
 ) -> Result<u8, Error> {
+    if invocation.interactive {
+        if invocation.options.json {
+            return Err(crate::service::credential_error(
+                crate::credentials::SourceError::InteractionRequired,
+            ));
+        }
+        #[cfg(target_os = "macos")]
+        if invocation.options.isolated {
+            return Err(crate::service::credential_error(
+                crate::credentials::SourceError::InteractionRequired,
+            ));
+        }
+        #[cfg(all(unix, feature = "cli"))]
+        {
+            let (host, prompts) = credentials::session::environment(host)
+                .map_err(crate::service::credential_error)?;
+            return tokio::select! {
+                result = execute_inner(invocation, host, request) => result,
+                () = prompts => unreachable!(),
+            };
+        }
+        #[cfg(not(all(unix, feature = "cli")))]
+        return Err(crate::service::credential_error(
+            crate::credentials::SourceError::InteractionRequired,
+        ));
+    }
+    execute_inner(invocation, host, request).await
+}
+
+async fn execute_inner(
+    invocation: Invocation,
+    host: std::sync::Arc<dyn crate::host::HostEnvironment>,
+    request: &Request,
+) -> Result<u8, Error> {
     let Invocation {
         mut options,
         action,
+        ..
     } = invocation;
     #[cfg(target_os = "macos")]
     if options.isolated {

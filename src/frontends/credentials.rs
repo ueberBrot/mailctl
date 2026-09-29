@@ -72,6 +72,9 @@ mod prompt;
 #[cfg(unix)]
 use prompt::prompt;
 
+#[cfg(all(unix, feature = "cli"))]
+pub(super) mod session;
+
 #[cfg(not(unix))]
 #[allow(
     clippy::unused_async,

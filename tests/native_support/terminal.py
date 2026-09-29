@@ -13,10 +13,18 @@ import time
 request = json.load(sys.stdin)
 pid, terminal = pty.fork()
 if pid == 0:
+    if request.get("background"):
+        worker = os.fork()
+        if worker:
+            _, status = os.waitpid(worker, 0)
+            os._exit(os.waitstatus_to_exitcode(status))
+        os.setpgid(0, 0)
+    os.environ.update(request.get("environment", {}))
     os.execv(request["command"][0], request["command"])
 
 output = bytearray()
 prompted = False
+echo_during_prompt = None
 deadline = time.monotonic() + 10
 status = None
 try:
@@ -36,6 +44,7 @@ try:
                 raise RuntimeError("terminal output exceeded fixture limit")
             if not prompted and any(prompt in bytes(output).lower() for prompt in (b"password:", b"credential:")):
                 prompted = True
+                echo_during_prompt = bool(termios.tcgetattr(terminal)[3] & termios.ECHO)
                 if "signal" in request:
                     os.kill(pid, getattr(signal, request["signal"]))
                 elif not request.get("wait"):
@@ -61,6 +70,7 @@ finally:
 
 text = output.decode("utf-8", "replace")
 json.dump({"exit": os.waitstatus_to_exitcode(status), "prompted": prompted,
+           "echo_during_prompt": echo_during_prompt,
            "echo_enabled": echo_enabled,
            "secret_disclosed": bool(request.get("secret")) and request["secret"] in text,
            "output": text}, sys.stdout)

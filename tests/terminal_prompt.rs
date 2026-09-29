@@ -127,6 +127,19 @@ fn credential_prompt_deadline_restores_echo() {
     assert_prompt(&installation, serde_json::json!({"wait": true}), 5);
 }
 
+#[test]
+fn background_credential_provisioning_requires_foreground_interaction() {
+    let installation = Installation::two_accounts();
+    setup(&installation);
+    let result = terminal::run(serde_json::json!({
+        "command": [MAILCTL, "--config", installation.config(), "--account", "work", "credential", "set"],
+        "background": true,
+    }));
+    assert_eq!(result["exit"], 4, "{result}");
+    assert_eq!(result["prompted"], false);
+    assert_eq!(result["echo_enabled"], true);
+}
+
 fn setup(installation: &Installation) {
     let mut command = installation.cli();
     command.args(["--json", "setup"]);

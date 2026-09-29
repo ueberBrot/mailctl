@@ -169,7 +169,7 @@ pub fn source_for(source: &CredentialSource) -> Arc<dyn SecretSource> {
         CredentialSource::Native {} => native_source(),
         CredentialSource::Session {} => Arc::new(DeferredSource {
             failure: SourceError::InteractionRequired,
-            prerequisite: "Foreground session credential resolution is unavailable in this build",
+            prerequisite: "Session credentials require mailctl --interactive in an operator terminal without --json",
         }),
         #[cfg(target_os = "linux")]
         CredentialSource::Systemd { name } => Arc::new(systemd::SystemdSource::new(name.clone())),

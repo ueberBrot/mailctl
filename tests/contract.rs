@@ -73,7 +73,9 @@ async fn doctor_separates_safe_source_status_from_explicit_rate_limited_authenti
     assert!(local.accounts[0].authentication.is_none());
     assert_eq!(
         local.prerequisites,
-        ["Foreground session credential resolution is unavailable in this build"]
+        [
+            "Session credentials require mailctl --interactive in an operator terminal without --json"
+        ]
     );
 
     let checked = service.doctor(&context, true).await.unwrap();

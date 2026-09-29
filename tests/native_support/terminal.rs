@@ -6,10 +6,7 @@ use std::{
 
 const MAX_PROTOCOL_BYTES: usize = 64 * 1024;
 const DEADLINE: Duration = Duration::from_secs(12);
-const SCRIPT: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/native_support/terminal.py"
-);
+const SCRIPT: &str = include_str!("terminal.py");
 
 pub(crate) fn run(request: serde_json::Value) -> serde_json::Value {
     let request = serde_json::to_vec(&request).expect("serialize terminal fixture request");
@@ -18,6 +15,7 @@ pub(crate) fn run(request: serde_json::Value) -> serde_json::Value {
         "terminal fixture request exceeded protocol limit"
     );
     let child = Command::new("python3")
+        .arg("-c")
         .arg(SCRIPT)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -34,6 +32,10 @@ pub(crate) fn run(request: serde_json::Value) -> serde_json::Value {
         !captured.stderr_exceeded_limit,
         "terminal fixture stderr exceeded protocol limit"
     );
-    assert!(captured.output.status.success(), "terminal fixture failed");
+    assert!(
+        captured.output.status.success(),
+        "terminal fixture failed: {}",
+        String::from_utf8_lossy(&captured.output.stderr)
+    );
     serde_json::from_slice(&captured.output.stdout).expect("terminal fixture JSON")
 }

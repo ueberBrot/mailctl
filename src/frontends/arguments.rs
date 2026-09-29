@@ -131,6 +131,9 @@ pub(super) enum Credential {
 struct Mailctl {
     #[command(flatten)]
     options: Options,
+    /// Prompt for session credentials in this foreground invocation; incompatible with JSON.
+    #[arg(long, global = true)]
+    interactive: bool,
     #[command(subcommand)]
     command: Email,
 }
@@ -341,6 +344,7 @@ struct Mcp {
 pub(super) struct Invocation {
     pub options: Options,
     pub action: Action,
+    pub interactive: bool,
 }
 pub(super) enum Action {
     State(State),
@@ -460,6 +464,7 @@ impl Invocation {
                 Ok(Self {
                     options: parsed.options,
                     action,
+                    interactive: parsed.interactive,
                 })
             }
             #[cfg(feature = "mcp")]
@@ -474,6 +479,7 @@ impl Invocation {
                 Ok(Self {
                     options: parsed.options,
                     action,
+                    interactive: false,
                 })
             }
         }
