@@ -537,6 +537,55 @@ async fn application_enforces_exact_frozen_mime_and_header_limits() {
 }
 
 #[tokio::test]
+async fn opening_contended_history_yields_until_the_other_connection_closes() {
+    let (_installation, config, service, identity) = fixture().await;
+    let writer = rusqlite::Connection::open(config.state_dir.join("drafts.sqlite")).unwrap();
+    writer
+        .execute_batch("PRAGMA locking_mode = EXCLUSIVE; BEGIN EXCLUSIVE")
+        .unwrap();
+    let release = async move {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        writer.execute_batch("ROLLBACK").unwrap();
+        drop(writer);
+    };
+    let (_, receipt) = tokio::join!(
+        release,
+        execute(&service, save(&identity, uuid::Uuid::new_v4()))
+    );
+    assert_eq!(receipt["state"], "created_reference_unavailable");
+    assert!(!config.state_dir.join("drafts.suspended").exists());
+}
+
+#[tokio::test]
+async fn opening_contended_history_obeys_the_initialization_deadline() {
+    let (_installation, mut config, service, identity) = fixture().await;
+    drop(service);
+    config.limits.initialization_seconds = 1;
+    for grant in &mut config.grants {
+        grant.limits.initialization_seconds = 1;
+    }
+    Service::setup(config.clone()).unwrap();
+    let service = Service::open(config.clone()).unwrap();
+    let writer = rusqlite::Connection::open(config.state_dir.join("drafts.sqlite")).unwrap();
+    writer
+        .execute_batch("PRAGMA locking_mode = EXCLUSIVE; BEGIN EXCLUSIVE")
+        .unwrap();
+    let started = std::time::Instant::now();
+    assert_eq!(
+        failure(
+            &service,
+            save(&identity, uuid::Uuid::new_v4()),
+            "writer",
+            false
+        )
+        .await,
+        mailctl::domain::ErrorCode::RateLimited
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    assert!(!config.state_dir.join("drafts.suspended").exists());
+}
+
+#[tokio::test]
 async fn sqlite_contention_never_blocks_the_async_executor_for_its_busy_timeout() {
     let (_installation, mut config, service, identity) = fixture().await;
     drop(service);

@@ -44,14 +44,7 @@ pub(super) fn private_files(directory: &Path) -> Result<(), Error> {
         match crate::file_storage::inspect(&directory.join(name)) {
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                eprintln!(
-                    "draft file inspection {name}: {:?} {:?}",
-                    error.kind(),
-                    error.raw_os_error()
-                );
-                return Err(unavailable());
-            }
+            Err(_) => return Err(unavailable()),
         }
     }
     Ok(())
@@ -137,7 +130,9 @@ impl DraftHistory {
         }
         let journal =
             DraftJournal::open_existing_nowait(directory.join(JOURNAL)).map_err(|error| {
-                eprintln!("draft journal opening: {error:?}");
+                if error == DraftJournalError::Busy {
+                    return Error::new(ErrorCode::RateLimited);
+                }
                 if error == DraftJournalError::InvalidDatabase {
                     let _ = Recovery::Suspended.persist(directory);
                 }
@@ -189,6 +184,26 @@ impl AccountRegistry {
         let mut history = DraftHistory::open(&lease.directory)?;
         history._lease = Some(lease.clone());
         Ok(history)
+    }
+    pub(in crate::service) async fn wait_for_draft_journal(
+        &self,
+        seconds: usize,
+    ) -> Result<DraftHistory, Error> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(seconds as u64);
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(Error::new(ErrorCode::RateLimited));
+            }
+            match self.draft_journal() {
+                Err(error) if error.code == ErrorCode::RateLimited => {
+                    tokio::time::sleep_until(
+                        (tokio::time::Instant::now() + Duration::from_millis(10)).min(deadline),
+                    )
+                    .await;
+                }
+                result => return result,
+            }
+        }
     }
     pub(in crate::service) async fn draft_writer(
         &self,
