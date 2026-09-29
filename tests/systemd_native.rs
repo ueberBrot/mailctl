@@ -50,7 +50,13 @@ fn launch(
     let mut command = unit(secret);
     command.arg(format!("--setenv=SSL_CERT_FILE={}", ca.display()));
     command
-        .arg(executable)
+        .arg(
+            installation
+                .config()
+                .parent()
+                .unwrap()
+                .join(Path::new(executable).file_name().unwrap()),
+        )
         .arg("--config")
         .arg(installation.config());
     command
@@ -92,6 +98,17 @@ async fn systemd_provisions_independent_components_and_rotates_at_unit_restart()
     }
     let original_config = toml::to_string(&config).unwrap();
     fs::write(installation.config(), &original_config).unwrap();
+    // The service identity cannot traverse a hosted runner's private checkout.
+    // Keep its executable inputs in the same disposable, owned directory.
+    for executable in COMPONENT_PATHS {
+        fs::copy(
+            executable,
+            directory.join(Path::new(executable).file_name().unwrap()),
+        )
+        .unwrap();
+    }
+    let worker = directory.join("systemd-worker-tests");
+    fs::copy(std::env::current_exe().unwrap(), &worker).unwrap();
     let mut ownership = Command::new("chown");
     ownership.args(["-R", "65534:65534"]).arg(directory);
     assert_success(&run_bounded(ownership));
@@ -120,7 +137,7 @@ async fn systemd_provisions_independent_components_and_rotates_at_unit_restart()
     let mut workers = unit(Some(&secret));
     workers
         .arg("--setenv=MAILCTL_SYSTEMD_WORKER_PROBE=1")
-        .arg(std::env::current_exe().unwrap())
+        .arg(&worker)
         .args([
             "--exact",
             "systemd_workers_are_bounded_and_process_local",
