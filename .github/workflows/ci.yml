@@ -49,6 +49,15 @@ jobs:
         shell: bash
         env:
           MAILCTL_FEATURES: ${{ matrix.features }}
+      - name: Repeat concurrent Windows draft acceptance
+        if: matrix.os == 'windows-latest' && matrix.features == 'cli,mcp'
+        shell: pwsh
+        run: |
+          1..20 | ForEach-Object {
+            cargo test --locked -p mailctl-process-tests --test drafts `
+              independent_cli_and_mcp_create_once_and_inspect_without_provider_work -- --exact
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
 
   greenmail:
     runs-on: ubuntu-latest

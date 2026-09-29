@@ -682,6 +682,9 @@ fn sqlite_generation(generation: u64) -> Result<i64, DraftJournalError> {
 }
 
 fn unavailable(error: rusqlite::Error) -> DraftJournalError {
+    if let rusqlite::Error::SqliteFailure(code, _) = &error {
+        eprintln!("draft sqlite error: {}", code.extended_code);
+    }
     match error {
         rusqlite::Error::InvalidColumnType(..)
         | rusqlite::Error::FromSqlConversionFailure(..)

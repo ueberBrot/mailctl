@@ -44,7 +44,14 @@ pub(super) fn private_files(directory: &Path) -> Result<(), Error> {
         match crate::file_storage::inspect(&directory.join(name)) {
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return Err(unavailable()),
+            Err(error) => {
+                eprintln!(
+                    "draft file inspection {name}: {:?} {:?}",
+                    error.kind(),
+                    error.raw_os_error()
+                );
+                return Err(unavailable());
+            }
         }
     }
     Ok(())
@@ -130,6 +137,7 @@ impl DraftHistory {
         }
         let journal =
             DraftJournal::open_existing_nowait(directory.join(JOURNAL)).map_err(|error| {
+                eprintln!("draft journal opening: {error:?}");
                 if error == DraftJournalError::InvalidDatabase {
                     let _ = Recovery::Suspended.persist(directory);
                 }

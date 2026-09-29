@@ -50,13 +50,7 @@ fn launch(
     let mut command = unit(secret);
     command.arg(format!("--setenv=SSL_CERT_FILE={}", ca.display()));
     command
-        .arg(
-            installation
-                .config()
-                .parent()
-                .unwrap()
-                .join(Path::new(executable).file_name().unwrap()),
-        )
+        .arg(executable)
         .arg("--config")
         .arg(installation.config());
     command
@@ -98,17 +92,6 @@ async fn systemd_provisions_independent_components_and_rotates_at_unit_restart()
     }
     let original_config = toml::to_string(&config).unwrap();
     fs::write(installation.config(), &original_config).unwrap();
-    // The service identity cannot traverse a hosted runner's private checkout.
-    // Keep its executable inputs in the same disposable, owned directory.
-    for executable in COMPONENT_PATHS {
-        fs::copy(
-            executable,
-            directory.join(Path::new(executable).file_name().unwrap()),
-        )
-        .unwrap();
-    }
-    let worker = directory.join("systemd-worker-tests");
-    fs::copy(std::env::current_exe().unwrap(), &worker).unwrap();
     let mut ownership = Command::new("chown");
     ownership.args(["-R", "65534:65534"]).arg(directory);
     assert_success(&run_bounded(ownership));
@@ -137,7 +120,7 @@ async fn systemd_provisions_independent_components_and_rotates_at_unit_restart()
     let mut workers = unit(Some(&secret));
     workers
         .arg("--setenv=MAILCTL_SYSTEMD_WORKER_PROBE=1")
-        .arg(&worker)
+        .arg(std::env::current_exe().unwrap())
         .args([
             "--exact",
             "systemd_workers_are_bounded_and_process_local",
@@ -303,25 +286,6 @@ async fn systemd_source_probe_in_an_independent_process() {
     }
     use mailctl::credentials::{Availability, source_for};
     assert_eq!(rustix::process::geteuid().as_raw(), 65534);
-    let credential_directory =
-        std::path::PathBuf::from(std::env::var_os("CREDENTIALS_DIRECTORY").unwrap());
-    for path in credential_directory.ancestors() {
-        let metadata = fs::symlink_metadata(path).unwrap();
-        use std::os::unix::fs::MetadataExt;
-        eprintln!(
-            "credential fixture directory owner={} mode={:o}",
-            metadata.uid(),
-            metadata.mode() & 0o7777
-        );
-    }
-    let metadata = fs::symlink_metadata(credential_directory.join("password")).unwrap();
-    use std::os::unix::fs::MetadataExt;
-    eprintln!(
-        "credential fixture file owner={} mode={:o} links={}",
-        metadata.uid(),
-        metadata.mode() & 0o7777,
-        metadata.nlink()
-    );
     let source = source_for(&CredentialSource::Systemd {
         name: "password".into(),
     });

@@ -73,11 +73,17 @@ pub(crate) fn open(path: &Path, options: &mut OpenOptions) -> io::Result<File> {
     Ok(file)
 }
 
-/// Inspect private state without opening descriptors owned by another storage module.
+/// Inspect private state without reading data or disturbing Unix record locks.
 pub(crate) fn inspect(path: &Path) -> io::Result<()> {
     #[cfg(windows)]
     {
-        open(path, OpenOptions::new().read(true)).map(|_| ())
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_READ_ATTRIBUTES, READ_CONTROL};
+        open(
+            path,
+            OpenOptions::new().access_mode(READ_CONTROL | FILE_READ_ATTRIBUTES),
+        )
+        .map(|_| ())
     }
     #[cfg(not(windows))]
     validate_file(&fs::symlink_metadata(path)?)
