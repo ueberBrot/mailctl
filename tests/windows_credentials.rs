@@ -9,7 +9,7 @@ use mailctl::{
     config::CredentialSource,
     credentials::{self, Availability, Secret},
 };
-use std::fs;
+use std::{fs, process::Command};
 use support::{Installation, assert_success, envelope, run_bounded};
 use uuid::Uuid;
 
@@ -56,12 +56,27 @@ fn command(installation: &Installation, executable: &str, arguments: &[&str]) ->
     envelope(&output)["result"].clone()
 }
 
+fn native_entry_count() -> usize {
+    let mut command = Command::new("cmdkey.exe");
+    command.arg("/list");
+    let output = run_bounded(command);
+    assert_success(&output);
+    String::from_utf8_lossy(&output.stdout)
+        .matches(".mailctl")
+        .count()
+}
+
 #[test]
 #[ignore = "requires an explicitly disposable Windows execution identity"]
 fn native_windows_credentials_cross_processes_and_rotate() {
     assert_eq!(
         std::env::var("MAILCTL_DISPOSABLE_WINDOWS").as_deref(),
         Ok("1")
+    );
+    assert_eq!(
+        native_entry_count(),
+        0,
+        "native acceptance requires an empty mailctl store"
     );
     let installation = Installation::empty();
     let binaries = executables();
@@ -155,6 +170,11 @@ fn native_windows_credentials_cross_processes_and_rotate() {
     );
     terminal::provision(&installation, second_binary, "renamed", ROTATED);
     assert_eq!(
+        native_entry_count(),
+        2,
+        "rename and rotation must not duplicate entries"
+    );
+    assert_eq!(
         command(
             &installation,
             first_binary,
@@ -227,6 +247,7 @@ fn native_windows_credentials_cross_processes_and_rotate() {
     );
     assert_eq!(source.availability(first), Availability::Missing);
     assert_eq!(source.availability(second), Availability::Missing);
+    assert_eq!(native_entry_count(), 0, "native fixture cleanup");
     server.finish();
 }
 

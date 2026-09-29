@@ -303,6 +303,25 @@ async fn systemd_source_probe_in_an_independent_process() {
     }
     use mailctl::credentials::{Availability, source_for};
     assert_eq!(rustix::process::geteuid().as_raw(), 65534);
+    let credential_directory =
+        std::path::PathBuf::from(std::env::var_os("CREDENTIALS_DIRECTORY").unwrap());
+    for path in credential_directory.ancestors() {
+        let metadata = fs::symlink_metadata(path).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        eprintln!(
+            "credential fixture directory owner={} mode={:o}",
+            metadata.uid(),
+            metadata.mode() & 0o7777
+        );
+    }
+    let metadata = fs::symlink_metadata(credential_directory.join("password")).unwrap();
+    use std::os::unix::fs::MetadataExt;
+    eprintln!(
+        "credential fixture file owner={} mode={:o} links={}",
+        metadata.uid(),
+        metadata.mode() & 0o7777,
+        metadata.nlink()
+    );
     let source = source_for(&CredentialSource::Systemd {
         name: "password".into(),
     });
