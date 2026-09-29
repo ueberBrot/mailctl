@@ -27,6 +27,9 @@ rcgen = { version = "=0.14.7", default-features = false, features = ["ring", "pe
 io-imap = { version = "=0.6.0", default-features = false }
 rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled"] }
 
+[target.'cfg(unix)'.dev-dependencies]
+rustix = { version = "1.1.4", features = ["fs", "process"] }
+
 [[bin]]
 name = "mailctl-test-cli"
 path = "src/bin/cli.rs"

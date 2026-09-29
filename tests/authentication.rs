@@ -397,28 +397,35 @@ async fn credentials_stay_bounded_after_an_operation_deadline() {
 
 #[tokio::test]
 async fn concurrent_authentications_share_only_the_in_flight_secret_resolution() {
-    let (port, roots, fixture) = fixture(3, false).await;
-    let limits = Limits::default();
-    let runtime = Arc::new(Runtime::new(limits.clone(), roots).unwrap());
-    let source = Source::new(true);
-    let account = account(port, source.clone());
-    let acquire = || {
-        let runtime = runtime.clone();
-        let account = account.clone();
-        let limits = limits.clone();
-        tokio::spawn(async move { runtime.acquire(&account, &limits).await })
-    };
-    let first = acquire();
-    source.wait_calls(1).await;
-    let second = acquire();
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    assert_eq!(source.calls.load(Ordering::SeqCst), 1);
-    source.unblock();
-    drop(first.await.unwrap().unwrap());
-    drop(second.await.unwrap().unwrap());
-    drop(runtime.acquire(&account, &limits).await.unwrap());
-    assert_eq!(source.calls.load(Ordering::SeqCst), 2);
-    fixture.await.unwrap();
+    for shared_limits in [true, false] {
+        let (port, roots, fixture) = fixture(3, false).await;
+        let limits = Limits::default();
+        let runtime = Arc::new(Runtime::new(limits.clone(), roots).unwrap());
+        let source = Source::new(true);
+        let account = account(port, source.clone());
+        let acquire = |limits: Limits| {
+            let runtime = runtime.clone();
+            let account = account.clone();
+            tokio::spawn(async move { runtime.acquire(&account, &limits).await })
+        };
+        let first = acquire(limits.clone());
+        source.wait_calls(1).await;
+        let mut second_limits = limits.clone();
+        if !shared_limits {
+            second_limits.command_stderr_bytes /= 2;
+        }
+        let second = acquire(second_limits);
+        let resolutions = if shared_limits { 1 } else { 2 };
+        source.wait_calls(resolutions).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(source.calls.load(Ordering::SeqCst), resolutions);
+        source.unblock();
+        drop(first.await.unwrap().unwrap());
+        drop(second.await.unwrap().unwrap());
+        drop(runtime.acquire(&account, &limits).await.unwrap());
+        assert_eq!(source.calls.load(Ordering::SeqCst), resolutions + 1);
+        fixture.await.unwrap();
+    }
 }
 
 #[tokio::test]

@@ -1,10 +1,13 @@
 //! Credential sources expose safe status separately from secret resolution.
 
-use crate::config::CredentialSource;
+use crate::config::{CredentialSource, Limits};
 pub use crate::domain::{CredentialFailure as SourceError, SourceAvailability as Availability};
 use std::{fmt, sync::Arc};
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
+
+#[cfg(unix)]
+mod command;
 
 #[cfg(target_os = "macos")]
 mod native;
@@ -94,6 +97,38 @@ impl From<SourceError> for Availability {
     }
 }
 
+/// Validated ceilings shared by credential execution and concurrent resolution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ResolutionLimits {
+    secret_bytes: usize,
+    stderr_bytes: usize,
+    timeout: std::time::Duration,
+}
+impl ResolutionLimits {
+    pub fn secret_bytes(&self) -> usize {
+        self.secret_bytes
+    }
+    pub fn stderr_bytes(&self) -> usize {
+        self.stderr_bytes
+    }
+    pub fn timeout(&self) -> std::time::Duration {
+        self.timeout
+    }
+}
+impl TryFrom<&Limits> for ResolutionLimits {
+    type Error = SourceError;
+    fn try_from(limits: &Limits) -> Result<Self, Self::Error> {
+        limits.validate().map_err(|_| SourceError::Unavailable)?;
+        Ok(Self {
+            secret_bytes: limits.secret_bytes,
+            stderr_bytes: limits.command_stderr_bytes,
+            timeout: std::time::Duration::from_secs(
+                limits.secret_command_seconds.min(limits.operation_seconds) as u64,
+            ),
+        })
+    }
+}
+
 /// Blocking operations run on the application's bounded credential workers.
 pub trait SecretSource: Send + Sync {
     /// Safe provisioning or platform requirements, without inspecting the source.
@@ -103,6 +138,18 @@ pub trait SecretSource: Send + Sync {
     /// Inspects metadata without authentication, secret retrieval, or prompting.
     fn availability(&self, account: Uuid) -> Availability;
     fn resolve(&self, account: Uuid) -> Result<Secret, SourceError>;
+    /// Resolution uses the caller's effective resource ceilings.
+    fn resolve_with_limits(
+        &self,
+        account: Uuid,
+        limits: &ResolutionLimits,
+    ) -> Result<Secret, SourceError> {
+        let secret = self.resolve(account)?;
+        if secret.len() > limits.secret_bytes {
+            return Err(SourceError::InvalidSecret);
+        }
+        Ok(secret)
+    }
     fn mutable_store(&self) -> Option<&dyn MutableSecretStore> {
         None
     }
@@ -125,9 +172,12 @@ pub fn source_for(source: &CredentialSource) -> Arc<dyn SecretSource> {
             failure: SourceError::Unavailable,
             prerequisite: "Systemd credentials need provisioning for the execution identity; source resolution is unavailable in this build",
         }),
-        CredentialSource::Command { .. } => Arc::new(DeferredSource {
+        #[cfg(unix)]
+        CredentialSource::Command(config) => Arc::new(command::CommandSource::new(config.clone())),
+        #[cfg(not(unix))]
+        CredentialSource::Command(_) => Arc::new(DeferredSource {
             failure: SourceError::Unavailable,
-            prerequisite: "Trusted credential commands need a provisioned helper; source execution is unavailable in this build",
+            prerequisite: "Trusted credential commands require a supported Unix execution environment",
         }),
     }
 }
@@ -145,7 +195,7 @@ fn native_source() -> Arc<dyn SecretSource> {
     })
 }
 
-// Platform qualification and external-source execution belong to later slices.
+// Sources unsupported by this build still expose safe provisioning status.
 struct DeferredSource {
     failure: SourceError,
     prerequisite: &'static str,

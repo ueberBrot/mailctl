@@ -2,7 +2,7 @@
 
 use crate::{
     config::{AccountConfig, Limits, TlsMode},
-    credentials::{Availability, Secret, SecretSource, SourceError},
+    credentials::{Availability, ResolutionLimits, Secret, SecretSource, SourceError},
     imap::{self, AuthenticatedConnection, ImapEndpoint},
 };
 use std::{
@@ -46,7 +46,7 @@ pub struct Runtime {
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum WorkKind {
     Inspect,
-    Resolve,
+    Resolve(ResolutionLimits),
 }
 #[derive(Clone)]
 enum Work {
@@ -400,6 +400,8 @@ impl Runtime {
             || limits.wire_fetch_bytes > self.limits.wire_fetch_bytes
             || limits.account_connections > self.limits.account_connections
             || limits.account_pending_requests > self.limits.account_pending_requests
+            || limits.command_stderr_bytes > self.limits.command_stderr_bytes
+            || limits.secret_command_seconds > self.limits.secret_command_seconds
             || limits.secret_bytes > self.limits.secret_bytes
             || limits.operation_seconds > self.limits.operation_seconds
             || limits.connection_seconds > self.limits.connection_seconds
@@ -482,7 +484,9 @@ impl Runtime {
                         account.id,
                         account.generation,
                         account.source.clone(),
-                        WorkKind::Resolve,
+                        WorkKind::Resolve(
+                            ResolutionLimits::try_from(limits).map_err(Error::Source)?,
+                        ),
                         limits,
                     )
                     .await?
@@ -587,8 +591,8 @@ impl Runtime {
                                 let _worker = admission;
                                 match kind {
                                     WorkKind::Inspect => Ok(Work::Availability(source.availability(id))),
-                                    WorkKind::Resolve => source
-                                        .resolve(id)
+                                    WorkKind::Resolve(resolution_limits) => source
+                                        .resolve_with_limits(id, &resolution_limits)
                                         .map(|secret| Work::Secret(Arc::new(secret)))
                                         .map_err(Error::Source),
                                 }

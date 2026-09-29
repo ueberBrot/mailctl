@@ -13,6 +13,9 @@ use tokio_rustls::rustls::{
 pub struct FixtureHost;
 impl HostEnvironment for FixtureHost {
     fn credential_source(&self, source: &CredentialSource) -> Arc<dyn SecretSource> {
+        if matches!(source, CredentialSource::Command(_)) {
+            return mailctl::credentials::source_for(source);
+        }
         Arc::new(FixtureSecret(matches!(source, CredentialSource::Native {})))
     }
     fn tls_roots(&self) -> Result<RootCertStore, SourceError> {

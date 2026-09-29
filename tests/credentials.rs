@@ -1,5 +1,5 @@
 use mailctl::{
-    config::CredentialSource,
+    config::{CredentialCommand, CredentialSource},
     credentials::{Availability, Secret, SourceError, source_for},
 };
 use uuid::Uuid;
@@ -41,16 +41,17 @@ fn unattended_session_sources_require_interaction_without_a_mutable_store() {
 }
 
 #[test]
-fn deferred_external_sources_never_execute_helpers_or_open_credential_files() {
+fn unprovisioned_external_sources_are_unavailable_without_a_mutable_store() {
     for configuration in [
         CredentialSource::Systemd {
             path: std::env::temp_dir().join("unprovisioned-secret"),
         },
-        CredentialSource::Command {
+        CredentialSource::Command(CredentialCommand {
             executable: std::env::temp_dir().join("unprovisioned-helper"),
             args: vec![],
             working_dir: std::env::temp_dir(),
-        },
+            protected_paths: vec![],
+        }),
     ] {
         let source = source_for(&configuration);
         let account = Uuid::new_v4();

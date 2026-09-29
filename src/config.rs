@@ -121,16 +121,35 @@ pub enum TlsMode {
 #[serde(tag = "source", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CredentialSource {
     Native {},
-    Systemd {
-        path: PathBuf,
-    },
-    Command {
-        executable: PathBuf,
-        #[serde(default)]
-        args: Vec<String>,
-        working_dir: PathBuf,
-    },
+    Systemd { path: PathBuf },
+    Command(CredentialCommand),
     Session {},
+}
+/// Operator-owned command reference; values contain no credential material.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialCommand {
+    pub executable: PathBuf,
+    #[serde(default)]
+    pub args: Vec<String>,
+    pub working_dir: PathBuf,
+    #[serde(default)]
+    pub protected_paths: Vec<PathBuf>,
+}
+impl CredentialCommand {
+    pub(crate) const MAX_ARGS: usize = 64;
+
+    pub(crate) fn valid(&self) -> bool {
+        safe_path(&self.executable)
+            && safe_path(&self.working_dir)
+            && self.protected_paths.len() <= 64
+            && self.protected_paths.iter().all(|path| safe_path(path))
+            && self.args.len() <= Self::MAX_ARGS
+            && self
+                .args
+                .iter()
+                .all(|arg| arg.len() <= 4096 && !arg.contains('\0'))
+    }
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -302,19 +321,7 @@ impl Config {
             }
             match &account.credential {
                 CredentialSource::Systemd { path } if !safe_path(path) => return Err(invalid()),
-                CredentialSource::Command {
-                    executable,
-                    args,
-                    working_dir,
-                } if !safe_path(executable)
-                    || !safe_path(working_dir)
-                    || args.len() > 64
-                    || args
-                        .iter()
-                        .any(|arg| arg.len() > 4096 || arg.contains('\0')) =>
-                {
-                    return Err(invalid());
-                }
+                CredentialSource::Command(command) if !command.valid() => return Err(invalid()),
                 _ => {}
             }
         }

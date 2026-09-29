@@ -105,3 +105,16 @@ const _: fn(Error) = |error| {
         let _: Option<u32> = operation.uid_validity;
     }
 };
+
+const _: fn(&dyn mailctl::credentials::SecretSource, &mailctl::config::Limits) =
+    |source, configured| {
+        use mailctl::credentials::{ResolutionLimits, Secret, SourceError};
+        let limits: Result<ResolutionLimits, SourceError> = configured.try_into();
+        if let Ok(limits) = limits {
+            let _: usize = limits.secret_bytes();
+            let _: usize = limits.stderr_bytes();
+            let _: std::time::Duration = limits.timeout();
+            let _: Result<Secret, SourceError> =
+                source.resolve_with_limits(uuid::Uuid::nil(), &limits);
+        }
+    };
