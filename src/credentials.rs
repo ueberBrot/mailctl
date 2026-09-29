@@ -9,6 +9,9 @@ use zeroize::{Zeroize, Zeroizing};
 #[cfg(unix)]
 mod command;
 
+#[cfg(target_os = "linux")]
+mod systemd;
+
 #[cfg(target_os = "macos")]
 mod native;
 #[cfg(target_os = "macos")]
@@ -168,9 +171,12 @@ pub fn source_for(source: &CredentialSource) -> Arc<dyn SecretSource> {
             failure: SourceError::InteractionRequired,
             prerequisite: "Foreground session credential resolution is unavailable in this build",
         }),
+        #[cfg(target_os = "linux")]
+        CredentialSource::Systemd { name } => Arc::new(systemd::SystemdSource::new(name.clone())),
+        #[cfg(not(target_os = "linux"))]
         CredentialSource::Systemd { .. } => Arc::new(DeferredSource {
             failure: SourceError::Unavailable,
-            prerequisite: "Systemd credentials need provisioning for the execution identity; source resolution is unavailable in this build",
+            prerequisite: "Systemd credentials require Linux and explicit provisioning with LoadCredential= for the execution identity",
         }),
         #[cfg(unix)]
         CredentialSource::Command(config) => Arc::new(command::CommandSource::new(config.clone())),

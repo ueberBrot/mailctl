@@ -42,17 +42,7 @@ fn unattended_session_sources_require_interaction_without_a_mutable_store() {
 
 #[test]
 fn unprovisioned_external_sources_are_unavailable_without_a_mutable_store() {
-    for configuration in [
-        CredentialSource::Systemd {
-            path: std::env::temp_dir().join("unprovisioned-secret"),
-        },
-        CredentialSource::Command(CredentialCommand {
-            executable: std::env::temp_dir().join("unprovisioned-helper"),
-            args: vec![],
-            working_dir: std::env::temp_dir(),
-            protected_paths: vec![],
-        }),
-    ] {
+    let assert_unavailable = |configuration| {
         let source = source_for(&configuration);
         let account = Uuid::new_v4();
         assert_eq!(source.availability(account), Availability::Unavailable);
@@ -61,5 +51,15 @@ fn unprovisioned_external_sources_are_unavailable_without_a_mutable_store() {
             SourceError::Unavailable
         );
         assert!(source.mutable_store().is_none());
-    }
+    };
+    assert_unavailable(CredentialSource::Command(CredentialCommand {
+        executable: std::env::temp_dir().join("unprovisioned-helper"),
+        args: vec![],
+        working_dir: std::env::temp_dir(),
+        protected_paths: vec![],
+    }));
+    #[cfg(not(target_os = "linux"))]
+    assert_unavailable(CredentialSource::Systemd {
+        name: "unprovisioned-secret".into(),
+    });
 }

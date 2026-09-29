@@ -121,7 +121,7 @@ pub enum TlsMode {
 #[serde(tag = "source", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CredentialSource {
     Native {},
-    Systemd { path: PathBuf },
+    Systemd { name: String },
     Command(CredentialCommand),
     Session {},
 }
@@ -320,7 +320,9 @@ impl Config {
                 return Err(invalid());
             }
             match &account.credential {
-                CredentialSource::Systemd { path } if !safe_path(path) => return Err(invalid()),
+                CredentialSource::Systemd { name } if !systemd_credential_name(name) => {
+                    return Err(invalid());
+                }
                 CredentialSource::Command(command) if !command.valid() => return Err(invalid()),
                 _ => {}
             }
@@ -396,4 +398,8 @@ fn server_name(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b':'))
+}
+
+pub(crate) fn systemd_credential_name(name: &str) -> bool {
+    identifier(name) && name != "." && name != ".."
 }
