@@ -130,6 +130,9 @@ impl DraftHistory {
         }
         let journal =
             DraftJournal::open_existing_nowait(directory.join(JOURNAL)).map_err(|error| {
+                if error == DraftJournalError::Busy {
+                    return Error::new(ErrorCode::RateLimited);
+                }
                 if error == DraftJournalError::InvalidDatabase {
                     let _ = Recovery::Suspended.persist(directory);
                 }
@@ -182,6 +185,26 @@ impl AccountRegistry {
         history._lease = Some(lease.clone());
         Ok(history)
     }
+    pub(in crate::service) async fn wait_for_draft_journal(
+        &self,
+        seconds: usize,
+    ) -> Result<DraftHistory, Error> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(seconds as u64);
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(Error::new(ErrorCode::RateLimited));
+            }
+            match self.draft_journal() {
+                Err(error) if error.code == ErrorCode::RateLimited => {
+                    tokio::time::sleep_until(
+                        (tokio::time::Instant::now() + Duration::from_millis(10)).min(deadline),
+                    )
+                    .await;
+                }
+                result => return result,
+            }
+        }
+    }
     pub(in crate::service) async fn draft_writer(
         &self,
         account: Uuid,
@@ -198,7 +221,10 @@ impl AccountRegistry {
                     if tokio::time::Instant::now() >= deadline {
                         return Err(Error::new(ErrorCode::RateLimited));
                     }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    tokio::time::sleep_until(
+                        (tokio::time::Instant::now() + Duration::from_millis(10)).min(deadline),
+                    )
+                    .await;
                 }
                 Err(_) => return Err(unavailable()),
             }

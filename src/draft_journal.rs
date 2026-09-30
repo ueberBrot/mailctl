@@ -77,6 +77,7 @@ pub struct PersistedDraftOperation {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DraftJournalError {
     Unavailable,
+    Busy,
     Full,
     InvalidDatabase,
     InvalidOperation,
@@ -89,6 +90,7 @@ impl fmt::Display for DraftJournalError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let message = match self {
             Self::Unavailable => "The draft journal is unavailable",
+            Self::Busy => "The draft journal is busy",
             Self::Full => "The draft journal is full",
             Self::InvalidDatabase => "The draft journal is invalid",
             Self::InvalidOperation => "The draft operation is invalid",
@@ -683,6 +685,14 @@ fn sqlite_generation(generation: u64) -> Result<i64, DraftJournalError> {
 
 fn unavailable(error: rusqlite::Error) -> DraftJournalError {
     match error {
+        rusqlite::Error::SqliteFailure(error, _)
+            if matches!(
+                error.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            ) =>
+        {
+            DraftJournalError::Busy
+        }
         rusqlite::Error::InvalidColumnType(..)
         | rusqlite::Error::FromSqlConversionFailure(..)
         | rusqlite::Error::IntegralValueOutOfRange(..)

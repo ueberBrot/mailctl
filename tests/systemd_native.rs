@@ -12,13 +12,6 @@ use support::{Installation, assert_success, envelope, run_bounded};
 const FIRST: &str = "disposable-password";
 const ROTATED: &str = " rotated-password ";
 
-const COMPONENT_PATHS: &[&str] = &[
-    #[cfg(feature = "cli")]
-    support::MAILCTL,
-    #[cfg(feature = "mcp")]
-    support::MAILCTL_MCP,
-];
-
 fn unit(secret: Option<&Path>) -> Command {
     let mut command = Command::new("systemd-run");
     command.args([
@@ -42,7 +35,7 @@ fn unit(secret: Option<&Path>) -> Command {
 }
 
 fn launch(
-    executable: &str,
+    executable: &Path,
     installation: &Installation,
     secret: Option<&Path>,
     ca: &Path,
@@ -77,6 +70,20 @@ async fn systemd_provisions_independent_components_and_rotates_at_unit_restart()
     );
     let installation = Installation::two_accounts();
     let directory = installation.config().parent().unwrap();
+    #[cfg(feature = "cli")]
+    let cli = installation.copy_executable(support::MAILCTL, "mailctl");
+    #[cfg(feature = "mcp")]
+    let mcp = installation.copy_executable(support::MAILCTL_MCP, "mailctl-mcp");
+    let executables: &[&Path] = &[
+        #[cfg(feature = "cli")]
+        &cli,
+        #[cfg(feature = "mcp")]
+        &mcp,
+    ];
+    let test_executable = installation.copy_executable(
+        std::env::current_exe().unwrap().to_str().unwrap(),
+        "systemd-native-tests",
+    );
     let mut server = server::ImapServer::new(directory);
     let mut config = Config::parse(&fs::read_to_string(installation.config()).unwrap()).unwrap();
     config.limits.connection_lifetime_seconds = 3;
@@ -120,7 +127,7 @@ async fn systemd_provisions_independent_components_and_rotates_at_unit_restart()
     let mut workers = unit(Some(&secret));
     workers
         .arg("--setenv=MAILCTL_SYSTEMD_WORKER_PROBE=1")
-        .arg(std::env::current_exe().unwrap())
+        .arg(&test_executable)
         .args([
             "--exact",
             "systemd_workers_are_bounded_and_process_local",
@@ -128,7 +135,7 @@ async fn systemd_provisions_independent_components_and_rotates_at_unit_restart()
         ]);
     assert_success(&run_bounded(workers));
 
-    for executable in COMPONENT_PATHS {
+    for executable in executables {
         let mut setup = launch(executable, &installation, None, &server.certificate);
         setup.args(["--json", "setup"]);
         assert_success(&run_bounded(setup));
@@ -179,7 +186,7 @@ async fn systemd_provisions_independent_components_and_rotates_at_unit_restart()
             private_output(&output);
         }
     }
-    for executable in COMPONENT_PATHS {
+    for executable in executables {
         for password in [FIRST, ROTATED] {
             fs::write(&secret, password).unwrap();
             server.expect("work@example.test", password);
@@ -216,7 +223,7 @@ async fn systemd_provisions_independent_components_and_rotates_at_unit_restart()
         }
     }
     #[cfg(feature = "mcp")]
-    mcp_rotation(&installation, &secret, &server).await;
+    mcp_rotation(&mcp, &installation, &secret, &server).await;
     assert_eq!(
         fs::read_to_string(installation.config()).unwrap(),
         original_config
@@ -225,17 +232,17 @@ async fn systemd_provisions_independent_components_and_rotates_at_unit_restart()
 }
 
 #[cfg(feature = "mcp")]
-async fn mcp_rotation(installation: &Installation, secret: &Path, server: &server::ImapServer) {
+async fn mcp_rotation(
+    executable: &Path,
+    installation: &Installation,
+    secret: &Path,
+    server: &server::ImapServer,
+) {
     use rmcp::{ServiceExt, model::CallToolRequestParams, transport::TokioChildProcess};
     use tokio::io::AsyncReadExt;
     for initial in [FIRST, ROTATED] {
         fs::write(secret, initial).unwrap();
-        let command = launch(
-            support::MAILCTL_MCP,
-            installation,
-            Some(secret),
-            &server.certificate,
-        );
+        let command = launch(executable, installation, Some(secret), &server.certificate);
         let (transport, stderr) =
             TokioChildProcess::builder(tokio::process::Command::from(command))
                 .stderr(std::process::Stdio::piped())

@@ -304,7 +304,10 @@ impl Service {
         {
             Ok(writer) => writer,
             Err(error) if error.code == ErrorCode::RateLimited => {
-                let mut journal = self.registry.draft_journal()?;
+                let mut journal = self
+                    .registry
+                    .wait_for_draft_journal(limits.initialization_seconds)
+                    .await?;
                 if let Some(prior) = authorized_operation(&mut journal, &identity, &input.mailbox)?
                     && prior.state == DraftOperationState::InFlight
                 {
@@ -317,7 +320,10 @@ impl Service {
             }
             Err(error) => return Err(error),
         };
-        let mut journal = self.registry.draft_journal()?;
+        let mut journal = self
+            .registry
+            .wait_for_draft_journal(limits.initialization_seconds)
+            .await?;
         let mut prior = authorized_operation(&mut journal, &identity, &input.mailbox)?;
         if let Some(pending) = &prior
             && pending.state == DraftOperationState::InFlight
@@ -534,7 +540,10 @@ impl Service {
             {
                 Ok(writer) => Some(writer),
                 Err(error) if error.code == ErrorCode::RateLimited => {
-                    let mut journal = self.registry.draft_journal()?;
+                    let mut journal = self
+                        .registry
+                        .wait_for_draft_journal(limits.initialization_seconds)
+                        .await?;
                     if let Some(prior) =
                         authorized_operation(&mut journal, &identity, &input.mailbox)?
                         && prior.state == DraftOperationState::InFlight
@@ -548,7 +557,10 @@ impl Service {
         } else {
             None
         };
-        let mut journal = self.registry.draft_journal()?;
+        let mut journal = self
+            .registry
+            .wait_for_draft_journal(limits.initialization_seconds)
+            .await?;
         let mut prior = authorized_operation(&mut journal, &identity, &input.mailbox)?
             .ok_or_else(|| self.registry.absent_draft())?;
         if input.reconcile {

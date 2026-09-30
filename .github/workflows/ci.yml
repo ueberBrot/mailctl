@@ -49,6 +49,15 @@ jobs:
         shell: bash
         env:
           MAILCTL_FEATURES: ${{ matrix.features }}
+      - name: Repeat concurrent Windows draft acceptance
+        if: matrix.os == 'windows-latest' && matrix.features == 'cli,mcp'
+        shell: pwsh
+        run: |
+          1..20 | ForEach-Object {
+            cargo test --locked -p mailctl-process-tests --test drafts `
+              independent_cli_and_mcp_create_once_and_inspect_without_provider_work -- --exact
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
 
   greenmail:
     runs-on: ubuntu-latest
@@ -80,13 +89,22 @@ jobs:
         env:
           MAILCTL_FEATURES: ${{ matrix.features }}
         run: |
-          test_binary=$(cargo test --locked --no-default-features \
-            --features "$MAILCTL_FEATURES" --test systemd_native \
+          test_binaries=$(cargo test --locked --no-default-features \
+            --features "$MAILCTL_FEATURES" \
+            --test systemd_native --test systemd_credentials \
             --no-run --message-format=json |
-            jq -r 'select(.reason == "compiler-artifact" and
-              .target.name == "systemd_native" and .executable != null) |
-              .executable')
+            jq -s 'map(select(.reason == "compiler-artifact" and
+              .executable != null)) |
+              map({key: .target.name, value: .executable}) | from_entries')
+          test_binary=$(jq -r '.systemd_native // empty' <<<"$test_binaries")
+          acl_test_binary=$(jq -r '.systemd_credentials // empty' \
+            <<<"$test_binaries")
           test -n "$test_binary"
+          test -n "$acl_test_binary"
+          sudo env MAILCTL_DISPOSABLE_SYSTEMD=1 \
+            "$acl_test_binary" \
+            linux::systemd_source_accepts_only_the_service_user_acl \
+            --exact --ignored --nocapture --test-threads=1
           sudo env MAILCTL_DISPOSABLE_SYSTEMD=1 \
             "$test_binary" --ignored --nocapture --test-threads=1
           systemctl --version
@@ -94,6 +112,31 @@ jobs:
           for binary in target/debug/mailctl target/debug/mailctl-mcp; do
             if test -f "$binary"; then sha256sum "$binary"; fi
           done
+
+  windows-native-credentials:
+    strategy:
+      fail-fast: false
+      matrix:
+        features: [cli, mcp, 'cli,mcp']
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f  # v2.0.0
+      - name: Qualify Credential Manager on the disposable hosted Windows identity
+        shell: pwsh
+        env:
+          MAILCTL_FEATURES: ${{ matrix.features }}
+          MAILCTL_DISPOSABLE_WINDOWS: '1'
+        run: |
+          cargo test --locked --no-default-features --features "$env:MAILCTL_FEATURES" `
+            --test windows_credentials native_windows_credentials_cross_processes_and_rotate `
+            -- --ignored --nocapture --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-CimInstance Win32_OperatingSystem | Select-Object Caption, Version, OSArchitecture
+          Get-ChildItem target/debug/mailctl*.exe | Get-FileHash -Algorithm SHA256
 
   native-credentials:
     runs-on: macos-latest

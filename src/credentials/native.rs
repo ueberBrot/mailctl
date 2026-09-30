@@ -16,7 +16,6 @@ use std::{
     time::{Duration, Instant},
 };
 use uuid::Uuid;
-use zeroize::Zeroize;
 
 /// The Apple native store selected once for both executable entry points.
 pub struct NativeSource {
@@ -269,27 +268,13 @@ fn parse_default_keychain(output: &[u8]) -> Result<PathBuf, SourceError> {
 }
 
 fn source_error(error: keyring_core::Error) -> SourceError {
-    match error {
-        keyring_core::Error::NoEntry => SourceError::Missing,
-        keyring_core::Error::PlatformFailure(error)
-        | keyring_core::Error::NoStorageAccess(error) => error
+    super::keyring_error(error, |error| {
+        error
             .downcast_ref::<PlatformError>()
             .map_or(SourceError::Unavailable, |error| {
                 platform_code(error.code())
-            }),
-        keyring_core::Error::BadEncoding(mut bytes)
-        | keyring_core::Error::BadDataFormat(mut bytes, _) => {
-            bytes.zeroize();
-            SourceError::InvalidSecret
-        }
-        keyring_core::Error::TooLong(..) | keyring_core::Error::Invalid(..) => {
-            SourceError::InvalidSecret
-        }
-        keyring_core::Error::NoDefaultStore | keyring_core::Error::NotSupportedByStore(_) => {
-            SourceError::Unavailable
-        }
-        _ => SourceError::Internal,
-    }
+            })
+    })
 }
 
 fn platform_error(error: PlatformError) -> SourceError {

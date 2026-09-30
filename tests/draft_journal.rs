@@ -436,7 +436,7 @@ fn writer_lock_contention_fails_with_the_finite_busy_timeout() {
     let elapsed = started.elapsed();
     connection.execute_batch("ROLLBACK;").unwrap();
 
-    assert!(matches!(result, Err(DraftJournalError::Unavailable)));
+    assert!(matches!(result, Err(DraftJournalError::Busy)));
     assert!(elapsed >= Duration::from_secs(4));
     // SQLite accumulates requested sleeps; scheduler oversleep adds wall-clock time.
     assert!(elapsed < Duration::from_secs(15));
