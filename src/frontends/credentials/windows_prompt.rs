@@ -2,6 +2,7 @@ use crate::credentials::{Secret, SourceError};
 use std::{
     fs::File,
     io::{IsTerminal, Write},
+    mem::MaybeUninit,
     os::windows::io::{AsHandle, AsRawHandle},
     time::Duration,
 };
@@ -25,6 +26,23 @@ pub(super) fn require_foreground_terminal(
 )]
 mod console {
     use super::*;
+
+    #[derive(Default)]
+    struct InputRecord(INPUT_RECORD);
+    impl Drop for InputRecord {
+        fn drop(&mut self) {
+            unsafe {
+                std::slice::from_raw_parts_mut(
+                    // The record's padding and unused union storage need not
+                    // contain initialized bytes after a console read.
+                    std::ptr::from_mut(&mut self.0).cast::<MaybeUninit<u8>>(),
+                    size_of::<INPUT_RECORD>(),
+                )
+                .zeroize();
+            }
+        }
+    }
+
     pub(super) struct Terminal {
         input: File,
         output: File,
@@ -69,29 +87,25 @@ mod console {
         }
         pub(super) fn key(&self) -> Result<Option<(u16, u16)>, SourceError> {
             unsafe {
-                let mut record = INPUT_RECORD::default();
+                let mut record = InputRecord::default();
                 let mut count = 0;
-                if PeekConsoleInputW(self.input.as_raw_handle(), &mut record, 1, &mut count) == 0 {
+                if PeekConsoleInputW(self.input.as_raw_handle(), &mut record.0, 1, &mut count) == 0
+                {
                     return Err(SourceError::Unavailable);
                 }
                 if count == 0 {
                     return Ok(None);
                 }
-                if ReadConsoleInputW(self.input.as_raw_handle(), &mut record, 1, &mut count) == 0 {
+                if ReadConsoleInputW(self.input.as_raw_handle(), &mut record.0, 1, &mut count) == 0
+                {
                     return Err(SourceError::Unavailable);
                 }
-                if count != 0 && record.EventType == KEY_EVENT as u16 {
-                    let mut key = record.Event.KeyEvent;
-                    let value = key.uChar.UnicodeChar;
-                    let result =
-                        (key.bKeyDown != 0 && value != 0).then_some((value, key.wRepeatCount));
-                    key.uChar.UnicodeChar.zeroize();
-                    std::slice::from_raw_parts_mut(
-                        std::ptr::from_mut(&mut record).cast::<u8>(),
-                        size_of::<INPUT_RECORD>(),
-                    )
-                    .zeroize();
-                    return Ok(result);
+                if count != 0 && record.0.EventType == KEY_EVENT as u16 {
+                    let key = &record.0.Event.KeyEvent;
+                    let value = Zeroizing::new(key.uChar.UnicodeChar);
+                    return Ok(
+                        (key.bKeyDown != 0 && *value != 0).then_some((*value, key.wRepeatCount))
+                    );
                 }
                 Ok(None)
             }
@@ -112,12 +126,12 @@ pub(super) async fn prompt(maximum: usize) -> Result<Secret, SourceError> {
     let terminal = console::Terminal::open()?;
     let mut units = Zeroizing::new(Vec::<u16>::with_capacity(maximum + 1));
     loop {
-        let Some((mut key, repeat)) = terminal.key()? else {
+        let Some((key, repeat)) = terminal.key()? else {
             tokio::time::sleep(Duration::from_millis(10)).await;
             continue;
         };
-        if key == 13 {
-            key.zeroize();
+        let key = Zeroizing::new(key);
+        if *key == 13 {
             let mut text = Zeroizing::new(String::with_capacity(units.len() * 3));
             for character in char::decode_utf16(units.iter().copied()) {
                 text.push(character.map_err(|_| SourceError::InvalidSecret)?);
@@ -125,31 +139,25 @@ pub(super) async fn prompt(maximum: usize) -> Result<Secret, SourceError> {
             if text.len() > maximum {
                 return Err(SourceError::InvalidSecret);
             }
-            return Secret::new(text.as_bytes().to_vec());
+            return Secret::new(std::mem::take(&mut *text).into_bytes());
         }
         for _ in 0..repeat {
-            match key {
+            match *key {
                 8 => {
-                    let last = units.last().copied();
-                    if let Some(unit) = units.last_mut() {
-                        unit.zeroize();
-                    }
-                    units.pop();
-                    if last.is_some_and(|unit| (0xdc00..=0xdfff).contains(&unit)) {
-                        if let Some(unit) = units.last_mut() {
-                            unit.zeroize();
-                        }
-                        units.pop();
-                    }
+                    let start = match units.as_slice() {
+                        [.., 0xd800..=0xdbff, 0xdc00..=0xdfff] => units.len() - 2,
+                        _ => units.len().saturating_sub(1),
+                    };
+                    units[start..].zeroize();
+                    units.truncate(start);
                 }
                 21 => units.zeroize(),
                 3 | 4 | 26 => return Err(SourceError::Unavailable),
-                _ => units.push(key),
+                _ => units.push(*key),
             }
             if units.len() > maximum {
                 return Err(SourceError::InvalidSecret);
             }
         }
-        key.zeroize();
     }
 }

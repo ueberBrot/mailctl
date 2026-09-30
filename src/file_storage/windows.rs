@@ -16,7 +16,7 @@ use std::{
     ptr,
 };
 use windows_sys::Win32::{
-    Foundation::{ERROR_ALREADY_EXISTS, LocalFree},
+    Foundation::LocalFree,
     Security::{
         Authorization::{
             ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SE_FILE_OBJECT,
@@ -165,11 +165,13 @@ pub(super) fn inspect(file: &File) -> io::Result<()> {
 }
 
 pub(super) fn directory(path: &Path) -> io::Result<()> {
+    super::inspect_ancestors(path)?;
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)?;
-    if !file.metadata()?.is_dir() || super::redirected(&file.metadata()?) {
+    let metadata = file.metadata()?;
+    if !metadata.is_dir() || super::redirected(&metadata) {
         return Err(io::ErrorKind::InvalidData.into());
     }
     inspect(&file)
@@ -186,6 +188,14 @@ pub(super) fn create_directory(path: &Path) -> io::Result<()> {
     {
         create_directory(parent)?;
     }
+    match create_new_directory(path) {
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => directory(path),
+        result => result,
+    }
+}
+
+pub(super) fn create_new_directory(path: &Path) -> io::Result<()> {
+    super::inspect_ancestors(path)?;
     unsafe {
         let user = CurrentUser::new()?;
         let sid = user.sid_string()?;
@@ -215,10 +225,7 @@ pub(super) fn create_directory(path: &Path) -> io::Result<()> {
             return Err(io::ErrorKind::InvalidInput.into());
         }
         if CreateDirectoryW(path_wide.as_ptr(), &attributes) == 0 {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() != Some(ERROR_ALREADY_EXISTS as i32) {
-                return Err(error);
-            }
+            return Err(io::Error::last_os_error());
         }
     }
     directory(path)

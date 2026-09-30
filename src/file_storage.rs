@@ -9,6 +9,20 @@ use std::{
 mod windows;
 
 #[cfg(windows)]
+fn inspect_ancestors(path: &Path) -> io::Result<()> {
+    for ancestor in path
+        .ancestors()
+        .skip(1)
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        if redirected(&fs::symlink_metadata(ancestor)?) {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
 pub(crate) fn inspect_directory(path: &Path) -> io::Result<()> {
     windows::directory(path)
 }
@@ -28,6 +42,21 @@ pub(crate) fn create_directory(path: &Path) -> io::Result<()> {
         builder.mode(0o700);
     }
     builder.create(path)
+}
+
+pub(crate) fn create_new_directory(path: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    return windows::create_new_directory(path);
+    #[cfg(not(windows))]
+    {
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(path)
+    }
 }
 
 pub(crate) fn redirected(metadata: &fs::Metadata) -> bool {
@@ -55,15 +84,7 @@ pub(crate) fn open(path: &Path, options: &mut OpenOptions) -> io::Result<File> {
         use std::os::windows::fs::OpenOptionsExt;
         // Inspect reparse points themselves instead of following their targets.
         options.custom_flags(0x00200000);
-        for ancestor in path
-            .ancestors()
-            .skip(1)
-            .filter(|path| !path.as_os_str().is_empty())
-        {
-            if redirected(&fs::symlink_metadata(ancestor)?) {
-                return Err(io::ErrorKind::InvalidData.into());
-            }
-        }
+        inspect_ancestors(path)?;
     }
     let file = options.open(path)?;
     let metadata = file.metadata()?;

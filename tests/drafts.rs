@@ -539,21 +539,70 @@ async fn application_enforces_exact_frozen_mime_and_header_limits() {
 #[tokio::test]
 async fn opening_contended_history_yields_until_the_other_connection_closes() {
     let (_installation, config, service, identity) = fixture().await;
-    let writer = rusqlite::Connection::open(config.state_dir.join("drafts.sqlite")).unwrap();
-    writer
+    let request = save(&identity, uuid::Uuid::new_v4());
+    let mut reconcile = status(request.clone());
+    reconcile["input"]["reconcile"] = json!(true);
+    for request in [request.clone(), status(request), reconcile] {
+        let writer = rusqlite::Connection::open(config.state_dir.join("drafts.sqlite")).unwrap();
+        writer
+            .execute_batch("PRAGMA locking_mode = EXCLUSIVE; BEGIN EXCLUSIVE")
+            .unwrap();
+        let release = async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            writer.execute_batch("ROLLBACK").unwrap();
+            drop(writer);
+        };
+        let (_, actual) = tokio::join!(release, execute(&service, request));
+        assert_eq!(actual["state"], "created_reference_unavailable");
+        assert!(!config.state_dir.join("drafts.suspended").exists());
+    }
+}
+
+#[tokio::test]
+async fn cancelling_contended_history_opening_releases_the_writer_without_preparing_a_draft() {
+    let (_installation, config, service, identity) = fixture().await;
+    execute(&service, save(&identity, uuid::Uuid::new_v4())).await;
+    let request = save(&identity, uuid::Uuid::new_v4());
+    let database = rusqlite::Connection::open(config.state_dir.join("drafts.sqlite")).unwrap();
+    database
         .execute_batch("PRAGMA locking_mode = EXCLUSIVE; BEGIN EXCLUSIVE")
         .unwrap();
-    let release = async move {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        writer.execute_batch("ROLLBACK").unwrap();
-        drop(writer);
+    let writer = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(config.state_dir.join(format!(
+            "draft-{}.lock",
+            identity["account_id"].as_str().unwrap()
+        )))
+        .unwrap();
+    let context = service.context("writer", &Default::default()).unwrap();
+    let writer_is_held = async {
+        loop {
+            match writer.try_lock() {
+                Err(std::fs::TryLockError::WouldBlock) => break,
+                Ok(()) => writer.unlock().unwrap(),
+                Err(error) => panic!("inspect writer ownership: {error}"),
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     };
-    let (_, receipt) = tokio::join!(
-        release,
-        execute(&service, save(&identity, uuid::Uuid::new_v4()))
+    tokio::select! {
+        result = service.execute(&context, serde_json::from_value(request.clone()).unwrap()) => {
+            panic!("contended journal opening completed: {result:?}");
+        }
+        waiting = tokio::time::timeout(std::time::Duration::from_secs(1), writer_is_held) => {
+            waiting.expect("draft request acquired its writer before cancellation");
+        }
+    }
+    writer.try_lock().unwrap();
+    database.execute_batch("ROLLBACK").unwrap();
+    drop(database);
+    assert_eq!(
+        failure(&service, status(request.clone()), "writer", false).await,
+        mailctl::domain::ErrorCode::OperationNotFound
     );
-    assert_eq!(receipt["state"], "created_reference_unavailable");
-    assert!(!config.state_dir.join("drafts.suspended").exists());
+    writer.unlock().unwrap();
+    execute(&service, request).await;
 }
 
 #[tokio::test]

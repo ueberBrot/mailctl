@@ -15,7 +15,12 @@ use windows_sys::Win32::{
     System::{Console::*, Threading::DETACHED_PROCESS},
 };
 
-pub fn provision(installation: &Installation, binary: &str, alias: &str, secret: &str) {
+fn console_command(
+    installation: &Installation,
+    binary: &str,
+    alias: &str,
+    secret: &str,
+) -> Command {
     let mut command = Command::new(std::env::current_exe().unwrap());
     command
         .args(["--exact", "console_provision", "--ignored", "--nocapture"])
@@ -24,6 +29,11 @@ pub fn provision(installation: &Installation, binary: &str, alias: &str, secret:
         .env("MAILCTL_TEST_ALIAS", alias)
         .env("MAILCTL_TEST_SECRET", secret)
         .creation_flags(DETACHED_PROCESS);
+    command
+}
+
+pub fn provision(installation: &Installation, binary: &str, alias: &str, secret: &str) {
+    let command = console_command(installation, binary, alias, secret);
     assert_success(&run_bounded(command));
 }
 
@@ -34,30 +44,17 @@ pub fn session(
     secret: &str,
     certificate: &std::path::Path,
 ) {
-    let mut command = Command::new(std::env::current_exe().unwrap());
+    let mut command = console_command(installation, crate::support::MAILCTL, alias, secret);
     command
-        .args(["--exact", "console_provision", "--ignored", "--nocapture"])
-        .env("MAILCTL_TEST_BINARY", crate::support::MAILCTL)
-        .env("MAILCTL_TEST_CONFIG", installation.config())
-        .env("MAILCTL_TEST_ALIAS", alias)
-        .env("MAILCTL_TEST_SECRET", secret)
         .env("MAILCTL_TEST_SESSION", "1")
         .env("SSL_CERT_FILE", certificate)
-        .env_remove("SSL_CERT_DIR")
-        .creation_flags(DETACHED_PROCESS);
+        .env_remove("SSL_CERT_DIR");
     assert_success(&run_bounded(command));
 }
 
 pub fn cancel(installation: &Installation, binary: &str, alias: &str) {
-    let mut command = Command::new(std::env::current_exe().unwrap());
-    command
-        .args(["--exact", "console_provision", "--ignored", "--nocapture"])
-        .env("MAILCTL_TEST_BINARY", binary)
-        .env("MAILCTL_TEST_CONFIG", installation.config())
-        .env("MAILCTL_TEST_ALIAS", alias)
-        .env("MAILCTL_TEST_SECRET", "cancelled-synthetic-secret")
-        .env("MAILCTL_TEST_CANCEL", "1")
-        .creation_flags(DETACHED_PROCESS);
+    let mut command = console_command(installation, binary, alias, "cancelled-synthetic-secret");
+    command.env("MAILCTL_TEST_CANCEL", "1");
     assert_success(&run_bounded(command));
 }
 
@@ -134,7 +131,10 @@ pub fn child() {
     }
     let events: Vec<INPUT_RECORD> = secret
         .encode_utf16()
-        .chain((!cancel).then_some(13))
+        // Erasing an orphan low surrogate must retain the preceding character.
+        .chain([0xdc00, 8, 13].into_iter().filter(|_| !cancel))
+        // The prompt must discard keys queued after submission or cancellation.
+        .chain("unread-after-prompt".encode_utf16())
         .map(|unit| INPUT_RECORD {
             EventType: KEY_EVENT as u16,
             Event: INPUT_RECORD_0 {
@@ -175,6 +175,26 @@ pub fn child() {
         assert_success(&result);
     }
     assert_eq!(mode(handle), original);
+    unsafe {
+        let mut count = 0;
+        assert_ne!(GetNumberOfConsoleInputEvents(handle, &mut count), 0);
+        if count != 0 {
+            let mut pending = vec![INPUT_RECORD::default(); count as usize];
+            assert_ne!(
+                PeekConsoleInputW(handle, pending.as_mut_ptr(), count, &mut count),
+                0
+            );
+            pending.truncate(count as usize);
+            assert!(
+                pending.iter().all(|record| {
+                    record.EventType != KEY_EVENT as u16
+                        || record.Event.KeyEvent.bKeyDown == 0
+                        || record.Event.KeyEvent.uChar.UnicodeChar == 0
+                }),
+                "prompt left unread input for the terminal"
+            );
+        }
+    }
     let mut screen = vec![0u16; 4096];
     unsafe {
         let mut count = 0;
@@ -190,11 +210,15 @@ pub fn child() {
         );
         screen.truncate(count as usize);
     }
-    assert!(
-        !String::from_utf16_lossy(&screen).contains(&secret),
-        "secret echoed to console"
-    );
-    assert!(!String::from_utf8_lossy(&result.stdout).contains(&secret));
+    let screen = String::from_utf16_lossy(&screen);
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    for fragment in secret
+        .split(char::is_control)
+        .filter(|text| !text.is_empty())
+    {
+        assert!(!screen.contains(fragment), "secret echoed to console");
+        assert!(!stdout.contains(fragment));
+    }
 }
 fn mode(handle: HANDLE) -> u32 {
     let mut mode = 0;

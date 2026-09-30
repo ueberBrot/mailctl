@@ -89,13 +89,22 @@ jobs:
         env:
           MAILCTL_FEATURES: ${{ matrix.features }}
         run: |
-          test_binary=$(cargo test --locked --no-default-features \
-            --features "$MAILCTL_FEATURES" --test systemd_native \
+          test_binaries=$(cargo test --locked --no-default-features \
+            --features "$MAILCTL_FEATURES" \
+            --test systemd_native --test systemd_credentials \
             --no-run --message-format=json |
-            jq -r 'select(.reason == "compiler-artifact" and
-              .target.name == "systemd_native" and .executable != null) |
-              .executable')
+            jq -s 'map(select(.reason == "compiler-artifact" and
+              .executable != null)) |
+              map({key: .target.name, value: .executable}) | from_entries')
+          test_binary=$(jq -r '.systemd_native // empty' <<<"$test_binaries")
+          acl_test_binary=$(jq -r '.systemd_credentials // empty' \
+            <<<"$test_binaries")
           test -n "$test_binary"
+          test -n "$acl_test_binary"
+          sudo env MAILCTL_DISPOSABLE_SYSTEMD=1 \
+            "$acl_test_binary" \
+            linux::systemd_source_accepts_only_the_service_user_acl \
+            --exact --ignored --nocapture --test-threads=1
           sudo env MAILCTL_DISPOSABLE_SYSTEMD=1 \
             "$test_binary" --ignored --nocapture --test-threads=1
           systemctl --version

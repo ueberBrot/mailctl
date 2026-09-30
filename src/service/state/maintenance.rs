@@ -80,15 +80,7 @@ pub(in crate::service) fn backup(
     if !destination.is_absolute() || destination.starts_with(&maintenance.directory) {
         return Err(invalid());
     }
-    let builder = fs::DirBuilder::new();
-    #[cfg(unix)]
-    let builder = {
-        use std::os::unix::fs::DirBuilderExt;
-        let mut builder = builder;
-        builder.mode(0o700);
-        builder
-    };
-    builder.create(destination).map_err(|_| invalid())?;
+    file_storage::create_new_directory(destination).map_err(|_| invalid())?;
     let result = (|| {
         if storage::directory(destination, false)?.starts_with(&maintenance.directory) {
             return Err(invalid());

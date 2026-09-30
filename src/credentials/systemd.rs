@@ -1,6 +1,6 @@
 use super::{Availability, ResolutionLimits, Secret, SecretSource, SourceError};
 use crate::config::{Limits, systemd_credential_name};
-use rustix::fs::{Mode, OFlags, open, openat};
+use rustix::fs::{Mode, OFlags, fgetxattr, open, openat};
 use std::{
     fs::File,
     io::{self, Read},
@@ -23,7 +23,7 @@ impl SystemdSource {
         }
     }
 
-    fn open(&self, access: OFlags) -> Result<File, SourceError> {
+    fn open(&self) -> Result<File, SourceError> {
         if !systemd_credential_name(&self.name) {
             return Err(SourceError::AccessDenied);
         }
@@ -50,22 +50,40 @@ impl SystemdSource {
         }
         let metadata = directory.metadata().map_err(failure)?;
         if metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
-            return Err(SourceError::AccessDenied);
+            if metadata.uid() != 0 || metadata.mode() & 0o777 != 0o550 {
+                return Err(SourceError::AccessDenied);
+            }
+            // O_PATH descriptors cannot read xattrs. Open the pinned directory,
+            // keeping validation independent of later path replacements.
+            let readable = File::from(
+                openat(
+                    &directory,
+                    ".",
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(failure)?,
+            );
+            if !service_user_acl(&readable, uid, 5) {
+                return Err(SourceError::AccessDenied);
+            }
         }
         let file = File::from(
             openat(
                 &directory,
                 &self.name,
-                access | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
                 Mode::empty(),
             )
             .map_err(failure)?,
         );
         let metadata = file.metadata().map_err(failure)?;
         if !metadata.is_file()
-            || metadata.uid() != uid
-            || metadata.mode() & 0o777 != 0o400
             || metadata.nlink() != 1
+            || !((metadata.uid() == uid && metadata.mode() & 0o777 == 0o400)
+                || (metadata.uid() == 0
+                    && metadata.mode() & 0o777 == 0o440
+                    && service_user_acl(&file, uid, 4)))
         {
             return Err(SourceError::AccessDenied);
         }
@@ -81,7 +99,7 @@ impl SecretSource for SystemdSource {
     }
 
     fn availability(&self, _: Uuid) -> Availability {
-        self.open(OFlags::PATH)
+        self.open()
             .map(|_| Availability::Configured)
             .unwrap_or_else(Availability::from)
     }
@@ -95,7 +113,7 @@ impl SecretSource for SystemdSource {
         _: Uuid,
         limits: &ResolutionLimits,
     ) -> Result<Secret, SourceError> {
-        let file = self.open(OFlags::RDONLY)?;
+        let file = self.open()?;
         let limit = limits.secret_bytes();
         if file.metadata().map_err(failure)?.len() > limit as u64 {
             return Err(SourceError::InvalidSecret);
@@ -109,6 +127,36 @@ impl SecretSource for SystemdSource {
         }
         Secret::new(std::mem::take(&mut *bytes))
     }
+}
+
+fn service_user_acl(file: &File, uid: u32, permissions: u16) -> bool {
+    // systemd grants the service UID access through a POSIX ACL. The ACL mask
+    // appears as group mode bits even though the owning group has no access.
+    // Accept only owner + service UID, with no other user or group grants.
+    let mut acl = [0_u8; 44];
+    if fgetxattr(file, "system.posix_acl_access", &mut acl).ok() != Some(acl.len())
+        || acl[..4] != 2_u32.to_le_bytes()
+    {
+        return false;
+    }
+    // Linux POSIX ACL xattr entries: USER_OBJ, USER, GROUP_OBJ, MASK, OTHER.
+    let entries = [
+        (1_u16, permissions, u32::MAX),
+        (2, permissions, uid),
+        (4, 0, u32::MAX),
+        (16, permissions, u32::MAX),
+        (32, 0, u32::MAX),
+    ];
+    acl[4..]
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .zip(entries)
+        .all(|(entry, (tag, permissions, id))| {
+            entry[..2] == tag.to_le_bytes()
+                && entry[2..4] == permissions.to_le_bytes()
+                && entry[4..] == id.to_le_bytes()
+        })
 }
 
 fn failure(error: impl Into<io::Error>) -> SourceError {

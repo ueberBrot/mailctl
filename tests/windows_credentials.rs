@@ -7,7 +7,7 @@ mod support;
 mod terminal;
 use mailctl::{
     config::CredentialSource,
-    credentials::{self, Availability, Secret},
+    credentials::{self, Availability, Secret, SourceError},
 };
 use std::{fs, process::Command};
 use support::{Installation, assert_success, envelope, run_bounded};
@@ -17,8 +17,8 @@ const FIRST: &str = "first-synthetic-account-password";
 const SECOND: &str = "second-distinct-synthetic-password";
 const ROTATED: &str = "replacement-synthetic-password";
 
-fn executables() -> Vec<&'static str> {
-    vec![
+fn executables() -> &'static [&'static str] {
+    &[
         #[cfg(feature = "cli")]
         support::MAILCTL,
         #[cfg(feature = "mcp")]
@@ -134,16 +134,28 @@ fn native_windows_credentials_cross_processes_and_rotate() {
         &installation,
         first_binary,
         "work",
-        "synthetic-é🦀-password",
+        "discarded-before-clear\u{15}synthetic-é🦀x\u{8}🦀\u{8}-password",
     );
+    use keyring_core::api::CredentialStoreApi;
+    let entry = windows_native_keyring_store::Store::new()
+        .unwrap()
+        .build(credentials::SERVICE_NAME, &first.to_string(), None)
+        .unwrap();
     assert_eq!(
-        source.resolve(first).unwrap().len(),
-        "synthetic-é🦀-password".len()
+        entry.get_secret().unwrap(),
+        "synthetic-é🦀-password".as_bytes()
+    );
+    assert_eq!(entry.get_attributes().unwrap()["persistence"], "Local");
+    entry.set_secret(&[0xff]).unwrap();
+    assert_eq!(source.availability(first), Availability::Available);
+    assert_eq!(
+        source.resolve(first).unwrap_err(),
+        SourceError::InvalidSecret
     );
     terminal::provision(&installation, first_binary, "work", FIRST);
     terminal::provision(&installation, second_binary, "personal", SECOND);
     terminal::cancel(&installation, first_binary, "work");
-    for binary in &binaries {
+    for binary in binaries {
         for alias in ["work", "personal"] {
             assert_eq!(
                 command(
@@ -157,12 +169,15 @@ fn native_windows_credentials_cross_processes_and_rotate() {
     }
     assert_eq!(server.accepted(), 0);
     assert_eq!(source.resolve(first).unwrap().len(), FIRST.len());
-    source
-        .mutable_store()
-        .unwrap()
-        .set(first, &Secret::new(vec![b'x'; 2561]).unwrap())
-        .unwrap_err();
-    assert_eq!(source.resolve(first).unwrap().len(), FIRST.len());
+    assert_eq!(
+        source
+            .mutable_store()
+            .unwrap()
+            .set(first, &Secret::new(vec![b'x'; 2561]).unwrap())
+            .unwrap_err(),
+        SourceError::InvalidSecret
+    );
+    assert_eq!(entry.get_secret().unwrap(), FIRST.as_bytes());
     command(
         &installation,
         first_binary,
@@ -183,7 +198,7 @@ fn native_windows_credentials_cross_processes_and_rotate() {
         first.to_string()
     );
     assert_eq!(source.resolve(second).unwrap().len(), SECOND.len());
-    for binary in &binaries {
+    for binary in binaries {
         for (alias, username, secret) in [
             ("renamed", "work@example.test", ROTATED),
             ("personal", "personal@example.test", SECOND),
