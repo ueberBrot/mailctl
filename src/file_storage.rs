@@ -6,7 +6,7 @@ use std::{
 };
 
 #[cfg(windows)]
-mod windows;
+pub(crate) mod windows;
 
 #[cfg(windows)]
 fn inspect_ancestors(path: &Path) -> io::Result<()> {

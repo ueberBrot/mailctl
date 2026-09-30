@@ -1,10 +1,14 @@
-#![cfg(all(feature = "cli", target_os = "macos"))]
+#![cfg(all(feature = "cli", any(target_os = "macos", windows)))]
 #[path = "../../imap_support/mod.rs"]
 mod imap_support;
+#[cfg(windows)]
+#[path = "../../native_support/windows_export.rs"]
+mod native_support;
 #[path = "../../imap_support/process.rs"]
 mod server;
 #[path = "../../support/mod.rs"]
 mod support;
+#[cfg(target_os = "macos")]
 use std::os::unix::fs::PermissionsExt;
 use support::{Installation, assert_success, envelope, run_bounded};
 
@@ -13,7 +17,10 @@ fn cli_streams_attachment_to_approved_root_with_native_receipt() {
     let installation = Installation::two_accounts();
     let root = installation.config().parent().unwrap().join("exports");
     std::fs::create_dir(&root).unwrap();
+    #[cfg(target_os = "macos")]
     std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    #[cfg(windows)]
+    native_support::protect_root(&root);
     let mut server = server::ImapServer::new(installation.config().parent().unwrap());
     let configuration = std::fs::read_to_string(installation.config())
         .unwrap()
@@ -100,6 +107,17 @@ fn cli_streams_attachment_to_approved_root_with_native_receipt() {
         "bef57ec7f53a6d40beb640a780a639c83bc29ac8a9816f1fc6c5c6dcd93c4721"
     );
     assert_eq!(std::fs::read(root.join("fixture.bin")).unwrap(), b"abcdef");
+    #[cfg(windows)]
+    {
+        assert!(
+            receipt["filesystem"]
+                .as_str()
+                .unwrap()
+                .starts_with("windows:")
+        );
+        assert!(std::path::Path::new(receipt["path"].as_str().unwrap()).is_absolute());
+        native_support::assert_private(&root.join("fixture.bin"));
+    }
     assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
     let denied = run(&[
         "--grant",
@@ -113,6 +131,87 @@ fn cli_streams_attachment_to_approved_root_with_native_receipt() {
     ]);
     assert_eq!(envelope(&denied)["error"]["code"], "permission_denied");
     assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+    let unapproved = root.with_file_name("unapproved");
+    std::fs::create_dir(&unapproved).unwrap();
+    #[cfg(target_os = "macos")]
+    std::fs::set_permissions(&unapproved, std::fs::Permissions::from_mode(0o700)).unwrap();
+    #[cfg(windows)]
+    native_support::protect_root(&unapproved);
+    let accepted = server.accepted();
+    let denied = run(&[
+        "attachment",
+        "export",
+        "--attachment",
+        &reference,
+        "--root",
+        unapproved.to_str().unwrap(),
+    ]);
+    assert_eq!(envelope(&denied)["error"]["code"], "permission_denied");
+    assert_eq!(server.accepted(), accepted);
+    assert_eq!(std::fs::read_dir(&unapproved).unwrap().count(), 0);
+    for phase in [
+        server::AttachmentPhase::Start,
+        server::AttachmentPhase::Continue,
+    ] {
+        server.expect_attachment("work@example.test", "disposable-password", "INBOX", phase);
+    }
+    let downloaded = run(&["attachment", "get", "--attachment", &reference]);
+    assert_success(&downloaded);
+    assert_eq!(envelope(&downloaded)["result"]["bytes_base64"], "YWJjZGVm");
+    let oversized = format!("{}.txt", "x".repeat(257));
+    server.expect_attachment_named(
+        "work@example.test",
+        "disposable-password",
+        "INBOX",
+        server::AttachmentPhase::List,
+        &oversized,
+    );
+    let attachments = run(&["attachment", "list", "--message", &message]);
+    assert_success(&attachments);
+    assert!(envelope(&attachments)["result"]["attachments"][0]["display_name"].is_null());
+    let hostile = "../NUL.txt";
+    server.expect_attachment_named(
+        "work@example.test",
+        "disposable-password",
+        "INBOX",
+        server::AttachmentPhase::List,
+        hostile,
+    );
+    let attachments = run(&["attachment", "list", "--message", &message]);
+    assert_success(&attachments);
+    let attachment = envelope(&attachments)["result"]["attachments"][0].take();
+    assert_eq!(attachment["display_name"], hostile);
+    let reference = attachment["reference"].as_str().unwrap();
+    for phase in [
+        server::AttachmentPhase::Start,
+        server::AttachmentPhase::Continue,
+    ] {
+        server.expect_attachment_named(
+            "work@example.test",
+            "disposable-password",
+            "INBOX",
+            phase,
+            hostile,
+        );
+    }
+    let exported = run(&[
+        "attachment",
+        "export",
+        "--attachment",
+        reference,
+        "--root",
+        root.to_str().unwrap(),
+    ]);
+    assert_success(&exported);
+    let default_path = root.join("attachment.bin");
+    let default_receipt = envelope(&exported)["result"].take();
+    assert_eq!(default_receipt["path"], default_path.to_str().unwrap());
+    assert_eq!(default_receipt["sha256"], receipt["sha256"]);
+    assert_eq!(std::fs::read(&default_path).unwrap(), b"abcdef");
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 2);
+    #[cfg(windows)]
+    native_support::assert_private(&default_path);
+    std::fs::remove_file(default_path).unwrap();
     for cleanup_fails in [false, true] {
         server.expect_attachment(
             "work@example.test",
@@ -129,12 +228,17 @@ fn cli_streams_attachment_to_approved_root_with_native_receipt() {
                 "attachment",
                 "export",
                 "--attachment",
-                &reference,
+                reference,
                 "--root",
                 root.to_str().unwrap(),
             ])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x00000010); // CREATE_NEW_CONSOLE keeps Ctrl+C inside this fixture.
+        }
         let mut child = command.spawn().unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while server.interrupted() == interrupted || std::fs::read_dir(&root).unwrap().count() != 2
@@ -145,9 +249,27 @@ fn cli_streams_attachment_to_approved_root_with_native_receipt() {
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+        let partial = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .ends_with(".partial")
+            })
+            .expect("interrupted export owns a partial file");
         if cleanup_fails {
+            #[cfg(target_os = "macos")]
             std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o500)).unwrap();
+            #[cfg(windows)]
+            {
+                let mut permissions = std::fs::metadata(&partial).unwrap().permissions();
+                permissions.set_readonly(true);
+                std::fs::set_permissions(&partial, permissions).unwrap();
+            }
         }
+        #[cfg(target_os = "macos")]
         assert!(
             std::process::Command::new("/bin/kill")
                 .args(["-TERM", &child.id().to_string()])
@@ -155,6 +277,9 @@ fn cli_streams_attachment_to_approved_root_with_native_receipt() {
                 .unwrap()
                 .success()
         );
+        #[cfg(windows)]
+        native_support::cancel(child.id());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while child.try_wait().unwrap().is_none() {
             if std::time::Instant::now() > deadline {
                 child.kill().unwrap();
@@ -171,18 +296,17 @@ fn cli_streams_attachment_to_approved_root_with_native_receipt() {
                 "cancelled"
             }
         );
+        #[cfg(target_os = "macos")]
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
         if cleanup_fails {
             let diagnostics = String::from_utf8(cancelled.stderr).unwrap();
             assert!(diagnostics.contains("cleanup failed"));
-            assert!(!diagnostics.contains(&reference));
+            assert!(!diagnostics.contains(reference));
             assert!(!diagnostics.contains("disposable-password"));
             assert_eq!(std::fs::read_dir(&root).unwrap().count(), 2);
-            for entry in std::fs::read_dir(&root).unwrap().flatten() {
-                if entry.file_name().to_string_lossy().ends_with(".partial") {
-                    std::fs::remove_file(entry.path()).unwrap();
-                }
-            }
+            #[cfg(windows)]
+            native_support::clear_readonly(&partial);
+            std::fs::remove_file(partial).unwrap();
         }
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
     }

@@ -5,7 +5,10 @@ use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 #[path = "export/macos.rs"]
 mod native;
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
+#[path = "export/windows.rs"]
+mod native;
+#[cfg(not(any(target_os = "macos", windows)))]
 #[path = "export/unsupported.rs"]
 mod native;
 use native::NativeFile;
@@ -93,8 +96,7 @@ impl ExportWriter {
                 total_decoded_bytes,
                 sha256,
             } => {
-                let actual =
-                    crate::encoding::hex(std::mem::take(&mut self.digest).finalize().as_slice());
+                let actual = crate::encoding::hex(self.digest.finalize_reset().as_slice());
                 if *total_decoded_bytes != total || *sha256 != actual {
                     return Err(failed());
                 }
@@ -127,20 +129,20 @@ fn safe_name(name: &str) -> bool {
     if !valid {
         return false;
     }
-    let stem = name.split('.').next().unwrap_or("");
+    let stem = name.split('.').next().unwrap_or("").trim_end_matches(' ');
     !["CON", "PRN", "AUX", "NUL"]
         .iter()
         .any(|reserved| stem.eq_ignore_ascii_case(reserved))
-        && !(stem.len() == 4
-            && stem.get(..3).is_some_and(|prefix| {
-                prefix.eq_ignore_ascii_case("COM") || prefix.eq_ignore_ascii_case("LPT")
-            })
-            && stem.as_bytes()[3].is_ascii_digit())
+        && !(stem.get(..3).is_some_and(|prefix| {
+            prefix.eq_ignore_ascii_case("COM") || prefix.eq_ignore_ascii_case("LPT")
+        }) && stem.get(3..).is_some_and(|digit| {
+            matches!(digit.as_bytes(), [b'0'..=b'9']) || matches!(digit, "¹" | "²" | "³")
+        }))
 }
 fn failed() -> Error {
     Error::new(ErrorCode::ExportFailed)
 }
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 fn cleanup_failed() -> Error {
     Error::new(ErrorCode::ExportCleanupFailed)
 }

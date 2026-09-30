@@ -1,4 +1,7 @@
 #![cfg(any(feature = "cli", feature = "mcp"))]
+#[cfg(all(feature = "cli", windows))]
+#[path = "native_support/windows_export.rs"]
+mod native_support;
 mod support;
 
 #[cfg(feature = "cli")]
@@ -25,14 +28,19 @@ fn export_root_configuration_is_bounded_and_absolute() {
     }
 }
 
-#[cfg(all(feature = "cli", target_os = "macos"))]
+#[cfg(all(feature = "cli", any(target_os = "macos", windows)))]
 #[test]
 fn export_cleans_partial_after_reference_rejection() {
     let installation = support::Installation::two_accounts();
     let root = installation.config().parent().unwrap().join("exports");
     std::fs::create_dir(&root).unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    #[cfg(windows)]
+    native_support::protect_root(&root);
     let text = std::fs::read_to_string(installation.config()).unwrap();
     std::fs::write(
         installation.config(),

@@ -24,8 +24,9 @@ use windows_sys::Win32::{
         *,
     },
     Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_FLAG_OPEN_REPARSE_POINT, GetFileInformationByHandle,
+        BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, FILE_ATTRIBUTE_DIRECTORY,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        GetFileInformationByHandle,
     },
     System::{
         SystemServices::{ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE},
@@ -33,7 +34,12 @@ use windows_sys::Win32::{
     },
 };
 
-struct Descriptor(*mut c_void);
+pub(crate) struct Descriptor(*mut c_void);
+impl Descriptor {
+    pub(crate) fn as_ptr(&self) -> *mut c_void {
+        self.0
+    }
+}
 impl Drop for Descriptor {
     fn drop(&mut self) {
         unsafe {
@@ -87,15 +93,13 @@ impl CurrentUser {
             if Authorization::ConvertSidToStringSidW(current, &mut sid_string) == 0 {
                 return Err(io::Error::last_os_error());
             }
-            let sid_allocation = Descriptor(sid_string.cast());
+            let _sid_allocation = Descriptor(sid_string.cast());
             let mut length = 0;
             while *sid_string.add(length) != 0 {
                 length += 1;
             }
-            let sid = String::from_utf16(std::slice::from_raw_parts(sid_string, length))
-                .map_err(|_| io::ErrorKind::InvalidData)?;
-            drop(sid_allocation);
-            Ok(sid)
+            String::from_utf16(std::slice::from_raw_parts(sid_string, length))
+                .map_err(|_| io::ErrorKind::InvalidData.into())
         }
     }
 }
@@ -110,7 +114,7 @@ fn trusted(sid: PSID, current: PSID) -> bool {
     }
 }
 
-pub(super) fn inspect(file: &File) -> io::Result<()> {
+pub(crate) fn inspect(file: &File) -> io::Result<BY_HANDLE_FILE_INFORMATION> {
     unsafe {
         let mut information = BY_HANDLE_FILE_INFORMATION::default();
         if GetFileInformationByHandle(file.as_raw_handle(), &mut information) == 0 {
@@ -160,8 +164,30 @@ pub(super) fn inspect(file: &File) -> io::Result<()> {
                 _ => return Err(io::ErrorKind::PermissionDenied.into()),
             }
         }
-        Ok(())
+        Ok(information)
     }
+}
+
+pub(crate) fn private_descriptor() -> io::Result<Descriptor> {
+    let user = CurrentUser::new()?;
+    let sid = user.sid_string()?;
+    let sddl: Vec<u16> = format!("O:{sid}D:P(A;OICI;FA;;;{sid})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)")
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    let mut descriptor = ptr::null_mut();
+    unsafe {
+        if ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            1,
+            &mut descriptor,
+            ptr::null_mut(),
+        ) == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(Descriptor(descriptor))
 }
 
 pub(super) fn directory(path: &Path) -> io::Result<()> {
@@ -170,11 +196,13 @@ pub(super) fn directory(path: &Path) -> io::Result<()> {
         .read(true)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)?;
-    let metadata = file.metadata()?;
-    if !metadata.is_dir() || super::redirected(&metadata) {
+    let information = inspect(&file)?;
+    if information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
+        || information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    {
         return Err(io::ErrorKind::InvalidData.into());
     }
-    inspect(&file)
+    Ok(())
 }
 
 pub(super) fn create_directory(path: &Path) -> io::Result<()> {
@@ -197,27 +225,10 @@ pub(super) fn create_directory(path: &Path) -> io::Result<()> {
 pub(super) fn create_new_directory(path: &Path) -> io::Result<()> {
     super::inspect_ancestors(path)?;
     unsafe {
-        let user = CurrentUser::new()?;
-        let sid = user.sid_string()?;
-        let sddl: Vec<u16> =
-            format!("O:{sid}D:P(A;OICI;FA;;;{sid})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)")
-                .encode_utf16()
-                .chain(Some(0))
-                .collect();
-        let mut descriptor = ptr::null_mut();
-        if ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            sddl.as_ptr(),
-            1,
-            &mut descriptor,
-            ptr::null_mut(),
-        ) == 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        let _descriptor = Descriptor(descriptor);
+        let descriptor = private_descriptor()?;
         let attributes = SECURITY_ATTRIBUTES {
             nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: descriptor,
+            lpSecurityDescriptor: descriptor.as_ptr(),
             bInheritHandle: 0,
         };
         let path_wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();

@@ -37,7 +37,7 @@ enum ExpectedOperation {
     Mailboxes(Vec<&'static str>),
     Search(&'static str, Option<u32>),
     Body(&'static str, Vec<u8>),
-    Attachment(&'static str, AttachmentPhase),
+    Attachment(&'static str, AttachmentPhase, String),
 }
 
 #[derive(Clone)]
@@ -152,8 +152,8 @@ impl ImapServer {
                                 }
                                 ExpectedOperation::Search(mailbox, position) => search_page(&mut wire, mailbox, position).await,
                                 ExpectedOperation::Body(mailbox, text) => body_page(&mut wire, mailbox, &text).await,
-                                ExpectedOperation::Attachment(mailbox, phase) => {
-                                    attachment_page(&mut wire, mailbox, phase, &stalled).await;
+                                ExpectedOperation::Attachment(mailbox, phase, filename) => {
+                                    attachment_page(&mut wire, mailbox, phase, &filename, &stalled).await;
                                     if phase == AttachmentPhase::Interrupted { return; }
                                 },
                             }
@@ -277,10 +277,21 @@ impl ImapServer {
         mailbox: &'static str,
         payload: AttachmentPhase,
     ) {
+        self.expect_attachment_named(username, password, mailbox, payload, "fixture.bin");
+    }
+
+    pub fn expect_attachment_named(
+        &self,
+        username: &'static str,
+        password: &'static str,
+        mailbox: &'static str,
+        payload: AttachmentPhase,
+        filename: &str,
+    ) {
         self.expected.lock().unwrap().push_back(Expected {
             username,
             password,
-            operation: ExpectedOperation::Attachment(mailbox, payload),
+            operation: ExpectedOperation::Attachment(mailbox, payload, filename.to_owned()),
         });
     }
 
@@ -399,6 +410,7 @@ async fn attachment_page(
     wire: &mut imap_support::Wire,
     mailbox: &str,
     payload: AttachmentPhase,
+    filename: &str,
     interrupted: &AtomicUsize,
 ) {
     use imap_support::{expect, write};
@@ -410,7 +422,7 @@ async fn attachment_page(
     .await;
     if payload != AttachmentPhase::Continue {
         let tag = expect(wire, "UID FETCH 3 (UID RFC822.SIZE BODYSTRUCTURE)").await;
-        write(wire, &format!("* 3 FETCH (UID 3 RFC822.SIZE 3000300 BODYSTRUCTURE ((\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" 13 1 NIL NIL NIL NIL)(\"APPLICATION\" \"OCTET-STREAM\" NIL NIL NIL \"BASE64\" 8 NIL (\"ATTACHMENT\" (\"FILENAME\" \"fixture.bin\")) NIL NIL) \"MIXED\" NIL NIL NIL NIL))\r\n{tag} OK fetched\r\n")).await;
+        write(wire, &format!("* 3 FETCH (UID 3 RFC822.SIZE 3000300 BODYSTRUCTURE ((\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" 13 1 NIL NIL NIL NIL)(\"APPLICATION\" \"OCTET-STREAM\" NIL NIL NIL \"BASE64\" 8 NIL (\"ATTACHMENT\" (\"FILENAME\" \"{filename}\")) NIL NIL) \"MIXED\" NIL NIL NIL NIL))\r\n{tag} OK fetched\r\n")).await;
     }
     if payload == AttachmentPhase::Interrupted {
         use tokio::io::AsyncReadExt;

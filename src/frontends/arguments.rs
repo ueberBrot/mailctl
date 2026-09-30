@@ -244,7 +244,7 @@ pub(super) fn draft_content(
 #[cfg(feature = "cli")]
 #[derive(Subcommand)]
 enum Attachment {
-    /// Save an attachment under a configured export root (embedded macOS only).
+    /// Save an attachment under a configured export root on macOS or Windows.
     Export {
         #[arg(long)]
         attachment: String,
