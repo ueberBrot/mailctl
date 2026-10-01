@@ -454,10 +454,10 @@ async fn execute_application(
 }
 
 #[cfg_attr(
-    not(unix),
+    not(any(unix, windows)),
     allow(
         clippy::unnecessary_wraps,
-        reason = "Unix signal registration can fail through this shared interface"
+        reason = "Native signal registration can fail through this shared interface"
     )
 )]
 fn termination_signal() -> Result<impl Future<Output = ()>, Error> {
@@ -472,7 +472,23 @@ fn termination_signal() -> Result<impl Future<Output = ()>, Error> {
             tokio::select! { _ = interrupt.recv() => {}, _ = terminate.recv() => {} }
         })
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        let mut interrupt =
+            tokio::signal::windows::ctrl_c().map_err(|_| Error::new(ErrorCode::InternalError))?;
+        // Children can inherit Ctrl+C suppression; restore it after installing the handler.
+        #[allow(
+            unsafe_code,
+            reason = "Restore Windows console signal delivery after registering the native listener"
+        )]
+        if unsafe { windows_sys::Win32::System::Console::SetConsoleCtrlHandler(None, 0) } == 0 {
+            return Err(Error::new(ErrorCode::InternalError));
+        }
+        Ok(async move {
+            interrupt.recv().await;
+        })
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         Ok(async {
             let _ = tokio::signal::ctrl_c().await;

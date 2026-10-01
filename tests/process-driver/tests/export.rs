@@ -238,6 +238,7 @@ fn cli_streams_attachment_to_approved_root_with_native_receipt() {
         {
             use std::os::windows::process::CommandExt;
             command.creation_flags(0x00000010); // CREATE_NEW_CONSOLE keeps Ctrl+C inside this fixture.
+            command.env("MAILCTL_FIXTURE_IGNORE_CTRL_C", "1");
         }
         let mut child = command.spawn().unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
