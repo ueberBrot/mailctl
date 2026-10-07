@@ -43,6 +43,8 @@ const CORPUS: &[&[u8]] = &[
     include_bytes!("fuzz_corpus/mime/attachment-quoted-printable.seed"),
     include_bytes!("fuzz_corpus/mime/attachment-quoted-printable-tail.seed"),
     include_bytes!("fuzz_corpus/mime/attachment-raw.seed"),
+    // RFC 3501 section 9 excludes NUL from ordinary IMAP literals.
+    include_bytes!("fuzz_corpus/mime/attachment-raw-nul.seed"),
 ];
 
 fn limits() -> Limits {
@@ -399,7 +401,7 @@ fn retained_mime_inputs_replay_through_bounded_public_reads() {
             (0 | 3, Outcome::Body(Ok(page))) => assert_eq!(page.text, "ok"),
             (1 | 4, Outcome::Body(Err(Error::Protocol)))
             | (2, Outcome::Body(Err(Error::Protocol | Error::Eof)))
-            | (12 | 14, Outcome::Attachment(Err(Error::Protocol))) => {}
+            | (12 | 14 | 16, Outcome::Attachment(Err(Error::Protocol))) => {}
             (5, Outcome::Body(Ok(page))) => {
                 assert_eq!(page.text, "> synthetic quote\r\n\r\nSynthetic reply.")
             }
@@ -443,11 +445,11 @@ fn retained_mime_inputs_replay_through_bounded_public_reads() {
                 );
             }
             (15, Outcome::Attachment(Ok(chunk))) => {
-                assert_eq!(chunk.bytes, b"Synthetic\0binary\xfffixture");
+                assert_eq!(chunk.bytes, b"Synthetic binary\xfffixture");
                 assert_integrity(
                     chunk,
                     24,
-                    "7633e09906aebd6253ec18f6bf16917011d03563cc449c82e438a8a1318d5799",
+                    "a0141c690005b91892d7969436725bd30f76beff4815486a4443293368b92699",
                 );
             }
             (_, Outcome::Body(Err(error))) => {
