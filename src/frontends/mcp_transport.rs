@@ -307,17 +307,9 @@ impl Transport<RoleServer> for BoundedStdio {
 }
 
 #[cfg(test)]
-#[path = "../../tests/fuzz_support/mod.rs"]
-mod fuzz_support;
-
-#[cfg(test)]
-#[path = "../../tests/fuzz_support/mcp_corpus.rs"]
-mod mcp_corpus;
-
-#[cfg(test)]
 mod tests {
-    use super::mcp_corpus::MCP;
     use super::*;
+    use crate::{fuzz_support, mcp_corpus::MCP};
     use serde_json::json;
 
     fn decoding_case(
