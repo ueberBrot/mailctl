@@ -92,6 +92,9 @@ operation uncertain. The error retains the original identity, a safe reason, and
 Reconciliation of a prepared operation returns its recorded status without
 creating it. Drafts-only grants receive the receipt or error, never message content.
 
+For parser mutation campaigns, retained fixtures, and failure records, see
+[Bounded parser campaigns](docs/fuzzing.md).
+
 ## Commit conventions
 
 Use [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/) for PR

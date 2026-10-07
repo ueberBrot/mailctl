@@ -1,3 +1,4 @@
+mod fuzz_support;
 mod support;
 use mailctl::{
     config::{Config, Limits},
@@ -372,4 +373,66 @@ async fn reconciliation_deadline_includes_admission_waiting() {
     owner.abort();
     let _ = owner.await;
     assert_eq!(backend.appends.load(Ordering::SeqCst), 1);
+}
+
+const RETRY_CORPUS: &[&[u8]] = &[
+    include_bytes!("fuzz_corpus/drafts/header-injection.json"),
+    include_bytes!("fuzz_corpus/drafts/nul-body.json"),
+    b"{}",
+];
+
+async fn reject_uncertain_retry(fixture: &Fixture, bytes: &[u8]) {
+    if let Ok(draft) = serde_json::from_slice::<mailctl::domain::DraftContent>(bytes) {
+        let mut input = fixture.input.clone();
+        *input.draft = draft;
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            save(&fixture.service, input),
+        )
+        .await
+        .expect("uncertain retry exceeded its deadline")
+        .expect_err("uncertain retry must retain a safe failure");
+        assert!(matches!(
+            error.code,
+            ErrorCode::OutcomeUnknown | ErrorCode::OperationConflict | ErrorCode::InvalidRequest
+        ));
+        assert!(!error.retryable);
+    }
+    assert_eq!(fixture.backend.appends.load(Ordering::SeqCst), 1);
+    uncertain(fixture.status().await.unwrap_err(), &fixture.input);
+}
+
+#[tokio::test]
+async fn retained_malformed_retries_never_redispatch_an_uncertain_draft() {
+    let fixture = Fixture::new(AppendOutcome::Unknown, false, false).await;
+    uncertain(fixture.save().await.unwrap_err(), &fixture.input);
+    for bytes in RETRY_CORPUS {
+        reject_uncertain_retry(&fixture, bytes).await;
+    }
+}
+
+#[test]
+#[ignore = "explicit bounded fuzz campaign; retained regressions run in ordinary CI"]
+fn fuzz_uncertain_draft_retries() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let fixture = runtime.block_on(Fixture::new(AppendOutcome::Unknown, false, false));
+    uncertain(
+        runtime.block_on(fixture.save()).unwrap_err(),
+        &fixture.input,
+    );
+    let campaign = fuzz_support::Campaign::from_env("uncertain_draft_retries");
+    for (index, bytes) in campaign.cases(RETRY_CORPUS) {
+        let allocations = allocation_counter::measure(|| {
+            runtime.block_on(reject_uncertain_retry(&fixture, &bytes))
+        });
+        assert!(
+            allocations.bytes_max < 8 * 1024 * 1024,
+            "draft retry case {index} exceeded its allocation ceiling"
+        );
+        assert!(allocations.bytes_total < 16 * 1024 * 1024);
+    }
+    campaign.finish();
 }

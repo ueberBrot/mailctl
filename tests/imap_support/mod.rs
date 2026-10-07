@@ -18,7 +18,10 @@ use io_imap::codec::{
     CommandCodec,
     decode::{CommandDecodeError, Decoder},
 };
-use io_imap::types::command::CommandBody;
+use io_imap::types::{
+    IntoStatic,
+    command::{Command, CommandBody},
+};
 use mailctl::imap::{Limits, TlsMode};
 mod client;
 pub use client::Client;
@@ -157,6 +160,52 @@ pub async fn literal_bytes(
     .await;
     wire.write_all(value).await.unwrap();
     write(wire, &format!(")\r\n{tag} OK fetched\r\n")).await;
+}
+
+/// Observe a bounded command independently of the production wire guard.
+/// EOF, reset, or abort before a command is allowed; partial commands and stalls fail the fixture.
+pub async fn observe_command(wire: &mut Wire, deadline: Duration) -> Option<Command<'static>> {
+    tokio::time::timeout(deadline, async {
+        let mut input = Vec::new();
+        loop {
+            match wire.read_u8().await {
+                Ok(byte) => input.push(byte),
+                Err(error)
+                    if input.is_empty()
+                        && matches!(
+                            error.kind(),
+                            std::io::ErrorKind::UnexpectedEof
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted
+                        ) =>
+                {
+                    return None;
+                }
+                Err(error) => panic!(
+                    "incomplete independently observed command: kind={:?} bytes={}",
+                    error.kind(),
+                    input.len()
+                ),
+            }
+            assert!(
+                input.len() <= 1024,
+                "independently observed command ceiling"
+            );
+            if input.ends_with(b"\r\n") {
+                let codec = CommandCodec::new();
+                let (remaining, command) = codec
+                    .decode(&input)
+                    .expect("independently observed command syntax");
+                assert!(
+                    remaining.is_empty(),
+                    "one independently observed command per frame"
+                );
+                return Some(command.into_static());
+            }
+        }
+    })
+    .await
+    .expect("independent command observation deadline")
 }
 
 /// Compare decoded command bodies, leaving tags and literal framing unconstrained.

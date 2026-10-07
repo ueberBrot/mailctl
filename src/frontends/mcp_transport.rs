@@ -1,5 +1,8 @@
 //! Apply admission limits around the SDK's STDIO transport.
-use crate::{config::Limits, domain::Error};
+use crate::{
+    config::Limits,
+    domain::{Error, ErrorCode},
+};
 use futures_util::StreamExt;
 use rmcp::{
     RoleServer,
@@ -14,7 +17,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::AsyncWriteExt,
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     sync::{OwnedSemaphorePermit, Semaphore},
     task::JoinHandle,
     time::{Instant, timeout, timeout_at},
@@ -150,6 +153,35 @@ pub(super) struct BoundedStdio {
     staged: Option<(RxJsonRpcMessage<RoleServer>, OwnedSemaphorePermit)>,
 }
 
+async fn forward_bounded_input(
+    reader: impl AsyncRead + Unpin,
+    writer: &mut (impl AsyncWrite + Unpin),
+    input_limit: usize,
+    nesting_limit: usize,
+    deadline: Duration,
+) -> Result<(), ErrorCode> {
+    let mut lines = FramedRead::new(reader, LinesCodec::new_with_max_length(input_limit));
+    for _ in 0..4096 {
+        let line = match timeout(deadline, lines.next()).await {
+            Ok(Some(Ok(line))) => line,
+            Ok(None) => return Ok(()),
+            Ok(Some(Err(_))) => return Err(ErrorCode::InvalidRequest),
+            Err(_) => return Err(ErrorCode::Timeout),
+        };
+        crate::encoding::validate_json_bounds(line.as_bytes(), nesting_limit, 4096)
+            .map_err(|error| error.code)?;
+        let write = async {
+            writer.write_all(line.as_bytes()).await?;
+            writer.write_all(b"\n").await
+        };
+        timeout(deadline, write)
+            .await
+            .map_err(|_| ErrorCode::Timeout)?
+            .map_err(|_| ErrorCode::Cancelled)?;
+    }
+    Ok(())
+}
+
 impl BoundedStdio {
     pub(super) fn new(bounds: Bounds, shutdown: tokio_util::sync::CancellationToken) -> Self {
         let (reader, mut writer) = tokio::io::duplex(8192);
@@ -157,27 +189,14 @@ impl BoundedStdio {
         let ingress = tokio::spawn(async move {
             // The SDK may drain requests after EOF; cancel active work as soon as input closes.
             let _cancel_on_exit = shutdown.drop_guard();
-            let mut lines = FramedRead::new(
+            let _ = forward_bounded_input(
                 tokio::io::stdin(),
-                LinesCodec::new_with_max_length(bounds.input),
-            );
-            for _ in 0..4096 {
-                let Ok(Some(Ok(line))) = timeout(bounds.deadline, lines.next()).await else {
-                    break;
-                };
-                if crate::encoding::validate_json_bounds(line.as_bytes(), bounds.nesting, 4096)
-                    .is_err()
-                {
-                    break;
-                }
-                let write = async {
-                    writer.write_all(line.as_bytes()).await?;
-                    writer.write_all(b"\n").await
-                };
-                if !matches!(timeout(bounds.deadline, write).await, Ok(Ok(()))) {
-                    break;
-                }
-            }
+                &mut writer,
+                bounds.input,
+                bounds.nesting,
+                bounds.deadline,
+            )
+            .await;
         });
         Self {
             sdk: AsyncRwTransport::new_server(reader, tokio::io::stdout()),
@@ -290,7 +309,128 @@ impl Transport<RoleServer> for BoundedStdio {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{fuzz_support, mcp_corpus::MCP};
     use serde_json::json;
+
+    fn decoding_case(
+        runtime: &tokio::runtime::Runtime,
+        input: &[u8],
+        case: usize,
+    ) -> (bool, Option<ErrorCode>) {
+        assert!(
+            input.len() <= fuzz_support::MAX_INPUT_BYTES,
+            "MCP decoding input ceiling in case {case}"
+        );
+        // Sessions admit at least 1 KiB; use the production control reservation,
+        // which includes decoder scratch and retained SDK buffers.
+        let (_, reservation, _) = Bounds::reservations(input.len().max(1024), 1024, 1, 0, 0);
+        let started = std::time::Instant::now();
+        let mut accepted = false;
+        let mut admission_error = None;
+        let measured = allocation_counter::measure(|| {
+            runtime.block_on(async {
+                let input = input.to_vec();
+                let (reader, mut writer) = tokio::io::duplex(8192);
+                let ingress = tokio::spawn(async move {
+                    forward_bounded_input(
+                        input.as_slice(),
+                        &mut writer,
+                        fuzz_support::MAX_INPUT_BYTES,
+                        32,
+                        Duration::from_secs(2),
+                    )
+                    .await
+                });
+                let mut sdk =
+                    AsyncRwTransport::<RoleServer, _, _>::new_server(reader, tokio::io::sink());
+                let received = timeout(Duration::from_secs(2), sdk.receive()).await;
+                let retained = received.as_ref().ok().and_then(Option::as_ref).cloned();
+                accepted = retained.is_some();
+                ingress.abort();
+                let joined = ingress.await;
+                admission_error = match joined {
+                    Ok(result) => result.err(),
+                    Err(error) => {
+                        assert!(
+                            error.is_cancelled(),
+                            "MCP ingress task failed in case {case}"
+                        );
+                        None
+                    }
+                };
+                assert!(received.is_ok(), "MCP SDK receive deadline in case {case}");
+                drop(std::hint::black_box((received, retained)));
+            });
+        });
+        assert!(
+            measured.bytes_max as usize <= reservation,
+            "MCP decoding control reservation exceeded in case {case}"
+        );
+        assert!(
+            measured.bytes_total <= 16 * 1024 * 1024,
+            "MCP decoding total allocation ceiling in case {case}"
+        );
+        assert!(
+            measured.count_total <= 32 * 1024,
+            "MCP decoding allocation work ceiling in case {case}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "MCP decoding deadline in case {case}"
+        );
+        (accepted, admission_error)
+    }
+
+    #[test]
+    fn mcp_decoding_regressions_fit_reservations_and_work_bounds() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("current-thread decoding runtime");
+        for (case, input) in MCP.iter().enumerate() {
+            let (accepted, _) = decoding_case(&runtime, input, case);
+            if case < 2 {
+                assert!(accepted, "valid retained MCP request in case {case}");
+            }
+        }
+        for (case, input) in [
+            vec![0xff, b'\n'],
+            format!("{}0{}\n", "[".repeat(65), "]".repeat(65)).into_bytes(),
+            format!("[{}]\n", vec!["0"; 4097].join(",")).into_bytes(),
+            vec![b'x'; fuzz_support::MAX_INPUT_BYTES],
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert!(
+                !decoding_case(&runtime, input, MCP.len() + case).0,
+                "invalid retained MCP request in case {case}"
+            );
+        }
+        let mut sequence = MCP[0].to_vec();
+        sequence.extend_from_slice(format!("{}0{}\n", "[".repeat(65), "]".repeat(65)).as_bytes());
+        let (accepted, admission_error) = decoding_case(&runtime, &sequence, MCP.len() + 4);
+        assert!(accepted, "valid MCP frame survives a later rejected frame");
+        assert_eq!(
+            admission_error,
+            Some(ErrorCode::InvalidRequest),
+            "later MCP frame exceeds the admission bound"
+        );
+    }
+
+    #[test]
+    #[ignore = "explicit bounded mutation campaign"]
+    fn fuzz_mcp_decoding() {
+        let campaign = fuzz_support::Campaign::from_env("mcp-decoding");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("current-thread decoding runtime");
+        for (case, input) in campaign.cases(MCP) {
+            decoding_case(&runtime, &input, case);
+        }
+        campaign.finish();
+    }
 
     #[test]
     fn bounded_sdk_decoding_fits_the_input_reservation_for_large_strings_and_many_nodes() {
