@@ -27,31 +27,31 @@ const TRUNCATED_LITERAL: &[u8] = include_bytes!("fuzz_corpus/imap/truncated-lite
 const CORPUS: &[Case] = &[
     Case {
         input: include_bytes!("fuzz_corpus/imap/list.imap"),
-        expected: Outcome::Listed,
+        expected: Expected::Listed(&["INBOX"]),
     },
     Case {
         input: include_bytes!("fuzz_corpus/imap/body.imap"),
-        expected: Outcome::Read,
+        expected: Expected::Read("Short body.\r\n"),
     },
     Case {
         input: include_bytes!("fuzz_corpus/imap/oversized-literal.imap"),
-        expected: Outcome::Rejected(Error::Limit),
+        expected: Expected::Rejected(Error::Limit),
     },
     Case {
         input: TRUNCATED_LITERAL,
-        expected: Outcome::Rejected(Error::Eof),
+        expected: Expected::Rejected(Error::Eof),
     },
     Case {
         input: include_bytes!("fuzz_corpus/imap/wrong-tag.imap"),
-        expected: Outcome::Rejected(Error::Protocol),
+        expected: Expected::Rejected(Error::Protocol),
     },
     Case {
         input: include_bytes!("fuzz_corpus/imap/draft-absent.imap"),
-        expected: Outcome::Draft(DraftEvidence::Absent),
+        expected: Expected::Draft(DraftEvidence::Absent),
     },
     Case {
         input: include_bytes!("fuzz_corpus/imap/draft-verified.imap"),
-        expected: Outcome::Draft(DraftEvidence::Verified(
+        expected: Expected::Draft(DraftEvidence::Verified(
             mailctl::draft::DraftMessageIdentity {
                 uid_validity: 77,
                 uid: 4,
@@ -60,28 +60,28 @@ const CORPUS: &[Case] = &[
     },
     Case {
         input: include_bytes!("fuzz_corpus/imap/draft-outside-window.imap"),
-        expected: Outcome::Rejected(Error::Protocol),
+        expected: Expected::Rejected(Error::Protocol),
     },
     Case {
         input: include_bytes!("fuzz_corpus/imap/literal-syntax.imap"),
-        expected: Outcome::Read,
+        expected: Expected::Read("x\r\n* BYE\r\ny\r\n"),
     },
     Case {
         input: include_bytes!("fuzz_corpus/imap/excessive-nesting.imap"),
-        expected: Outcome::Rejected(Error::Limit),
+        expected: Expected::Rejected(Error::Limit),
     },
     Case {
         input: include_bytes!("fuzz_corpus/imap/response-flood.imap"),
-        expected: Outcome::Rejected(Error::Limit),
+        expected: Expected::Rejected(Error::Limit),
     },
     Case {
         input: include_bytes!("fuzz_corpus/imap/oversized-line.imap"),
-        expected: Outcome::Rejected(Error::Limit),
+        expected: Expected::Rejected(Error::Limit),
     },
     Case {
         // Reduced from seed 35002, case 0: malformed tagged response disposes TLS.
         input: include_bytes!("fuzz_corpus/imap/malformed-tagged-response.imap"),
-        expected: Outcome::Rejected(Error::Protocol),
+        expected: Expected::Rejected(Error::Protocol),
     },
 ];
 const HEADERS: &[u8] = b"Content-Type: multipart/mixed; boundary=fixture\r\n\r\n";
@@ -97,15 +97,22 @@ enum Route {
 
 #[derive(Debug, PartialEq, Eq)]
 enum Outcome {
-    Listed,
-    Read,
+    Listed(Vec<String>),
+    Read(String),
+    Draft(DraftEvidence),
+    Rejected(Error),
+}
+
+enum Expected {
+    Listed(&'static [&'static str]),
+    Read(&'static str),
     Draft(DraftEvidence),
     Rejected(Error),
 }
 
 struct Case {
     input: &'static [u8],
-    expected: Outcome,
+    expected: Expected,
 }
 
 fn limits() -> Limits {
@@ -275,7 +282,7 @@ fn run_case(input: &[u8], index: usize, hold_open: bool) -> Outcome {
                             rows.iter().all(|row| row.name == "INBOX"),
                             "unapproved mailbox"
                         );
-                        Outcome::Listed
+                        Outcome::Listed(rows.into_iter().map(|row| row.name).collect())
                     }),
                 Route::Body => client
                     .read_body(
@@ -298,7 +305,7 @@ fn run_case(input: &[u8], index: usize, hold_open: bool) -> Outcome {
                             page.metrics.decoded_bytes <= bounds.max_decoded_bytes,
                             "decoded byte ceiling"
                         );
-                        Outcome::Read
+                        Outcome::Read(page.text)
                     }),
                 Route::Reconcile => client
                     .reconcile_draft(
@@ -318,7 +325,7 @@ fn run_case(input: &[u8], index: usize, hold_open: bool) -> Outcome {
     });
     assert!(
         server.join().is_ok(),
-        "case {index}: independent command observation failed; outcome={result:?}"
+        "case {index}: independent command observation failed"
     );
     assert!(
         started.elapsed() < Duration::from_secs(4),
@@ -389,11 +396,21 @@ fn run_case(input: &[u8], index: usize, hold_open: bool) -> Outcome {
 #[test]
 fn retained_imap_framing_regressions() {
     for (index, case) in CORPUS.iter().enumerate() {
-        assert_eq!(
-            run_case(case.input, index, false),
-            case.expected,
-            "retained IMAP fixture {index}"
-        );
+        match (&case.expected, run_case(case.input, index, false)) {
+            (Expected::Listed(expected), Outcome::Listed(actual)) => {
+                assert_eq!(actual, *expected, "retained IMAP fixture {index}")
+            }
+            (Expected::Read(expected), Outcome::Read(actual)) => {
+                assert_eq!(actual, *expected, "retained IMAP fixture {index}")
+            }
+            (Expected::Draft(expected), Outcome::Draft(actual)) => {
+                assert_eq!(actual, *expected, "retained IMAP fixture {index}")
+            }
+            (Expected::Rejected(expected), Outcome::Rejected(actual)) => {
+                assert_eq!(actual, *expected, "retained IMAP fixture {index}")
+            }
+            (_, actual) => panic!("retained IMAP fixture {index}: unexpected result {actual:?}"),
+        }
     }
 }
 

@@ -14,6 +14,7 @@ use mailctl::imap::{
     AttachmentData, AttachmentDecoder, BodyPage, BodyRequest, Error, Limits, Metrics, TlsMode,
 };
 use std::{
+    fmt::Write,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -26,25 +27,105 @@ const ROOT_HEADERS: &[u8] =
     b"MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=fixture\r\n\r\n";
 const WIRE_SLICE: usize = 1024;
 
-const CORPUS: &[&[u8]] = &[
-    include_bytes!("fuzz_corpus/mime/structure-depth-seven.seed"),
-    include_bytes!("fuzz_corpus/mime/structure-depth-eight.seed"),
-    include_bytes!("fuzz_corpus/mime/structure-incomplete.seed"),
-    include_bytes!("fuzz_corpus/mime/headers-valid.seed"),
-    include_bytes!("fuzz_corpus/mime/headers-incomplete.seed"),
-    include_bytes!("fuzz_corpus/mime/plain-quoted.seed"),
-    include_bytes!("fuzz_corpus/mime/plain-invalid-utf8.seed"),
-    include_bytes!("fuzz_corpus/mime/html-active-content.seed"),
-    include_bytes!("fuzz_corpus/mime/html-table-span.seed"),
-    include_bytes!("fuzz_corpus/mime/body-base64-tail.seed"),
-    include_bytes!("fuzz_corpus/mime/body-quoted-printable-tail.seed"),
-    include_bytes!("fuzz_corpus/mime/attachment-base64.seed"),
-    include_bytes!("fuzz_corpus/mime/attachment-base64-tail.seed"),
-    include_bytes!("fuzz_corpus/mime/attachment-quoted-printable.seed"),
-    include_bytes!("fuzz_corpus/mime/attachment-quoted-printable-tail.seed"),
-    include_bytes!("fuzz_corpus/mime/attachment-raw.seed"),
-    // RFC 3501 section 9 excludes NUL from ordinary IMAP literals.
-    include_bytes!("fuzz_corpus/mime/attachment-raw-nul.seed"),
+struct Case {
+    input: &'static [u8],
+    expected: Expected,
+}
+
+enum Expected {
+    BodyText(&'static str),
+    BodyProtocol,
+    IncompleteStructure,
+    Replacements,
+    ReplacedText(&'static str),
+    SanitizedHtml,
+    HtmlText(&'static str),
+    Attachment {
+        bytes: &'static [u8],
+        digest: &'static str,
+    },
+    AttachmentProtocol,
+}
+
+const CORPUS: &[Case] = &[
+    Case {
+        input: include_bytes!("fuzz_corpus/mime/structure-depth-seven.seed"),
+        expected: Expected::BodyText("ok"),
+    },
+    Case {
+        input: include_bytes!("fuzz_corpus/mime/structure-depth-eight.seed"),
+        expected: Expected::BodyProtocol,
+    },
+    Case {
+        input: include_bytes!("fuzz_corpus/mime/structure-incomplete.seed"),
+        expected: Expected::IncompleteStructure,
+    },
+    Case {
+        input: include_bytes!("fuzz_corpus/mime/headers-valid.seed"),
+        expected: Expected::BodyText("ok"),
+    },
+    Case {
+        input: include_bytes!("fuzz_corpus/mime/headers-incomplete.seed"),
+        expected: Expected::BodyProtocol,
+    },
+    Case {
+        input: include_bytes!("fuzz_corpus/mime/plain-quoted.seed"),
+        expected: Expected::BodyText("> synthetic quote\r\n\r\nSynthetic reply."),
+    },
+    Case {
+        input: include_bytes!("fuzz_corpus/mime/plain-invalid-utf8.seed"),
+        expected: Expected::Replacements,
+    },
+    Case {
+        input: include_bytes!("fuzz_corpus/mime/html-active-content.seed"),
+        expected: Expected::SanitizedHtml,
+    },
+    Case {
+        input: include_bytes!("fuzz_corpus/mime/html-table-span.seed"),
+        expected: Expected::HtmlText("safe"),
+    },
+    Case {
+        input: include_bytes!("fuzz_corpus/mime/body-base64-tail.seed"),
+        expected: Expected::ReplacedText("\u{fffd}Hello"),
+    },
+    Case {
+        input: include_bytes!("fuzz_corpus/mime/body-quoted-printable-tail.seed"),
+        expected: Expected::ReplacedText("\u{fffd}hello"),
+    },
+    Case {
+        input: include_bytes!("fuzz_corpus/mime/attachment-base64.seed"),
+        expected: Expected::Attachment {
+            bytes: b"Hello",
+            digest: "185f8db32271fe25f561a6fc938b2e264306ec304eda518007d1764826381969",
+        },
+    },
+    Case {
+        input: include_bytes!("fuzz_corpus/mime/attachment-base64-tail.seed"),
+        expected: Expected::AttachmentProtocol,
+    },
+    Case {
+        input: include_bytes!("fuzz_corpus/mime/attachment-quoted-printable.seed"),
+        expected: Expected::Attachment {
+            bytes: b"first\r\nsecond \t\r\nthird \tline\r\nlast",
+            digest: "c462e3691dd79e9a1d6bcc9e4fdecdec133dda19a9ec9410d832e25e1d2e3dec",
+        },
+    },
+    Case {
+        input: include_bytes!("fuzz_corpus/mime/attachment-quoted-printable-tail.seed"),
+        expected: Expected::AttachmentProtocol,
+    },
+    Case {
+        input: include_bytes!("fuzz_corpus/mime/attachment-raw.seed"),
+        expected: Expected::Attachment {
+            bytes: b"Synthetic binary\xfffixture",
+            digest: "a0141c690005b91892d7969436725bd30f76beff4815486a4443293368b92699",
+        },
+    },
+    Case {
+        // RFC 3501 section 9 excludes NUL from ordinary IMAP literals.
+        input: include_bytes!("fuzz_corpus/mime/attachment-raw-nul.seed"),
+        expected: Expected::AttachmentProtocol,
+    },
 ];
 
 fn limits() -> Limits {
@@ -280,14 +361,21 @@ fn run(input: &[u8], case: usize) -> Outcome {
     let server_bytes = Arc::new(AtomicUsize::new(b"* OK synthetic server ready\r\n".len()));
     let counted = server_bytes.clone();
     let (mut probe, server) = dedicated_fixture(TlsMode::Implicit, limits.clone(), move |wire| {
-        Box::pin(serve(
-            Box::new(CountedWire {
-                wire,
-                written: counted,
-            }),
-            kind,
-            payload,
-        ))
+        Box::pin(async move {
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                serve(
+                    Box::new(CountedWire {
+                        wire,
+                        written: counted,
+                    }),
+                    kind,
+                    payload,
+                ),
+            )
+            .await
+            .expect("independent MIME server deadline");
+        })
     });
     let mut outcome = None;
     let started = Instant::now();
@@ -396,61 +484,33 @@ fn run(input: &[u8], case: usize) -> Outcome {
 
 #[test]
 fn retained_mime_inputs_replay_through_bounded_public_reads() {
-    for (case, input) in CORPUS.iter().enumerate() {
-        match (case, run(input, case)) {
-            (0 | 3, Outcome::Body(Ok(page))) => assert_eq!(page.text, "ok"),
-            (1 | 4, Outcome::Body(Err(Error::Protocol)))
-            | (2, Outcome::Body(Err(Error::Protocol | Error::Eof)))
-            | (12 | 14 | 16, Outcome::Attachment(Err(Error::Protocol))) => {}
-            (5, Outcome::Body(Ok(page))) => {
-                assert_eq!(page.text, "> synthetic quote\r\n\r\nSynthetic reply.")
-            }
-            (6, Outcome::Body(Ok(page))) => {
+    for (case, fixture) in CORPUS.iter().enumerate() {
+        match (&fixture.expected, run(fixture.input, case)) {
+            (Expected::BodyText(text), Outcome::Body(Ok(page))) => assert_eq!(page.text, *text),
+            (Expected::BodyProtocol, Outcome::Body(Err(Error::Protocol)))
+            | (Expected::IncompleteStructure, Outcome::Body(Err(Error::Protocol | Error::Eof)))
+            | (Expected::AttachmentProtocol, Outcome::Attachment(Err(Error::Protocol))) => {}
+            (Expected::Replacements, Outcome::Body(Ok(page))) => {
                 assert!(page.replacements);
                 assert!(page.text.contains('\u{fffd}'));
             }
-            (7, Outcome::Body(Ok(page))) => {
+            (Expected::SanitizedHtml, Outcome::Body(Ok(page))) => {
                 assert!(page.converted);
                 assert!(page.text.contains("Visible synthetic text"));
                 assert!(page.text.contains("Quoted synthetic text"));
                 assert!(!page.text.contains("synthetic-active-marker"));
                 assert!(!page.text.contains("synthetic-style-marker"));
             }
-            (8, Outcome::Body(Ok(page))) => {
+            (Expected::HtmlText(text), Outcome::Body(Ok(page))) => {
                 assert!(page.converted);
-                assert!(page.text.contains("safe"));
+                assert!(page.text.contains(*text));
             }
-            (9, Outcome::Body(Ok(page))) => {
-                assert_eq!(page.text, "\u{fffd}Hello");
+            (Expected::ReplacedText(text), Outcome::Body(Ok(page))) => {
+                assert_eq!(page.text, *text);
                 assert!(page.replacements);
             }
-            (10, Outcome::Body(Ok(page))) => {
-                assert_eq!(page.text, "\u{fffd}hello");
-                assert!(page.replacements);
-            }
-            (11, Outcome::Attachment(Ok(chunk))) => {
-                assert_eq!(chunk.bytes, b"Hello");
-                assert_integrity(
-                    chunk,
-                    5,
-                    "185f8db32271fe25f561a6fc938b2e264306ec304eda518007d1764826381969",
-                );
-            }
-            (13, Outcome::Attachment(Ok(chunk))) => {
-                assert_eq!(chunk.bytes, b"first\r\nsecond \t\r\nthird \tline\r\nlast");
-                assert_integrity(
-                    chunk,
-                    34,
-                    "c462e3691dd79e9a1d6bcc9e4fdecdec133dda19a9ec9410d832e25e1d2e3dec",
-                );
-            }
-            (15, Outcome::Attachment(Ok(chunk))) => {
-                assert_eq!(chunk.bytes, b"Synthetic binary\xfffixture");
-                assert_integrity(
-                    chunk,
-                    24,
-                    "a0141c690005b91892d7969436725bd30f76beff4815486a4443293368b92699",
-                );
+            (Expected::Attachment { bytes, digest }, Outcome::Attachment(Ok(chunk))) => {
+                assert_integrity(chunk, bytes, digest);
             }
             (_, Outcome::Body(Err(error))) => {
                 panic!("mime retained case {case}: unexpected body error {error}")
@@ -463,14 +523,14 @@ fn retained_mime_inputs_replay_through_bounded_public_reads() {
     }
 }
 
-fn assert_integrity(chunk: AttachmentData, expected_len: u64, expected_digest: &str) {
+fn assert_integrity(chunk: AttachmentData, expected_bytes: &[u8], expected_digest: &str) {
+    assert_eq!(chunk.bytes, expected_bytes);
     let integrity = chunk.integrity.unwrap();
-    assert_eq!(integrity.total_decoded_bytes, expected_len);
-    let digest = integrity
-        .sha256
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
+    assert_eq!(integrity.total_decoded_bytes, expected_bytes.len() as u64);
+    let mut digest = String::with_capacity(64);
+    for byte in integrity.sha256 {
+        write!(digest, "{byte:02x}").unwrap();
+    }
     assert_eq!(digest, expected_digest);
 }
 
@@ -478,7 +538,8 @@ fn assert_integrity(chunk: AttachmentData, expected_len: u64, expected_digest: &
 #[ignore = "explicit bounded synthetic MIME mutation campaign"]
 fn fuzz_mime() {
     let campaign = Campaign::from_env("mime");
-    for (case, input) in campaign.cases(CORPUS) {
+    let seeds: Vec<_> = CORPUS.iter().map(|case| case.input).collect();
+    for (case, input) in campaign.cases(&seeds) {
         run(&input, case);
     }
     campaign.finish();

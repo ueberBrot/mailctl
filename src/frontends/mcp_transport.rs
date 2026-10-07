@@ -311,21 +311,14 @@ impl Transport<RoleServer> for BoundedStdio {
 mod fuzz_support;
 
 #[cfg(test)]
+#[path = "../../tests/fuzz_support/mcp_corpus.rs"]
+mod mcp_corpus;
+
+#[cfg(test)]
 mod tests {
+    use super::mcp_corpus::MCP;
     use super::*;
     use serde_json::json;
-
-    const MCP: &[&[u8]] = &[
-        include_bytes!("../../tests/fuzz_corpus/envelopes/mcp/accounts.json"),
-        include_bytes!("../../tests/fuzz_corpus/envelopes/mcp/mailboxes.json"),
-        include_bytes!("../../tests/fuzz_corpus/envelopes/mcp/unknown-tool.json"),
-        include_bytes!("../../tests/fuzz_corpus/envelopes/mcp/unknown-field.json"),
-        include_bytes!("../../tests/fuzz_corpus/envelopes/mcp/denied-draft.json"),
-        include_bytes!("../../tests/fuzz_corpus/envelopes/mcp/invalid-params.json"),
-        include_bytes!("../../tests/fuzz_corpus/envelopes/mcp/duplicate-id.json"),
-        include_bytes!("../../tests/fuzz_corpus/envelopes/mcp/invalid-version.json"),
-        include_bytes!("../../tests/fuzz_corpus/envelopes/mcp/batch.json"),
-    ];
 
     fn decoding_case(
         runtime: &tokio::runtime::Runtime,

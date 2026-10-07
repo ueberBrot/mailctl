@@ -66,12 +66,11 @@ impl Campaign {
                     input.extend(std::iter::repeat_n(byte, length));
                 }
                 6 => {
-                    let end = (position + 32).min(input.len());
-                    let block = input[position..end].to_vec();
+                    let length = (input.len() - position).min(32);
                     let repetitions = next() as usize % 32 + 1;
                     for _ in 0..repetitions {
-                        let length = block.len().min(MAX_INPUT_BYTES - input.len());
-                        input.extend_from_slice(&block[..length]);
+                        let retained = length.min(MAX_INPUT_BYTES - input.len());
+                        input.extend_from_within(position..position + retained);
                     }
                 }
                 _ => input.resize(MAX_INPUT_BYTES, byte),

@@ -35,6 +35,9 @@ campaign_command=(cargo test --locked --lib
 	done < <(find tests/fuzz_corpus -type f | sort)
 } >"$record_dir/metadata.txt"
 git diff HEAD --binary >"$record_dir/working-tree.patch"
+while IFS= read -r -d '' untracked_file; do
+	git diff --no-index --binary -- /dev/null "$untracked_file" >>"$record_dir/working-tree.patch" || [ "$?" -eq 1 ]
+done < <(git ls-files --others --exclude-standard -z)
 checksum "$record_dir/working-tree.patch" >>"$record_dir/metadata.txt"
 
 if ! "${campaign_command[@]}" 2>&1 | tee "$record_dir/results.log"; then

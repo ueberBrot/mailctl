@@ -1,5 +1,8 @@
 //! Replay synthetic envelopes at the application and SDK STDIO seams.
 mod fuzz_support;
+#[cfg(feature = "mcp")]
+#[path = "fuzz_support/mcp_corpus.rs"]
+mod mcp_corpus;
 mod support;
 
 use mailctl::{
@@ -114,7 +117,7 @@ fn safe_output(bytes: &[u8], case: usize) {
     );
 }
 
-async fn application_case(service: &Service, input: &[u8], case: usize) -> serde_json::Value {
+async fn application_case(service: &Service, input: &[u8], case: usize) -> Envelope {
     assert!(input.len() <= fuzz_support::MAX_INPUT_BYTES);
     let started = Instant::now();
     let mut operation = None;
@@ -159,7 +162,7 @@ async fn application_case(service: &Service, input: &[u8], case: usize) -> serde
     let decoded: Envelope =
         serde_json::from_slice(&output).expect("versioned application envelope");
     assert_eq!(decoded.is_success(), envelope.is_success());
-    serde_json::from_slice(&output).unwrap()
+    decoded
 }
 
 #[tokio::test]
@@ -168,18 +171,18 @@ async fn application_envelope_regressions_preserve_bounds_and_read_only_authorit
     for (case, input) in APPLICATION.iter().enumerate() {
         let envelope = application_case(&service, input, case).await;
         if case < 3 {
-            assert_eq!(
-                envelope["ok"], true,
+            assert!(
+                envelope.is_success(),
                 "valid retained application case {case}"
             );
         } else {
-            assert_eq!(
-                envelope["ok"], false,
+            assert!(
+                !envelope.is_success(),
                 "invalid or denied retained application case {case}"
             );
         }
         if matches!(case, 7 | 8) {
-            assert_eq!(envelope["error"]["code"], "permission_denied");
+            assert_eq!(envelope.error().unwrap().code, ErrorCode::PermissionDenied);
         }
     }
     assert_eq!(
@@ -208,8 +211,9 @@ async fn fuzz_application_envelopes() {
 #[cfg(feature = "mcp")]
 mod mcp {
     use super::*;
+    use crate::mcp_corpus::MCP;
     use rmcp::{ServiceExt, model::CallToolRequestParams, transport::TokioChildProcess};
-    use serde_json::{Value, json};
+    use serde_json::Value;
     use std::{
         io::{Read, Write},
         net::TcpListener,
@@ -218,17 +222,6 @@ mod mcp {
         thread,
     };
 
-    const MCP: &[&[u8]] = &[
-        include_bytes!("fuzz_corpus/envelopes/mcp/accounts.json"),
-        include_bytes!("fuzz_corpus/envelopes/mcp/mailboxes.json"),
-        include_bytes!("fuzz_corpus/envelopes/mcp/unknown-tool.json"),
-        include_bytes!("fuzz_corpus/envelopes/mcp/unknown-field.json"),
-        include_bytes!("fuzz_corpus/envelopes/mcp/denied-draft.json"),
-        include_bytes!("fuzz_corpus/envelopes/mcp/invalid-params.json"),
-        include_bytes!("fuzz_corpus/envelopes/mcp/duplicate-id.json"),
-        include_bytes!("fuzz_corpus/envelopes/mcp/invalid-version.json"),
-        include_bytes!("fuzz_corpus/envelopes/mcp/batch.json"),
-    ];
     const INITIALIZE: &[u8] = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"envelope-fixture","version":"1"}}}
 "#;
     const INITIALIZED: &[u8] = b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n";
@@ -399,7 +392,7 @@ mod mcp {
                 "versioned SDK frame in case {case}"
             );
             if let Some(envelope) = frame["result"].get("structuredContent") {
-                let _: Envelope<Value> = serde_json::from_value(envelope.clone())
+                let _: Envelope<Value> = serde::Deserialize::deserialize(envelope)
                     .expect("versioned normalized MCP envelope");
             }
         }
@@ -429,17 +422,38 @@ mod mcp {
         let (installation, provider) = installation();
         for (case, input) in MCP.iter().enumerate() {
             let output = raw_case(&installation, input, case);
-            if case < 2 {
-                let response: Value = serde_json::from_slice(
-                    output
-                        .stdout
-                        .split(|byte| *byte == b'\n')
-                        .nth(1)
-                        .expect("retained request response"),
-                )
-                .unwrap();
+            let mut responses = output
+                .stdout
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .skip(1)
+                .map(|line| serde_json::from_slice::<Value>(line).unwrap());
+            let response = responses.next();
+            if case < 5 {
+                let response = response.as_ref().expect("retained request response");
                 assert_eq!(response["id"], 2);
-                assert_eq!(response["result"]["structuredContent"]["ok"], true);
+                match case {
+                    0 | 1 => assert_eq!(response["result"]["structuredContent"]["ok"], true),
+                    2 | 4 => assert_eq!(response["error"]["code"], -32601),
+                    3 => {
+                        assert_eq!(response["result"]["structuredContent"]["ok"], false);
+                        assert_eq!(
+                            response["result"]["structuredContent"]["error"]["code"],
+                            "invalid_request"
+                        );
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            if case >= 2 {
+                for response in response.into_iter().chain(responses) {
+                    assert!(
+                        (response.get("error").is_some_and(Value::is_object)
+                            && response.get("result").is_none())
+                            || response["result"]["structuredContent"]["ok"] == false,
+                        "invalid retained MCP case {case} produced a successful response"
+                    );
+                }
             }
             no_provider_connections(&provider);
         }
@@ -471,19 +485,13 @@ mod mcp {
             .unwrap()
             .expect("bounded SDK initialization");
         for input in [MCP[0], MCP[1], MCP[3]] {
-            let frame: Value = serde_json::from_slice(input).unwrap();
-            let response = tokio::time::timeout(
-                Duration::from_secs(2),
-                client.call_tool(
-                    CallToolRequestParams::new(
-                        frame["params"]["name"].as_str().unwrap().to_owned(),
-                    )
-                    .with_arguments(frame["params"]["arguments"].as_object().unwrap().clone()),
-                ),
-            )
-            .await
-            .unwrap()
-            .expect("bounded SDK tool response");
+            let mut frame: Value = serde_json::from_slice(input).unwrap();
+            let params: CallToolRequestParams =
+                serde_json::from_value(frame["params"].take()).unwrap();
+            let response = tokio::time::timeout(Duration::from_secs(2), client.call_tool(params))
+                .await
+                .unwrap()
+                .expect("bounded SDK tool response");
             let structured = response.structured_content.unwrap();
             let text: Value =
                 serde_json::from_str(&response.content[0].as_text().unwrap().text).unwrap();
@@ -491,12 +499,12 @@ mod mcp {
             let output = serde_json::to_vec(&structured).unwrap();
             assert!(output.len() <= 4096);
             safe_output(&output, 0);
-            let _: Envelope<Value> = serde_json::from_value(structured.clone()).unwrap();
             if input == MCP[3] {
                 assert_eq!(structured["error"]["code"], "invalid_request");
             } else {
                 assert_eq!(structured["ok"], true);
             }
+            let _: Envelope<Value> = serde_json::from_value(structured).unwrap();
         }
         let tools = tokio::time::timeout(Duration::from_secs(2), client.list_all_tools())
             .await
@@ -506,8 +514,7 @@ mod mcp {
         let denied = tokio::time::timeout(
             Duration::from_secs(2),
             client.call_tool(
-                CallToolRequestParams::new("email_save_draft")
-                    .with_arguments(json!({}).as_object().unwrap().clone()),
+                CallToolRequestParams::new("email_save_draft").with_arguments(Default::default()),
             ),
         )
         .await

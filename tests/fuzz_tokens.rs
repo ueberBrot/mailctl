@@ -4,6 +4,7 @@ mod support;
 use mailctl::{
     config::Config,
     domain::{BodyText, ErrorCode, MailboxMetadata, MessageMetadata, Operation},
+    policy::RequestContext,
     service::{
         MemoryAttachments, MemoryBodies, MemoryMailboxes, MemoryMessage, MemoryMessages, Service,
     },
@@ -13,6 +14,7 @@ use std::{sync::Arc, time::Duration};
 
 struct Tokens {
     service: Service,
+    context: RequestContext,
     cases: Vec<TokenCase>,
 }
 
@@ -20,20 +22,14 @@ struct TokenCase {
     name: &'static str,
     request: Value,
     field: &'static str,
-    value: String,
     expected: ErrorCode,
 }
 
 impl TokenCase {
-    fn new(name: &'static str, request: Value, field: &'static str, expected: ErrorCode) -> Self {
-        let value = request["input"][field].as_str().unwrap().to_owned();
-        Self {
-            name,
-            request,
-            field,
-            value,
-            expected,
-        }
+    fn value(&self) -> &str {
+        self.request["input"][self.field]
+            .as_str()
+            .expect("authentic token fixture")
     }
 }
 
@@ -124,96 +120,106 @@ impl Tokens {
             .with_search_backend(messages)
             .with_body_backend(bodies)
             .with_attachment_backend(attachments);
+        let context = service.context("all", &Default::default()).unwrap();
         let inventory = execute(
             &service,
+            &context,
             json!({"operation":"list_mailboxes","input":{"account":"work"}}),
         )
         .await;
-        let mailbox = inventory["mailboxes"]
+        let mailbox = &inventory["mailboxes"]
             .as_array()
             .unwrap()
             .iter()
             .find(|mailbox| mailbox["metadata"]["name"] == "INBOX")
-            .unwrap()["reference"]
-            .clone();
+            .unwrap()["reference"];
         let page = execute(
             &service,
+            &context,
             json!({"operation":"search_messages","input":{"mailbox":mailbox,"limit":1}}),
         )
         .await;
-        let message = page["messages"][0]["reference"].clone();
+        let message = &page["messages"][0]["reference"];
         let body = execute(
             &service,
+            &context,
             json!({"operation":"get_message","input":{"message":message}}),
         )
         .await;
         let list = execute(
             &service,
+            &context,
             json!({"operation":"list_attachments","input":{"message":message}}),
         )
         .await;
-        let attachment = list["attachments"][0]["reference"].clone();
+        let attachment = &list["attachments"][0]["reference"];
         let chunk = execute(
             &service,
+            &context,
             json!({"operation":"get_attachment","input":{"attachment":attachment}}),
         )
         .await;
         let mailbox_page = execute(
             &service,
+            &context,
             json!({"operation":"list_mailboxes","input":{"account":"work","limit":1}}),
         )
         .await;
         let cases = vec![
-            TokenCase::new(
-                "mailbox-reference",
-                json!({"operation":"list_mailboxes","input":{"reference":mailbox}}),
-                "reference",
-                ErrorCode::StaleReference,
-            ),
-            TokenCase::new(
-                "mailbox-cursor",
-                json!({"operation":"list_mailboxes","input":{"account":"work","limit":1,"cursor":mailbox_page["next_cursor"]}}),
-                "cursor",
-                ErrorCode::StaleCursor,
-            ),
-            TokenCase::new(
-                "search-cursor",
-                json!({"operation":"search_messages","input":{"mailbox":mailbox,"limit":1,"cursor":page["next_cursor"]}}),
-                "cursor",
-                ErrorCode::StaleCursor,
-            ),
-            TokenCase::new(
-                "message-reference",
-                json!({"operation":"get_message","input":{"message":message}}),
-                "message",
-                ErrorCode::StaleReference,
-            ),
-            TokenCase::new(
-                "body-cursor",
-                json!({"operation":"get_message","input":{"message":message,"cursor":body["body"]["next_cursor"]}}),
-                "cursor",
-                ErrorCode::StaleCursor,
-            ),
-            TokenCase::new(
-                "attachment-reference",
-                json!({"operation":"get_attachment","input":{"attachment":attachment}}),
-                "attachment",
-                ErrorCode::StaleReference,
-            ),
-            TokenCase::new(
-                "transfer-token",
-                json!({"operation":"get_attachment","input":{"token":chunk["progress"]["next_token"]}}),
-                "token",
-                ErrorCode::TransferExpired,
-            ),
+            TokenCase {
+                name: "mailbox-reference",
+                request: json!({"operation":"list_mailboxes","input":{"reference":mailbox}}),
+                field: "reference",
+                expected: ErrorCode::StaleReference,
+            },
+            TokenCase {
+                name: "mailbox-cursor",
+                request: json!({"operation":"list_mailboxes","input":{"account":"work","limit":1,"cursor":mailbox_page["next_cursor"]}}),
+                field: "cursor",
+                expected: ErrorCode::StaleCursor,
+            },
+            TokenCase {
+                name: "search-cursor",
+                request: json!({"operation":"search_messages","input":{"mailbox":mailbox,"limit":1,"cursor":page["next_cursor"]}}),
+                field: "cursor",
+                expected: ErrorCode::StaleCursor,
+            },
+            TokenCase {
+                name: "message-reference",
+                request: json!({"operation":"get_message","input":{"message":message}}),
+                field: "message",
+                expected: ErrorCode::StaleReference,
+            },
+            TokenCase {
+                name: "body-cursor",
+                request: json!({"operation":"get_message","input":{"message":message,"cursor":body["body"]["next_cursor"]}}),
+                field: "cursor",
+                expected: ErrorCode::StaleCursor,
+            },
+            TokenCase {
+                name: "attachment-reference",
+                request: json!({"operation":"get_attachment","input":{"attachment":attachment}}),
+                field: "attachment",
+                expected: ErrorCode::StaleReference,
+            },
+            TokenCase {
+                name: "transfer-token",
+                request: json!({"operation":"get_attachment","input":{"token":chunk["progress"]["next_token"]}}),
+                field: "token",
+                expected: ErrorCode::TransferExpired,
+            },
         ];
-        Self { service, cases }
+        Self {
+            service,
+            context,
+            cases,
+        }
     }
 
     async fn reject(&self, case: &TokenCase, input: &[u8]) {
         let value = String::from_utf8_lossy(input);
         // Some mutations are no-ops. Genuine references remain valid and are exercised during setup.
-        if value == case.value {
+        if value == case.value() {
             return;
         }
         let mut request = case.request.clone();
@@ -221,10 +227,9 @@ impl Tokens {
         let Ok(operation) = serde_json::from_value::<Operation>(request) else {
             return;
         };
-        let context = self.service.context("all", &Default::default()).unwrap();
         let error = tokio::time::timeout(
             Duration::from_secs(1),
-            self.service.execute(&context, operation),
+            self.service.execute(&self.context, operation),
         )
         .await
         .expect("token decoding exceeded its deadline")
@@ -234,13 +239,28 @@ impl Tokens {
         assert!(!error.retryable);
         assert!(error.draft_operation.is_none());
     }
+
+    async fn verify_transfer(&self) {
+        let case = self
+            .cases
+            .iter()
+            .find(|case| case.name == "transfer-token")
+            .unwrap();
+        let chunk = tokio::time::timeout(
+            Duration::from_secs(1),
+            execute(&self.service, &self.context, case.request.clone()),
+        )
+        .await
+        .expect("authentic transfer continuation deadline");
+        assert_eq!(chunk["decoded_offset"], 2);
+        assert_eq!(chunk["bytes_base64"], "Y2Q=");
+    }
 }
 
-async fn execute(service: &Service, request: Value) -> Value {
-    let context = service.context("all", &Default::default()).unwrap();
+async fn execute(service: &Service, context: &RequestContext, request: Value) -> Value {
     serde_json::to_value(
         service
-            .execute(&context, serde_json::from_value(request).unwrap())
+            .execute(context, serde_json::from_value(request).unwrap())
             .await
             .unwrap(),
     )
@@ -271,7 +291,7 @@ fn retained_token_regressions_reject_every_resource_and_continuation_kind() {
     }
     // Alter each authenticated part independently, including the kind, payload, and signature.
     for case in &tokens.cases {
-        let token = &case.value;
+        let token = case.value();
         for position in [0, token.find('.').unwrap() + 1, token.len() - 1] {
             let mut altered = token.as_bytes().to_vec();
             altered[position] = if altered[position] == b'A' {
@@ -282,6 +302,7 @@ fn retained_token_regressions_reject_every_resource_and_continuation_kind() {
             runtime.block_on(tokens.reject(case, &altered));
         }
     }
+    runtime.block_on(tokens.verify_transfer());
 }
 
 #[test]
@@ -295,7 +316,7 @@ fn fuzz_tokens() {
     let seeds: Vec<_> = tokens
         .cases
         .iter()
-        .map(|case| case.value.as_bytes())
+        .map(|case| case.value().as_bytes())
         .collect();
     let campaign = fuzz_support::Campaign::from_env("tokens");
     for (index, input) in campaign.cases(&seeds) {
@@ -308,5 +329,6 @@ fn fuzz_tokens() {
         );
         assert!(allocation.bytes_total < 2 * 1024 * 1024);
     }
+    runtime.block_on(tokens.verify_transfer());
     campaign.finish();
 }

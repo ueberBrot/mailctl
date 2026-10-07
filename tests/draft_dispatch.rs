@@ -384,7 +384,7 @@ const RETRY_CORPUS: &[&[u8]] = &[
 async fn reject_uncertain_retry(fixture: &Fixture, bytes: &[u8]) {
     if let Ok(draft) = serde_json::from_slice::<mailctl::domain::DraftContent>(bytes) {
         let mut input = fixture.input.clone();
-        input.draft = Box::new(draft);
+        *input.draft = draft;
         let error = tokio::time::timeout(
             std::time::Duration::from_secs(3),
             save(&fixture.service, input),
