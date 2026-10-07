@@ -1,5 +1,8 @@
 //! Apply admission limits around the SDK's STDIO transport.
-use crate::{config::Limits, domain::Error};
+use crate::{
+    config::Limits,
+    domain::{Error, ErrorCode},
+};
 use futures_util::StreamExt;
 use rmcp::{
     RoleServer,
@@ -14,7 +17,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::AsyncWriteExt,
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     sync::{OwnedSemaphorePermit, Semaphore},
     task::JoinHandle,
     time::{Instant, timeout, timeout_at},
@@ -150,6 +153,35 @@ pub(super) struct BoundedStdio {
     staged: Option<(RxJsonRpcMessage<RoleServer>, OwnedSemaphorePermit)>,
 }
 
+async fn forward_bounded_input(
+    reader: impl AsyncRead + Unpin,
+    writer: &mut (impl AsyncWrite + Unpin),
+    input_limit: usize,
+    nesting_limit: usize,
+    deadline: Duration,
+) -> Result<(), ErrorCode> {
+    let mut lines = FramedRead::new(reader, LinesCodec::new_with_max_length(input_limit));
+    for _ in 0..4096 {
+        let line = match timeout(deadline, lines.next()).await {
+            Ok(Some(Ok(line))) => line,
+            Ok(None) => return Ok(()),
+            Ok(Some(Err(_))) => return Err(ErrorCode::InvalidRequest),
+            Err(_) => return Err(ErrorCode::Timeout),
+        };
+        crate::encoding::validate_json_bounds(line.as_bytes(), nesting_limit, 4096)
+            .map_err(|error| error.code)?;
+        let write = async {
+            writer.write_all(line.as_bytes()).await?;
+            writer.write_all(b"\n").await
+        };
+        timeout(deadline, write)
+            .await
+            .map_err(|_| ErrorCode::Timeout)?
+            .map_err(|_| ErrorCode::Cancelled)?;
+    }
+    Ok(())
+}
+
 impl BoundedStdio {
     pub(super) fn new(bounds: Bounds, shutdown: tokio_util::sync::CancellationToken) -> Self {
         let (reader, mut writer) = tokio::io::duplex(8192);
@@ -157,27 +189,14 @@ impl BoundedStdio {
         let ingress = tokio::spawn(async move {
             // The SDK may drain requests after EOF; cancel active work as soon as input closes.
             let _cancel_on_exit = shutdown.drop_guard();
-            let mut lines = FramedRead::new(
+            let _ = forward_bounded_input(
                 tokio::io::stdin(),
-                LinesCodec::new_with_max_length(bounds.input),
-            );
-            for _ in 0..4096 {
-                let Ok(Some(Ok(line))) = timeout(bounds.deadline, lines.next()).await else {
-                    break;
-                };
-                if crate::encoding::validate_json_bounds(line.as_bytes(), bounds.nesting, 4096)
-                    .is_err()
-                {
-                    break;
-                }
-                let write = async {
-                    writer.write_all(line.as_bytes()).await?;
-                    writer.write_all(b"\n").await
-                };
-                if !matches!(timeout(bounds.deadline, write).await, Ok(Ok(()))) {
-                    break;
-                }
-            }
+                &mut writer,
+                bounds.input,
+                bounds.nesting,
+                bounds.deadline,
+            )
+            .await;
         });
         Self {
             sdk: AsyncRwTransport::new_server(reader, tokio::io::stdout()),
@@ -308,7 +327,11 @@ mod tests {
         include_bytes!("../../tests/fuzz_corpus/envelopes/mcp/batch.json"),
     ];
 
-    fn decoding_case(runtime: &tokio::runtime::Runtime, input: &[u8], case: usize) -> (bool, bool) {
+    fn decoding_case(
+        runtime: &tokio::runtime::Runtime,
+        input: &[u8],
+        case: usize,
+    ) -> (bool, Option<ErrorCode>) {
         assert!(
             input.len() <= fuzz_support::MAX_INPUT_BYTES,
             "MCP decoding input ceiling in case {case}"
@@ -318,41 +341,20 @@ mod tests {
         let (_, reservation, _) = Bounds::reservations(input.len().max(1024), 1024, 1, 0, 0);
         let started = std::time::Instant::now();
         let mut accepted = false;
-        let mut guard_rejected = false;
+        let mut admission_error = None;
         let measured = allocation_counter::measure(|| {
             runtime.block_on(async {
                 let input = input.to_vec();
                 let (reader, mut writer) = tokio::io::duplex(8192);
                 let ingress = tokio::spawn(async move {
-                    let mut lines = FramedRead::new(
+                    forward_bounded_input(
                         input.as_slice(),
-                        LinesCodec::new_with_max_length(fuzz_support::MAX_INPUT_BYTES),
-                    );
-                    for _ in 0..4096 {
-                        let Some(Ok(line)) = lines.next().await else {
-                            break;
-                        };
-                        if let Err(error) =
-                            crate::encoding::validate_json_bounds(line.as_bytes(), 32, 4096)
-                        {
-                            assert_eq!(
-                                error.code,
-                                crate::domain::ErrorCode::InvalidRequest,
-                                "safe admission error code in case {case}"
-                            );
-                            assert!(
-                                error.message == Error::new(error.code).message,
-                                "safe admission error message in case {case}"
-                            );
-                            return true;
-                        }
-                        if writer.write_all(line.as_bytes()).await.is_err()
-                            || writer.write_all(b"\n").await.is_err()
-                        {
-                            break;
-                        }
-                    }
-                    false
+                        &mut writer,
+                        fuzz_support::MAX_INPUT_BYTES,
+                        32,
+                        Duration::from_secs(2),
+                    )
+                    .await
                 });
                 let mut sdk =
                     AsyncRwTransport::<RoleServer, _, _>::new_server(reader, tokio::io::sink());
@@ -361,18 +363,18 @@ mod tests {
                 accepted = retained.is_some();
                 ingress.abort();
                 let joined = ingress.await;
-                guard_rejected = match joined {
-                    Ok(rejected) => rejected,
+                admission_error = match joined {
+                    Ok(result) => result.err(),
                     Err(error) => {
                         assert!(
                             error.is_cancelled(),
                             "MCP ingress task failed in case {case}"
                         );
-                        false
+                        None
                     }
                 };
                 assert!(received.is_ok(), "MCP SDK receive deadline in case {case}");
-                std::hint::black_box((received, retained));
+                drop(std::hint::black_box((received, retained)));
             });
         });
         assert!(
@@ -391,7 +393,7 @@ mod tests {
             started.elapsed() < Duration::from_secs(2),
             "MCP decoding deadline in case {case}"
         );
-        (accepted, guard_rejected)
+        (accepted, admission_error)
     }
 
     #[test]
@@ -422,10 +424,11 @@ mod tests {
         }
         let mut sequence = MCP[0].to_vec();
         sequence.extend_from_slice(format!("{}0{}\n", "[".repeat(65), "]".repeat(65)).as_bytes());
-        let (accepted, guard_rejected) = decoding_case(&runtime, &sequence, MCP.len() + 4);
+        let (accepted, admission_error) = decoding_case(&runtime, &sequence, MCP.len() + 4);
         assert!(accepted, "valid MCP frame survives a later rejected frame");
-        assert!(
-            guard_rejected,
+        assert_eq!(
+            admission_error,
+            Some(ErrorCode::InvalidRequest),
             "later MCP frame exceeds the admission bound"
         );
     }
