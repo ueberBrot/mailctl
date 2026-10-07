@@ -163,7 +163,7 @@ pub async fn literal_bytes(
 }
 
 /// Observe a bounded command independently of the production wire guard.
-/// EOF or reset before a command is allowed; partial commands and stalls fail the fixture.
+/// EOF, reset, or abort before a command is allowed; partial commands and stalls fail the fixture.
 pub async fn observe_command(wire: &mut Wire, deadline: Duration) -> Option<Command<'static>> {
     tokio::time::timeout(deadline, async {
         let mut input = Vec::new();
@@ -174,7 +174,9 @@ pub async fn observe_command(wire: &mut Wire, deadline: Duration) -> Option<Comm
                     if input.is_empty()
                         && matches!(
                             error.kind(),
-                            std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+                            std::io::ErrorKind::UnexpectedEof
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted
                         ) =>
                 {
                     return None;
