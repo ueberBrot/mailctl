@@ -288,9 +288,161 @@ impl Transport<RoleServer> for BoundedStdio {
 }
 
 #[cfg(test)]
+#[path = "../../tests/fuzz_support/mod.rs"]
+mod fuzz_support;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    const MCP: &[&[u8]] = &[
+        include_bytes!("../../tests/fuzz_corpus/envelopes/mcp/accounts.json"),
+        include_bytes!("../../tests/fuzz_corpus/envelopes/mcp/mailboxes.json"),
+        include_bytes!("../../tests/fuzz_corpus/envelopes/mcp/unknown-tool.json"),
+        include_bytes!("../../tests/fuzz_corpus/envelopes/mcp/unknown-field.json"),
+        include_bytes!("../../tests/fuzz_corpus/envelopes/mcp/denied-draft.json"),
+        include_bytes!("../../tests/fuzz_corpus/envelopes/mcp/invalid-params.json"),
+        include_bytes!("../../tests/fuzz_corpus/envelopes/mcp/duplicate-id.json"),
+        include_bytes!("../../tests/fuzz_corpus/envelopes/mcp/invalid-version.json"),
+        include_bytes!("../../tests/fuzz_corpus/envelopes/mcp/batch.json"),
+    ];
+
+    fn decoding_case(runtime: &tokio::runtime::Runtime, input: &[u8], case: usize) -> (bool, bool) {
+        assert!(
+            input.len() <= fuzz_support::MAX_INPUT_BYTES,
+            "MCP decoding input ceiling in case {case}"
+        );
+        // Sessions admit at least 1 KiB; use the production control reservation,
+        // which includes decoder scratch and retained SDK buffers.
+        let (_, reservation, _) = Bounds::reservations(input.len().max(1024), 1024, 1, 0, 0);
+        let started = std::time::Instant::now();
+        let mut accepted = false;
+        let mut guard_rejected = false;
+        let measured = allocation_counter::measure(|| {
+            runtime.block_on(async {
+                let input = input.to_vec();
+                let (reader, mut writer) = tokio::io::duplex(8192);
+                let ingress = tokio::spawn(async move {
+                    let mut lines = FramedRead::new(
+                        input.as_slice(),
+                        LinesCodec::new_with_max_length(fuzz_support::MAX_INPUT_BYTES),
+                    );
+                    for _ in 0..4096 {
+                        let Some(Ok(line)) = lines.next().await else {
+                            break;
+                        };
+                        if let Err(error) =
+                            crate::encoding::validate_json_bounds(line.as_bytes(), 32, 4096)
+                        {
+                            assert_eq!(
+                                error.code,
+                                crate::domain::ErrorCode::InvalidRequest,
+                                "safe admission error code in case {case}"
+                            );
+                            assert!(
+                                error.message == Error::new(error.code).message,
+                                "safe admission error message in case {case}"
+                            );
+                            return true;
+                        }
+                        if writer.write_all(line.as_bytes()).await.is_err()
+                            || writer.write_all(b"\n").await.is_err()
+                        {
+                            break;
+                        }
+                    }
+                    false
+                });
+                let mut sdk =
+                    AsyncRwTransport::<RoleServer, _, _>::new_server(reader, tokio::io::sink());
+                let received = timeout(Duration::from_secs(2), sdk.receive()).await;
+                let retained = received.as_ref().ok().and_then(Option::as_ref).cloned();
+                accepted = retained.is_some();
+                ingress.abort();
+                let joined = ingress.await;
+                guard_rejected = match joined {
+                    Ok(rejected) => rejected,
+                    Err(error) => {
+                        assert!(
+                            error.is_cancelled(),
+                            "MCP ingress task failed in case {case}"
+                        );
+                        false
+                    }
+                };
+                assert!(received.is_ok(), "MCP SDK receive deadline in case {case}");
+                std::hint::black_box((received, retained));
+            });
+        });
+        assert!(
+            measured.bytes_max as usize <= reservation,
+            "MCP decoding control reservation exceeded in case {case}"
+        );
+        assert!(
+            measured.bytes_total <= 16 * 1024 * 1024,
+            "MCP decoding total allocation ceiling in case {case}"
+        );
+        assert!(
+            measured.count_total <= 32 * 1024,
+            "MCP decoding allocation work ceiling in case {case}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "MCP decoding deadline in case {case}"
+        );
+        (accepted, guard_rejected)
+    }
+
+    #[test]
+    fn mcp_decoding_regressions_fit_reservations_and_work_bounds() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("current-thread decoding runtime");
+        for (case, input) in MCP.iter().enumerate() {
+            let (accepted, _) = decoding_case(&runtime, input, case);
+            if case < 2 {
+                assert!(accepted, "valid retained MCP request in case {case}");
+            }
+        }
+        for (case, input) in [
+            vec![0xff, b'\n'],
+            format!("{}0{}\n", "[".repeat(65), "]".repeat(65)).into_bytes(),
+            format!("[{}]\n", vec!["0"; 4097].join(",")).into_bytes(),
+            vec![b'x'; fuzz_support::MAX_INPUT_BYTES],
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert!(
+                !decoding_case(&runtime, input, MCP.len() + case).0,
+                "invalid retained MCP request in case {case}"
+            );
+        }
+        let mut sequence = MCP[0].to_vec();
+        sequence.extend_from_slice(format!("{}0{}\n", "[".repeat(65), "]".repeat(65)).as_bytes());
+        let (accepted, guard_rejected) = decoding_case(&runtime, &sequence, MCP.len() + 4);
+        assert!(accepted, "valid MCP frame survives a later rejected frame");
+        assert!(
+            guard_rejected,
+            "later MCP frame exceeds the admission bound"
+        );
+    }
+
+    #[test]
+    #[ignore = "explicit bounded mutation campaign"]
+    fn fuzz_mcp_decoding() {
+        let campaign = fuzz_support::Campaign::from_env("mcp-decoding");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("current-thread decoding runtime");
+        for (case, input) in campaign.cases(MCP) {
+            decoding_case(&runtime, &input, case);
+        }
+        campaign.finish();
+    }
 
     #[test]
     fn bounded_sdk_decoding_fits_the_input_reservation_for_large_strings_and_many_nodes() {

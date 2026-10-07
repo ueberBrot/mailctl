@@ -2,14 +2,13 @@ mod fuzz_support;
 mod imap_support;
 
 use fuzz_support::{Campaign, MAX_INPUT_BYTES};
-use imap_support::{CountedWire, Wire, authenticate, dedicated_fixture, examine, expect};
-use io_imap::{
-    codec::{CommandCodec, decode::Decoder},
-    types::{
-        command::CommandBody,
-        fetch::{MacroOrMessageDataItemNames, MessageDataItemName, Section},
-        sequence::{SeqOrUid, Sequence},
-    },
+use imap_support::{
+    CountedWire, Wire, authenticate, dedicated_fixture, examine, expect, observe_command,
+};
+use io_imap::types::{
+    command::CommandBody,
+    fetch::{MacroOrMessageDataItemNames, MessageDataItemName, Section},
+    sequence::{SeqOrUid, Sequence},
 };
 use mailctl::imap::{
     AttachmentData, AttachmentDecoder, BodyPage, BodyRequest, Error, Limits, Metrics, TlsMode,
@@ -21,7 +20,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 
 const ROOT_HEADERS: &[u8] =
     b"MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=fixture\r\n\r\n";
@@ -81,27 +80,6 @@ fn attachment_structure(encoding: &str, size: usize) -> Vec<u8> {
     ).into_bytes()
 }
 
-// Complete fixture commands are decoded independently. EOF is expected when hostile
-// structure, headers, or transfer bytes make the production operation close its transport.
-async fn command(wire: &mut Wire) -> Option<Vec<u8>> {
-    tokio::time::timeout(Duration::from_millis(500), async {
-        let mut input = Vec::new();
-        loop {
-            match wire.read_u8().await {
-                Ok(byte) => input.push(byte),
-                Err(_) => return None,
-            }
-            assert!(input.len() <= 1024, "synthetic command ceiling");
-            if input.ends_with(b"\r\n") {
-                return Some(input);
-            }
-        }
-    })
-    .await
-    .ok()
-    .flatten()
-}
-
 async fn serve(mut wire: Wire, kind: u8, input: Vec<u8>) {
     authenticate(&mut wire).await;
     examine(&mut wire).await;
@@ -132,14 +110,9 @@ async fn serve(mut wire: Wire, kind: u8, input: Vec<u8>) {
     let mut header_offset = 0usize;
     let mut body_offset = 0usize;
     for _ in 0..64 {
-        let Some(input_command) = command(&mut wire).await else {
+        let Some(command) = observe_command(&mut wire, Duration::from_secs(3)).await else {
             return;
         };
-        let codec = CommandCodec::new();
-        let (remaining, command) = codec
-            .decode(&input_command)
-            .expect("synthetic command syntax");
-        assert!(remaining.is_empty(), "one synthetic command per frame");
         let tag = command.tag.as_ref();
         if matches!(command.body, CommandBody::Logout) {
             let _ = wire
@@ -501,7 +474,7 @@ fn assert_integrity(chunk: AttachmentData, expected_len: u64, expected_digest: &
 
 #[test]
 #[ignore = "explicit bounded synthetic MIME mutation campaign"]
-fn mime_mutation_campaign() {
+fn fuzz_mime() {
     let campaign = Campaign::from_env("mime");
     for (case, input) in campaign.cases(CORPUS) {
         run(&input, case);

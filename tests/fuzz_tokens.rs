@@ -13,8 +13,28 @@ use std::{sync::Arc, time::Duration};
 
 struct Tokens {
     service: Service,
-    requests: Vec<Value>,
-    values: Vec<String>,
+    cases: Vec<TokenCase>,
+}
+
+struct TokenCase {
+    name: &'static str,
+    request: Value,
+    field: &'static str,
+    value: String,
+    expected: ErrorCode,
+}
+
+impl TokenCase {
+    fn new(name: &'static str, request: Value, field: &'static str, expected: ErrorCode) -> Self {
+        let value = request["input"][field].as_str().unwrap().to_owned();
+        Self {
+            name,
+            request,
+            field,
+            value,
+            expected,
+        }
+    }
 }
 
 impl Tokens {
@@ -143,35 +163,61 @@ impl Tokens {
             json!({"operation":"list_mailboxes","input":{"account":"work","limit":1}}),
         )
         .await;
-        let requests = vec![
-            json!({"operation":"list_mailboxes","input":{"reference":mailbox}}),
-            json!({"operation":"list_mailboxes","input":{"account":"work","limit":1,"cursor":mailbox_page["next_cursor"]}}),
-            json!({"operation":"search_messages","input":{"mailbox":mailbox,"limit":1,"cursor":page["next_cursor"]}}),
-            json!({"operation":"get_message","input":{"message":message}}),
-            json!({"operation":"get_message","input":{"message":message,"cursor":body["body"]["next_cursor"]}}),
-            json!({"operation":"get_attachment","input":{"attachment":attachment}}),
-            json!({"operation":"get_attachment","input":{"token":chunk["progress"]["next_token"]}}),
+        let cases = vec![
+            TokenCase::new(
+                "mailbox-reference",
+                json!({"operation":"list_mailboxes","input":{"reference":mailbox}}),
+                "reference",
+                ErrorCode::StaleReference,
+            ),
+            TokenCase::new(
+                "mailbox-cursor",
+                json!({"operation":"list_mailboxes","input":{"account":"work","limit":1,"cursor":mailbox_page["next_cursor"]}}),
+                "cursor",
+                ErrorCode::StaleCursor,
+            ),
+            TokenCase::new(
+                "search-cursor",
+                json!({"operation":"search_messages","input":{"mailbox":mailbox,"limit":1,"cursor":page["next_cursor"]}}),
+                "cursor",
+                ErrorCode::StaleCursor,
+            ),
+            TokenCase::new(
+                "message-reference",
+                json!({"operation":"get_message","input":{"message":message}}),
+                "message",
+                ErrorCode::StaleReference,
+            ),
+            TokenCase::new(
+                "body-cursor",
+                json!({"operation":"get_message","input":{"message":message,"cursor":body["body"]["next_cursor"]}}),
+                "cursor",
+                ErrorCode::StaleCursor,
+            ),
+            TokenCase::new(
+                "attachment-reference",
+                json!({"operation":"get_attachment","input":{"attachment":attachment}}),
+                "attachment",
+                ErrorCode::StaleReference,
+            ),
+            TokenCase::new(
+                "transfer-token",
+                json!({"operation":"get_attachment","input":{"token":chunk["progress"]["next_token"]}}),
+                "token",
+                ErrorCode::TransferExpired,
+            ),
         ];
-        let values = requests
-            .iter()
-            .enumerate()
-            .map(|(route, request)| request["input"][field(route)].as_str().unwrap().to_owned())
-            .collect();
-        Self {
-            service,
-            requests,
-            values,
-        }
+        Self { service, cases }
     }
 
-    async fn reject(&self, route: usize, input: &[u8]) {
+    async fn reject(&self, case: &TokenCase, input: &[u8]) {
         let value = String::from_utf8_lossy(input);
         // Some mutations are no-ops. Genuine references remain valid and are exercised during setup.
-        if value == self.values[route] {
+        if value == case.value {
             return;
         }
-        let mut request = self.requests[route].clone();
-        request["input"][field(route)] = json!(value);
+        let mut request = case.request.clone();
+        request["input"][case.field] = json!(value);
         let Ok(operation) = serde_json::from_value::<Operation>(request) else {
             return;
         };
@@ -183,30 +229,11 @@ impl Tokens {
         .await
         .expect("token decoding exceeded its deadline")
         .expect_err("altered token was accepted");
-        let expected = if route == 6 {
-            ErrorCode::TransferExpired
-        } else if [1, 2, 4].contains(&route) {
-            ErrorCode::StaleCursor
-        } else {
-            ErrorCode::StaleReference
-        };
-        assert_eq!(error.code, expected, "token route {route}");
+        assert_eq!(error.code, case.expected, "token case {}", case.name);
         assert!(error.message.len() < 256);
         assert!(!error.retryable);
         assert!(error.draft_operation.is_none());
     }
-}
-
-fn field(route: usize) -> &'static str {
-    [
-        "reference",
-        "cursor",
-        "cursor",
-        "message",
-        "cursor",
-        "attachment",
-        "token",
-    ][route]
 }
 
 async fn execute(service: &Service, request: Value) -> Value {
@@ -232,9 +259,9 @@ fn retained_token_regressions_reject_every_resource_and_continuation_kind() {
         include_bytes!("fuzz_corpus/tokens/extra-separator.token").as_slice(),
         include_bytes!("fuzz_corpus/tokens/noncanonical-base64.token").as_slice(),
     ] {
-        for route in 0..tokens.values.len() {
+        for case in &tokens.cases {
             let allocation =
-                allocation_counter::measure(|| runtime.block_on(tokens.reject(route, input)));
+                allocation_counter::measure(|| runtime.block_on(tokens.reject(case, input)));
             assert!(
                 allocation.bytes_max < 1024 * 1024,
                 "token decoding exceeded its allocation ceiling"
@@ -243,7 +270,8 @@ fn retained_token_regressions_reject_every_resource_and_continuation_kind() {
         }
     }
     // Alter each authenticated part independently, including the kind, payload, and signature.
-    for (route, token) in tokens.values.iter().enumerate() {
+    for case in &tokens.cases {
+        let token = &case.value;
         for position in [0, token.find('.').unwrap() + 1, token.len() - 1] {
             let mut altered = token.as_bytes().to_vec();
             altered[position] = if altered[position] == b'A' {
@@ -251,7 +279,7 @@ fn retained_token_regressions_reject_every_resource_and_continuation_kind() {
             } else {
                 b'A'
             };
-            runtime.block_on(tokens.reject(route, &altered));
+            runtime.block_on(tokens.reject(case, &altered));
         }
     }
 }
@@ -264,11 +292,15 @@ fn fuzz_tokens() {
         .build()
         .unwrap();
     let tokens = runtime.block_on(Tokens::new());
-    let seeds: Vec<_> = tokens.values.iter().map(|value| value.as_bytes()).collect();
+    let seeds: Vec<_> = tokens
+        .cases
+        .iter()
+        .map(|case| case.value.as_bytes())
+        .collect();
     let campaign = fuzz_support::Campaign::from_env("tokens");
     for (index, input) in campaign.cases(&seeds) {
         let allocation = allocation_counter::measure(|| {
-            runtime.block_on(tokens.reject(index % seeds.len(), &input))
+            runtime.block_on(tokens.reject(&tokens.cases[index % seeds.len()], &input))
         });
         assert!(
             allocation.bytes_max < 1024 * 1024,

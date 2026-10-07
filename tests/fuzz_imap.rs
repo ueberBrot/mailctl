@@ -20,22 +20,64 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 
 // A route byte and NUL precede each raw transcript, preserving binary corpus bytes.
-const CORPUS: &[&[u8]] = &[
-    include_bytes!("fuzz_corpus/imap/list.imap"),
-    include_bytes!("fuzz_corpus/imap/body.imap"),
-    include_bytes!("fuzz_corpus/imap/oversized-literal.imap"),
-    include_bytes!("fuzz_corpus/imap/truncated-literal.imap"),
-    include_bytes!("fuzz_corpus/imap/wrong-tag.imap"),
-    include_bytes!("fuzz_corpus/imap/draft-absent.imap"),
-    include_bytes!("fuzz_corpus/imap/draft-verified.imap"),
-    include_bytes!("fuzz_corpus/imap/draft-outside-window.imap"),
-    include_bytes!("fuzz_corpus/imap/literal-syntax.imap"),
-    include_bytes!("fuzz_corpus/imap/excessive-nesting.imap"),
-    include_bytes!("fuzz_corpus/imap/response-flood.imap"),
-    include_bytes!("fuzz_corpus/imap/oversized-line.imap"),
+const TRUNCATED_LITERAL: &[u8] = include_bytes!("fuzz_corpus/imap/truncated-literal.imap");
+const CORPUS: &[Case] = &[
+    Case {
+        input: include_bytes!("fuzz_corpus/imap/list.imap"),
+        expected: Outcome::Listed,
+    },
+    Case {
+        input: include_bytes!("fuzz_corpus/imap/body.imap"),
+        expected: Outcome::Read,
+    },
+    Case {
+        input: include_bytes!("fuzz_corpus/imap/oversized-literal.imap"),
+        expected: Outcome::Rejected(Error::Limit),
+    },
+    Case {
+        input: TRUNCATED_LITERAL,
+        expected: Outcome::Rejected(Error::Eof),
+    },
+    Case {
+        input: include_bytes!("fuzz_corpus/imap/wrong-tag.imap"),
+        expected: Outcome::Rejected(Error::Protocol),
+    },
+    Case {
+        input: include_bytes!("fuzz_corpus/imap/draft-absent.imap"),
+        expected: Outcome::Draft(DraftEvidence::Absent),
+    },
+    Case {
+        input: include_bytes!("fuzz_corpus/imap/draft-verified.imap"),
+        expected: Outcome::Draft(DraftEvidence::Verified(
+            mailctl::draft::DraftMessageIdentity {
+                uid_validity: 77,
+                uid: 4,
+            },
+        )),
+    },
+    Case {
+        input: include_bytes!("fuzz_corpus/imap/draft-outside-window.imap"),
+        expected: Outcome::Rejected(Error::Protocol),
+    },
+    Case {
+        input: include_bytes!("fuzz_corpus/imap/literal-syntax.imap"),
+        expected: Outcome::Read,
+    },
+    Case {
+        input: include_bytes!("fuzz_corpus/imap/excessive-nesting.imap"),
+        expected: Outcome::Rejected(Error::Limit),
+    },
+    Case {
+        input: include_bytes!("fuzz_corpus/imap/response-flood.imap"),
+        expected: Outcome::Rejected(Error::Limit),
+    },
+    Case {
+        input: include_bytes!("fuzz_corpus/imap/oversized-line.imap"),
+        expected: Outcome::Rejected(Error::Limit),
+    },
 ];
 const HEADERS: &[u8] = b"Content-Type: multipart/mixed; boundary=fixture\r\n\r\n";
 const STRUCTURE: &str = "((\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" 13 1 NIL NIL NIL NIL) \"MIXED\" (\"BOUNDARY\" \"fixture\") NIL NIL NIL)";
@@ -54,6 +96,11 @@ enum Outcome {
     Read,
     Draft(DraftEvidence),
     Rejected(Error),
+}
+
+struct Case {
+    input: &'static [u8],
+    expected: Outcome,
 }
 
 fn limits() -> Limits {
@@ -93,23 +140,8 @@ fn draft_limits() -> config::Limits {
 /// The server checks outgoing commands independently of the production wire guard.
 async fn observe_cleanup(wire: &mut Wire, route: Route, commands: &AtomicUsize) {
     let mut verified = false;
-    loop {
-        let mut bytes = Vec::new();
-        loop {
-            match wire.read_u8().await {
-                Ok(byte) => bytes.push(byte),
-                Err(_) if bytes.is_empty() => return,
-                Err(_) => panic!("incomplete command after fuzz response"),
-            }
-            assert!(bytes.len() <= 1024, "outgoing command ceiling");
-            if bytes.ends_with(b"\r\n") {
-                break;
-            }
-        }
+    while let Some(command) = observe_command(wire, Duration::from_secs(3)).await {
         commands.fetch_add(1, Ordering::Relaxed);
-        let codec = CommandCodec::new();
-        let (remaining, command) = codec.decode(&bytes).expect("complete read-only command");
-        assert!(remaining.is_empty(), "one command per observation");
         match command.body {
             CommandBody::Logout if route != Route::Reconcile => {
                 let tag = command.tag.as_ref();
@@ -119,6 +151,7 @@ async fn observe_cleanup(wire: &mut Wire, route: Route, commands: &AtomicUsize) 
                 }
             }
             body if route == Route::Reconcile && !verified => {
+                let codec = CommandCodec::new();
                 let (_, expected) = codec
                     .decode(b"expected UID FETCH 4 (UID BODY.PEEK[]<0.1025>)\r\n")
                     .unwrap();
@@ -350,29 +383,10 @@ fn run_case(input: &[u8], index: usize, hold_open: bool) -> Outcome {
 
 #[test]
 fn retained_imap_framing_regressions() {
-    let expected = [
-        Outcome::Listed,
-        Outcome::Read,
-        Outcome::Rejected(Error::Limit),
-        Outcome::Rejected(Error::Eof),
-        Outcome::Rejected(Error::Protocol),
-        Outcome::Draft(DraftEvidence::Absent),
-        Outcome::Draft(DraftEvidence::Verified(
-            mailctl::draft::DraftMessageIdentity {
-                uid_validity: 77,
-                uid: 4,
-            },
-        )),
-        Outcome::Rejected(Error::Protocol),
-        Outcome::Read,
-        Outcome::Rejected(Error::Limit),
-        Outcome::Rejected(Error::Limit),
-        Outcome::Rejected(Error::Limit),
-    ];
-    for (index, (input, expected)) in CORPUS.iter().zip(expected).enumerate() {
+    for (index, case) in CORPUS.iter().enumerate() {
         assert_eq!(
-            run_case(input, index, false),
-            expected,
+            run_case(case.input, index, false),
+            case.expected,
             "retained IMAP fixture {index}"
         );
     }
@@ -381,7 +395,7 @@ fn retained_imap_framing_regressions() {
 #[test]
 fn delayed_imap_literal_times_out_and_disposes_transport() {
     assert_eq!(
-        run_case(CORPUS[3], 3, true),
+        run_case(TRUNCATED_LITERAL, 3, true),
         Outcome::Rejected(Error::Timeout)
     );
 }
@@ -390,7 +404,8 @@ fn delayed_imap_literal_times_out_and_disposes_transport() {
 #[ignore = "bounded byte-mutation campaign; run explicitly with MAILCTL_FUZZ_CASES and MAILCTL_FUZZ_SEED"]
 fn fuzz_imap_framing() {
     let campaign = Campaign::from_env("imap");
-    for (index, input) in campaign.cases(CORPUS) {
+    let seeds: Vec<_> = CORPUS.iter().map(|case| case.input).collect();
+    for (index, input) in campaign.cases(&seeds) {
         let _ = run_case(&input, index, false);
     }
     campaign.finish();
