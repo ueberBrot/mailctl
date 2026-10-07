@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"email_save_draft","arguments":{"mailbox":"Drafts","account_id":"35000000-0000-4000-8000-000000000001","account_generation":1,"operation_id":"35000000-0000-4000-8000-000000000002","draft":{"body":"fixture-private-content"}}}}

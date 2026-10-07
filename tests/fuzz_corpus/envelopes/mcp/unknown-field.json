@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"email_list_accounts","arguments":{"fixture-private-content":"fixture-secret-canary\u001b]52;c;canary\u0007\u202e"}}}
