@@ -78,6 +78,11 @@ const CORPUS: &[Case] = &[
         input: include_bytes!("fuzz_corpus/imap/oversized-line.imap"),
         expected: Outcome::Rejected(Error::Limit),
     },
+    Case {
+        // Reduced from seed 35002, case 0: malformed tagged response disposes TLS.
+        input: include_bytes!("fuzz_corpus/imap/malformed-tagged-response.imap"),
+        expected: Outcome::Rejected(Error::Protocol),
+    },
 ];
 const HEADERS: &[u8] = b"Content-Type: multipart/mixed; boundary=fixture\r\n\r\n";
 const STRUCTURE: &str = "((\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" 13 1 NIL NIL NIL NIL) \"MIXED\" (\"BOUNDARY\" \"fixture\") NIL NIL NIL)";

@@ -43,7 +43,7 @@ operations rather than their opaque bytes.
 When a campaign finds a failure, reduce its synthetic input while keeping the
 same public operation and failing assertion. Retain the smallest useful fixture
 under `tests/fuzz_corpus/`, add a normal test with an independently expected
-result, fix the production path, and rerun the affected campaign. Keep private
+result, fix the demonstrated defect, and rerun the affected campaign. Keep private
 provider inputs and secrets out of the corpus and evidence.
 
 The runner requires exactly one passing completion record for each of its seven

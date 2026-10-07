@@ -163,7 +163,7 @@ pub async fn literal_bytes(
 }
 
 /// Observe a bounded command independently of the production wire guard.
-/// Closure before a command is allowed; partial commands and stalls fail the fixture.
+/// EOF or reset before a command is allowed; partial commands and stalls fail the fixture.
 pub async fn observe_command(wire: &mut Wire, deadline: Duration) -> Option<Command<'static>> {
     tokio::time::timeout(deadline, async {
         let mut input = Vec::new();
@@ -171,11 +171,19 @@ pub async fn observe_command(wire: &mut Wire, deadline: Duration) -> Option<Comm
             match wire.read_u8().await {
                 Ok(byte) => input.push(byte),
                 Err(error)
-                    if input.is_empty() && error.kind() == std::io::ErrorKind::UnexpectedEof =>
+                    if input.is_empty()
+                        && matches!(
+                            error.kind(),
+                            std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+                        ) =>
                 {
                     return None;
                 }
-                Err(_) => panic!("incomplete independently observed command"),
+                Err(error) => panic!(
+                    "incomplete independently observed command: kind={:?} bytes={}",
+                    error.kind(),
+                    input.len()
+                ),
             }
             assert!(
                 input.len() <= 1024,
