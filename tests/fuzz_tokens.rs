@@ -46,7 +46,11 @@ impl Tokens {
         for grant in &mut config.grants {
             grant.limits = config.limits.clone();
             if grant.name == "all" {
-                grant.mailboxes.push("Drafts".into());
+                if let mailctl::config::MailboxScope::Only(names) = &mut grant.mailboxes {
+                    names.push("Drafts".into());
+                } else {
+                    panic!("fixture requires an explicit scope");
+                }
             }
         }
         let mailboxes = Arc::new(MemoryMailboxes::default());

@@ -33,6 +33,11 @@ enum Administration {
     #[command(subcommand, long_about = STATE_RECOVERY_HELP)]
     State(State),
     /// Validate configuration, or add/update one named account without replacing others.
+    ///
+    /// New installations allow read-only access to every current and future folder.
+    /// Existing explicit mailbox restrictions and credential references are preserved.
+    /// Set nonempty exact-name mailbox lists in TOML to restrict account or grant scope.
+    /// After editing configuration, run setup and restart long-running MCP processes.
     Setup(Setup),
     #[command(subcommand)]
     Credential(Credential),

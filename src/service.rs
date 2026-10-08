@@ -209,15 +209,13 @@ impl Service {
         if context.permissions().contains(&Permission::ListMailboxes) {
             let grant = self.grant(context)?;
             for account in self.visible_accounts(context) {
-                let mut entries = account
-                    .mailboxes
+                let crate::config::MailboxScope::Only(names) =
+                    account.mailboxes.intersection(&grant.mailboxes)
+                else {
+                    return Ok(maximum);
+                };
+                let mut entries = names
                     .iter()
-                    .filter(|name| {
-                        grant.mailboxes.iter().any(|allowed| {
-                            crate::domain::mailbox_identity(name)
-                                == crate::domain::mailbox_identity(allowed)
-                        })
-                    })
                     .map(|name| {
                         2048usize
                             .saturating_add(grant.limits.token_bytes)

@@ -43,7 +43,10 @@ async fn setup_with_state(
     backend: Arc<dyn mailctl::service::BodyBackend>,
     persistent: bool,
 ) -> (Service, String) {
-    let name = config.accounts[0].mailboxes[0].clone();
+    let name = match &config.accounts[0].mailboxes {
+        mailctl::config::MailboxScope::Only(names) => names[0].clone(),
+        mailctl::config::MailboxScope::All => panic!("fixture requires an explicit scope"),
+    };
     let service = setup_service(config, persistent)
         .unwrap()
         .with_body_backend(backend);
@@ -196,7 +199,10 @@ async fn live(
     config.accounts[0].server = "127.0.0.1".into();
     config.accounts[0].port = fixture.port;
     config.accounts[0].username = "fixture".into();
-    let name = config.accounts[0].mailboxes[0].clone();
+    let name = match &config.accounts[0].mailboxes {
+        mailctl::config::MailboxScope::Only(names) => names[0].clone(),
+        mailctl::config::MailboxScope::All => panic!("fixture requires an explicit scope"),
+    };
     let service = Service::in_memory(config)
         .unwrap()
         .with_environment(host_support::Host::new(
@@ -220,8 +226,8 @@ async fn application_reads_short_body_without_fetching_large_attachment() {
         logout(&mut wire).await;
     })).await;
         let mut configuration = config();
-        configuration.accounts[0].mailboxes = vec![name.into()];
-        configuration.grants[0].mailboxes = vec![name.into()];
+        configuration.accounts[0].mailboxes = vec![name.into()].into();
+        configuration.grants[0].mailboxes = vec![name.into()].into();
         let (service, reference) = live(&fixture, configuration).await;
         let context = service.context("reader", &Default::default()).unwrap();
         let OperationResult::Message(result) =

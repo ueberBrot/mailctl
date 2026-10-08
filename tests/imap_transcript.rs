@@ -4,6 +4,268 @@ use imap_support::*;
 use mailctl::imap::{Limits, TlsMode};
 
 #[tokio::test]
+async fn all_folder_discovery_preserves_real_names_and_metadata_without_selection() {
+    let mut fixture =
+        fixture(TlsMode::Implicit, Limits::default(), |mut wire| {
+            Box::pin(async move {
+                authenticate(&mut wire).await;
+                let tag = expect(&mut wire, "LIST \"\" \"*\"").await;
+                write(
+                &mut wire,
+                &format!(concat!(
+                    "* LIST (\\Noselect) \"/\" \"\"\r\n",
+                    "* LIST (\\HasNoChildren) \"/\" inbox\r\n",
+                        "* LIST (\\Archive \\HasNoChildren) \"/\" \"Later &AOQ- &- Folder\"\r\n",
+                        "* LIST (\\Noselect) \"/\" Parent\r\n",
+                        "* LIST () \"/\" &,,0-\r\n",
+                        "* LIST () \"/\" &2D3eAA-\r\n",
+                    "{tag} OK listed\r\n"
+                ), tag = tag),
+            )
+            .await;
+                logout(&mut wire).await;
+            })
+        })
+        .await;
+    let result = fixture
+        .probe
+        .discover_all("fixture", "disposable-password")
+        .await
+        .unwrap();
+    assert_eq!(
+        result
+            .iter()
+            .map(|mailbox| mailbox.name.as_str())
+            .collect::<Vec<_>>(),
+        ["INBOX", "Later ä & Folder", "Parent", "\u{fffd}", "😀"]
+    );
+    assert!(result[0].selectable);
+    assert_eq!(result[1].attributes, ["\\Archive", "\\HasNoChildren"]);
+    assert!(!result[2].selectable);
+    fixture.task.await.unwrap();
+}
+
+#[tokio::test]
+async fn restricted_discovery_treats_wildcard_characters_as_exact_names() {
+    let mut discovery = true;
+    let mut fixture = repeating_fixture(Limits::default(), 2, move |mut wire| {
+        let list = discovery;
+        discovery = false;
+        Box::pin(async move {
+            authenticate(&mut wire).await;
+            if list {
+                let tag = expect(&mut wire, "LIST \"\" \"*\"").await;
+                write(
+                    &mut wire,
+                    &format!(
+                        "* LIST () \"/\" Hidden\r\n* LIST () \"/\" Rate\r\n\
+                         * LIST () \"/\" {{10}}\r\nRate%* Box\r\n{tag} OK listed\r\n"
+                    ),
+                )
+                .await;
+            } else {
+                let tag = expect(&mut wire, "EXAMINE \"Rate%* Box\"").await;
+                write(
+                    &mut wire,
+                    &format!("* OK [UIDVALIDITY 77] identity\r\n{tag} OK [READ-ONLY] examined\r\n"),
+                )
+                .await;
+                let tag = expect(&mut wire, "UID SEARCH UID 1:2").await;
+                write(&mut wire, &format!("* SEARCH\r\n{tag} OK searched\r\n")).await;
+            }
+            logout(&mut wire).await;
+        })
+    })
+    .await;
+    let result = fixture
+        .probe
+        .discover("fixture", "disposable-password", &["Rate%* Box".into()])
+        .await
+        .unwrap();
+    assert_eq!(
+        result
+            .iter()
+            .map(|row| row.name.as_str())
+            .collect::<Vec<_>>(),
+        ["Rate%* Box"]
+    );
+    assert!(
+        fixture
+            .probe
+            .search_window("fixture", "disposable-password", &result[0].name, 77, 1..=2)
+            .await
+            .unwrap()
+            .messages
+            .is_empty()
+    );
+    fixture.task.await.unwrap();
+}
+
+#[tokio::test]
+async fn inventory_limits_count_rows_omitted_deduplicated_or_scope_filtered() {
+    for restricted in [false, true] {
+        let mut fixture = fixture(
+            TlsMode::Implicit,
+            Limits {
+                max_mailboxes: 2,
+                ..Limits::default()
+            },
+            |mut wire| {
+                Box::pin(async move {
+                    authenticate(&mut wire).await;
+                    let tag = expect(&mut wire, "LIST \"\" \"*\"").await;
+                    write(
+                        &mut wire,
+                        &format!(
+                            "* LIST () \"/\" INBOX\r\n* LIST () \"/\" inbox\r\n\
+                         * LIST (\\Noselect) \"/\" \"\"\r\n{tag} OK listed\r\n"
+                        ),
+                    )
+                    .await;
+                    dropped(&mut wire).await;
+                })
+            },
+        )
+        .await;
+        let result = if restricted {
+            fixture
+                .probe
+                .discover("fixture", "disposable-password", &["Literal*".into()])
+                .await
+        } else {
+            fixture
+                .probe
+                .discover_all("fixture", "disposable-password")
+                .await
+        };
+        assert_eq!(result.unwrap_err(), mailctl::imap::Error::Limit);
+        fixture.task.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn all_folder_discovery_rejects_invalid_names_and_inconsistent_identities() {
+    for rows in [
+        "* LIST () \"/\" \"\"\r\n".to_owned(),
+        format!("* LIST () \"/\" \"{}\"\r\n", "x".repeat(1025)),
+        "* LIST () \"/\" {8}\r\nbad\r\nbox\r\n".to_owned(),
+        "* LIST () \"/\" \"&broken-\"\r\n".to_owned(),
+        "* LIST () \"/\" \"trailing&\"\r\n".to_owned(),
+        "* LIST () \"/\" \"&ACU-\"\r\n".to_owned(),
+        "* LIST () \"/\" INBOX\r\n* LIST (\\Noselect) \"/\" inbox\r\n".to_owned(),
+    ] {
+        let mut fixture = fixture(TlsMode::Implicit, Limits::default(), move |mut wire| {
+            Box::pin(async move {
+                authenticate(&mut wire).await;
+                let tag = expect(&mut wire, "LIST \"\" \"*\"").await;
+                write(&mut wire, &format!("{rows}{tag} OK listed\r\n")).await;
+                dropped(&mut wire).await;
+            })
+        })
+        .await;
+        assert_eq!(
+            fixture
+                .probe
+                .discover_all("fixture", "disposable-password")
+                .await
+                .unwrap_err(),
+            mailctl::imap::Error::Protocol
+        );
+        fixture.task.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn discovery_rejects_lossy_modified_utf7_identities() {
+    for restricted in [false, true] {
+        let mut fixture = fixture(TlsMode::Implicit, Limits::default(), move |mut wire| {
+            Box::pin(async move {
+                authenticate(&mut wire).await;
+                let command = if restricted {
+                    "LIST \"\" &,,0-"
+                } else {
+                    "LIST \"\" \"*\""
+                };
+                let tag = expect(&mut wire, command).await;
+                // UTF-16 D800 is a lone surrogate, not the literal replacement character.
+                write(
+                    &mut wire,
+                    &format!("* LIST () \"/\" &2AA-\r\n{tag} OK listed\r\n"),
+                )
+                .await;
+                dropped(&mut wire).await;
+            })
+        })
+        .await;
+        let result = if restricted {
+            fixture
+                .probe
+                .discover("fixture", "disposable-password", &["\u{fffd}".into()])
+                .await
+        } else {
+            fixture
+                .probe
+                .discover_all("fixture", "disposable-password")
+                .await
+        };
+        assert_eq!(result.unwrap_err(), mailctl::imap::Error::Protocol);
+        fixture.task.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn runtime_all_folder_discovery_applies_the_narrowed_inventory_limit() {
+    use mailctl::{
+        authentication::{Account, Error, Runtime},
+        credentials::{Availability, Secret, SecretSource, SourceError},
+    };
+    struct FixtureSecret;
+    impl SecretSource for FixtureSecret {
+        fn availability(&self, _: uuid::Uuid) -> Availability {
+            Availability::Configured
+        }
+        fn resolve(&self, _: uuid::Uuid) -> Result<Secret, SourceError> {
+            Secret::new(b"disposable-password".to_vec())
+        }
+    }
+    let fixture = fixture(TlsMode::Implicit, Limits::default(), |mut wire| {
+        Box::pin(async move {
+            authenticate(&mut wire).await;
+            let tag = expect(&mut wire, "LIST \"\" \"*\"").await;
+            write(
+                &mut wire,
+                &format!("* LIST () \"/\" INBOX\r\n* LIST () \"/\" Later\r\n{tag} OK listed\r\n"),
+            )
+            .await;
+            dropped(&mut wire).await;
+        })
+    })
+    .await;
+    let runtime = Runtime::new(mailctl::config::Limits::default(), fixture.roots.clone()).unwrap();
+    let account = Account {
+        id: uuid::Uuid::new_v4(),
+        generation: 1,
+        config: serde_json::from_value(serde_json::json!({
+            "key":"fixture", "alias":"fixture", "server":"127.0.0.1",
+            "port":fixture.port, "username":"fixture", "from_identities":[],
+            "credential":{"source":"session"}
+        }))
+        .unwrap(),
+        source: std::sync::Arc::new(FixtureSecret),
+    };
+    let narrow = mailctl::config::Limits {
+        mailbox_inventory: 1,
+        mailbox_page: 1,
+        ..Default::default()
+    };
+    assert_eq!(
+        runtime.discover_all(&account, &narrow).await,
+        Err(Error::Imap(mailctl::imap::Error::Limit))
+    );
+    fixture.task.await.unwrap();
+}
+
+#[tokio::test]
 async fn exact_discovery_authenticates_over_verified_tls_and_logs_out_safely() {
     let mut fixture = fixture(TlsMode::Implicit, Limits::default(), |mut wire| {
         Box::pin(async move {
@@ -474,6 +736,7 @@ fn client_allocations_remain_bounded_for_discovery_envelopes_and_oversized_liter
         .unwrap();
     for route in [
         "discovery",
+        "all-discovery",
         "envelopes",
         "large-envelope",
         "starttls",
@@ -489,13 +752,21 @@ fn client_allocations_remain_bounded_for_discovery_envelopes_and_oversized_liter
             move |mut wire| {
                 Box::pin(async move {
                     authenticate(&mut wire).await;
-                    if route == "discovery" {
-                        let tag = expect(&mut wire, "LIST \"\" INBOX").await;
-                        write(
-                            &mut wire,
-                            &format!("* LIST () \"/\" INBOX\r\n{tag} OK listed\r\n"),
-                        )
-                        .await;
+                    if route == "discovery" || route == "all-discovery" {
+                        let command = if route == "all-discovery" {
+                            "LIST \"\" \"*\""
+                        } else {
+                            "LIST \"\" INBOX"
+                        };
+                        let tag = expect(&mut wire, command).await;
+                        let rows = if route == "all-discovery" {
+                            (0..1000)
+                                .map(|index| format!("* LIST () \"/\" Folder{index:04}\r\n"))
+                                .collect::<String>()
+                        } else {
+                            "* LIST () \"/\" INBOX\r\n".into()
+                        };
+                        write(&mut wire, &format!("{rows}{tag} OK listed\r\n")).await;
                         logout(&mut wire).await;
                     } else {
                         examine(&mut wire).await;
@@ -524,7 +795,15 @@ fn client_allocations_remain_bounded_for_discovery_envelopes_and_oversized_liter
         );
         let allocations = allocation_counter::measure(|| {
             runtime.block_on(async {
-                if route == "discovery" {
+                if route == "all-discovery" {
+                    let inventory = probe
+                        .discover_all("fixture", "disposable-password")
+                        .await
+                        .unwrap();
+                    assert_eq!(inventory.len(), 1000);
+                    assert_eq!(inventory[0].name, "Folder0000");
+                    assert_eq!(inventory[999].name, "Folder0999");
+                } else if route == "discovery" {
                     assert_eq!(
                         probe
                             .discover("fixture", "disposable-password", &["INBOX".into()])
@@ -644,16 +923,12 @@ async fn excessive_nesting_and_invalid_literal_declarations_dispose_connections(
 #[tokio::test]
 async fn discovery_inputs_are_bounded_before_mailbox_dispatch() {
     use mailctl::imap::Error;
-    let mut cases = [
-        "*",
-        "Approved/%",
-        "bad\r\nname",
-        "bad\u{7f}name",
-        "bad\u{85}name",
-    ]
-    .into_iter()
-    .map(|name| (vec![name.into()], Error::Unsupported))
-    .collect::<Vec<_>>();
+    let mut cases = ["bad\r\nname", "bad\u{7f}name", "bad\u{85}name"]
+        .into_iter()
+        .map(|name| (vec![name.into()], Error::Unsupported))
+        .collect::<Vec<_>>();
+    cases.push((vec![String::new()], Error::InvalidInput));
+    cases.push((vec!["x".repeat(1025)], Error::InvalidInput));
     cases.push((vec!["INBOX".into(); 1001], Error::Limit));
     for (names, expected) in cases {
         let mut fixture = fixture(TlsMode::Implicit, Limits::default(), |mut wire| {

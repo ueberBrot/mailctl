@@ -36,6 +36,50 @@ mailboxes = ["inbox", "Archive", "Folder", "Missing"]
 }
 
 #[tokio::test]
+async fn omitted_scopes_discover_current_and_future_folders_without_reconfiguration() {
+    let input = toml::to_string(&config()).unwrap();
+    let input = input
+        .lines()
+        .filter(|line| !line.starts_with("mailboxes ="))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let configuration = Config::parse(&input).expect("omitted scopes allow all folders");
+    let memory = Arc::new(MemoryMailboxes::default());
+    memory.set("work", vec![metadata("INBOX"), metadata("Projects")]);
+    let service = Service::in_memory(configuration)
+        .unwrap()
+        .with_mailbox_backend(memory.clone());
+    let first = list(&service, "reader", ListMailboxesInput::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        first
+            .mailboxes
+            .iter()
+            .map(|mailbox| mailbox.metadata.name.as_str())
+            .collect::<Vec<_>>(),
+        ["INBOX", "Projects"]
+    );
+    memory.set(
+        "work",
+        vec![metadata("Projects"), metadata("Later"), metadata("INBOX")],
+    );
+    let later = list(&service, "reader", ListMailboxesInput::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        later
+            .mailboxes
+            .iter()
+            .map(|mailbox| mailbox.metadata.name.as_str())
+            .collect::<Vec<_>>(),
+        ["INBOX", "Later", "Projects"]
+    );
+    assert!(later.complete);
+    assert!(later.next_cursor.is_none());
+}
+
+#[tokio::test]
 async fn discovery_pages_only_real_approved_mailboxes_in_identity_order() {
     let memory = MemoryMailboxes::default();
     memory.set(
@@ -131,7 +175,7 @@ async fn references_reauthorize_mailbox_scope_and_cannot_cross_installations() {
     let mut configuration = config();
     let mut restricted = configuration.grants[0].clone();
     restricted.name = "restricted".into();
-    restricted.mailboxes = vec!["INBOX".into()];
+    restricted.mailboxes = vec!["INBOX".into()].into();
     configuration.grants.push(restricted);
     let service = Service::in_memory(configuration.clone())
         .unwrap()
@@ -240,8 +284,8 @@ async fn imap_preserves_international_names_and_deduplicates_exact_server_identi
         logout(&mut wire).await;
     })).await;
         let mut configuration = config();
-        configuration.accounts[0].mailboxes = vec![name.into()];
-        configuration.grants[0].mailboxes = vec![name.into()];
+        configuration.accounts[0].mailboxes = vec![name.into()].into();
+        configuration.grants[0].mailboxes = vec![name.into()].into();
         let service = imap_service(configuration, &fixture);
         let context = service.context("reader", &Narrowing::default()).unwrap();
         let OperationResult::Mailboxes(page) = service
@@ -503,7 +547,7 @@ async fn persistent_references_survive_restart_and_alias_rename_but_not_repointi
         ErrorCode::StaleCursor
     );
     drop(service);
-    configuration.grants[0].mailboxes = vec!["INBOX".into()];
+    configuration.grants[0].mailboxes = vec!["INBOX".into()].into();
     let service = Service::open(configuration.clone())
         .unwrap()
         .with_mailbox_backend(memory.clone());
@@ -512,7 +556,11 @@ async fn persistent_references_survive_restart_and_alias_rename_but_not_repointi
         ErrorCode::MailboxNotAllowed
     );
     drop(service);
-    configuration.grants[0].mailboxes.push("Archive".into());
+    if let mailctl::config::MailboxScope::Only(names) = &mut configuration.grants[0].mailboxes {
+        names.push("Archive".into());
+    } else {
+        panic!("fixture requires an explicit scope");
+    }
     configuration.accounts[0].server = "new.example.test".into();
     let service = Service::open(configuration)
         .unwrap()
@@ -536,8 +584,16 @@ async fn inbox_is_case_insensitive_while_other_mailboxes_keep_exact_identity() {
         ],
     );
     let mut configuration = config();
-    configuration.accounts[0].mailboxes.push("inbox".into());
-    configuration.accounts[0].mailboxes.push("archive".into());
+    if let mailctl::config::MailboxScope::Only(names) = &mut configuration.accounts[0].mailboxes {
+        names.push("inbox".into());
+    } else {
+        panic!("fixture requires an explicit scope");
+    }
+    if let mailctl::config::MailboxScope::Only(names) = &mut configuration.accounts[0].mailboxes {
+        names.push("archive".into());
+    } else {
+        panic!("fixture requires an explicit scope");
+    }
     let service = Service::in_memory(configuration)
         .unwrap()
         .with_mailbox_backend(memory);
@@ -672,7 +728,7 @@ async fn imap_fails_explicitly_on_malformed_unrequested_conflicting_and_oversize
         })
         .await;
         let mut configuration = config();
-        configuration.accounts[0].mailboxes = vec!["INBOX".into()];
+        configuration.accounts[0].mailboxes = vec!["INBOX".into()].into();
         let service = imap_service(configuration, &fixture);
         assert_eq!(
             list(&service, "reader", ListMailboxesInput::default())
@@ -693,8 +749,8 @@ async fn configured_inventory_ceiling_returns_all_thousand_mailboxes_without_fal
         .collect::<Vec<_>>();
     memory.set("work", names.iter().map(|name| metadata(name)).collect());
     let mut configuration = config();
-    configuration.accounts[0].mailboxes = names.clone();
-    configuration.grants[0].mailboxes = names.clone();
+    configuration.accounts[0].mailboxes = names.clone().into();
+    configuration.grants[0].mailboxes = names.clone().into();
     configuration.grants[0].limits.mailbox_page = 1000;
     configuration.limits.mailbox_page = 1000;
     let service = Service::in_memory(configuration)
@@ -729,8 +785,8 @@ fn a_small_response_budget_stops_large_page_assembly() {
         .collect::<Vec<_>>();
     memory.set("work", names.iter().map(|name| metadata(name)).collect());
     let mut configuration = config();
-    configuration.accounts[0].mailboxes = names.clone();
-    configuration.grants[0].mailboxes = names;
+    configuration.accounts[0].mailboxes = names.clone().into();
+    configuration.grants[0].mailboxes = names.into();
     configuration.limits.mailbox_page = 1000;
     configuration.grants[0].limits.mailbox_page = 1000;
     let service = Service::in_memory(configuration)
@@ -838,7 +894,7 @@ async fn cancelled_and_timed_out_discovery_release_the_connection_and_admission(
         })
         .await;
         let mut configuration = config();
-        configuration.accounts[0].mailboxes = vec!["INBOX".into()];
+        configuration.accounts[0].mailboxes = vec!["INBOX".into()].into();
         for limits in [
             &mut configuration.limits,
             &mut configuration.grants[0].limits,

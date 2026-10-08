@@ -84,7 +84,7 @@ fn account(port: u16, source: Arc<dyn SecretSource>) -> Account {
             port,
             tls: TlsMode::Implicit,
             username: "fixture".into(),
-            mailboxes: vec!["INBOX".into()],
+            mailboxes: vec!["INBOX".into()].into(),
             from_identities: vec![],
             drafts_mailbox: None,
             credential: CredentialSource::Session {},

@@ -46,6 +46,12 @@ fn imap_discovery_and_search_preserve_mailbox_content_identity_and_flags() {
         assert_eq!(discovery.len(), 1);
         assert_eq!(discovery[0].name, "INBOX");
         assert!(discovery[0].selectable);
+        assert_eq!(
+            probe
+                .discover_all("fixture+smoke@example.test", "disposable-fixture-password")
+                .await?,
+            discovery
+        );
 
         let first = snapshot_before
             .messages
@@ -623,11 +629,15 @@ fn application_mailbox_discovery_and_reference_reuse_preserve_independently_obse
     greenmail_support::run(async {
         use mailctl::{
             config::Config,
-            domain::{ListMailboxesInput, Operation, OperationResult},
+            domain::{
+                GetMessageInput, ListMailboxesInput, Operation, OperationResult,
+                SearchMessagesInput,
+            },
             policy::Narrowing,
             service::Service,
         };
 
+        const NESTED: &str = "fixture folder/child";
         let fixture = greenmail_support::Fixture::start().await?;
         let contents = fixture.contents().await?;
         let snapshot = fixture.snapshot().await?;
@@ -641,14 +651,12 @@ alias = "fixture"
 server = "localhost"
 port = {port}
 username = "fixture+smoke@example.test"
-mailboxes = ["INBOX"]
 from_identities = ["fixture"]
 [accounts.credential]
 source = "session"
 [[grants]]
 name = "reader"
 accounts = ["fixture"]
-mailboxes = ["INBOX"]
 "#,
             state =
                 serde_json::to_string(&std::env::temp_dir().join("mailctl-greenmail-application"))?,
@@ -687,8 +695,117 @@ mailboxes = ["INBOX"]
             resolved.mailboxes[0].reference,
             first.mailboxes[0].reference
         );
+
+        fixture.verify_folder_path_encoding().await?;
+        let nested_contents = fixture.contents_mailbox(NESTED).await?;
+        let nested_snapshot = fixture.snapshot_mailbox(NESTED).await?;
+        let OperationResult::Mailboxes(later) = service
+            .execute(
+                &context,
+                Operation::ListMailboxes(ListMailboxesInput::default()),
+            )
+            .await?
+        else {
+            panic!("mailboxes")
+        };
+        assert!(later.complete);
+        assert_eq!(
+            later
+                .mailboxes
+                .iter()
+                .find(|mailbox| mailbox.metadata.name == "INBOX")
+                .unwrap()
+                .reference,
+            first.mailboxes[0].reference
+        );
+        let nested = later
+            .mailboxes
+            .iter()
+            .find(|mailbox| mailbox.metadata.name == NESTED)
+            .expect("a folder created after setup is visible without restarting the service");
+        assert!(nested.metadata.selectable);
+        let OperationResult::Mailboxes(resolved) = service
+            .execute(
+                &context,
+                Operation::ListMailboxes(ListMailboxesInput {
+                    reference: Some(nested.reference.clone()),
+                    ..Default::default()
+                }),
+            )
+            .await?
+        else {
+            panic!("mailboxes")
+        };
+        assert!(resolved.complete);
+        assert_eq!(resolved.mailboxes.len(), 1);
+        assert_eq!(resolved.mailboxes[0].reference, nested.reference);
+
+        for (reference, observed) in [
+            (&first.mailboxes[0].reference, &snapshot),
+            (&nested.reference, &nested_snapshot),
+        ] {
+            let OperationResult::Messages(page) = service
+                .execute(
+                    &context,
+                    Operation::SearchMessages(SearchMessagesInput {
+                        mailbox: reference.clone(),
+                        criteria: Default::default(),
+                        limit: None,
+                        cursor: None,
+                    }),
+                )
+                .await?
+            else {
+                panic!("search")
+            };
+            assert!(page.complete);
+            assert_eq!(page.messages.len(), observed.messages.len());
+            for message in page.messages {
+                let id = message.metadata.message_id.value().unwrap();
+                let observed = observed
+                    .messages
+                    .iter()
+                    .find(|message| &message.message_id == id)
+                    .expect("search preserves the independently observed message identity");
+                assert_eq!(
+                    message.metadata.flags.iter().any(|flag| flag == "\\Seen"),
+                    observed.seen
+                );
+                let OperationResult::Message(body) = service
+                    .execute(
+                        &context,
+                        Operation::GetMessage(GetMessageInput {
+                            message: message.reference,
+                            cursor: None,
+                        }),
+                    )
+                    .await?
+                else {
+                    panic!("body")
+                };
+                let expected = match id.as_str() {
+                    "<observed-seen@example.test>" => "Synthetic seen message.",
+                    "<bootstrap-smoke@example.test>" | "<nested-folder@example.test>" => {
+                        "Synthetic bootstrap message."
+                    }
+                    _ => panic!("unexpected fixture message"),
+                };
+                // GreenMail's whole-message route can retain one terminal CRLF.
+                // The protocol transcripts verify exact whitespace preservation.
+                assert_eq!(
+                    body.body
+                        .text
+                        .strip_suffix("\r\n")
+                        .unwrap_or(&body.body.text),
+                    expected
+                );
+                assert!(!body.body.truncated);
+            }
+        }
         assert_eq!(fixture.snapshot().await?, snapshot);
         assert_eq!(fixture.contents().await?, contents);
+        assert_eq!(fixture.snapshot_mailbox(NESTED).await?, nested_snapshot);
+        assert_eq!(fixture.contents_mailbox(NESTED).await?, nested_contents);
         fixture.shutdown().await?;
         Ok(())
     });
@@ -716,14 +833,14 @@ fn application_draft_retries_create_one_exact_draft_and_preserve_existing_mail()
         config.accounts[0].port = fixture.imaps_port();
         config.accounts[0].username = "fixture+smoke@example.test".into();
         config.accounts[0].from_identities = vec!["sender@example.test".into()];
-        config.accounts[0].mailboxes = vec!["INBOX".into(), TARGET.into()];
+        config.accounts[0].mailboxes = vec!["INBOX".into(), TARGET.into()].into();
         config.accounts[0].drafts_mailbox = Some(TARGET.into());
         config
             .grants
             .iter_mut()
             .find(|g| g.name == "writer")
             .unwrap()
-            .mailboxes = vec![TARGET.into()];
+            .mailboxes = vec![TARGET.into()].into();
         Service::setup(config.clone())?;
         let service = Service::open(config.clone())?.with_environment(host_support::Host::new(
             fixture.tls_roots(),

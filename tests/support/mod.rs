@@ -200,6 +200,22 @@ pub(crate) fn envelope(output: &Output) -> Value {
     serde_json::from_str(stdout).expect("valid output envelope")
 }
 
+#[cfg(feature = "mcp")]
+pub(crate) fn assert_mcp_envelope(response: rmcp::model::CallToolResult) -> Value {
+    let structured = response
+        .structured_content
+        .expect("structured MCP output envelope");
+    assert_eq!(response.is_error, Some(structured.get("error").is_some()));
+    let text = response.content[0]
+        .as_text()
+        .expect("serialized MCP output envelope");
+    assert_eq!(
+        serde_json::from_str::<Value>(&text.text).expect("valid serialized MCP output envelope"),
+        structured
+    );
+    structured
+}
+
 pub(crate) fn toml_string(path: &Path) -> String {
     toml::Value::String(path.to_string_lossy().into_owned()).to_string()
 }

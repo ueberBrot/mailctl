@@ -14,6 +14,14 @@ struct Provider {
     fail: std::sync::atomic::AtomicBool,
 }
 impl MailboxBackend for Provider {
+    fn discover_all<'a>(
+        &'a self,
+        target: MailboxTarget<'a>,
+        limits: &'a Limits,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<MailboxMetadata>, Error>> + Send + 'a>> {
+        self.discover(target, &[], limits)
+    }
+
     fn discover<'a>(
         &'a self,
         target: MailboxTarget<'a>,

@@ -40,8 +40,46 @@ impl ImapBackend {
             .await
             .map_err(super::credentials::authentication_error)
     }
+    fn mailbox_metadata(rows: Vec<crate::imap::Mailbox>) -> Vec<MailboxMetadata> {
+        rows.into_iter()
+            .map(|row| MailboxMetadata {
+                name: row.name,
+                selectable: row.selectable,
+                special_use: row
+                    .attributes
+                    .into_iter()
+                    .filter(|attribute| {
+                        [
+                            "\\All",
+                            "\\Archive",
+                            "\\Drafts",
+                            "\\Flagged",
+                            "\\Junk",
+                            "\\Sent",
+                            "\\Trash",
+                        ]
+                        .iter()
+                        .any(|flag| attribute.eq_ignore_ascii_case(flag))
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
 }
 impl MailboxBackend for ImapBackend {
+    fn discover_all<'a>(
+        &'a self,
+        _: MailboxTarget<'a>,
+        limits: &'a Limits,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<MailboxMetadata>, Error>> + Send + 'a>> {
+        Box::pin(async move {
+            self.runtime
+                .discover_all(&self.account, limits)
+                .await
+                .map_err(super::credentials::authentication_error)
+                .map(Self::mailbox_metadata)
+        })
+    }
     fn discover<'a>(
         &'a self,
         _: MailboxTarget<'a>,
@@ -53,31 +91,7 @@ impl MailboxBackend for ImapBackend {
                 .discover(&self.account, names, limits)
                 .await
                 .map_err(super::credentials::authentication_error)
-                .map(|rows| {
-                    rows.into_iter()
-                        .map(|row| MailboxMetadata {
-                            name: row.name,
-                            selectable: row.selectable,
-                            special_use: row
-                                .attributes
-                                .into_iter()
-                                .filter(|attribute| {
-                                    [
-                                        "\\All",
-                                        "\\Archive",
-                                        "\\Drafts",
-                                        "\\Flagged",
-                                        "\\Junk",
-                                        "\\Sent",
-                                        "\\Trash",
-                                    ]
-                                    .iter()
-                                    .any(|flag| attribute.eq_ignore_ascii_case(flag))
-                                })
-                                .collect(),
-                        })
-                        .collect()
-                })
+                .map(Self::mailbox_metadata)
         })
     }
 }

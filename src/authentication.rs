@@ -331,6 +331,15 @@ impl Runtime {
         .map_err(|_| Error::Timeout)?
     }
 
+    /// Discover the bounded provider inventory on one admitted connection, then log out.
+    pub async fn discover_all(
+        &self,
+        account: &Account,
+        limits: &Limits,
+    ) -> Result<Vec<imap::Mailbox>, Error> {
+        self.discover_inventory(account, None, limits).await
+    }
+
     /// Discover exact approved names on one admitted connection, then log out.
     pub async fn discover(
         &self,
@@ -338,12 +347,23 @@ impl Runtime {
         names: &[String],
         limits: &Limits,
     ) -> Result<Vec<imap::Mailbox>, Error> {
+        self.discover_inventory(account, Some(names), limits).await
+    }
+
+    async fn discover_inventory(
+        &self,
+        account: &Account,
+        names: Option<&[String]>,
+        limits: &Limits,
+    ) -> Result<Vec<imap::Mailbox>, Error> {
         self.validate_limits(limits)?;
-        if names.len() > limits.mailbox_inventory {
-            return Err(Error::Imap(imap::Error::Limit));
-        }
-        for name in names {
-            imap::mailbox(name).map_err(Error::Imap)?;
+        if let Some(names) = names {
+            if names.len() > limits.mailbox_inventory {
+                return Err(Error::Imap(imap::Error::Limit));
+            }
+            for name in names {
+                imap::mailbox(name).map_err(Error::Imap)?;
+            }
         }
         let pool = self.pool(account.id)?;
         tokio::time::timeout(
@@ -352,16 +372,17 @@ impl Runtime {
                 self.acquire_inner(account, limits, pool, true)
                     .await?
                     .with_connection(async |connection| {
-                        connection
-                            .discover(
-                                names,
-                                &imap::Limits {
-                                    max_mailboxes: limits.mailbox_inventory,
-                                    ..Default::default()
-                                },
-                                &mut imap::Metrics::default(),
-                            )
-                            .await
+                        let imap_limits = imap::Limits {
+                            max_mailboxes: limits.mailbox_inventory,
+                            ..Default::default()
+                        };
+                        let mut metrics = imap::Metrics::default();
+                        match names {
+                            Some(names) => {
+                                connection.discover(names, &imap_limits, &mut metrics).await
+                            }
+                            None => connection.discover_all(&imap_limits, &mut metrics).await,
+                        }
                     })
                     .await
                     .map_err(Error::Imap)

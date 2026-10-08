@@ -382,7 +382,10 @@ async fn imap_service_with_config(
     inventory.set(
         "work",
         vec![MailboxMetadata {
-            name: configuration.accounts[0].mailboxes[0].clone(),
+            name: match &configuration.accounts[0].mailboxes {
+                mailctl::config::MailboxScope::Only(names) => names[0].clone(),
+                mailctl::config::MailboxScope::All => panic!("fixture requires an explicit scope"),
+            },
             selectable: true,
             special_use: vec![],
         }],
@@ -454,8 +457,8 @@ async fn imap_pages_use_one_read_only_selection_and_fetch_only_the_requested_pag
     })
     .await;
     let mut configuration = config();
-    configuration.accounts[0].mailboxes = vec!["Entwürfe".into()];
-    configuration.grants[0].mailboxes = vec!["Entwürfe".into()];
+    configuration.accounts[0].mailboxes = vec!["Entwürfe".into()].into();
+    configuration.grants[0].mailboxes = vec!["Entwürfe".into()].into();
     let (service, reference) = imap_service_with_config(&fixture, configuration).await;
     let first = search(&service, json!({"mailbox":reference,"limit":2})).await;
     assert_eq!(first["messages"][0]["subject"]["value"], "message 5");
@@ -780,7 +783,7 @@ async fn persistent_search_cursors_resume_and_reauthorize_after_configuration_ch
             .is_ok()
     );
     drop(service);
-    configuration.grants[0].mailboxes = vec!["Archive".into()];
+    configuration.grants[0].mailboxes = vec!["Archive".into()].into();
     let service = open(configuration.clone());
     let context = service.context("reader", &Default::default()).unwrap();
     assert_eq!(
@@ -792,7 +795,7 @@ async fn persistent_search_cursors_resume_and_reauthorize_after_configuration_ch
         ErrorCode::MailboxNotAllowed
     );
     drop(service);
-    configuration.grants[0].mailboxes = vec!["INBOX".into()];
+    configuration.grants[0].mailboxes = vec!["INBOX".into()].into();
     configuration.accounts[0].server = "changed.example.test".into();
     let service = open(configuration);
     let context = service.context("reader", &Default::default()).unwrap();

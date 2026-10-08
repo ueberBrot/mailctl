@@ -24,7 +24,7 @@ use io_imap::{
         capability::ImapCapabilityGet, greeting::ImapGreetingGet, list::ImapMailboxList,
         login::ImapLogin, logout::ImapLogout,
     },
-    types::{mailbox::Mailbox as WireMailbox, response::Capability},
+    types::{flag::FlagNameAttribute, mailbox::Mailbox as WireMailbox, response::Capability},
 };
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, fmt, sync::Arc, time::Duration};
@@ -41,7 +41,7 @@ use wire::Connection;
 /// use mailctl::imap::{AuthenticatedConnection, Limits, Metrics};
 /// async fn reuse(connection: AuthenticatedConnection, limits: &Limits) {
 ///     let mut metrics = Metrics::default();
-///     connection.discover(&[], limits, &mut metrics).await.unwrap();
+///     connection.discover_all(limits, &mut metrics).await.unwrap();
 ///     connection.discover(&[], limits, &mut metrics).await.unwrap();
 /// }
 /// ```
@@ -60,6 +60,19 @@ pub struct AuthenticatedConnection {
     identity: [u8; 32],
 }
 impl AuthenticatedConnection {
+    /// List the bounded provider inventory without selecting a mailbox.
+    pub async fn discover_all(
+        self,
+        limits: &Limits,
+        metrics: &mut Metrics,
+    ) -> Result<Vec<Mailbox>, Error> {
+        limits.validate()?;
+        let mut connection = self.session.resume(metrics);
+        connection.limit_body(limits);
+        let result = connection.discover_all(limits.max_mailboxes).await?;
+        connection.drive(ImapLogout::new()).await?;
+        Ok(result)
+    }
     pub async fn discover(
         self,
         allowlist: &[String],
@@ -75,13 +88,22 @@ impl AuthenticatedConnection {
         }
         let mut connection = self.session.resume(metrics);
         connection.limit_body(limits);
-        let names = allowlist
+        let names: BTreeMap<_, _> = allowlist
             .iter()
             .map(|name| (mailbox_identity(name), name.as_str()))
             .collect();
-        let result = connection
-            .discover_names(names, limits.max_mailboxes)
-            .await?;
+        let result = if names.keys().any(|name| name.contains(['*', '%'])) {
+            connection
+                .discover_all(limits.max_mailboxes)
+                .await?
+                .into_iter()
+                .filter(|mailbox| names.contains_key(mailbox.name.as_str()))
+                .collect()
+        } else {
+            connection
+                .discover_names(names, limits.max_mailboxes)
+                .await?
+        };
         connection.drive(ImapLogout::new()).await?;
         Ok(result)
     }
@@ -250,7 +272,7 @@ pub struct Mailbox {
 ///
 /// Authentication accepts printable ASCII credentials; literal authentication remains
 /// gated. Mailbox names use Unicode with modified UTF-7 on the IMAP wire.
-/// Control characters and LIST wildcards remain unsupported.
+/// Control characters are unsupported; wildcard characters are literal mailbox names.
 pub struct ImapEndpoint {
     host: String,
     port: u16,
@@ -365,13 +387,10 @@ fn credentials(user: &str, password: &str) -> Result<(), Error> {
     Ok(())
 }
 pub(crate) fn mailbox(name: &str) -> Result<(), Error> {
-    if name.is_empty() || name.len() > 4096 {
+    if name.is_empty() || name.len() > 1024 {
         return Err(Error::InvalidInput);
     }
-    if name
-        .chars()
-        .any(|c| c.is_control() || matches!(c, '*' | '%'))
-    {
+    if name.chars().any(char::is_control) {
         return Err(Error::Unsupported);
     }
     Ok(())
@@ -412,7 +431,117 @@ fn mailbox_pattern(name: &str) -> String {
     encoded
 }
 
+// Validate before io-imap's lossy decoding can replace a provider mailbox identity.
+fn validate_wire_mailbox_name(mailbox: &WireMailbox<'_>) -> Result<(), Error> {
+    use base64::{
+        Engine,
+        alphabet::IMAP_MUTF7,
+        engine::general_purpose::{GeneralPurpose, NO_PAD},
+    };
+    const BASE64: GeneralPurpose = GeneralPurpose::new(&IMAP_MUTF7, NO_PAD);
+    let WireMailbox::Other(name) = mailbox else {
+        return Ok(());
+    };
+    let wire = std::str::from_utf8(name.inner().as_ref()).map_err(|_| Error::Protocol)?;
+    if wire.len() > 4096 || wire.bytes().any(|byte| !(32..=126).contains(&byte)) {
+        return Err(Error::Protocol);
+    }
+    let mut decoded = String::with_capacity(wire.len().min(1024));
+    let mut remaining = wire;
+    while let Some((plain, shifted)) = remaining.split_once('&') {
+        if plain.len() > 1024usize.saturating_sub(decoded.len()) {
+            return Err(Error::Protocol);
+        }
+        decoded.push_str(plain);
+        let (payload, tail) = shifted.split_once('-').ok_or(Error::Protocol)?;
+        if payload.is_empty() {
+            decoded.push('&');
+        } else {
+            let bytes = BASE64.decode(payload).map_err(|_| Error::Protocol)?;
+            if bytes.len() % 2 != 0 {
+                return Err(Error::Protocol);
+            }
+            let units = bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+                .collect::<Vec<_>>();
+            let text = String::from_utf16(&units).map_err(|_| Error::Protocol)?;
+            if text.len() > 1024usize.saturating_sub(decoded.len()) {
+                return Err(Error::Protocol);
+            }
+            decoded.push_str(&text);
+        }
+        if decoded.len() > 1024 {
+            return Err(Error::Protocol);
+        }
+        remaining = tail;
+    }
+    if remaining.len() > 1024usize.saturating_sub(decoded.len()) {
+        return Err(Error::Protocol);
+    }
+    decoded.push_str(remaining);
+    // RFC 3501 §5.1.3 forbids superfluous shifts and encoded printable ASCII.
+    if decoded.chars().any(char::is_control) || mailbox_pattern(&decoded) != wire {
+        return Err(Error::Protocol);
+    }
+    Ok(())
+}
+
 impl Connection<'_> {
+    fn decode_mailbox(
+        returned: &WireMailbox<'_>,
+        attrs: &[FlagNameAttribute<'_>],
+    ) -> Result<Option<Mailbox>, Error> {
+        let returned = match returned {
+            WireMailbox::Inbox => "INBOX",
+            WireMailbox::Other(name) => {
+                std::str::from_utf8(name.inner().as_ref()).map_err(|_| Error::Protocol)?
+            }
+        };
+        let mut attributes: Vec<_> = attrs.iter().map(ToString::to_string).collect();
+        attributes.sort();
+        attributes.dedup();
+        let selectable = !attributes
+            .iter()
+            .any(|attribute| attribute.eq_ignore_ascii_case("\\Noselect"));
+        if returned.is_empty() && !selectable {
+            return Ok(None);
+        }
+        if returned.is_empty() || returned.len() > 1024 || returned.chars().any(char::is_control) {
+            return Err(Error::Protocol);
+        }
+        Ok(Some(Mailbox {
+            name: mailbox_identity(returned).into(),
+            selectable,
+            attributes,
+        }))
+    }
+    async fn discover_all(&mut self, maximum: usize) -> Result<Vec<Mailbox>, Error> {
+        let rows = self
+            .drive(ImapMailboxList::new(
+                "".try_into().map_err(|_| Error::InvalidInput)?,
+                "*".try_into().map_err(|_| Error::InvalidInput)?,
+            ))
+            .await?;
+        if rows.len() > maximum {
+            return Err(Error::Limit);
+        }
+        let mut mailboxes = BTreeMap::new();
+        for (returned, _, attrs) in rows {
+            let Some(mailbox) = Self::decode_mailbox(&returned, &attrs)? else {
+                continue;
+            };
+            if mailboxes
+                .insert(mailbox.name.clone(), mailbox.clone())
+                .is_some_and(|previous| previous != mailbox)
+            {
+                return Err(Error::Protocol);
+            }
+        }
+        Ok(mailboxes.into_values().collect())
+    }
     async fn discover_names(
         &mut self,
         names: BTreeMap<&str, &str>,
@@ -437,26 +566,10 @@ impl Connection<'_> {
             }
             let mut found = None;
             for (returned, _, attrs) in rows {
-                let returned = match &returned {
-                    WireMailbox::Inbox => "INBOX",
-                    WireMailbox::Other(name) => {
-                        std::str::from_utf8(name.inner().as_ref()).map_err(|_| Error::Protocol)?
-                    }
-                };
-                if mailbox_identity(returned) != expected {
+                let mailbox = Self::decode_mailbox(&returned, &attrs)?.ok_or(Error::Protocol)?;
+                if mailbox.name != expected {
                     return Err(Error::Protocol);
                 }
-                let mut attributes: Vec<_> = attrs.iter().map(ToString::to_string).collect();
-                attributes.sort();
-                attributes.dedup();
-                let selectable = !attributes
-                    .iter()
-                    .any(|a| a.eq_ignore_ascii_case("\\Noselect"));
-                let mailbox = Mailbox {
-                    name: expected.into(),
-                    selectable,
-                    attributes,
-                };
                 if found.as_ref().is_some_and(|previous| previous != &mailbox) {
                     return Err(Error::Protocol);
                 }

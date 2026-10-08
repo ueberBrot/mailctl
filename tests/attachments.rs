@@ -54,7 +54,10 @@ async fn setup(
     config: mailctl::config::Config,
     backend: Arc<dyn mailctl::service::AttachmentBackend>,
 ) -> (Service, String) {
-    let name = config.accounts[0].mailboxes[0].clone();
+    let name = match &config.accounts[0].mailboxes {
+        mailctl::config::MailboxScope::Only(names) => names[0].clone(),
+        mailctl::config::MailboxScope::All => panic!("fixture requires an explicit scope"),
+    };
     setup_service(
         name,
         Service::in_memory(config)
@@ -116,7 +119,10 @@ async fn live(
     config.accounts[0].server = "127.0.0.1".into();
     config.accounts[0].port = fixture.port;
     config.accounts[0].username = "fixture".into();
-    let name = config.accounts[0].mailboxes[0].clone();
+    let name = match &config.accounts[0].mailboxes {
+        mailctl::config::MailboxScope::Only(names) => names[0].clone(),
+        mailctl::config::MailboxScope::All => panic!("fixture requires an explicit scope"),
+    };
     let service = Service::in_memory(config)
         .unwrap()
         .with_environment(host_support::Host::new(

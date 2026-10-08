@@ -1,6 +1,9 @@
 //! Configuration lookup and explicit operator initialization.
 use crate::{
-    config::{AccessGrant, AccountConfig, Config, CredentialSource, Limits, TlsMode, Topology},
+    config::{
+        AccessGrant, AccountConfig, Config, CredentialSource, Limits, MailboxScope, TlsMode,
+        Topology,
+    },
     domain::{Error, ErrorCode, Setup},
     policy::Profile,
     service::Service,
@@ -88,7 +91,7 @@ pub(super) fn setup(
                 name: "default".into(),
                 profile: Profile::ReadOnly,
                 accounts: Vec::new(),
-                mailboxes: vec!["INBOX".into()],
+                mailboxes: MailboxScope::All,
                 historical_drafts: Vec::new(),
                 limits: Limits::default(),
             }],
@@ -124,7 +127,7 @@ pub(super) fn setup(
                 username: args.username.ok_or_else(Error::setup_required)?,
                 port: 993,
                 tls: TlsMode::Implicit,
-                mailboxes: vec!["INBOX".into()],
+                mailboxes: MailboxScope::All,
                 from_identities: vec![alias],
                 drafts_mailbox: None,
                 credential: CredentialSource::Native {},

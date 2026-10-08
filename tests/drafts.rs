@@ -93,6 +93,48 @@ fn status(mut request: Value) -> Value {
     request["input"].as_object_mut().unwrap().remove("draft");
     request
 }
+
+#[tokio::test]
+async fn all_folder_scope_preserves_read_only_and_explicit_draft_target_authority() {
+    use mailctl::{config::MailboxScope, domain::ErrorCode};
+    let (_installation, mut config, service, identity) = fixture().await;
+    drop(service);
+    config.accounts[0].mailboxes = MailboxScope::All;
+    for grant in &mut config.grants {
+        grant.mailboxes = MailboxScope::All;
+    }
+    Service::setup(config.clone()).unwrap();
+    let provider = Arc::new(MemoryDrafts::default());
+    provider.set("work", "Drafts", 77);
+    let service = Service::open(config).unwrap().with_draft_backend(provider);
+    let request = save(&identity, uuid::Uuid::new_v4());
+    let mut reconcile = status(request.clone());
+    reconcile["input"]["reconcile"] = json!(true);
+    for request in [request.clone(), status(request.clone()), reconcile] {
+        assert_eq!(
+            failure(&service, request, "default", false).await,
+            ErrorCode::PermissionDenied
+        );
+    }
+    let mut wrong_target = request.clone();
+    wrong_target["input"]["mailbox"] = json!("INBOX");
+    assert_eq!(
+        failure(&service, wrong_target, "writer", false).await,
+        ErrorCode::PermissionDenied
+    );
+    assert_eq!(
+        failure(&service, request.clone(), "writer", true).await,
+        ErrorCode::PermissionDenied
+    );
+    assert_eq!(
+        execute(&service, request.clone()).await["state"],
+        "created_reference_unavailable"
+    );
+    assert_eq!(
+        execute(&service, status(request)).await["mailbox"],
+        "Drafts"
+    );
+}
 #[tokio::test]
 async fn authorization_precedes_journal_existence_and_input_conflicts() {
     use mailctl::domain::ErrorCode::*;
@@ -227,14 +269,18 @@ async fn changing_draft_routing_advances_generation_and_never_redirects_old_oper
     let request = save(&identity, uuid::Uuid::new_v4());
     execute(&service, request.clone()).await;
     drop(service);
-    config.accounts[0].mailboxes.push("New Drafts".into());
+    if let mailctl::config::MailboxScope::Only(names) = &mut config.accounts[0].mailboxes {
+        names.push("New Drafts".into());
+    } else {
+        panic!("fixture requires an explicit scope");
+    }
     config.accounts[0].drafts_mailbox = Some("New Drafts".into());
     config
         .grants
         .iter_mut()
         .find(|g| g.name == "writer")
         .unwrap()
-        .mailboxes = vec!["New Drafts".into()];
+        .mailboxes = vec!["New Drafts".into()].into();
     Service::setup(config.clone()).unwrap();
     let service = Service::open(config).unwrap();
     let current = account(&service).await;
@@ -279,14 +325,18 @@ async fn explicit_historical_scope_recovers_completed_operations_after_repointin
     drop(service);
     config.accounts[0].server = "replacement.example.test".into();
     config.accounts[0].drafts_mailbox = Some("New Drafts".into());
-    config.accounts[0].mailboxes.push("New Drafts".into());
+    if let mailctl::config::MailboxScope::Only(names) = &mut config.accounts[0].mailboxes {
+        names.push("New Drafts".into());
+    } else {
+        panic!("fixture requires an explicit scope");
+    }
     config.accounts[0].from_identities = vec!["replacement@example.test".into()];
     let writer = config
         .grants
         .iter_mut()
         .find(|g| g.name == "writer")
         .unwrap();
-    writer.mailboxes = vec!["New Drafts".into()];
+    writer.mailboxes = vec!["New Drafts".into()].into();
     writer.historical_drafts = vec![mailctl::config::HistoricalDraftScope {
         account_id: identity["account_id"].as_str().unwrap().parse().unwrap(),
         account_generation: 1,
@@ -428,14 +478,14 @@ async fn original_mailbox_authorization_precedes_known_and_unknown_journal_looku
     let known = save(&identity, uuid::Uuid::new_v4());
     execute(&service, known.clone()).await;
     drop(service);
-    config.accounts[0].mailboxes = vec!["INBOX".into(), "New Drafts".into()];
+    config.accounts[0].mailboxes = vec!["INBOX".into(), "New Drafts".into()].into();
     config.accounts[0].drafts_mailbox = Some("New Drafts".into());
     config
         .grants
         .iter_mut()
         .find(|g| g.name == "writer")
         .unwrap()
-        .mailboxes = vec!["New Drafts".into()];
+        .mailboxes = vec!["New Drafts".into()].into();
     Service::setup(config.clone()).unwrap();
     let service = Service::open(config).unwrap();
     for request in [known, save(&identity, uuid::Uuid::new_v4())] {

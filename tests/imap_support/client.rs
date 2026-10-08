@@ -80,6 +80,16 @@ impl Client {
         })
         .await
     }
+    pub async fn discover_all(
+        &mut self,
+        username: &str,
+        password: &str,
+    ) -> Result<Vec<Mailbox>, Error> {
+        self.run(username, password, async |connection, limits, metrics| {
+            connection.discover_all(limits, metrics).await
+        })
+        .await
+    }
     pub async fn search_messages(
         &mut self,
         username: &str,

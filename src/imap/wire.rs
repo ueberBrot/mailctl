@@ -569,9 +569,11 @@ impl<'a> Connection<'a> {
                     if !remaining.is_empty() {
                         return Err(Error::Protocol);
                     }
-                    self.session
-                        .command
-                        .inspect(response, self.session.uid_validity)?;
+                    self.session.command.inspect(
+                        response,
+                        self.session.uid_validity,
+                        self.session.limits.max_mailboxes,
+                    )?;
                     if let CommandKind::Append { outcome, .. } = self.session.command.kind {
                         self.metrics.append_outcome = Some(outcome);
                     }
@@ -597,7 +599,9 @@ enum CommandKind {
     Capability,
     Login,
     StartTls,
-    List,
+    List {
+        rows: usize,
+    },
     Examine {
         uid_validity: Option<NonZeroU32>,
         read_only: bool,
@@ -658,7 +662,7 @@ impl CommandState {
             CommandBody::Capability => CommandKind::Capability,
             CommandBody::Login { .. } => CommandKind::Login,
             CommandBody::StartTLS => CommandKind::StartTls,
-            CommandBody::List { .. } => CommandKind::List,
+            CommandBody::List { .. } => CommandKind::List { rows: 0 },
             CommandBody::Examine { parameters, .. } if parameters.is_empty() => {
                 CommandKind::Examine {
                     uid_validity: None,
@@ -736,6 +740,7 @@ impl CommandState {
         &mut self,
         response: Response<'_>,
         selected: Option<NonZeroU32>,
+        max_mailboxes: usize,
     ) -> Result<(), Error> {
         match response {
             Response::Status(status) => {
@@ -805,7 +810,16 @@ impl CommandState {
             Response::Data(data) => match data {
                 Data::Capability(_)
                     if matches!(self.kind, CommandKind::Capability | CommandKind::Login) => {}
-                Data::List { .. } if matches!(self.kind, CommandKind::List) => {}
+                Data::List { mailbox, .. } => {
+                    let CommandKind::List { rows } = &mut self.kind else {
+                        return Err(Error::Protocol);
+                    };
+                    *rows += 1;
+                    if *rows > max_mailboxes {
+                        return Err(Error::Limit);
+                    }
+                    super::validate_wire_mailbox_name(&mailbox)?;
+                }
                 Data::Flags(_) | Data::Exists(_) | Data::Recent(_) | Data::Expunge(_) => {}
                 Data::Search(..) => {
                     let CommandKind::Search {

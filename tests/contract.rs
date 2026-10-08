@@ -52,6 +52,25 @@ mailboxes = ["INBOX"]
     )
 }
 
+#[test]
+fn omitted_mailbox_scopes_round_trip_without_becoming_explicit_restrictions() {
+    let input = configuration()
+        .lines()
+        .filter(|line| !line.starts_with("mailboxes ="))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let config = Config::parse(&input).expect("omitted scopes permit all folders");
+    let output = toml::to_string(&config).unwrap();
+    assert!(!output.contains("mailboxes ="));
+    Config::parse(&output).unwrap();
+    assert!(
+        Config::parse(&configuration().replace("mailboxes = [\"INBOX\"]", "mailboxes = []"))
+            .is_err()
+    );
+    let restricted = toml::to_string(&Config::parse(&configuration()).unwrap()).unwrap();
+    assert!(restricted.contains("mailboxes = [\"INBOX\", \"Drafts\"]"));
+}
+
 #[tokio::test]
 async fn doctor_separates_safe_source_status_from_explicit_rate_limited_authentication() {
     use mailctl::domain::{
@@ -602,7 +621,11 @@ fn capabilities_include_the_same_grant_filtered_safe_health_as_doctor() {
 fn hidden_draft_mailbox_does_not_consume_the_discovery_response_budget() {
     let mut config = Config::parse(&configuration()).unwrap();
     let mailbox = "D".repeat(1024);
-    config.accounts[0].mailboxes.push(mailbox.clone());
+    if let mailctl::config::MailboxScope::Only(names) = &mut config.accounts[0].mailboxes {
+        names.push(mailbox.clone());
+    } else {
+        panic!("fixture requires an explicit scope");
+    }
     config.accounts[0].drafts_mailbox = Some(mailbox);
     let service = Service::in_memory(config).unwrap();
     let context = service

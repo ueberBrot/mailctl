@@ -2,13 +2,13 @@
 use super::{Service, tokens::fingerprint};
 use crate::domain::mailbox_identity;
 use crate::{
-    config::{AccountConfig, Limits},
+    config::{AccountConfig, Limits, MailboxScope},
     domain::{Error, ErrorCode, ListMailboxesInput, Mailbox, MailboxDiscovery, MailboxMetadata},
     policy::{Permission, RequestContext},
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, btree_map::Entry},
+    collections::{BTreeMap, BTreeSet, btree_map::Entry},
     future::Future,
     pin::Pin,
     sync::{Arc, RwLock},
@@ -22,12 +22,30 @@ pub struct MailboxTarget<'a> {
 }
 
 pub trait MailboxBackend: Send + Sync {
+    fn discover_all<'a>(
+        &'a self,
+        target: MailboxTarget<'a>,
+        limits: &'a Limits,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<MailboxMetadata>, Error>> + Send + 'a>>;
+
     fn discover<'a>(
         &'a self,
         target: MailboxTarget<'a>,
         names: &'a [String],
         limits: &'a Limits,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<MailboxMetadata>, Error>> + Send + 'a>>;
+}
+
+fn validate_metadata(row: &MailboxMetadata) -> Result<(), Error> {
+    if (row.name.is_empty() && row.selectable)
+        || row.name.len() > 1024
+        || row.name.chars().any(char::is_control)
+        || row.special_use.len() > 16
+        || row.special_use.iter().any(|flag| flag.len() > 64)
+    {
+        return Err(Error::new(ErrorCode::ProviderUnavailable));
+    }
+    Ok(())
 }
 
 #[derive(Default)]
@@ -39,30 +57,87 @@ impl MemoryMailboxes {
             .unwrap()
             .insert(account_key.into(), mailboxes);
     }
-}
-impl MailboxBackend for MemoryMailboxes {
-    fn discover<'a>(
-        &'a self,
-        target: MailboxTarget<'a>,
-        names: &'a [String],
-        _: &'a Limits,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<MailboxMetadata>, Error>> + Send + 'a>> {
-        Box::pin(async move {
-            Ok(self
-                .0
-                .read()
-                .unwrap()
-                .get(&target.config.key)
-                .into_iter()
-                .flatten()
-                .filter(|mailbox| {
+
+    fn inventory(
+        &self,
+        target: MailboxTarget<'_>,
+        names: Option<&[String]>,
+        limits: &Limits,
+    ) -> Result<Vec<MailboxMetadata>, Error> {
+        let store = self.0.read().unwrap();
+        let Some(rows) = store.get(&target.config.key) else {
+            return Ok(Vec::new());
+        };
+        // Wildcard characters require a full provider inventory before exact
+        // filtering. Count those raw rows just as the IMAP adapter does.
+        let full_inventory =
+            names.is_none_or(|names| names.iter().any(|name| name.contains(['*', '%'])));
+        if full_inventory && rows.len() > limits.mailbox_inventory {
+            return Err(Error::new(ErrorCode::ResponseTooLarge));
+        }
+        if full_inventory {
+            let mut seen = BTreeMap::new();
+            for row in rows {
+                validate_metadata(row)?;
+                if row.name.is_empty() {
+                    continue;
+                }
+                let attributes = (
+                    row.selectable,
+                    row.special_use
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<BTreeSet<_>>(),
+                );
+                match seen.entry(mailbox_identity(&row.name)) {
+                    Entry::Vacant(entry) => {
+                        entry.insert(attributes);
+                    }
+                    Entry::Occupied(entry) if entry.get() != &attributes => {
+                        return Err(Error::new(ErrorCode::ProviderUnavailable));
+                    }
+                    Entry::Occupied(_) => {}
+                }
+            }
+        }
+        let selected = rows
+            .iter()
+            .filter(|mailbox| {
+                names.is_none_or(|names| {
                     names
                         .iter()
                         .any(|name| mailbox_identity(name) == mailbox_identity(&mailbox.name))
                 })
-                .cloned()
-                .collect())
-        })
+            })
+            .take(limits.mailbox_inventory.saturating_add(1))
+            .collect::<Vec<_>>();
+        if selected.len() > limits.mailbox_inventory {
+            return Err(Error::new(ErrorCode::ResponseTooLarge));
+        }
+        selected
+            .into_iter()
+            .map(|row| {
+                validate_metadata(row)?;
+                Ok(row.clone())
+            })
+            .collect()
+    }
+}
+impl MailboxBackend for MemoryMailboxes {
+    fn discover_all<'a>(
+        &'a self,
+        target: MailboxTarget<'a>,
+        limits: &'a Limits,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<MailboxMetadata>, Error>> + Send + 'a>> {
+        Box::pin(async move { self.inventory(target, None, limits) })
+    }
+    fn discover<'a>(
+        &'a self,
+        target: MailboxTarget<'a>,
+        names: &'a [String],
+        limits: &'a Limits,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<MailboxMetadata>, Error>> + Send + 'a>> {
+        Box::pin(async move { self.inventory(target, Some(names), limits) })
     }
 }
 
@@ -118,17 +193,7 @@ impl Service {
         target: MailboxTarget<'a>,
         mailbox: &str,
     ) -> Result<MailboxTarget<'a>, Error> {
-        let name = mailbox_identity(mailbox);
-        if !target
-            .config
-            .mailboxes
-            .iter()
-            .any(|allowed| mailbox_identity(allowed) == name)
-            || !grant
-                .mailboxes
-                .iter()
-                .any(|allowed| mailbox_identity(allowed) == name)
-        {
+        if !target.config.mailboxes.allows(mailbox) || !grant.mailboxes.allows(mailbox) {
             return Err(Error::new(ErrorCode::MailboxNotAllowed));
         }
         Ok(target)
@@ -205,29 +270,17 @@ impl Service {
         }) {
             return Err(Error::new(ErrorCode::StaleCursor));
         }
-        let names = account
-            .mailboxes
-            .iter()
-            .filter(|name| {
-                reference.as_ref().is_none_or(|reference| {
-                    mailbox_identity(name) == mailbox_identity(&reference.mailbox)
-                })
-            })
-            .filter(|name| {
-                grant
-                    .mailboxes
-                    .iter()
-                    .any(|allowed| mailbox_identity(allowed) == mailbox_identity(name))
-            })
-            .map(|name| (mailbox_identity(name), name))
-            .collect::<BTreeMap<_, _>>();
-        if names.len() > limits.mailbox_inventory {
+        let mut effective = account.mailboxes.intersection(&grant.mailboxes);
+        if let Some(reference) = &reference {
+            effective =
+                effective.intersection(&MailboxScope::Only(vec![reference.mailbox.clone()]));
+        }
+        if matches!(&effective, MailboxScope::Only(names) if names.len() > limits.mailbox_inventory)
+        {
             return Err(Error::new(ErrorCode::ResponseTooLarge));
         }
-        // Preserve canonical identity order for provider-row membership checks.
         let _admission = self.requests.admit(id, limits).await?;
-        let names = names.into_values().cloned().collect::<Vec<_>>();
-        let rows = if names.is_empty() {
+        let rows = if matches!(&effective, MailboxScope::Only(names) if names.is_empty()) {
             Vec::new()
         } else {
             let target = MailboxTarget {
@@ -243,22 +296,23 @@ impl Service {
                     &live
                 }
             };
-            self.observed(id, backend.discover(target, &names, limits).await)?
+            let rows = match &effective {
+                MailboxScope::All => backend.discover_all(target, limits).await,
+                MailboxScope::Only(names) => backend.discover(target, names, limits).await,
+            };
+            self.observed(id, rows)?
         };
         if rows.len() > limits.mailbox_inventory {
             return Err(Error::new(ErrorCode::ResponseTooLarge));
         }
         let mut inventory = BTreeMap::new();
         for mut row in rows {
+            validate_metadata(&row)?;
+            if effective.is_all() && row.name.is_empty() && !row.selectable {
+                continue;
+            }
             let identity = mailbox_identity(&row.name);
-            if row.name.is_empty()
-                || row.name.len() > 1024
-                || names
-                    .binary_search_by(|name| mailbox_identity(name).cmp(identity))
-                    .is_err()
-                || row.special_use.len() > 16
-                || row.special_use.iter().any(|flag| flag.len() > 64)
-            {
+            if row.name.is_empty() || !effective.allows(&row.name) {
                 return Err(Error::new(ErrorCode::ProviderUnavailable));
             }
             if identity != row.name {

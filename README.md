@@ -22,6 +22,22 @@ Configure an account and list it:
 ./target/debug/mailctl account list --json
 ```
 
+For a new installation, setup grants read-only access to every current and future
+folder. Newly created account and grant scopes omit `mailboxes`, which means all
+folders. A folder created on the provider appears in a later discovery request
+without editing configuration or restarting the process.
+
+To restrict folders, set an explicit, nonempty list such as
+`mailboxes = ["INBOX", "Archive"]` on the account, access grant, or both. The
+effective scope is their intersection. Names containing `*` or `%` identify
+literal folders; they are not patterns. An empty list is invalid. Re-running
+setup preserves existing explicit restrictions and credential references.
+After editing configuration, run `setup` to apply its revision and restart
+long-running MCP processes. Draft creation requires a `drafts_only` or
+`read_and_drafts` grant, approved From identities, and a configured existing
+Drafts folder. MCP also requires `--use-configured-grant` to enable those draft
+permissions.
+
 Run `./target/debug/mailctl-mcp` to serve MCP over STDIO using the same configuration.
 Use `--grant` to select an access grant, `--account` to narrow accounts, or `--help`
 for available commands.

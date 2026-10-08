@@ -197,11 +197,11 @@ impl DraftFixture {
         config.accounts[0].alias = "renamed".into();
         config.accounts[0].server = "unreachable.example.test".into();
         config.accounts[0].from_identities = vec!["changed@example.test".into()];
-        config.accounts[0].mailboxes = vec!["New Drafts".into()];
+        config.accounts[0].mailboxes = vec!["New Drafts".into()].into();
         config.accounts[0].drafts_mailbox = Some("New Drafts".into());
         for grant in &mut config.grants {
             if grant.name == "writer" || grant.name == "other-writer" {
-                grant.mailboxes = vec!["New Drafts".into()];
+                grant.mailboxes = vec!["New Drafts".into()].into();
                 grant.historical_drafts = vec![mailctl::config::HistoricalDraftScope {
                     account_id: self.input["account_id"].as_str().unwrap().parse().unwrap(),
                     account_generation: 1,

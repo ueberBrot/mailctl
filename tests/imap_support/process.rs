@@ -35,6 +35,7 @@ enum ExpectedOperation {
     Reconcile,
     RejectAuthentication(bool),
     Mailboxes(Vec<&'static str>),
+    AllMailboxes(Vec<&'static str>),
     Search(&'static str, Option<u32>),
     Body(&'static str, Vec<u8>),
     Attachment(&'static str, AttachmentPhase, String),
@@ -150,6 +151,18 @@ impl ImapServer {
                                         imap_support::write(&mut wire, &format!("* LIST ({attributes}) \"/\" {name}\r\n{tag} OK listed\r\n")).await;
                                     }
                                 }
+                                ExpectedOperation::AllMailboxes(mailboxes) => {
+                                    let tag = imap_support::expect(&mut wire, "LIST \"\" *").await;
+                                    for name in mailboxes {
+                                        let attributes = match name {
+                                            "Archive" => "\\Archive",
+                                            "Projects" => "\\Noselect",
+                                            _ => "",
+                                        };
+                                        imap_support::write(&mut wire, &format!("* LIST ({attributes}) \"/\" \"{name}\"\r\n")).await;
+                                    }
+                                    imap_support::write(&mut wire, &format!("{tag} OK listed\r\n")).await;
+                                }
                                 ExpectedOperation::Search(mailbox, position) => search_page(&mut wire, mailbox, position).await,
                                 ExpectedOperation::Body(mailbox, text) => body_page(&mut wire, mailbox, &text).await,
                                 ExpectedOperation::Attachment(mailbox, phase, filename) => {
@@ -235,6 +248,19 @@ impl ImapServer {
         });
     }
 
+    pub fn expect_all_mailboxes(
+        &self,
+        username: &'static str,
+        password: &'static str,
+        mailboxes: &[&'static str],
+    ) {
+        self.expected.lock().unwrap().push_back(Expected {
+            username,
+            password,
+            operation: ExpectedOperation::AllMailboxes(mailboxes.to_vec()),
+        });
+    }
+
     pub fn expect_search(
         &self,
         username: &'static str,
@@ -313,9 +339,13 @@ impl ImapServer {
     }
 }
 
+fn mailbox_argument(mailbox: &str) -> String {
+    format!("\"{}\"", mailbox.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
 async fn search_page(wire: &mut imap_support::Wire, mailbox: &str, position: Option<u32>) {
     use imap_support::{expect, write};
-    let tag = expect(wire, &format!("EXAMINE {mailbox}")).await;
+    let tag = expect(wire, &format!("EXAMINE {}", mailbox_argument(mailbox))).await;
     write(
         wire,
         &format!("* 3 EXISTS\r\n* OK [UIDVALIDITY 77] stable\r\n{tag} OK [READ-ONLY] selected\r\n"),
@@ -361,7 +391,7 @@ async fn body_page(wire: &mut imap_support::Wire, mailbox: &str, text: &[u8]) {
         encoded = STANDARD.encode(text);
         ("BASE64", encoded.as_bytes())
     };
-    let tag = expect(wire, &format!("EXAMINE {mailbox}")).await;
+    let tag = expect(wire, &format!("EXAMINE {}", mailbox_argument(mailbox))).await;
     write(
         wire,
         &format!("* 3 EXISTS\r\n* OK [UIDVALIDITY 77] stable\r\n{tag} OK [READ-ONLY] selected\r\n"),
@@ -414,7 +444,7 @@ async fn attachment_page(
     interrupted: &AtomicUsize,
 ) {
     use imap_support::{expect, write};
-    let tag = expect(wire, &format!("EXAMINE {mailbox}")).await;
+    let tag = expect(wire, &format!("EXAMINE {}", mailbox_argument(mailbox))).await;
     write(
         wire,
         &format!("* 3 EXISTS\r\n* OK [UIDVALIDITY 77] stable\r\n{tag} OK [READ-ONLY] selected\r\n"),

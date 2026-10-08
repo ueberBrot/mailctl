@@ -2,7 +2,7 @@
 use crate::{domain::Error, policy::Profile};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashSet,
+    collections::{BTreeSet, HashSet},
     path::{Component, Path, PathBuf},
 };
 
@@ -10,6 +10,59 @@ pub(crate) const MAX_BYTES: usize = 4 * 1024 * 1024;
 
 fn invalid() -> Error {
     Error::setup_required()
+}
+/// Mailboxes allowed by an account or access grant. Omission means all current
+/// and future folders; an explicit list contains literal server identities.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum MailboxScope {
+    #[default]
+    All,
+    Only(Vec<String>),
+}
+impl MailboxScope {
+    pub fn is_all(&self) -> bool {
+        matches!(self, Self::All)
+    }
+
+    pub fn allows(&self, mailbox: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Only(names) => names.iter().any(|name| {
+                crate::domain::mailbox_identity(name) == crate::domain::mailbox_identity(mailbox)
+            }),
+        }
+    }
+
+    /// Intersect authority, normalizing only the case-insensitive INBOX identity.
+    /// An empty intersection is valid even though an empty configured list is not.
+    pub fn intersection(&self, other: &Self) -> Self {
+        let names = match (self, other) {
+            (Self::All, Self::All) => return Self::All,
+            (Self::Only(names), _) | (_, Self::Only(names)) => names,
+        };
+        Self::Only(
+            names
+                .iter()
+                .filter(|name| self.allows(name) && other.allows(name))
+                .map(|name| crate::domain::mailbox_identity(name).to_owned())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect(),
+        )
+    }
+
+    fn valid(&self, max: usize) -> bool {
+        match self {
+            Self::All => true,
+            Self::Only(names) => unique_labels(names, max),
+        }
+    }
+}
+impl From<Vec<String>> for MailboxScope {
+    fn from(names: Vec<String>) -> Self {
+        Self::Only(names)
+    }
 }
 
 fn obsolete_runtime_capacity(input: &str) -> bool {
@@ -162,7 +215,8 @@ pub struct AccountConfig {
     #[serde(default)]
     pub tls: TlsMode,
     pub username: String,
-    pub mailboxes: Vec<String>,
+    #[serde(default, skip_serializing_if = "MailboxScope::is_all")]
+    pub mailboxes: MailboxScope,
     pub from_identities: Vec<String>,
     pub drafts_mailbox: Option<String>,
     pub credential: CredentialSource,
@@ -177,7 +231,8 @@ pub struct AccessGrant {
     pub name: String,
     pub profile: Profile,
     pub accounts: Vec<String>,
-    pub mailboxes: Vec<String>,
+    #[serde(skip_serializing_if = "MailboxScope::is_all")]
+    pub mailboxes: MailboxScope,
     pub historical_drafts: Vec<HistoricalDraftScope>,
     pub limits: Limits,
 }
@@ -196,7 +251,8 @@ struct RawGrant {
     #[serde(default)]
     profile: Profile,
     accounts: Vec<String>,
-    mailboxes: Vec<String>,
+    #[serde(default)]
+    mailboxes: MailboxScope,
     #[serde(default)]
     historical_drafts: Vec<HistoricalDraftScope>,
     #[serde(default)]
@@ -310,12 +366,12 @@ impl Config {
                 || !server_name(&account.server)
                 || account.port == 0
                 || !label(&account.username)
-                || !unique_labels(&account.mailboxes, self.limits.mailbox_inventory)
+                || !account.mailboxes.valid(self.limits.mailbox_inventory)
                 || !unique_labels(&account.from_identities, 100)
                 || account
                     .drafts_mailbox
                     .as_ref()
-                    .is_some_and(|mailbox| !account.mailboxes.contains(mailbox))
+                    .is_some_and(|mailbox| !label(mailbox) || !account.mailboxes.allows(mailbox))
             {
                 return Err(invalid());
             }
@@ -336,7 +392,7 @@ impl Config {
             if !identifier(&grant.name)
                 || !names.insert(&grant.name)
                 || grant.accounts.len() > self.limits.accounts
-                || !unique_labels(&grant.mailboxes, self.limits.mailbox_inventory)
+                || !grant.mailboxes.valid(self.limits.mailbox_inventory)
                 || grant.accounts.iter().any(|key| !keys.contains(key))
                 || grant.historical_drafts.len() > self.limits.mailbox_inventory
                 || grant.historical_drafts.iter().any(|scope| {
@@ -357,7 +413,7 @@ impl Config {
                             account
                                 .drafts_mailbox
                                 .as_ref()
-                                .is_none_or(|mailbox| !grant.mailboxes.contains(mailbox))
+                                .is_none_or(|mailbox| !grant.mailboxes.allows(mailbox))
                         })
                 })
             {

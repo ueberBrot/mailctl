@@ -164,7 +164,7 @@ impl Fixture {
         account.alias = "renamed".into();
         account.server = "replacement.example.test".into();
         account.credential = CredentialSource::Session {};
-        account.mailboxes = vec!["New Drafts".into()];
+        account.mailboxes = vec!["New Drafts".into()].into();
         account.drafts_mailbox = Some("New Drafts".into());
         account
             .from_identities
@@ -175,7 +175,7 @@ impl Fixture {
             .iter_mut()
             .find(|g| g.name == "writer")
             .unwrap();
-        grant.mailboxes = vec!["New Drafts".into()];
+        grant.mailboxes = vec!["New Drafts".into()].into();
         grant.historical_drafts = vec![HistoricalDraftScope {
             account_id: self.input.account_id,
             account_generation: 1,
@@ -392,6 +392,7 @@ async fn prepared_retry_refuses_missing_routing_target_from_or_reconstruction() 
 async fn historical_denials_hide_existence_and_conflicts_and_obey_narrowing() {
     for scope in [
         "absent",
+        "all_folders",
         "uuid",
         "generation",
         "mailbox",
@@ -400,6 +401,9 @@ async fn historical_denials_hide_existence_and_conflicts_and_obey_narrowing() {
     ] {
         let mut f = Fixture::new(DraftOperationState::Prepared).await;
         f.repoint();
+        if scope == "all_folders" {
+            f.config.accounts[0].mailboxes = mailctl::config::MailboxScope::All;
+        }
         let grant = f
             .config
             .grants
@@ -408,6 +412,10 @@ async fn historical_denials_hide_existence_and_conflicts_and_obey_narrowing() {
             .unwrap();
         match scope {
             "absent" => grant.historical_drafts.clear(),
+            "all_folders" => {
+                grant.mailboxes = mailctl::config::MailboxScope::All;
+                grant.historical_drafts.clear();
+            }
             "uuid" => grant.historical_drafts[0].account_id = uuid::Uuid::new_v4(),
             "generation" => grant.historical_drafts[0].account_generation = 2,
             "mailbox" => grant.historical_drafts[0].mailbox = "New Drafts".into(),

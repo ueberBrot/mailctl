@@ -5,27 +5,35 @@ mod imap_support;
 mod server;
 #[path = "../../support/mod.rs"]
 mod support;
-use support::{Installation, assert_success, envelope, run_bounded};
+use rmcp::{ServiceExt, model::CallToolRequestParams, transport::TokioChildProcess};
+use serde_json::{Value, json};
+use support::{Installation, assert_mcp_envelope, assert_success, envelope, run_bounded};
+
+type McpClient = rmcp::service::RunningService<rmcp::RoleClient, ()>;
+const READ_MAILBOX: &str = "Archive*Literal%";
 
 #[tokio::test]
 async fn cli_mcp_and_restarted_sessions_continue_under_fresh_authorization() {
     let installation = Installation::two_accounts();
     let mut server = server::ImapServer::new(installation.config().parent().unwrap());
-    let configuration = std::fs::read_to_string(installation.config())
+    let mut configuration: toml::Value =
+        toml::from_str(&std::fs::read_to_string(installation.config()).unwrap()).unwrap();
+    for account in configuration["accounts"].as_array_mut().unwrap() {
+        let account = account.as_table_mut().unwrap();
+        account.insert("server".into(), "127.0.0.1".into());
+        account.insert("port".into(), toml::Value::Integer(server.port.into()));
+        account.remove("mailboxes");
+    }
+    for grant in configuration["grants"]
+        .as_array_mut()
         .unwrap()
-        .replace(
-            "server = \"imap.example.test\"",
-            &format!("server = \"127.0.0.1\"\nport = {}", server.port),
-        )
-        .replace(
-            "mailboxes = [\"INBOX\", \"Drafts\"]",
-            "mailboxes = [\"INBOX\", \"Drafts\", \"Archive\"]",
-        )
-        .replace(
-            "mailboxes = [\"INBOX\"]",
-            "mailboxes = [\"INBOX\", \"Archive\"]",
-        )
-        + "\n[[grants]]\nname = \"text\"\naccounts = [\"work\"]\nmailboxes = [\"Archive\"]\n[grants.limits]\ntext_page_bytes = 4\n\n[[grants]]\nname = \"restricted\"\naccounts = [\"work\"]\nmailboxes = [\"INBOX\"]\n";
+        .iter_mut()
+        .take(2)
+    {
+        grant.as_table_mut().unwrap().remove("mailboxes");
+    }
+    let configuration = toml::to_string(&configuration).unwrap()
+        + "\n[[grants]]\nname = \"text\"\naccounts = [\"work\"]\nmailboxes = [\"Archive*Literal%\"]\n[grants.limits]\ntext_page_bytes = 4\nattachment_chunk_bytes = 3\n\n[[grants]]\nname = \"restricted\"\naccounts = [\"work\"]\nmailboxes = [\"INBOX\"]\n";
     std::fs::write(installation.config(), configuration).unwrap();
     let mut command = installation.cli();
     command.args(["--json", "setup"]);
@@ -40,10 +48,10 @@ async fn cli_mcp_and_restarted_sessions_continue_under_fresh_authorization() {
         assert_eq!(envelope(&output)["result"]["status"], "ready");
         assert_eq!(server.accepted(), 0);
     }
-    server.expect_mailboxes(
+    server.expect_all_mailboxes(
         "work@example.test",
         "disposable-password",
-        &["Archive", "INBOX"],
+        &[READ_MAILBOX, "INBOX"],
     );
     let mut command = installation.cli();
     command
@@ -55,7 +63,52 @@ async fn cli_mcp_and_restarted_sessions_continue_under_fresh_authorization() {
         .as_str()
         .unwrap()
         .to_owned();
-    server.expect_search("work@example.test", "disposable-password", "Archive", None);
+    server.expect_all_mailboxes(
+        "work@example.test",
+        "disposable-password",
+        &[READ_MAILBOX, "INBOX"],
+    );
+    let mut command = installation.cli();
+    command
+        .env("MAILCTL_FIXTURE_CA", &server.certificate)
+        .args([
+            "--json",
+            "--grant",
+            "text",
+            "mailbox",
+            "list",
+            "--reference",
+            &mailbox,
+        ]);
+    let resolved = run_bounded(command);
+    assert_success(&resolved);
+    let resolved = envelope(&resolved)["result"].take();
+    assert_eq!(resolved["mailboxes"].as_array().unwrap().len(), 1);
+    assert_eq!(resolved["mailboxes"][0]["metadata"]["name"], READ_MAILBOX);
+    server.expect_all_mailboxes(
+        "work@example.test",
+        "disposable-password",
+        &[READ_MAILBOX, "INBOX"],
+    );
+    let mut command = installation.mcp();
+    command
+        .env("MAILCTL_FIXTURE_CA", &server.certificate)
+        .args(["--grant", "text"]);
+    assert_eq!(
+        mcp_tool(
+            command,
+            "email_list_mailboxes",
+            json!({"reference": mailbox})
+        )
+        .await["result"],
+        resolved
+    );
+    server.expect_search(
+        "work@example.test",
+        "disposable-password",
+        READ_MAILBOX,
+        None,
+    );
     let mut command = installation.cli();
     command
         .env("MAILCTL_FIXTURE_CA", &server.certificate)
@@ -74,7 +127,90 @@ async fn cli_mcp_and_restarted_sessions_continue_under_fresh_authorization() {
         .as_str()
         .unwrap()
         .to_owned();
+    let message_before = envelope(&output)["result"]["messages"][0].clone();
+    assert_eq!(message_before["flags"], json!(["\\Seen"]));
+    let search_cursor = envelope(&output)["result"]["next_cursor"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let before = server.accepted();
+    for (arguments, tool, input) in [
+        (
+            vec!["mailbox", "list", "--reference", &mailbox],
+            "email_list_mailboxes",
+            json!({"reference": mailbox}),
+        ),
+        (
+            vec![
+                "message",
+                "search",
+                "--mailbox",
+                &mailbox,
+                "--cursor",
+                &search_cursor,
+                "--limit",
+                "1",
+            ],
+            "email_search_messages",
+            json!({"mailbox": mailbox, "cursor": search_cursor, "limit": 1}),
+        ),
+    ] {
+        let mut denied = installation.cli();
+        denied
+            .args(["--json", "--grant", "restricted"])
+            .args(arguments);
+        assert_eq!(
+            envelope(&run_bounded(denied))["error"]["code"],
+            "mailbox_not_allowed"
+        );
+        let mut command = installation.mcp();
+        command.args(["--grant", "restricted"]);
+        assert_eq!(
+            mcp_tool(command, tool, input).await["error"]["code"],
+            "mailbox_not_allowed"
+        );
+    }
+    assert_eq!(server.accepted(), before);
+    server.expect_search(
+        "work@example.test",
+        "disposable-password",
+        READ_MAILBOX,
+        None,
+    );
+    let mut command = installation.mcp();
+    command.env("MAILCTL_FIXTURE_CA", &server.certificate);
+    let searched = mcp_tool(
+        command,
+        "email_search_messages",
+        serde_json::json!({"mailbox": mailbox, "limit": 1}),
+    )
+    .await;
+    assert_eq!(searched["result"]["messages"][0], message_before);
     text_handoffs(&installation, &server, &message).await;
+    attachment_handoffs(&installation, &server, &message).await;
+    // The transcript permits only EXAMINE, metadata FETCH, and BODY.PEEK reads.
+    // Re-read the fixed fixture's flags and metadata after body and attachment access.
+    server.expect_search(
+        "work@example.test",
+        "disposable-password",
+        READ_MAILBOX,
+        None,
+    );
+    let mut command = installation.cli();
+    command
+        .env("MAILCTL_FIXTURE_CA", &server.certificate)
+        .args([
+            "--json",
+            "message",
+            "search",
+            "--mailbox",
+            &mailbox,
+            "--limit",
+            "1",
+        ]);
+    let after = run_bounded(command);
+    assert_success(&after);
+    assert_eq!(envelope(&after)["result"]["messages"][0], message_before);
     hostile_presentation(&installation, &server, &message).await;
     hostile_failures(&installation, &server);
     server.finish();
@@ -84,7 +220,7 @@ async fn text_handoffs(installation: &Installation, server: &server::ImapServer,
     let mut cursor: Option<String> = None;
     let mut reconstructed = String::new();
     for (index, expected) in ["Shor", "t bo", "dy.\r", "\n"].into_iter().enumerate() {
-        server.expect_body("work@example.test", "disposable-password", "Archive");
+        server.expect_body("work@example.test", "disposable-password", READ_MAILBOX);
         let result = if index == 0 || index == 3 {
             let mut command = installation.cli();
             command
@@ -151,36 +287,176 @@ async fn mcp_message(
     message: &str,
     cursor: Option<&str>,
 ) -> serde_json::Value {
-    use rmcp::{ServiceExt, model::CallToolRequestParams, transport::TokioChildProcess};
-    use serde_json::{Value, json};
+    mcp_tool(
+        command,
+        "email_get_message",
+        serde_json::json!({"message": message, "cursor": cursor}),
+    )
+    .await
+}
 
+async fn mcp_tool(
+    command: std::process::Command,
+    tool: &str,
+    arguments: serde_json::Value,
+) -> serde_json::Value {
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         let client =
             ().serve(TokioChildProcess::new(tokio::process::Command::from(command)).unwrap())
                 .await
                 .unwrap();
-        let response = client
-            .call_tool(
-                CallToolRequestParams::new("email_get_message").with_arguments(
-                    serde_json::Map::from_iter([
-                        ("message".into(), json!(message)),
-                        ("cursor".into(), json!(cursor)),
-                    ]),
-                ),
-            )
-            .await
-            .unwrap();
-        let structured = response.structured_content.unwrap();
-        assert_eq!(response.is_error, Some(structured.get("error").is_some()));
-        assert_eq!(
-            serde_json::from_str::<Value>(&response.content[0].as_text().unwrap().text).unwrap(),
-            structured
-        );
+        let structured = mcp_call(&client, tool, arguments).await;
         client.cancel().await.unwrap();
         structured
     })
     .await
     .expect("MCP message request and shutdown finish within the deadline")
+}
+
+async fn mcp_call(client: &McpClient, tool: &str, arguments: Value) -> Value {
+    let response = client
+        .call_tool(
+            CallToolRequestParams::new(tool.to_owned())
+                .with_arguments(arguments.as_object().unwrap().clone()),
+        )
+        .await
+        .unwrap();
+    assert_mcp_envelope(response)
+}
+
+async fn attachment_handoffs(
+    installation: &Installation,
+    server: &server::ImapServer,
+    message: &str,
+) {
+    let cli = |arguments: &[&str]| {
+        let mut command = installation.cli();
+        command
+            .env("MAILCTL_FIXTURE_CA", &server.certificate)
+            .args(["--json", "--grant", "text"])
+            .args(arguments);
+        run_bounded(command)
+    };
+    server.expect_attachment(
+        "work@example.test",
+        "disposable-password",
+        READ_MAILBOX,
+        server::AttachmentPhase::List,
+    );
+    let listed = cli(&["attachment", "list", "--message", message]);
+    assert_success(&listed);
+    let listed = envelope(&listed)["result"].take();
+    let attachment = listed["attachments"][0]["reference"].as_str().unwrap();
+    server.expect_attachment(
+        "work@example.test",
+        "disposable-password",
+        READ_MAILBOX,
+        server::AttachmentPhase::List,
+    );
+    let mut command = installation.mcp();
+    command
+        .env("MAILCTL_FIXTURE_CA", &server.certificate)
+        .args(["--grant", "text"]);
+    assert_eq!(
+        mcp_tool(
+            command,
+            "email_list_attachments",
+            json!({"message": message})
+        )
+        .await["result"],
+        listed
+    );
+
+    for phase in [
+        server::AttachmentPhase::Start,
+        server::AttachmentPhase::Continue,
+    ] {
+        server.expect_attachment(
+            "work@example.test",
+            "disposable-password",
+            READ_MAILBOX,
+            phase,
+        );
+    }
+    let downloaded = cli(&["attachment", "get", "--attachment", attachment]);
+    assert_success(&downloaded);
+    let downloaded = envelope(&downloaded)["result"].take();
+    assert_eq!(downloaded["bytes_base64"], "YWJjZGVm");
+    assert_eq!(downloaded["progress"]["total_decoded_bytes"], 6);
+    assert_eq!(
+        downloaded["progress"]["sha256"],
+        "bef57ec7f53a6d40beb640a780a639c83bc29ac8a9816f1fc6c5c6dcd93c4721"
+    );
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mut command = installation.mcp();
+        command
+            .env("MAILCTL_FIXTURE_CA", &server.certificate)
+            .args(["--grant", "text"]);
+        let client =
+            ().serve(TokioChildProcess::new(tokio::process::Command::from(command)).unwrap())
+                .await
+                .unwrap();
+        server.expect_attachment(
+            "work@example.test",
+            "disposable-password",
+            READ_MAILBOX,
+            server::AttachmentPhase::Start,
+        );
+        let first = mcp_call(
+            &client,
+            "email_get_attachment",
+            json!({"attachment": attachment}),
+        )
+        .await;
+        assert_eq!(first["result"]["decoded_offset"], 0);
+        assert_eq!(first["result"]["bytes_base64"], "YWJj");
+        assert_eq!(first["result"]["progress"]["status"], "continue");
+        let token = first["result"]["progress"]["next_token"].as_str().unwrap();
+        server.expect_attachment(
+            "work@example.test",
+            "disposable-password",
+            READ_MAILBOX,
+            server::AttachmentPhase::Continue,
+        );
+        let last = mcp_call(&client, "email_get_attachment", json!({"token": token})).await;
+        assert_eq!(last["result"]["decoded_offset"], 3);
+        assert_eq!(last["result"]["bytes_base64"], "ZGVm");
+        assert_eq!(last["result"]["progress"], downloaded["progress"]);
+        client.cancel().await.unwrap();
+    })
+    .await
+    .expect("attachment chunks and shutdown finish within the deadline");
+
+    let before = server.accepted();
+    for (arguments, tool, input) in [
+        (
+            vec!["attachment", "list", "--message", message],
+            "email_list_attachments",
+            json!({"message": message}),
+        ),
+        (
+            vec!["attachment", "get", "--attachment", attachment],
+            "email_get_attachment",
+            json!({"attachment": attachment}),
+        ),
+    ] {
+        let mut denied = installation.cli();
+        denied
+            .args(["--json", "--grant", "restricted"])
+            .args(arguments);
+        assert_eq!(
+            envelope(&run_bounded(denied))["error"]["code"],
+            "mailbox_not_allowed"
+        );
+        let mut command = installation.mcp();
+        command.args(["--grant", "restricted"]);
+        assert_eq!(
+            mcp_tool(command, tool, input).await["error"]["code"],
+            "mailbox_not_allowed"
+        );
+    }
+    assert_eq!(server.accepted(), before);
 }
 
 async fn hostile_presentation(
@@ -195,7 +471,7 @@ async fn hostile_presentation(
     let semantic = format!("�{}", String::from_utf8_lossy(&bytes));
     for level in ["error", "warn", "info", "debug", "trace"] {
         for json in [false, true] {
-            server.expect_body_bytes("Archive", &bytes);
+            server.expect_body_bytes(READ_MAILBOX, &bytes);
             let mut command = installation.cli();
             command
                 .env("MAILCTL_FIXTURE_CA", &server.certificate)
@@ -250,7 +526,7 @@ async fn hostile_presentation(
             }
         }
     }
-    server.expect_body_bytes("Archive", &bytes);
+    server.expect_body_bytes(READ_MAILBOX, &bytes);
     let mut command = installation.mcp();
     command.env("MAILCTL_FIXTURE_CA", &server.certificate);
     let response = mcp_message(command, message, None).await;

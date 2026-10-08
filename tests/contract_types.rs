@@ -4,6 +4,18 @@ use mailctl::{
     service::Service,
 };
 
+const _: fn(mailctl::config::AccountConfig, mailctl::config::AccessGrant) = |account, grant| {
+    let account_scope: mailctl::config::MailboxScope = account.mailboxes;
+    let grant_scope: mailctl::config::MailboxScope = grant.mailboxes;
+    let effective: mailctl::config::MailboxScope = account_scope.intersection(&grant_scope);
+    match effective {
+        mailctl::config::MailboxScope::All => {}
+        mailctl::config::MailboxScope::Only(names) => {
+            let _: Vec<String> = names;
+        }
+    }
+};
+
 const _: fn(&Service, &RequestContext, Operation) = |service, context, operation| {
     fn require_send(_: impl std::future::Future<Output = Result<OperationResult, Error>> + Send) {}
     require_send(service.execute(context, operation));

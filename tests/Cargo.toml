@@ -72,6 +72,10 @@ name = "message_handoff"
 path = "process-driver/tests/message_handoff.rs"
 
 [[test]]
+name = "mailbox_scope"
+path = "process-driver/tests/mailbox_scope.rs"
+
+[[test]]
 name = "session_credentials"
 path = "process-driver/tests/session_credentials.rs"
 
