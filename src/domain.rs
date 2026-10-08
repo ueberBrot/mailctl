@@ -75,42 +75,31 @@ impl Error {
         }
     }
     pub fn draft_conflict() -> Self {
-        let mut error = Self::new(ErrorCode::OperationConflict);
-        error.message = "Draft operation input conflicts with its recorded input".into();
-        error.conflict_kind = Some(ConflictKind::DraftInput);
-        error
+        Self {
+            conflict_kind: Some(ConflictKind::DraftInput),
+            ..Self::with_message(
+                ErrorCode::OperationConflict,
+                "Draft operation input conflicts with its recorded input",
+            )
+        }
     }
     pub fn incompatible_schema() -> Self {
-        Self {
-            code: ErrorCode::InvalidRequest,
-            message: "Unsupported configuration or state schema; install compatible CLI/MCP versions and restart active processes. Preserve existing configuration and history".into(),
-            retryable: false,
-            draft_operation: None,
-            credential_failure: None,
-            conflict_kind: None,
-        }
+        Self::with_message(
+            ErrorCode::InvalidRequest,
+            "Unsupported configuration or state schema; install compatible CLI/MCP versions and restart active processes. Preserve existing configuration and history",
+        )
     }
     pub fn setup_required() -> Self {
-        Self {
-            code: ErrorCode::InvalidRequest,
-            message:
-                "Configuration is unavailable or invalid; run this executable's setup subcommand"
-                    .into(),
-            retryable: false,
-            draft_operation: None,
-            credential_failure: None,
-            conflict_kind: None,
-        }
+        Self::with_message(
+            ErrorCode::InvalidRequest,
+            "Configuration is unavailable or invalid; run this executable's setup subcommand",
+        )
     }
     pub fn obsolete_runtime_capacity() -> Self {
-        Self {
-            code: ErrorCode::InvalidRequest,
-            message: "Configuration uses removed shared runtime capacity settings; remove runtimes, runtime_slots, and shared permit settings. Limits now apply per process; run this executable's setup subcommand to migrate".into(),
-            retryable: false,
-            draft_operation: None,
-            credential_failure: None,
-            conflict_kind: None,
-        }
+        Self::with_message(
+            ErrorCode::InvalidRequest,
+            "Configuration uses removed shared runtime capacity settings; remove runtimes, runtime_slots, and shared permit settings. Limits now apply per process; run this executable's setup subcommand to migrate",
+        )
     }
     pub fn new(code: ErrorCode) -> Self {
         let message = match code {
@@ -150,6 +139,9 @@ impl Error {
             }
             _ => "Operation could not be completed",
         };
+        Self::with_message(code, message)
+    }
+    fn with_message(code: ErrorCode, message: &str) -> Self {
         Self {
             code,
             message: message.into(),

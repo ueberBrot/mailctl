@@ -3,7 +3,7 @@ use super::*;
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, sync::Mutex};
 #[derive(Clone, Default)]
-pub struct MemoryAttachments(Arc<Mutex<BTreeMap<(String, String), Mailbox>>>);
+pub struct MemoryAttachments(Arc<Mutex<BTreeMap<String, BTreeMap<String, Mailbox>>>>);
 struct Mailbox {
     validity: u32,
     messages: BTreeMap<u32, Vec<(imap::AttachmentMetadata, Vec<u8>)>>,
@@ -19,7 +19,9 @@ impl MemoryAttachments {
     ) {
         let mut store = self.0.lock().unwrap();
         let mailbox = store
-            .entry((account.into(), domain::mailbox_identity(mailbox).into()))
+            .entry(account.into())
+            .or_default()
+            .entry(domain::mailbox_identity(mailbox).into())
             .or_insert_with(|| Mailbox {
                 validity,
                 messages: BTreeMap::new(),
@@ -32,14 +34,16 @@ impl MemoryAttachments {
     }
     fn with<T>(
         &self,
-        key: &(String, String),
+        account: &str,
+        mailbox: &str,
         uid: u32,
         validity: u32,
         read: impl FnOnce(&[(imap::AttachmentMetadata, Vec<u8>)]) -> Result<T, Error>,
     ) -> Result<T, Error> {
         let store = self.0.lock().unwrap();
         let mailbox = store
-            .get(key)
+            .get(account)
+            .and_then(|mailboxes| mailboxes.get(domain::mailbox_identity(mailbox)))
             .ok_or_else(|| Error::new(ErrorCode::StaleReference))?;
         if mailbox.validity != validity {
             return Err(Error::new(ErrorCode::StaleReference));
@@ -63,10 +67,8 @@ impl AttachmentBackend for MemoryAttachments {
     {
         Box::pin(async move {
             self.with(
-                &(
-                    target.config.key.clone(),
-                    domain::mailbox_identity(mailbox).into(),
-                ),
+                &target.config.key,
+                mailbox,
                 request.uid,
                 request.uid_validity,
                 |entries| {
@@ -92,10 +94,8 @@ impl AttachmentBackend for MemoryAttachments {
     ) -> Result<Box<dyn AttachmentReader>, Error> {
         Ok(Box::new(Reader {
             source: self.clone(),
-            key: (
-                target.config.key.clone(),
-                domain::mailbox_identity(mailbox).into(),
-            ),
+            account: target.config.key.clone(),
+            mailbox: domain::mailbox_identity(mailbox).into(),
             uid,
             validity,
             part: part.into(),
@@ -106,7 +106,8 @@ impl AttachmentBackend for MemoryAttachments {
 }
 struct Reader {
     source: MemoryAttachments,
-    key: (String, String),
+    account: String,
+    mailbox: String,
     uid: u32,
     validity: u32,
     part: String,
@@ -119,8 +120,12 @@ impl AttachmentReader for Reader {
         limits: &'a Limits,
     ) -> Pin<Box<dyn Future<Output = Result<imap::AttachmentData, Error>> + Send + 'a>> {
         Box::pin(async move {
-            self.source
-                .with(&self.key, self.uid, self.validity, |entries| {
+            self.source.with(
+                &self.account,
+                &self.mailbox,
+                self.uid,
+                self.validity,
+                |entries| {
                     let (metadata, bytes) = entries
                         .iter()
                         .find(|(metadata, _)| metadata.part == self.part)
@@ -149,7 +154,8 @@ impl AttachmentReader for Reader {
                     };
                     self.offset = end;
                     Ok(result)
-                })
+                },
+            )
         })
     }
 }

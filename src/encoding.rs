@@ -10,16 +10,26 @@ pub(crate) struct BoundedString<const MIN: usize, const MAX: usize>(pub(crate) S
 impl<'de, const MIN: usize, const MAX: usize> Deserialize<'de> for BoundedString<MIN, MAX> {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct Visitor<const MIN: usize, const MAX: usize>;
+        impl<const MIN: usize, const MAX: usize> Visitor<MIN, MAX> {
+            fn string<E: serde::de::Error>(
+                value: impl AsRef<str> + Into<String>,
+            ) -> Result<BoundedString<MIN, MAX>, E> {
+                if !(MIN..=MAX).contains(&value.as_ref().len()) {
+                    return Err(E::custom("string exceeds its bound"));
+                }
+                Ok(BoundedString(value.into()))
+            }
+        }
         impl<const MIN: usize, const MAX: usize> serde::de::Visitor<'_> for Visitor<MIN, MAX> {
             type Value = BoundedString<MIN, MAX>;
             fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 write!(f, "a string of {MIN}..={MAX} UTF-8 bytes")
             }
             fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
-                if !(MIN..=MAX).contains(&value.len()) {
-                    return Err(E::custom("string exceeds its bound"));
-                }
-                Ok(BoundedString(value.into()))
+                Self::string(value)
+            }
+            fn visit_string<E: serde::de::Error>(self, value: String) -> Result<Self::Value, E> {
+                Self::string(value)
             }
         }
         deserializer.deserialize_str(Visitor::<MIN, MAX>)

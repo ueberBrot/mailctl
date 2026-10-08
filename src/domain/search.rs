@@ -50,8 +50,45 @@ impl TryFrom<String> for SearchDate {
 }
 impl<'de> Deserialize<'de> for SearchDate {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Self::try_from(String::deserialize(deserializer)?)
-            .map_err(|_| serde::de::Error::custom("invalid search date"))
+        struct Visitor;
+        impl Visitor {
+            fn date<E: serde::de::Error>(
+                value: impl AsRef<str> + Into<String>,
+            ) -> Result<SearchDate, E> {
+                if value.as_ref().len() != 10 {
+                    return Err(E::custom("invalid search date"));
+                }
+                SearchDate::try_from(value.into()).map_err(|_| E::custom("invalid search date"))
+            }
+        }
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = SearchDate;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a string")
+            }
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<SearchDate, E> {
+                Self::date(value)
+            }
+            fn visit_string<E: serde::de::Error>(self, value: String) -> Result<SearchDate, E> {
+                Self::date(value)
+            }
+            fn visit_bytes<E: serde::de::Error>(self, value: &[u8]) -> Result<SearchDate, E> {
+                match std::str::from_utf8(value) {
+                    Ok(value) => self.visit_str(value),
+                    Err(_) => Err(E::invalid_value(serde::de::Unexpected::Bytes(value), &self)),
+                }
+            }
+            fn visit_byte_buf<E: serde::de::Error>(self, value: Vec<u8>) -> Result<SearchDate, E> {
+                match String::from_utf8(value) {
+                    Ok(value) => self.visit_string(value),
+                    Err(error) => Err(E::invalid_value(
+                        serde::de::Unexpected::Bytes(error.as_bytes()),
+                        &self,
+                    )),
+                }
+            }
+        }
+        deserializer.deserialize_string(Visitor)
     }
 }
 
@@ -213,6 +250,12 @@ fn search_text<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Stri
                 return Err(E::custom("invalid search text"));
             }
             Ok(value.to_owned())
+        }
+        fn visit_string<E: serde::de::Error>(self, value: String) -> Result<String, E> {
+            if !valid_search_text(&value) {
+                return Err(E::custom("invalid search text"));
+            }
+            Ok(value)
         }
     }
     deserializer.deserialize_str(Visitor)

@@ -2,7 +2,7 @@
 use crate::{domain::Error, policy::Profile};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::HashSet,
     path::{Component, Path, PathBuf},
 };
 
@@ -37,19 +37,18 @@ impl MailboxScope {
     /// Intersect authority, normalizing only the case-insensitive INBOX identity.
     /// An empty intersection is valid even though an empty configured list is not.
     pub fn intersection(&self, other: &Self) -> Self {
-        let names = match (self, other) {
+        let (names, scope) = match (self, other) {
             (Self::All, Self::All) => return Self::All,
-            (Self::Only(names), _) | (_, Self::Only(names)) => names,
+            (Self::Only(names), scope) | (scope, Self::Only(names)) => (names, scope),
         };
-        Self::Only(
-            names
-                .iter()
-                .filter(|name| self.allows(name) && other.allows(name))
-                .map(|name| crate::domain::mailbox_identity(name).to_owned())
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect(),
-        )
+        let mut names = names
+            .iter()
+            .filter(|name| scope.allows(name))
+            .map(|name| crate::domain::mailbox_identity(name).to_owned())
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        names.dedup();
+        Self::Only(names)
     }
 
     fn valid(&self, max: usize) -> bool {

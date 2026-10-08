@@ -4,10 +4,7 @@ use super::{
     Error, Limits, Metrics,
     fetch::Fetch,
     mailbox,
-    mime::{
-        attachment as is_attachment, child_path as child_part, imap_text as imap_string, part_name,
-        validate_structure,
-    },
+    mime::{attachment, child_path, imap_text, part_name, validate_structure},
     wire::Connection,
 };
 use decoder::{Decoder, TransferEncoding};
@@ -175,7 +172,7 @@ fn attachments(
                 extension_data,
             } => {
                 let disposition = extension_data.as_ref().and_then(|data| data.tail.as_ref());
-                if is_attachment(disposition) {
+                if attachment(disposition) {
                     output.push(attachment_definition(
                         path.cloned()
                             .unwrap_or_else(|| Part(NonZeroU32::MIN.into())),
@@ -188,7 +185,7 @@ fn attachments(
             }
             BodyStructure::Multi { bodies, .. } => {
                 for (index, child) in bodies.as_ref().iter().enumerate() {
-                    let path = child_part(path, index + 1)?;
+                    let path = child_path(path, index + 1)?;
                     visit(child, Some(&path), output)?;
                 }
             }
@@ -207,20 +204,20 @@ fn attachment_definition(
     disposition: Option<&Disposition<'_>>,
 ) -> Result<AttachmentDefinition, Error> {
     let (kind, subtype) = match &body.specific {
-        SpecificFields::Basic { r#type, subtype } => (imap_string(r#type)?, imap_string(subtype)?),
-        SpecificFields::Text { subtype, .. } => ("text", imap_string(subtype)?),
+        SpecificFields::Basic { r#type, subtype } => (imap_text(r#type)?, imap_text(subtype)?),
+        SpecificFields::Text { subtype, .. } => ("text", imap_text(subtype)?),
         SpecificFields::Message { .. } => ("message", "rfc822"),
     };
     let filename = disposition
         .and_then(|value| value.disposition.as_ref())
         .and_then(|(_, parameters)| {
             parameters.iter().find(|(name, _)| {
-                imap_string(name).is_ok_and(|name| name.eq_ignore_ascii_case("filename"))
+                imap_text(name).is_ok_and(|name| name.eq_ignore_ascii_case("filename"))
             })
         })
-        .and_then(|(_, value)| imap_string(value).ok())
+        .and_then(|(_, value)| imap_text(value).ok())
         .and_then(safe_filename);
-    let encoding = imap_string(&body.basic.content_transfer_encoding)?.trim();
+    let encoding = imap_text(&body.basic.content_transfer_encoding)?.trim();
     let encoding = if encoding.eq_ignore_ascii_case("7bit") || encoding.eq_ignore_ascii_case("8bit")
     {
         Some(TransferEncoding::Identity)

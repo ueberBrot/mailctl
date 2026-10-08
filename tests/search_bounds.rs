@@ -9,6 +9,34 @@ use mailctl::{
 };
 use tokio::io::AsyncReadExt;
 
+#[test]
+fn search_dates_preserve_utf8_byte_deserialization() {
+    use serde::{Deserialize, de::value::BytesDeserializer};
+    for value in [b"2024-02-29".as_slice(), b"0001-01-01", b"9999-12-31"] {
+        let deserializer = BytesDeserializer::<serde::de::value::Error>::new(value);
+        let date = mailctl::domain::SearchDate::deserialize(deserializer).unwrap();
+        assert_eq!(date.as_str().as_bytes(), value);
+    }
+    for value in [b"2023-02-29".as_slice(), b"2024-2-29", b"2024-02-29\xff"] {
+        let deserializer = BytesDeserializer::<serde::de::value::Error>::new(value);
+        assert!(mailctl::domain::SearchDate::deserialize(deserializer).is_err());
+    }
+}
+
+#[test]
+fn oversized_search_dates_are_rejected_without_copying_the_input() {
+    let input = format!("\"{}\"", "9".repeat(1024 * 1024));
+    let allocations = allocation_counter::measure(|| {
+        assert!(serde_json::from_str::<mailctl::domain::SearchDate>(&input).is_err());
+    });
+    assert!(allocations.bytes_total < 1024, "{allocations:?}");
+    let owned = serde_json::Value::String("9".repeat(1024 * 1024));
+    let allocations = allocation_counter::measure(|| {
+        assert!(serde_json::from_value::<mailctl::domain::SearchDate>(owned).is_err());
+    });
+    assert!(allocations.bytes_total < 1024, "{allocations:?}");
+}
+
 async fn select(wire: &mut Wire, upper: u32) {
     let tag = expect(wire, "EXAMINE INBOX").await;
     write(wire, &format!("* OK [UIDVALIDITY 7] stable\r\n* OK [UIDNEXT {}] next\r\n{tag} OK [READ-ONLY] selected\r\n", upper+1)).await;

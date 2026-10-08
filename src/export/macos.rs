@@ -59,11 +59,11 @@ impl NativeFile {
         }
         for suffix in 0..1000 {
             let name = if suffix == 0 {
-                self.name.clone()
+                &self.name
             } else {
-                format!("{}-{suffix}", self.name)
+                &format!("{}-{suffix}", self.name)
             };
-            match fs::fclonefileat(&self.file, &self.root, &name, CloneFlags::NOOWNERCOPY) {
+            match fs::fclonefileat(&self.file, &self.root, name, CloneFlags::NOOWNERCOPY) {
                 Ok(()) => {}
                 Err(rustix::io::Errno::EXIST) => continue,
                 Err(_) => return Err(failed()),
@@ -71,7 +71,7 @@ impl NativeFile {
             self.unreported_destination = true;
             let output = fs::openat(
                 &self.root,
-                &name,
+                name,
                 OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
                 Mode::empty(),
             )
@@ -92,7 +92,7 @@ impl NativeFile {
             let directory = PathBuf::from(OsString::from_vec(
                 fs::getpath(&self.root).map_err(|_| failed())?.into_bytes(),
             ));
-            if actual != directory.join(&name) {
+            if actual != directory.join(name) {
                 return Err(failed());
             }
             self.remove_partial()?;

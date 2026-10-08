@@ -192,15 +192,15 @@ fn parsed_addresses(
                     Metadata::Missing => None,
                     Metadata::Malformed => return Metadata::Malformed,
                 };
-                let local = if dot_atom(local) {
-                    local.to_owned()
+                let address = if dot_atom(local) {
+                    format!("{local}@{host}")
                 } else {
-                    format!("\"{}\"", local.replace('\\', "\\\\").replace('"', "\\\""))
+                    format!(
+                        "\"{}\"@{host}",
+                        local.replace('\\', "\\\\").replace('"', "\\\"")
+                    )
                 };
-                addresses.push(MessageAddress {
-                    name,
-                    address: format!("{local}@{host}"),
-                });
+                addresses.push(MessageAddress { name, address });
             }
             _ => return Metadata::Malformed,
         }

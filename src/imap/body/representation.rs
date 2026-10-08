@@ -94,12 +94,10 @@ pub(super) fn validate_headers(
             || ("text/plain".to_owned(), "us-ascii"),
             |content_type| {
                 let subtype = content_type.c_subtype.as_deref().unwrap_or("plain");
+                let mut media_type = format!("{}/{subtype}", content_type.c_type);
+                media_type.make_ascii_lowercase();
                 (
-                    format!(
-                        "{}/{}",
-                        content_type.c_type.to_ascii_lowercase(),
-                        subtype.to_ascii_lowercase()
-                    ),
+                    media_type,
                     content_type.attribute("charset").unwrap_or("us-ascii"),
                 )
             },
@@ -282,13 +280,17 @@ fn leaf(body: &Body<'_>, part: Part) -> Result<Option<Selected>, Error> {
     let SpecificFields::Text { subtype, .. } = &body.specific else {
         return Ok(None);
     };
-    let subtype = imap_text(subtype)?.to_ascii_lowercase();
-    if subtype != "plain" && subtype != "html" {
+    let subtype = imap_text(subtype)?;
+    let media_type = if subtype.eq_ignore_ascii_case("plain") {
+        "text/plain"
+    } else if subtype.eq_ignore_ascii_case("html") {
+        "text/html"
+    } else {
         return Ok(None);
-    }
+    };
     Ok(Some(Selected {
         part,
-        media_type: format!("text/{subtype}"),
+        media_type: media_type.to_owned(),
         charset: parameter(&body.basic.parameter_list, "charset")?
             .unwrap_or("us-ascii")
             .to_owned(),

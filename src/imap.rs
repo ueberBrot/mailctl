@@ -19,6 +19,11 @@ pub use attachment::{
 
 pub use body::{BodyCursor, BodyPage, BodyRequest};
 
+use base64::{
+    Engine,
+    alphabet::IMAP_MUTF7,
+    engine::general_purpose::{GeneralPurpose, NO_PAD},
+};
 use io_imap::{
     rfc3501::{
         capability::ImapCapabilityGet, greeting::ImapGreetingGet, list::ImapMailboxList,
@@ -27,7 +32,12 @@ use io_imap::{
     types::{flag::FlagNameAttribute, mailbox::Mailbox as WireMailbox, response::Capability},
 };
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, fmt, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, btree_map::Entry},
+    fmt,
+    sync::Arc,
+    time::Duration,
+};
 use tokio_rustls::rustls::{self, RootCertStore};
 use wire::Connection;
 
@@ -397,13 +407,9 @@ pub(crate) fn mailbox(name: &str) -> Result<(), Error> {
 }
 
 // io-imap encodes mailbox arguments but leaves LIST patterns in wire form.
+const MODIFIED_UTF7: GeneralPurpose = GeneralPurpose::new(&IMAP_MUTF7, NO_PAD);
+
 fn mailbox_pattern(name: &str) -> String {
-    use base64::{
-        Engine,
-        alphabet::IMAP_MUTF7,
-        engine::general_purpose::{GeneralPurpose, NO_PAD},
-    };
-    const BASE64: GeneralPurpose = GeneralPurpose::new(&IMAP_MUTF7, NO_PAD);
     let mut encoded = String::with_capacity(name.len());
     let mut remaining = name;
     while !remaining.is_empty() {
@@ -416,7 +422,7 @@ fn mailbox_pattern(name: &str) -> String {
                 .flat_map(u16::to_be_bytes)
                 .collect();
             encoded.push('&');
-            BASE64.encode_string(bytes, &mut encoded);
+            MODIFIED_UTF7.encode_string(bytes, &mut encoded);
             encoded.push('-');
             remaining = &remaining[end..];
         }
@@ -433,12 +439,6 @@ fn mailbox_pattern(name: &str) -> String {
 
 // Validate before io-imap's lossy decoding can replace a provider mailbox identity.
 fn validate_wire_mailbox_name(mailbox: &WireMailbox<'_>) -> Result<(), Error> {
-    use base64::{
-        Engine,
-        alphabet::IMAP_MUTF7,
-        engine::general_purpose::{GeneralPurpose, NO_PAD},
-    };
-    const BASE64: GeneralPurpose = GeneralPurpose::new(&IMAP_MUTF7, NO_PAD);
     let WireMailbox::Other(name) = mailbox else {
         return Ok(());
     };
@@ -457,7 +457,7 @@ fn validate_wire_mailbox_name(mailbox: &WireMailbox<'_>) -> Result<(), Error> {
         if payload.is_empty() {
             decoded.push('&');
         } else {
-            let bytes = BASE64.decode(payload).map_err(|_| Error::Protocol)?;
+            let bytes = MODIFIED_UTF7.decode(payload).map_err(|_| Error::Protocol)?;
             if bytes.len() % 2 != 0 {
                 return Err(Error::Protocol);
             }
@@ -465,13 +465,14 @@ fn validate_wire_mailbox_name(mailbox: &WireMailbox<'_>) -> Result<(), Error> {
                 .as_chunks::<2>()
                 .0
                 .iter()
-                .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
-                .collect::<Vec<_>>();
-            let text = String::from_utf16(&units).map_err(|_| Error::Protocol)?;
-            if text.len() > 1024usize.saturating_sub(decoded.len()) {
-                return Err(Error::Protocol);
+                .map(|pair| u16::from_be_bytes(*pair));
+            for character in char::decode_utf16(units) {
+                let character = character.map_err(|_| Error::Protocol)?;
+                if character.len_utf8() > 1024usize.saturating_sub(decoded.len()) {
+                    return Err(Error::Protocol);
+                }
+                decoded.push(character);
             }
-            decoded.push_str(&text);
         }
         if decoded.len() > 1024 {
             return Err(Error::Protocol);
@@ -533,11 +534,12 @@ impl Connection<'_> {
             let Some(mailbox) = Self::decode_mailbox(&returned, &attrs)? else {
                 continue;
             };
-            if mailboxes
-                .insert(mailbox.name.clone(), mailbox.clone())
-                .is_some_and(|previous| previous != mailbox)
-            {
-                return Err(Error::Protocol);
+            match mailboxes.entry(mailbox.name.clone()) {
+                Entry::Vacant(entry) => {
+                    entry.insert(mailbox);
+                }
+                Entry::Occupied(entry) if entry.get() != &mailbox => return Err(Error::Protocol),
+                Entry::Occupied(_) => {}
             }
         }
         Ok(mailboxes.into_values().collect())

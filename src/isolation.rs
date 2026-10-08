@@ -421,29 +421,32 @@ async fn serve_session(
                 .clone()
                 .with_response_limit(client_bound.saturating_sub(256));
             let operation_deadline = Duration::from_secs(limits.operation_seconds as u64);
-            let result = match request {
+            let creates_draft = matches!(
+                &request,
                 ClientFrame::Operation {
-                    operation: Operation::SaveDraft(input),
+                    operation: Operation::SaveDraft(_),
                     ..
-                } => {
-                    service
-                        .execute(&narrowed, Operation::SaveDraft(input))
-                        .await
                 }
-                request => timeout(operation_deadline, async {
-                    match request {
-                        ClientFrame::Operation { operation, .. } => {
-                            service.execute(&narrowed, operation).await
-                        }
-                        ClientFrame::Doctor { check_account, .. } => service
-                            .doctor(&narrowed, check_account)
-                            .await
-                            .map(OperationResult::Doctor),
-                        ClientFrame::Hello { .. } => Err(Error::new(ErrorCode::ProtocolMismatch)),
+            );
+            let operation = async {
+                match request {
+                    ClientFrame::Operation { operation, .. } => {
+                        service.execute(&narrowed, operation).await
                     }
-                })
-                .await
-                .map_err(|_| Error::new(ErrorCode::Timeout))?,
+                    ClientFrame::Doctor { check_account, .. } => service
+                        .doctor(&narrowed, check_account)
+                        .await
+                        .map(OperationResult::Doctor),
+                    ClientFrame::Hello { .. } => Err(Error::new(ErrorCode::ProtocolMismatch)),
+                }
+            };
+            // Draft creation owns its deadline and preserves uncertain outcomes.
+            let result = if creates_draft {
+                operation.await
+            } else {
+                timeout(operation_deadline, operation)
+                    .await
+                    .map_err(|_| Error::new(ErrorCode::Timeout))?
             };
             timeout(
                 operation_deadline,

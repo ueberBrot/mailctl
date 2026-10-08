@@ -152,11 +152,18 @@ impl PreparedDraft {
 }
 
 pub(crate) fn normalize_body(body: String) -> String {
-    if body.contains('\r') {
-        body.replace("\r\n", "\n").replace('\r', "\n")
-    } else {
-        body
+    if !body.contains('\r') {
+        return body;
     }
+    let mut normalized = String::with_capacity(body.len());
+    let mut remaining = body.as_str();
+    while let Some((line, rest)) = remaining.split_once('\r') {
+        normalized.push_str(line);
+        normalized.push('\n');
+        remaining = rest.strip_prefix('\n').unwrap_or(rest);
+    }
+    normalized.push_str(remaining);
+    normalized
 }
 
 fn address(value: &str) -> Result<(), Error> {

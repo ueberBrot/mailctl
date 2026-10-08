@@ -19,6 +19,48 @@ use std::{
 };
 use tokio::sync::Notify;
 
+#[test]
+fn draft_deserialization_reuses_the_owned_body_input() {
+    let bytes = 1024 * 1024;
+    let input = serde_json::json!({"body": "x".repeat(bytes)});
+    let allocations = allocation_counter::measure(|| {
+        let content: mailctl::domain::DraftContent = serde_json::from_value(input).unwrap();
+        assert_eq!(content.body.len(), bytes);
+    });
+    assert!(allocations.bytes_total < 64 * 1024, "{allocations:?}");
+}
+
+#[test]
+fn mixed_line_endings_are_normalized_with_one_bounded_body_allocation() {
+    let repetitions = 65_536;
+    let body = "one\r\ntwo\rthree\n".repeat(repetitions);
+    let body_bytes = body.len();
+    let maximum_mime_bytes = 2 * 1024 * 1024;
+    let input = mailctl::draft::DraftInput {
+        from: "work@example.test".into(),
+        message_id: "normalization@mailctl.invalid".into(),
+        date_unix: 1_700_000_000,
+        body,
+        ..Default::default()
+    };
+    let mut draft = None;
+    let allocations = allocation_counter::measure(|| {
+        draft = Some(PreparedDraft::compose(input, maximum_mime_bytes).unwrap());
+    });
+    assert!(
+        allocations.bytes_total <= maximum_mime_bytes as u64 + body_bytes as u64 + 128 * 1024,
+        "{allocations:?}"
+    );
+    let draft = draft.unwrap();
+    let message = mail_parser::MessageParser::default()
+        .parse(draft.bytes())
+        .unwrap();
+    assert_eq!(
+        message.body_text(0).unwrap().replace("\r\n", "\n"),
+        "one\ntwo\nthree\n".repeat(repetitions)
+    );
+}
+
 struct Backend {
     outcome: AppendOutcome,
     validity: AtomicU32,

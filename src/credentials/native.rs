@@ -116,22 +116,24 @@ fn create_shared_entry(account: Uuid) -> Result<(), SourceError> {
     // Create only empty metadata with the cooperative same-login access policy.
     // Password bytes enter Keychain through keyring-core afterward. Omitting -U
     // makes a concurrent creator fail safely without changing an existing ACL.
-    let mut child = security_command()
-        .args([
-            "add-generic-password",
-            "-A",
-            "-s",
-            SERVICE_NAME,
-            "-a",
-            &account.to_string(),
-            "-w",
-            "",
-        ])
-        .arg(keychain)
-        .stdout(Stdio::null())
-        .spawn()
-        .map_err(|_| SourceError::Unavailable)?;
-    wait_for_security(&mut child, deadline).and_then(|status| {
+    let mut child = SecurityProcess(
+        security_command()
+            .args([
+                "add-generic-password",
+                "-A",
+                "-s",
+                SERVICE_NAME,
+                "-a",
+                &account.to_string(),
+                "-w",
+                "",
+            ])
+            .arg(keychain)
+            .stdout(Stdio::null())
+            .spawn()
+            .map_err(|_| SourceError::Unavailable)?,
+    );
+    wait_for_security(&mut child.0, deadline).and_then(|status| {
         status
             .success()
             .then_some(())
@@ -145,24 +147,20 @@ fn default_user_keychain(deadline: Instant) -> Result<PathBuf, SourceError> {
     if Instant::now() >= deadline {
         return Err(SourceError::Unavailable);
     }
-    let mut child = security_command()
-        .args(["default-keychain", "-d", "user"])
-        .stdout(Stdio::piped())
-        .spawn()
-        .map_err(|_| SourceError::Unavailable)?;
-    let result = (|| {
-        let mut stdout = child.stdout.take().ok_or(SourceError::Unavailable)?;
-        set_nonblocking(&stdout)?;
-        let (status, output) = collect_stdout(&mut child, &mut stdout, deadline)?;
-        if !status.success() {
-            return Err(SourceError::Unavailable);
-        }
-        parse_default_keychain(&output)
-    })();
-    if result.is_err() {
-        terminate_security(&mut child);
+    let mut child = SecurityProcess(
+        security_command()
+            .args(["default-keychain", "-d", "user"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .map_err(|_| SourceError::Unavailable)?,
+    );
+    let mut stdout = child.0.stdout.take().ok_or(SourceError::Unavailable)?;
+    set_nonblocking(&stdout)?;
+    let (status, output) = collect_stdout(&mut child.0, &mut stdout, deadline)?;
+    if !status.success() {
+        return Err(SourceError::Unavailable);
     }
-    result
+    parse_default_keychain(&output)
 }
 
 fn security_command() -> Command {
@@ -228,23 +226,22 @@ fn collect_stdout(
 fn wait_for_security(child: &mut Child, deadline: Instant) -> Result<ExitStatus, SourceError> {
     loop {
         if Instant::now() >= deadline {
-            terminate_security(child);
             return Err(SourceError::Unavailable);
         }
-        match child.try_wait() {
-            Ok(Some(status)) => return Ok(status),
-            Ok(None) => std::thread::sleep(Duration::from_millis(1)),
-            Err(_) => {
-                terminate_security(child);
-                return Err(SourceError::Unavailable);
-            }
+        match child.try_wait().map_err(|_| SourceError::Unavailable)? {
+            Some(status) => return Ok(status),
+            None => std::thread::sleep(Duration::from_millis(1)),
         }
     }
 }
 
-fn terminate_security(child: &mut Child) {
-    let _ = child.kill();
-    let _ = child.wait();
+struct SecurityProcess(Child);
+
+impl Drop for SecurityProcess {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 fn parse_default_keychain(output: &[u8]) -> Result<PathBuf, SourceError> {
@@ -295,8 +292,39 @@ fn platform_code(code: i32) -> SourceError {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_default_keychain;
-    use std::{ffi::OsString, os::unix::ffi::OsStringExt, path::PathBuf};
+    use super::{SecurityProcess, SourceError, parse_default_keychain, wait_for_security};
+    use rustix::process::{Pid, WaitOptions, waitpid};
+    use std::{
+        ffi::OsString,
+        os::unix::ffi::OsStringExt,
+        path::PathBuf,
+        time::{Duration, Instant},
+    };
+
+    #[test]
+    fn security_process_cleanup_reaps_children_after_early_failure() {
+        let started = Instant::now();
+        let mut child = SecurityProcess(
+            std::process::Command::new("/bin/sleep")
+                .arg("5")
+                .spawn()
+                .unwrap(),
+        );
+        let pid = Pid::from_raw(child.0.id() as i32).unwrap();
+        assert_eq!(
+            wait_for_security(&mut child.0, started).unwrap_err(),
+            SourceError::Unavailable
+        );
+        drop(child);
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "cleanup must terminate the child before its sleep finishes"
+        );
+        assert!(matches!(
+            waitpid(Some(pid), WaitOptions::NOHANG),
+            Err(rustix::io::Errno::CHILD)
+        ));
+    }
 
     #[test]
     fn default_keychain_output_preserves_a_quoted_raw_path() {
