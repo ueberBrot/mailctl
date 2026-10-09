@@ -52,15 +52,19 @@ impl Service {
         maximum: usize,
     ) -> Result<String, Error> {
         let payload = crate::encoding::serialize_bounded(value, maximum)?;
-        let mut token = format!("{kind}.");
+        let length = base64::encoded_len(payload.len(), false)
+            .and_then(|length| length.checked_add(kind.len()))
+            .and_then(|length| length.checked_add(2 + base64::encoded_len(32, false).unwrap()))
+            .filter(|length| *length <= maximum)
+            .ok_or_else(|| Error::new(ErrorCode::ResponseTooLarge))?;
+        let mut token = String::with_capacity(length);
+        token.push_str(kind);
+        token.push('.');
         URL_SAFE_NO_PAD.encode_string(payload, &mut token);
         let key = hmac::Key::new(hmac::HMAC_SHA256, self.registry.reference_key());
         let tag = hmac::sign(&key, token.as_bytes());
         token.push('.');
         URL_SAFE_NO_PAD.encode_string(tag.as_ref(), &mut token);
-        if token.len() > maximum {
-            return Err(Error::new(ErrorCode::ResponseTooLarge));
-        }
         Ok(token)
     }
     pub(super) fn decode<T: DeserializeOwned>(
@@ -95,4 +99,67 @@ impl Service {
 }
 pub(super) fn fingerprint(value: &impl Serialize) -> Result<String, Error> {
     crate::encoding::json_sha256(value, 4 * 1024 * 1024).map(|digest| crate::encoding::hex(&digest))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_encoding_allocates_only_the_payload_and_complete_token() {
+        let config = crate::config::Config::parse(&format!(
+            "version = 1\nstate_dir = {}\naccounts = []\n[[grants]]\nname = 'default'\naccounts = []\n",
+            serde_json::to_string(&std::env::temp_dir().join("mailctl-token-test")).unwrap()
+        ))
+        .unwrap();
+        let service = Service::in_memory(config).unwrap();
+        let mut measurements = Vec::new();
+        for mailbox in [
+            "x".repeat(5),
+            "x".repeat(6),
+            "x".repeat(7),
+            "x".repeat(1024),
+            "x".repeat(4096),
+            "é\\\"\n".repeat(256),
+        ] {
+            let reference = MessageReference {
+                account: "12345678-9abc-4def-8123-456789abcdef",
+                generation: 1,
+                mailbox: mailbox.as_str(),
+                uid_validity: 77,
+                uid: 4,
+            };
+            let payload = serde_json::to_vec(&reference).unwrap();
+            let signed = format!("msg1.{}", URL_SAFE_NO_PAD.encode(&payload));
+            let key = hmac::Key::new(hmac::HMAC_SHA256, service.registry.reference_key());
+            let tag = hmac::sign(&key, signed.as_bytes());
+            let expected = format!("{signed}.{}", URL_SAFE_NO_PAD.encode(tag.as_ref()));
+            let mut token = None;
+            let measured = allocation_counter::measure(|| {
+                token = Some(service.encode("msg1", &reference, 8192).unwrap());
+            });
+            assert_eq!(token.as_deref(), Some(expected.as_str()));
+            assert_eq!(
+                service.encode("msg1", &reference, expected.len()).unwrap(),
+                expected
+            );
+            assert_eq!(
+                service
+                    .encode("msg1", &reference, expected.len() - 1)
+                    .unwrap_err()
+                    .code,
+                ErrorCode::ResponseTooLarge
+            );
+            eprintln!(
+                "token mailbox={} output={} {measured:?}",
+                mailbox.len(),
+                expected.len()
+            );
+            measurements.push((payload.len() + expected.len(), measured));
+        }
+        for (bytes, measured) in measurements {
+            assert_eq!(measured.count_total, 2, "{measured:?}");
+            assert_eq!(measured.bytes_total, bytes as u64, "{measured:?}");
+        }
+    }
 }

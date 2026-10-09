@@ -187,4 +187,17 @@ impl Client {
             .append_draft(target, draft, &self.limits, &mut self.metrics)
             .await
     }
+    pub async fn inspect_draft_target(
+        &mut self,
+        username: &str,
+        password: &str,
+        mailbox: &str,
+    ) -> Result<u32, Error> {
+        self.run(username, password, async |connection, limits, metrics| {
+            connection
+                .inspect_draft_target(mailbox, limits, metrics)
+                .await
+        })
+        .await
+    }
 }

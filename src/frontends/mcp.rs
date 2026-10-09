@@ -201,11 +201,10 @@ impl ServerHandler for EmailTools {
         let operation = match request.name.as_ref() {
             name if self.tools.iter().any(|tool| tool.name == name) => {
                 let name = name.strip_prefix("email_").unwrap();
-                let mut wire = json!({"operation": name});
-                if name != "capabilities" || !input.is_empty() {
-                    wire["input"] = Value::Object(input);
-                }
-                serde_json::from_value(wire).map_err(|_| invalid_arguments(request.name.as_ref()))
+                let input =
+                    (name != "capabilities" || !input.is_empty()).then_some(Value::Object(input));
+                Operation::from_input(name, input)
+                    .map_err(|_| invalid_arguments(request.name.as_ref()))
             }
             _ => {
                 return Err(McpError::new(

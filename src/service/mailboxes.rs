@@ -146,11 +146,11 @@ pub(super) struct Reference<S = String> {
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Cursor {
-    account: String,
+struct Cursor<S = String> {
+    account: S,
     generation: u64,
-    scope: String,
-    inventory: String,
+    scope: S,
+    inventory: S,
     position: usize,
 }
 
@@ -256,11 +256,12 @@ impl Service {
         }) {
             return Err(Error::new(ErrorCode::StaleCursor));
         }
-        let mut effective = account.mailboxes.intersection(&grant.mailboxes);
-        if let Some(reference) = &reference {
-            effective =
-                effective.intersection(&MailboxScope::Only(vec![reference.mailbox.clone()]));
-        }
+        let effective = match &reference {
+            Some(reference) => {
+                MailboxScope::Only(vec![mailbox_identity(&reference.mailbox).to_owned()])
+            }
+            None => account.mailboxes.intersection(&grant.mailboxes),
+        };
         if matches!(&effective, MailboxScope::Only(names) if names.len() > limits.mailbox_inventory)
         {
             return Err(Error::new(ErrorCode::ResponseTooLarge));
@@ -340,10 +341,10 @@ impl Service {
             Some(self.encode(
                 "mc1",
                 &Cursor {
-                    account: id.into(),
+                    account: id,
                     generation,
-                    scope,
-                    inventory: inventory_hash,
+                    scope: scope.as_str(),
+                    inventory: inventory_hash.as_str(),
                     position: end,
                 },
                 limits.token_bytes,

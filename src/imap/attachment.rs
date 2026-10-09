@@ -4,7 +4,7 @@ use super::{
     Error, Limits, Metrics,
     fetch::Fetch,
     mailbox,
-    mime::{attachment, child_path, imap_text, part_name, validate_structure},
+    mime::{attachment, imap_text, part_name, validate_structure},
     wire::Connection,
 };
 use decoder::{Decoder, TransferEncoding};
@@ -72,10 +72,10 @@ impl TransferState {
         limits: &Limits,
     ) -> Result<Vec<u8>, Error> {
         if self.wire_bytes == 0 && !self.eof {
-            let definition = attachment_definitions(conn, self.uid, limits)
+            let definition = attachment_definitions(conn, self.uid, limits, Some(&self.part))
                 .await?
                 .into_iter()
-                .find(|entry| entry.part == self.part)
+                .next()
                 .ok_or(Error::StaleReference)?;
             self.decoder = Decoder::new(definition.encoding.ok_or(Error::Unsupported)?);
         }
@@ -160,11 +160,13 @@ fn parse_part(part: &str, limits: &Limits) -> Result<Part, Error> {
 fn attachments(
     structure: &BodyStructure<'_>,
     limits: &Limits,
+    wanted: Option<&Part>,
 ) -> Result<Vec<AttachmentDefinition>, Error> {
     fn visit(
         structure: &BodyStructure<'_>,
-        path: Option<&Part>,
+        path: &mut Vec<NonZeroU32>,
         output: &mut Vec<AttachmentDefinition>,
+        wanted: Option<&Part>,
     ) -> Result<(), Error> {
         match structure {
             BodyStructure::Single {
@@ -172,21 +174,23 @@ fn attachments(
                 extension_data,
             } => {
                 let disposition = extension_data.as_ref().and_then(|data| data.tail.as_ref());
-                if attachment(disposition) {
-                    output.push(attachment_definition(
-                        path.cloned()
-                            .unwrap_or_else(|| Part(NonZeroU32::MIN.into())),
-                        body,
-                        disposition,
-                    )?);
+                if attachment(disposition)
+                    && let Some(definition) =
+                        attachment_definition(path, body, disposition, wanted)?
+                {
+                    output.push(definition);
                 }
                 // An attached message is transferred as its enclosing RFC822 part. Traversing its
                 // embedded body would fabricate duplicate/ambiguous IMAP section locators.
             }
             BodyStructure::Multi { bodies, .. } => {
                 for (index, child) in bodies.as_ref().iter().enumerate() {
-                    let path = child_path(path, index + 1)?;
-                    visit(child, Some(&path), output)?;
+                    let number =
+                        NonZeroU32::new(u32::try_from(index + 1).map_err(|_| Error::Limit)?)
+                            .ok_or(Error::Limit)?;
+                    path.push(number);
+                    visit(child, path, output, wanted)?;
+                    path.pop();
                 }
             }
         }
@@ -194,29 +198,21 @@ fn attachments(
     }
     validate_structure(structure, limits)?;
     let mut output = Vec::new();
-    visit(structure, None, &mut output)?;
+    visit(structure, &mut Vec::new(), &mut output, wanted)?;
     Ok(output)
 }
 
 fn attachment_definition(
-    part: Part,
+    path: &[NonZeroU32],
     body: &Body<'_>,
     disposition: Option<&Disposition<'_>>,
-) -> Result<AttachmentDefinition, Error> {
+    wanted: Option<&Part>,
+) -> Result<Option<AttachmentDefinition>, Error> {
     let (kind, subtype) = match &body.specific {
         SpecificFields::Basic { r#type, subtype } => (imap_text(r#type)?, imap_text(subtype)?),
         SpecificFields::Text { subtype, .. } => ("text", imap_text(subtype)?),
         SpecificFields::Message { .. } => ("message", "rfc822"),
     };
-    let filename = disposition
-        .and_then(|value| value.disposition.as_ref())
-        .and_then(|(_, parameters)| {
-            parameters.iter().find(|(name, _)| {
-                imap_text(name).is_ok_and(|name| name.eq_ignore_ascii_case("filename"))
-            })
-        })
-        .and_then(|(_, value)| imap_text(value).ok())
-        .and_then(safe_filename);
     let encoding = imap_text(&body.basic.content_transfer_encoding)?.trim();
     let encoding = if encoding.eq_ignore_ascii_case("7bit") || encoding.eq_ignore_ascii_case("8bit")
     {
@@ -228,15 +224,34 @@ fn attachment_definition(
     } else {
         None
     };
+    // First reads retain one attachment, but every eligible sibling still validates
+    // its fallible fields before metadata and its owned section path are filtered.
+    let path = if path.is_empty() {
+        &[NonZeroU32::MIN]
+    } else {
+        path
+    };
+    if wanted.is_some_and(|wanted| wanted.0.as_ref() != path) {
+        return Ok(None);
+    }
+    let filename = disposition
+        .and_then(|value| value.disposition.as_ref())
+        .and_then(|(_, parameters)| {
+            parameters.iter().find(|(name, _)| {
+                imap_text(name).is_ok_and(|name| name.eq_ignore_ascii_case("filename"))
+            })
+        })
+        .and_then(|(_, value)| imap_text(value).ok())
+        .and_then(safe_filename);
     let mut media_type = format!("{kind}/{subtype}");
     media_type.make_ascii_lowercase();
-    Ok(AttachmentDefinition {
-        part,
+    Ok(Some(AttachmentDefinition {
+        part: Part(path.to_vec().try_into().expect("path is nonempty")),
         filename,
         media_type,
         declared_size: Some(body.basic.size as u64),
         encoding,
-    })
+    }))
 }
 
 fn safe_filename(value: &str) -> Option<String> {
@@ -279,7 +294,7 @@ impl super::AuthenticatedConnection {
         if conn.examine(name).await? != request.uid_validity {
             return Err(Error::StaleReference);
         }
-        let result = attachment_definitions(&mut conn, request.uid, limits)
+        let result = attachment_definitions(&mut conn, request.uid, limits, None)
             .await?
             .into_iter()
             .map(AttachmentDefinition::into_metadata)
@@ -396,11 +411,12 @@ async fn attachment_definitions(
     conn: &mut Connection<'_>,
     uid: u32,
     limits: &Limits,
+    wanted: Option<&Part>,
 ) -> Result<Vec<AttachmentDefinition>, Error> {
     let fetch = Fetch::Metadata { uid };
     let fields = fetch.execute(conn).await?;
     let (_, structure) = Fetch::metadata(&fields)?;
-    attachments(structure, limits)
+    attachments(structure, limits, wanted)
 }
 impl AttachmentDefinition {
     fn into_metadata(self) -> AttachmentMetadata {
@@ -410,6 +426,261 @@ impl AttachmentDefinition {
             media_type: self.media_type,
             declared_size: self.declared_size,
             available: self.encoding.is_some(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod traversal_tests {
+    use super::*;
+    use io_imap::types::{
+        body::{BasicFields, SinglePartExtensionData},
+        core::NString,
+        envelope::Envelope,
+    };
+
+    fn leaf(attached: bool) -> BodyStructure<'static> {
+        BodyStructure::Single {
+            body: Body {
+                basic: BasicFields {
+                    parameter_list: vec![],
+                    id: NString::NIL,
+                    description: NString::NIL,
+                    content_transfer_encoding: "7BIT".try_into().unwrap(),
+                    size: 5,
+                },
+                specific: SpecificFields::Basic {
+                    r#type: "APPLICATION".try_into().unwrap(),
+                    subtype: "OCTET-STREAM".try_into().unwrap(),
+                },
+            },
+            extension_data: attached.then(|| SinglePartExtensionData {
+                md5: NString::NIL,
+                tail: Some(Disposition {
+                    disposition: Some(("ATTACHMENT".try_into().unwrap(), vec![])),
+                    tail: None,
+                }),
+            }),
+        }
+    }
+
+    fn multipart(children: Vec<BodyStructure<'static>>) -> BodyStructure<'static> {
+        BodyStructure::Multi {
+            bodies: children.try_into().unwrap(),
+            subtype: "MIXED".try_into().unwrap(),
+            extension_data: None,
+        }
+    }
+
+    fn attached_message(embedded: BodyStructure<'static>) -> BodyStructure<'static> {
+        let mut structure = leaf(true);
+        let BodyStructure::Single { body, .. } = &mut structure else {
+            unreachable!();
+        };
+        body.specific = SpecificFields::Message {
+            envelope: Box::new(Envelope {
+                date: NString::NIL,
+                subject: NString::NIL,
+                from: vec![],
+                sender: vec![],
+                reply_to: vec![],
+                to: vec![],
+                cc: vec![],
+                bcc: vec![],
+                in_reply_to: NString::NIL,
+                message_id: NString::NIL,
+            }),
+            body_structure: Box::new(embedded),
+            number_of_lines: 1,
+        };
+        structure
+    }
+
+    #[test]
+    fn root_single_attachment_has_part_one() {
+        let definitions = attachments(&leaf(true), &Limits::default(), None).unwrap();
+        assert_eq!(definitions.len(), 1);
+        assert_eq!(part_name(&definitions[0].part), "1");
+        assert_eq!(definitions[0].media_type, "application/octet-stream");
+    }
+
+    #[test]
+    fn nested_attachment_paths_preserve_sibling_numbering() {
+        let structure = multipart(vec![
+            leaf(false),
+            multipart(vec![leaf(true), leaf(true)]),
+            leaf(true),
+        ]);
+        let definitions = attachments(&structure, &Limits::default(), None).unwrap();
+        let parts = definitions
+            .iter()
+            .map(|entry| part_name(&entry.part))
+            .collect::<Vec<_>>();
+        assert_eq!(parts, ["2.1", "2.2", "3"]);
+    }
+
+    #[test]
+    fn attached_message_uses_its_enclosing_part_and_counts_its_embedded_structure() {
+        let structure = multipart(vec![
+            leaf(false),
+            attached_message(multipart(vec![leaf(true), leaf(true)])),
+        ]);
+        let limits = Limits {
+            max_mime_parts: 6,
+            ..Limits::default()
+        };
+        let definitions = attachments(&structure, &limits, None).unwrap();
+        assert_eq!(definitions.len(), 1);
+        assert_eq!(part_name(&definitions[0].part), "2");
+        assert_eq!(definitions[0].media_type, "message/rfc822");
+        assert!(matches!(
+            attachments(
+                &structure,
+                &Limits {
+                    max_mime_parts: 5,
+                    ..limits
+                },
+                None,
+            ),
+            Err(Error::Limit)
+        ));
+    }
+
+    #[test]
+    fn excluded_leaves_do_not_allocate_individual_part_paths() {
+        for (depth, parts) in [(2, 1_000), (40, 1_000)] {
+            let mut structure = multipart(vec![leaf(false); parts - depth + 1]);
+            for _ in 2..depth {
+                structure = multipart(vec![structure]);
+            }
+            let limits = Limits {
+                max_nesting: depth,
+                max_mime_parts: parts,
+                ..Limits::default()
+            };
+            let measured = allocation_counter::measure(|| {
+                assert!(attachments(&structure, &limits, None).unwrap().is_empty());
+            });
+            assert!(
+                measured.count_total < 16 && measured.bytes_total < 16 * 1_024,
+                "attachment discovery must reuse its path for excluded leaves: {measured:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn selecting_one_attachment_only_materializes_its_metadata() {
+        for (depth, parts) in [(2, 1_000), (40, 1_000)] {
+            let mut entry = leaf(true);
+            let BodyStructure::Single { extension_data, .. } = &mut entry else {
+                unreachable!();
+            };
+            extension_data
+                .as_mut()
+                .unwrap()
+                .tail
+                .as_mut()
+                .unwrap()
+                .disposition
+                .as_mut()
+                .unwrap()
+                .1
+                .push((
+                    "FILENAME".try_into().unwrap(),
+                    "report.txt".try_into().unwrap(),
+                ));
+            let leaves = parts - depth + 1;
+            let mut structure = multipart(vec![entry; leaves]);
+            for _ in 2..depth {
+                structure = multipart(vec![structure]);
+            }
+            let mut path = vec![NonZeroU32::MIN; depth - 2];
+            path.push(NonZeroU32::new(leaves as u32).unwrap());
+            let wanted = Part(path.try_into().unwrap());
+            let limits = Limits {
+                max_nesting: depth,
+                max_mime_parts: parts,
+                ..Limits::default()
+            };
+            let measured = allocation_counter::measure(|| {
+                let mut selected = attachments(&structure, &limits, Some(&wanted)).unwrap();
+                assert_eq!(selected.len(), 1);
+                let selected = selected.pop().unwrap();
+                assert_eq!(selected.part, wanted);
+                assert_eq!(selected.filename.as_deref(), Some("report.txt"));
+                assert_eq!(selected.media_type, "application/octet-stream");
+                assert_eq!(selected.encoding, Some(TransferEncoding::Identity));
+            });
+            eprintln!(
+                "selected attachment depth={depth} parts={parts} leaves={leaves} allocations={} total={} peak={}",
+                measured.count_total, measured.bytes_total, measured.bytes_max
+            );
+            assert!(
+                measured.count_total < 20 && measured.bytes_total < 8 * 1_024,
+                "choosing one attachment must not own every sibling's metadata: {measured:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn selecting_one_attachment_still_validates_other_attachment_fields() {
+        for field in ["type", "subtype", "encoding"] {
+            let mut malformed = leaf(true);
+            let BodyStructure::Single { body, .. } = &mut malformed else {
+                unreachable!();
+            };
+            match field {
+                "type" | "subtype" => {
+                    let SpecificFields::Basic { r#type, subtype } = &mut body.specific else {
+                        unreachable!();
+                    };
+                    let value = if field == "type" { r#type } else { subtype };
+                    *value = b"\xff".as_slice().try_into().unwrap();
+                }
+                "encoding" => {
+                    body.basic.content_transfer_encoding = b"\xff".as_slice().try_into().unwrap();
+                }
+                _ => unreachable!(),
+            }
+            for malformed_first in [false, true] {
+                let (children, wanted) = if malformed_first {
+                    (vec![malformed.clone(), leaf(true)], 2)
+                } else {
+                    (vec![leaf(true), malformed.clone()], 1)
+                };
+                let wanted = Part(NonZeroU32::new(wanted).unwrap().into());
+                let selected = attachments(&multipart(children), &Limits::default(), Some(&wanted));
+                assert!(
+                    matches!(selected, Err(Error::Protocol)),
+                    "malformed {field}, malformed_first={malformed_first}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn selected_root_attachment_preserves_unsupported_and_missing_outcomes() {
+        let wanted = Part(NonZeroU32::MIN.into());
+        let missing = Part(NonZeroU32::new(2).unwrap().into());
+        for (encoding, expected) in [
+            ("7BIT", Some(TransferEncoding::Identity)),
+            ("X-UNKNOWN", None),
+        ] {
+            let mut structure = leaf(true);
+            let BodyStructure::Single { body, .. } = &mut structure else {
+                unreachable!();
+            };
+            body.basic.content_transfer_encoding = encoding.try_into().unwrap();
+            let mut selected = attachments(&structure, &Limits::default(), Some(&wanted)).unwrap();
+            assert_eq!(selected.len(), 1);
+            let selected = selected.pop().unwrap();
+            assert_eq!(selected.part, wanted);
+            assert_eq!(selected.encoding, expected);
+            assert!(
+                attachments(&structure, &Limits::default(), Some(&missing))
+                    .unwrap()
+                    .is_empty()
+            );
         }
     }
 }

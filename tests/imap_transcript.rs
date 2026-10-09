@@ -17,6 +17,7 @@ async fn all_folder_discovery_preserves_real_names_and_metadata_without_selectio
                     "* LIST (\\HasNoChildren) \"/\" inbox\r\n",
                         "* LIST (\\Archive \\HasNoChildren) \"/\" \"Later &AOQ- &- Folder\"\r\n",
                         "* LIST (\\Noselect) \"/\" Parent\r\n",
+                        "* LIST () \"/\" &AOk-/&2D7dgA-/&AOk-\r\n",
                         "* LIST () \"/\" &,,0-\r\n",
                         "* LIST () \"/\" &2D3eAA-\r\n",
                     "{tag} OK listed\r\n"
@@ -37,7 +38,14 @@ async fn all_folder_discovery_preserves_real_names_and_metadata_without_selectio
             .iter()
             .map(|mailbox| mailbox.name.as_str())
             .collect::<Vec<_>>(),
-        ["INBOX", "Later ä & Folder", "Parent", "\u{fffd}", "😀"]
+        [
+            "INBOX",
+            "Later ä & Folder",
+            "Parent",
+            "é/🦀/é",
+            "\u{fffd}",
+            "😀"
+        ]
     );
     assert!(result[0].selectable);
     assert_eq!(result[1].attributes, ["\\Archive", "\\HasNoChildren"]);

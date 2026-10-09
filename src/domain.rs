@@ -240,14 +240,11 @@ pub enum Operation {
 impl<'de> Deserialize<'de> for Operation {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Default)]
-        enum Input {
-            #[default]
-            Absent,
-            Present(serde_json::Value),
-        }
+        struct Input(Option<serde_json::Value>);
         impl<'de> Deserialize<'de> for Input {
             fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-                serde_json::Value::deserialize(deserializer).map(Self::Present)
+                // An explicit null is input, unlike an omitted field.
+                serde_json::Value::deserialize(deserializer).map(|value| Self(Some(value)))
             }
         }
         #[derive(Deserialize)]
@@ -258,37 +255,38 @@ impl<'de> Deserialize<'de> for Operation {
             input: Input,
         }
         let wire = Wire::deserialize(deserializer)?;
-        let invalid = || serde::de::Error::custom("invalid operation input");
-        match (wire.operation.as_str(), wire.input) {
-            ("save_draft", Input::Present(input)) => {
-                serde_json::from_value(input).map(Self::SaveDraft)
-            }
-            ("draft_status", Input::Present(input)) => {
-                serde_json::from_value(input).map(Self::DraftStatus)
-            }
-            ("list_attachments", Input::Present(input)) => {
+        Self::from_input(&wire.operation, wire.input.0)
+            .map_err(|_| serde::de::Error::custom("invalid operation input"))
+    }
+}
+
+impl Operation {
+    /// Decode typed inputs shared by serialized operations and MCP tool arguments.
+    pub(crate) fn from_input(
+        name: &str,
+        input: Option<serde_json::Value>,
+    ) -> Result<Self, serde_json::Error> {
+        match (name, input) {
+            ("save_draft", Some(input)) => serde_json::from_value(input).map(Self::SaveDraft),
+            ("draft_status", Some(input)) => serde_json::from_value(input).map(Self::DraftStatus),
+            ("list_attachments", Some(input)) => {
                 serde_json::from_value(input).map(Self::ListAttachments)
             }
-            ("get_attachment", Input::Present(input)) => {
+            ("get_attachment", Some(input)) => {
                 serde_json::from_value(input).map(Self::GetAttachment)
             }
-            ("list_accounts", Input::Present(input)) => {
-                serde_json::from_value(input).map(Self::ListAccounts)
-            }
-            ("list_mailboxes", Input::Present(input)) => {
+            ("list_accounts", Some(input)) => serde_json::from_value(input).map(Self::ListAccounts),
+            ("list_mailboxes", Some(input)) => {
                 serde_json::from_value(input).map(Self::ListMailboxes)
             }
-            ("get_message", Input::Present(input)) => {
-                serde_json::from_value(input).map(Self::GetMessage)
-            }
-            ("search_messages", Input::Present(input)) => {
+            ("get_message", Some(input)) => serde_json::from_value(input).map(Self::GetMessage),
+            ("search_messages", Some(input)) => {
                 serde_json::from_value(input).map(Self::SearchMessages)
             }
-            ("capabilities", Input::Absent) => Ok(Self::Capabilities),
-            ("health", Input::Absent) => Ok(Self::Health),
-            _ => return Err(invalid()),
+            ("capabilities", None) => Ok(Self::Capabilities),
+            ("health", None) => Ok(Self::Health),
+            _ => Err(serde::de::Error::custom("invalid operation input")),
         }
-        .map_err(|_| invalid())
     }
 }
 

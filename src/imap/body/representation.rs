@@ -2,7 +2,7 @@
 
 use super::super::{
     Error, Limits,
-    mime::{attachment, child_path, imap_text, validate_structure},
+    mime::{attachment, imap_text, validate_structure},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use io_imap::types::{
@@ -73,7 +73,7 @@ pub(super) fn related_multipart_headers(
 ) -> Result<Vec<Part>, Error> {
     validate_structure(structure, limits)?;
     let mut paths = Vec::new();
-    related_headers(structure, None, &mut paths)?;
+    related_headers(structure, &mut Vec::new(), &mut paths)?;
     Ok(paths)
 }
 
@@ -185,7 +185,7 @@ fn identity_header_value<'a>(
     Ok(projected_mime_value(value, wanted))
 }
 
-// Projection is limited to canonical ASCII tokens and nonempty continuations.
+// Projection is limited to canonical ASCII tokens, quoted empty scalars and nonempty continuations.
 // Any uncertain segment keeps the entire original field: removing later text
 // can otherwise change the dependency's permissive recovery from earlier text.
 fn projected_mime_value<'a>(raw: &'a [u8], wanted: Option<&str>) -> Cow<'a, [u8]> {
@@ -238,8 +238,13 @@ fn projected_mime_value<'a>(raw: &'a [u8], wanted: Option<&str>) -> Cow<'a, [u8]
         if !token(name) {
             return None;
         }
+        // Empty quoted scalars do not leave continuation state in the pinned
+        // parser. Starred empties can affect recovery of the next parameter.
+        if value == "\"\"" && !name.contains('*') {
+            return Some(name);
+        }
         // Quoted tokens follow the same simple parser path as unquoted ones.
-        // Empty values, escapes, folds and more complex quotes retain the full
+        // Other empty values, escapes, folds and more complex quotes retain the full
         // original field, including the pinned parser's recovery behavior.
         let value = if let Some(value) = value.strip_prefix('"') {
             value.strip_suffix('"')?
@@ -485,7 +490,7 @@ enum BodyKind {
 
 fn related_headers(
     structure: &BodyStructure<'_>,
-    path: Option<&Part>,
+    path: &mut Vec<NonZeroU32>,
     paths: &mut Vec<Part>,
 ) -> Result<Option<BodyKind>, Error> {
     match structure {
@@ -534,12 +539,19 @@ fn related_headers(
             let mut selected = None;
             let mut matched_root = false;
             for (index, child) in bodies.as_ref().iter().enumerate() {
-                let child_path = child_path(path, index + 1)?;
+                let number = NonZeroU32::new(u32::try_from(index + 1).map_err(|_| Error::Limit)?)
+                    .ok_or(Error::Limit)?;
+                path.push(number);
                 let before = paths.len();
                 if root.is_some() && matches!(child, BodyStructure::Multi { .. }) {
-                    paths.push(child_path.clone());
+                    paths.push(Part(
+                        path.clone()
+                            .try_into()
+                            .expect("child makes the path nonempty"),
+                    ));
                 }
-                let candidate = related_headers(child, Some(&child_path), paths)?;
+                let candidate = related_headers(child, path, paths)?;
+                path.pop();
                 // Eligibility is stable without Content-IDs: a related child
                 // falls back to its first readable candidate. Return its type
                 // from this traversal so ancestors need no repeated selection.
@@ -665,7 +677,8 @@ fn scan_base64(wire: &[u8]) -> (usize, bool) {
         quartet[len] = byte;
         len += 1;
         if len == quartet.len() {
-            if STANDARD.decode_slice(quartet, &mut [0; 3]).is_err() {
+            // Alphabet-only quartets are valid; padding still needs strict checks.
+            if quartet.contains(&b'=') && STANDARD.decode_slice(quartet, &mut [0; 3]).is_err() {
                 return (complete, false);
             }
             complete = index + 1;
@@ -838,6 +851,63 @@ mod planner_performance_tests {
     use io_imap::types::{body::BasicFields, core::NString};
 
     #[test]
+    fn base64_scan_preserves_padding_validation_and_complete_prefixes() {
+        for (wire, expected) in [
+            (b"Zm9v".as_slice(), (4, true)),
+            (b"////".as_slice(), (4, true)),
+            (b"Z m\t9\r\nv".as_slice(), (8, true)),
+            (b"Zg==".as_slice(), (4, true)),
+            (b"Zm8=".as_slice(), (4, true)),
+            (b"Zh==".as_slice(), (0, false)),
+            (b"Zm9=".as_slice(), (0, false)),
+            (b"=AAA".as_slice(), (0, false)),
+            (b"A=AA".as_slice(), (0, false)),
+            (b"Zg===".as_slice(), (4, false)),
+            (b"Zg==Zm9v".as_slice(), (4, false)),
+            (b"Zm9v$ignored".as_slice(), (4, false)),
+            (b"Zm9vZg".as_slice(), (4, false)),
+        ] {
+            assert_eq!(scan_base64(wire), expected, "{wire:?}");
+        }
+    }
+
+    #[test]
+    fn empty_scalar_mime_parameters_preserve_bounded_continuation_allocation() {
+        for fragments in [128, 512, 2048] {
+            let mut field = format!("text/plain; x*0={}", "a".repeat(32 * 1024));
+            for index in 1..fragments {
+                field.push_str(&format!("; x*{index}=b"));
+            }
+            for tail in ["; charset=utf-8", "; unused=\"\"; charset=utf-8"] {
+                let selected = Selected {
+                    part: Part(NonZeroU32::MIN.into()),
+                    media_type: "text/plain".into(),
+                    charset: "utf-8".into(),
+                    transfer_encoding: "7bit".into(),
+                    wire_size: 5,
+                };
+                let raw = format!("Content-Type: {field}{tail}\r\n\r\n");
+                let started = std::time::Instant::now();
+                let measured = allocation_counter::measure(|| {
+                    assert_eq!(
+                        validate_headers(raw.as_bytes(), Some(&selected), &Limits::default()),
+                        Ok(None)
+                    );
+                });
+                eprintln!(
+                    "mime fallback fragments={fragments} source={} tail={tail:?} elapsed={:?} {measured:?}",
+                    raw.len(),
+                    started.elapsed()
+                );
+                assert!(
+                    measured.bytes_total < 64 * 1024 + raw.len() as u64 * 4,
+                    "an empty scalar must not force unused continuation materialization: {measured:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn replacement_markers_do_not_grow_an_already_owned_body_copy() {
         let mut measurements = Vec::new();
         for size in [64 * 1_024, 256 * 1_024, 2 * 1_024 * 1_024] {
@@ -947,10 +1017,22 @@ mod planner_performance_tests {
     }
 
     #[test]
-    fn related_header_planning_allocations_do_not_multiply_by_depth() {
+    fn related_header_planning_does_not_allocate_unneeded_part_paths() {
         let mut measurements = Vec::new();
-        for (depth, parts) in [(20, 200), (40, 1_000)] {
-            let structure = deep_structure(depth, parts);
+        for (depth, parts, subtype) in [
+            (2, 1_000, "ALTERNATIVE"),
+            (20, 200, "MIXED"),
+            (40, 1_000, "MIXED"),
+        ] {
+            let mut structure = deep_structure(depth, parts);
+            let BodyStructure::Multi {
+                subtype: root_subtype,
+                ..
+            } = &mut structure
+            else {
+                unreachable!();
+            };
+            *root_subtype = subtype.try_into().unwrap();
             let limits = Limits {
                 max_nesting: depth,
                 max_mime_parts: parts,
@@ -967,12 +1049,12 @@ mod planner_performance_tests {
                 "related planner depth={depth} parts={parts} allocations={} total={} peak={}",
                 measured.count_total, measured.bytes_total, measured.bytes_max
             );
-            measurements.push((parts, measured));
+            measurements.push(measured);
         }
-        for (parts, measured) in measurements {
+        for measured in measurements {
             assert!(
-                measured.count_total < parts as u64 * 4,
-                "header planning must not repeatedly select every descendant: {measured:?}"
+                measured.count_total < 16 && measured.bytes_total < 16 * 1_024,
+                "header planning must reuse its traversal path when no headers are needed: {measured:?}"
             );
         }
     }
@@ -1186,6 +1268,10 @@ mod planner_performance_tests {
     #[test]
     fn uncertain_encoded_mime_parameters_keep_the_entire_pinned_parser_input() {
         for value in [
+            "text/plain; unused=; charset=utf-8\r\n",
+            "text/plain; x*=\"\"; charset=utf-8\r\n",
+            "text/plain; x*0=\"\"; charset=utf-8\r\n",
+            "text/plain; x*0*=\"\"; charset=utf-8\r\n",
             "text/plain; x*0*=utf-8'en'%61; x*1*=%; charset=utf-8\r\n",
             "text/plain; x*0*=utf-8'en'%61; x*1*=%QZ; charset=utf-8\r\n",
             "text/plain; x*0*=utf-8'en'%61; x*1*=extra'apostrophe; charset=utf-8\r\n",
@@ -1209,6 +1295,18 @@ mod planner_performance_tests {
     #[test]
     fn mime_identity_projection_matches_the_full_pinned_parser() {
         let values = [
+            "text/plain; unused=\"\"; charset=utf-8",
+            "text/plain; unused=\"\"; x*0=first; x*1=last; charset=utf-8",
+            "text/plain; x*0=first; unused=\"\"; x*1=last; charset=utf-8",
+            "text/plain; x*0=first; x*1=last; unused=\"\"; charset=utf-8",
+            "text/plain; charset=us-ascii; unused=\"\"; charset=utf-8",
+            "text/plain; charset=us-ascii; charset=\"\"; unused=\"\"",
+            "text/plain; charset*0=utf; unused=\"\"; charset*1=-8",
+            "text/plain; charset*0*=utf-8'en'utf; unused=\"\"; charset*1*=%2D8",
+            "text/plain; charset-language=en; unused=\"\"; charset*=utf-8'en'utf-8",
+            "text/plain; charset-language=\"\"; unused=\"\"; charset*=utf-8'en'utf-8",
+            "inline; filename*0=first; unused=\"\"; filename*1=last",
+            "attachment; unused=\"\"; filename*0*=utf-8'en'%61; filename*1*=%62",
             "text/plain; charset=UTF-8",
             "text/plain; x*0=first; charset=\"us-ascii\"; x*1=last",
             "text/plain; x*0=\"first\"; charset=\"utf-8\"; x*1=\"last\"",
@@ -1365,6 +1463,7 @@ mod planner_performance_tests {
         }
         let bases: &[&[u8]] = &[
             b"text/plain; x*0=first; x*1=last; charset=utf-8",
+            b"text/plain; x*0=first; unused=\"\"; x*1=last; charset=utf-8",
             b"text/plain; x*0=first; x*1=last; charset=\"us-ascii\"",
             b"text/plain; x*0=\"first\"; x*1=\"last\"; charset=\"utf-8\"",
             b"text/plain; charset*0=utf; charset*1=-8; charset=iso-8859-1",
@@ -1375,6 +1474,7 @@ mod planner_performance_tests {
             b"inline; filename*2*=%AC; filename*0*=utf-8'en'%E2; filename*1*=%82; charset=utf-8",
         ];
         let additions: &[&[u8]] = &[
+            b"; unused=\"\"",
             b"\r\n ",
             b"\r\n\t",
             b"\xff\xfe",

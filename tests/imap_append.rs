@@ -9,11 +9,104 @@ use mailctl::{
 use std::time::Duration;
 
 #[tokio::test]
+async fn draft_target_inspection_counts_logout_in_operation_progress() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    let written = Arc::new(AtomicUsize::new(b"* OK synthetic server ready\r\n".len()));
+    let counted = written.clone();
+    let mut fixture = fixture(TlsMode::Implicit, Limits::default(), move |wire| {
+        Box::pin(async move {
+            let mut wire: Wire = Box::new(CountedWire {
+                wire,
+                written: counted,
+            });
+            authenticate(&mut wire).await;
+            examine(&mut wire).await;
+            logout(&mut wire).await;
+        })
+    })
+    .await;
+    assert_eq!(
+        fixture
+            .probe
+            .inspect_draft_target("fixture", "disposable-password", "INBOX")
+            .await
+            .unwrap(),
+        77
+    );
+    fixture.task.await.unwrap();
+    assert_eq!(
+        fixture.probe.metrics().wire_bytes,
+        written.load(Ordering::Relaxed)
+    );
+    assert_eq!(fixture.probe.metrics().responses, 12);
+}
+
+#[tokio::test]
+async fn draft_target_inspection_keeps_its_operation_byte_ceiling_during_logout() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    const OPERATION_BYTES: usize = 384;
+    const RESPONSE_BYTES: usize = 256;
+    let written = Arc::new(AtomicUsize::new(b"* OK synthetic server ready\r\n".len()));
+    let counted = written.clone();
+    let mut fixture = fixture(
+        TlsMode::Implicit,
+        Limits {
+            max_operation_bytes: OPERATION_BYTES,
+            max_response_bytes: RESPONSE_BYTES,
+            max_literal_bytes: RESPONSE_BYTES,
+            ..Limits::default()
+        },
+        move |wire| {
+            Box::pin(async move {
+                let mut wire: Wire = Box::new(CountedWire {
+                    wire,
+                    written: counted.clone(),
+                });
+                authenticate(&mut wire).await;
+                examine(&mut wire).await;
+                let tag = expect(&mut wire, "LOGOUT").await;
+                let remaining = OPERATION_BYTES - counted.load(Ordering::Relaxed);
+                let prefix = "* BYE ";
+                let suffix = format!("\r\n{tag} OK logout\r\n");
+                let response_bytes = remaining + 1;
+                assert!(response_bytes <= RESPONSE_BYTES);
+                assert!(response_bytes >= prefix.len() + suffix.len());
+                let padding = "x".repeat(response_bytes - prefix.len() - suffix.len());
+                write(&mut wire, &format!("{prefix}{padding}{suffix}")).await;
+                dropped(&mut wire).await;
+            })
+        },
+    )
+    .await;
+    assert_eq!(
+        fixture
+            .probe
+            .inspect_draft_target("fixture", "disposable-password", "INBOX")
+            .await
+            .unwrap_err(),
+        Error::Limit
+    );
+    fixture.task.await.unwrap();
+    assert_eq!(written.load(Ordering::Relaxed), OPERATION_BYTES + 1);
+    assert_eq!(fixture.probe.metrics().wire_bytes, OPERATION_BYTES);
+    assert!(fixture.probe.metrics().max_response_bytes <= RESPONSE_BYTES);
+}
+
+#[tokio::test]
 async fn unicode_draft_targets_preserve_exact_modified_utf7_identity() {
     for (target, wire_target) in [
         ("é", "&AOk-"),
         ("é&", "&AOk-&-"),
         ("🦀", "&2D7dgA-"),
+        ("é/🦀/é", "&AOk-/&2D7dgA-/&AOk-"),
         ("A&B", "A&-B"),
         ("Draft folder", "Draft folder"),
         ("Draft\"quote", "Draft\"quote"),

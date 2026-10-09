@@ -246,11 +246,11 @@ impl Transfers {
             entry,
         ))
     }
-    pub(in crate::service) fn session(&self) -> Arc<TransferSession> {
-        Arc::new(TransferSession {
+    pub(in crate::service) fn session(&self) -> TransferSession {
+        TransferSession {
             id: Uuid::new_v4(),
             store: Arc::downgrade(&self.0),
-        })
+        }
     }
 }
 #[derive(Debug)]

@@ -434,9 +434,20 @@ fn persisted_account_identity_survives_alias_change_and_tracks_repointing() {
 
 #[test]
 fn operation_schemas_reject_forged_authority_and_unknown_inputs() {
+    for operation in ["capabilities", "health"] {
+        assert!(
+            serde_json::from_value::<Operation>(serde_json::json!({"operation": operation}))
+                .is_ok()
+        );
+    }
     for input in [
         r#"{"operation":"list_accounts","input":{"profile":"read_and_drafts"}}"#,
         r#"{"operation":"capabilities","input":{"read_only":false}}"#,
+        r#"{"operation":"capabilities","input":null}"#,
+        r#"{"operation":"capabilities","input":{}}"#,
+        r#"{"operation":"health","input":null}"#,
+        r#"{"operation":"health","input":{}}"#,
+        r#"{"operation":"list_accounts"}"#,
         r#"{"operation":"health","harness":"admin"}"#,
         r#"{"operation":"list_accounts","input":{"limit":-1}}"#,
         r#"{"operation":"search_messages","input":{"mailbox":null}}"#,
@@ -573,35 +584,71 @@ fn private_account_history_fails_closed_on_corruption() {
 }
 
 #[test]
-fn unchanged_configuration_rejects_missing_account_history() {
-    let directory = std::fs::canonicalize(std::env::temp_dir())
-        .unwrap()
-        .join(format!("mailctl-history-{}", uuid::Uuid::new_v4()));
-    let mut config = Config::parse(&configuration()).unwrap();
-    config.state_dir = directory.clone();
-    Service::setup(config.clone()).unwrap();
-    let registry_path = config.state_dir.join("accounts.json");
-    let mut registry: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&registry_path).unwrap()).unwrap();
-    registry["accounts"]
-        .as_object_mut()
-        .unwrap()
-        .remove(&config.accounts[0].key);
-    let corrupted = serde_json::to_vec(&registry).unwrap();
-    std::fs::write(&registry_path, &corrupted).unwrap();
+fn unchanged_configuration_rejects_invalid_account_history() {
+    const ACCOUNT_ID: &str = "12345678-9abc-4def-8123-456789abcdef";
 
-    assert!(Service::open(config.clone()).is_err());
-    let mut updated = false;
-    assert!(
-        Service::maintain(config, || {
-            updated = true;
-            Ok(())
-        })
-        .is_err()
-    );
-    assert!(!updated);
-    assert_eq!(std::fs::read(&registry_path).unwrap(), corrupted);
-    std::fs::remove_dir_all(directory).unwrap();
+    for fault in [
+        "missing_account",
+        "uppercase_identity",
+        "simple_identity",
+        "duplicate_alternate_spelling",
+    ] {
+        let directory = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("mailctl-history-{}", uuid::Uuid::new_v4()));
+        let mut config = Config::parse(&configuration()).unwrap();
+        config.state_dir = directory.clone();
+        Service::setup(config.clone()).unwrap();
+        let registry_path = config.state_dir.join("accounts.json");
+        let mut registry: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&registry_path).unwrap()).unwrap();
+        match fault {
+            "missing_account" => {
+                registry["accounts"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(&config.accounts[0].key);
+            }
+            "uppercase_identity" => {
+                registry["accounts"][&config.accounts[0].key]["account_id"] =
+                    ACCOUNT_ID.to_ascii_uppercase().into();
+            }
+            "simple_identity" => {
+                registry["accounts"][&config.accounts[0].key]["account_id"] =
+                    ACCOUNT_ID.replace('-', "").into();
+            }
+            "duplicate_alternate_spelling" => {
+                registry["accounts"][&config.accounts[0].key]["account_id"] = ACCOUNT_ID.into();
+                registry["accounts"][&config.accounts[1].key]["account_id"] =
+                    ACCOUNT_ID.to_ascii_uppercase().into();
+            }
+            _ => unreachable!(),
+        }
+        let corrupted = serde_json::to_vec(&registry).unwrap();
+        std::fs::write(&registry_path, &corrupted).unwrap();
+
+        assert_eq!(
+            Service::open(config.clone()).err(),
+            Some(Error::setup_required()),
+            "registry fault: {fault}"
+        );
+        let mut updated = false;
+        assert_eq!(
+            Service::maintain(config, || {
+                updated = true;
+                Ok(())
+            })
+            .err(),
+            Some(Error::setup_required()),
+            "registry fault: {fault}"
+        );
+        assert!(
+            !updated,
+            "invalid history must not update configuration: {fault}"
+        );
+        assert_eq!(std::fs::read(&registry_path).unwrap(), corrupted);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }
 
 #[test]
@@ -973,11 +1020,18 @@ fn maintenance_checks_registry_capacity_before_updating_configuration() {
 #[test]
 fn response_narrowing_rejects_large_results_and_cannot_be_widened() {
     let service = Service::in_memory(Config::parse(&configuration()).unwrap()).unwrap();
-    let context = service
-        .context("reader", &Narrowing::default())
-        .unwrap()
-        .with_response_limit(512)
-        .with_response_limit(16 * 1024 * 1024);
+    let original = service.context("reader", &Narrowing::default()).unwrap();
+    let mut context = None;
+    let allocation = allocation_counter::measure(|| {
+        context = Some(
+            original
+                .clone()
+                .with_response_limit(512)
+                .with_response_limit(16 * 1024 * 1024),
+        );
+    });
+    assert_eq!(allocation.bytes_total, 0, "{allocation:?}");
+    let context = context.unwrap();
     for operation in [
         Operation::ListAccounts(ListAccountsInput::default()),
         Operation::Capabilities,
@@ -988,6 +1042,15 @@ fn response_narrowing_rejects_large_results_and_cannot_be_widened() {
             mailctl::domain::ErrorCode::ResponseTooLarge
         );
     }
+    assert_eq!(
+        execute(
+            &service,
+            &original,
+            Operation::ListAccounts(ListAccountsInput::default()),
+        )
+        .unwrap()["accounts"][0]["alias"],
+        "work"
+    );
 }
 
 #[test]

@@ -32,12 +32,7 @@ use io_imap::{
     types::{flag::FlagNameAttribute, mailbox::Mailbox as WireMailbox, response::Capability},
 };
 use sha2::{Digest, Sha256};
-use std::{
-    collections::{BTreeMap, btree_map::Entry},
-    fmt,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::BTreeMap, fmt, sync::Arc, time::Duration};
 use tokio_rustls::rustls::{self, RootCertStore};
 use wire::Connection;
 
@@ -421,18 +416,17 @@ const MODIFIED_UTF7: GeneralPurpose = GeneralPurpose::new(&IMAP_MUTF7, NO_PAD);
 
 fn mailbox_pattern(name: &str) -> String {
     let mut encoded = String::with_capacity(name.len());
+    let mut bytes = Vec::new();
     let mut remaining = name;
     while !remaining.is_empty() {
         let end = remaining
             .find(|c: char| c.is_ascii())
             .unwrap_or(remaining.len());
         if end > 0 {
-            let bytes: Vec<_> = remaining[..end]
-                .encode_utf16()
-                .flat_map(u16::to_be_bytes)
-                .collect();
+            bytes.clear();
+            bytes.extend(remaining[..end].encode_utf16().flat_map(u16::to_be_bytes));
             encoded.push('&');
-            MODIFIED_UTF7.encode_string(bytes, &mut encoded);
+            MODIFIED_UTF7.encode_string(&bytes, &mut encoded);
             encoded.push('-');
             remaining = &remaining[end..];
         }
@@ -457,6 +451,7 @@ fn validate_wire_mailbox_name(mailbox: &WireMailbox<'_>) -> Result<(), Error> {
         return Err(Error::Protocol);
     }
     let mut decoded = String::with_capacity(wire.len().min(1024));
+    let mut bytes = Vec::new();
     let mut remaining = wire;
     while let Some((plain, shifted)) = remaining.split_once('&') {
         if plain.len() > 1024usize.saturating_sub(decoded.len()) {
@@ -467,7 +462,10 @@ fn validate_wire_mailbox_name(mailbox: &WireMailbox<'_>) -> Result<(), Error> {
         if payload.is_empty() {
             decoded.push('&');
         } else {
-            let bytes = MODIFIED_UTF7.decode(payload).map_err(|_| Error::Protocol)?;
+            bytes.clear();
+            MODIFIED_UTF7
+                .decode_vec(payload, &mut bytes)
+                .map_err(|_| Error::Protocol)?;
             if bytes.len() % 2 != 0 {
                 return Err(Error::Protocol);
             }
@@ -512,7 +510,7 @@ impl Connection<'_> {
             }
         };
         let mut attributes: Vec<_> = attrs.iter().map(ToString::to_string).collect();
-        attributes.sort();
+        attributes.sort_unstable();
         attributes.dedup();
         let selectable = !attributes
             .iter()
@@ -539,20 +537,22 @@ impl Connection<'_> {
         if rows.len() > maximum {
             return Err(Error::Limit);
         }
-        let mut mailboxes = BTreeMap::new();
+        let mut mailboxes = Vec::with_capacity(rows.len());
         for (returned, _, attrs) in rows {
             let Some(mailbox) = Self::decode_mailbox(&returned, &attrs)? else {
                 continue;
             };
-            match mailboxes.entry(mailbox.name.clone()) {
-                Entry::Vacant(entry) => {
-                    entry.insert(mailbox);
-                }
-                Entry::Occupied(entry) if entry.get() != &mailbox => return Err(Error::Protocol),
-                Entry::Occupied(_) => {}
-            }
+            mailboxes.push(mailbox);
         }
-        Ok(mailboxes.into_values().collect())
+        mailboxes.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+        mailboxes.dedup();
+        if mailboxes
+            .windows(2)
+            .any(|pair| pair[0].name == pair[1].name)
+        {
+            return Err(Error::Protocol);
+        }
+        Ok(mailboxes)
     }
     async fn discover_names(
         &mut self,

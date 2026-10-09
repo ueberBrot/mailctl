@@ -105,8 +105,11 @@ impl Registry {
         }
         let mut identities = HashSet::new();
         for history in self.accounts.values() {
-            if Uuid::parse_str(&history.account_id).is_err()
-                || !identities.insert(&history.account_id)
+            let account_id = Uuid::parse_str(&history.account_id).map_err(|_| invalid())?;
+            let mut buffer = Uuid::encode_buffer();
+            let canonical: &str = account_id.hyphenated().encode_lower(&mut buffer);
+            if canonical != history.account_id
+                || !identities.insert(account_id)
                 || history.generations.is_empty()
                 || history
                     .generations

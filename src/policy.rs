@@ -1,6 +1,7 @@
 //! Access-grant authority and request narrowing are independent of provider adapters.
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -47,30 +48,37 @@ pub struct Narrowing {
 /// Created by the application from a configured access grant.
 #[derive(Clone, Debug)]
 pub struct RequestContext {
+    authority: Arc<Authority>,
+    response_limit: usize,
+}
+
+#[derive(Debug)]
+struct Authority {
     service_id: Uuid,
-    session: std::sync::Arc<crate::service::TransferSession>,
+    session: crate::service::TransferSession,
     grant: String,
     // Indices into the immutable configuration of the issuing Service.
     account_indices: Vec<usize>,
     permissions: Vec<Permission>,
-    response_limit: usize,
 }
 
 impl RequestContext {
     pub(crate) fn new(
         service_id: Uuid,
-        session: std::sync::Arc<crate::service::TransferSession>,
+        session: crate::service::TransferSession,
         grant: String,
         account_indices: Vec<usize>,
         permissions: Vec<Permission>,
         response_limit: usize,
     ) -> Self {
         Self {
-            service_id,
-            session,
-            grant,
-            account_indices,
-            permissions,
+            authority: Arc::new(Authority {
+                service_id,
+                session,
+                grant,
+                account_indices,
+                permissions,
+            }),
             response_limit,
         }
     }
@@ -79,19 +87,19 @@ impl RequestContext {
         self
     }
     pub(crate) fn session_id(&self) -> Uuid {
-        self.session.id
+        self.authority.session.id
     }
     pub(crate) fn belongs_to(&self, service_id: Uuid) -> bool {
-        self.service_id == service_id
+        self.authority.service_id == service_id
     }
     pub(crate) fn grant_name(&self) -> &str {
-        &self.grant
+        &self.authority.grant
     }
     pub(crate) fn account_indices(&self) -> &[usize] {
-        &self.account_indices
+        &self.authority.account_indices
     }
     pub(crate) fn permissions(&self) -> &[Permission] {
-        &self.permissions
+        &self.authority.permissions
     }
     pub(crate) fn response_limit(&self) -> usize {
         self.response_limit

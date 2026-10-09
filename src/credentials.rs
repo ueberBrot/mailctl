@@ -23,6 +23,13 @@ pub use native::NativeSource;
 pub const SERVICE_NAME: &str = "mailctl";
 pub const MAX_SECRET_BYTES: usize = 64 * 1024;
 
+#[cfg(unix)]
+fn nonblocking(pipe: &impl std::os::fd::AsFd) -> Result<(), SourceError> {
+    let flags = rustix::fs::fcntl_getfl(pipe).map_err(|_| SourceError::Unavailable)?;
+    rustix::fs::fcntl_setfl(pipe, flags | rustix::fs::OFlags::NONBLOCK)
+        .map_err(|_| SourceError::Unavailable)
+}
+
 /// Suppress native dialogs before credential or TLS trust-store access.
 #[cfg_attr(
     not(target_os = "macos"),

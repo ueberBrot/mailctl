@@ -98,6 +98,47 @@ fn restore_rejects_incomplete_tampered_and_foreign_snapshots_before_mutation() {
 }
 
 #[test]
+fn restore_reports_incompatible_registry_layout_before_mutation() {
+    use sha2::{Digest, Sha256};
+
+    for future_layout in [false, true] {
+        let installation = support::Installation::two_accounts();
+        let config =
+            Config::parse(&std::fs::read_to_string(installation.config()).unwrap()).unwrap();
+        Service::setup(config.clone()).unwrap();
+        let source = config.state_dir.parent().unwrap().join("backup");
+        Service::backup(&config, &source).unwrap();
+        let before = std::fs::read(config.state_dir.join("accounts.json")).unwrap();
+        let mut registry: serde_json::Value = serde_json::from_slice(&before).unwrap();
+        registry["version"] = 999.into();
+        if future_layout {
+            registry = serde_json::json!({"version": 999, "future": {"layout": true}});
+        }
+        let bytes = serde_json::to_vec(&registry).unwrap();
+        std::fs::write(source.join("accounts.json"), &bytes).unwrap();
+        let manifest_path = source.join("manifest.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        let checksum: String = Sha256::digest(&bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        manifest["files"]["accounts.json"] = checksum.into();
+        std::fs::write(manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+        assert_eq!(
+            Service::restore(&config, &source).unwrap_err(),
+            mailctl::domain::Error::incompatible_schema()
+        );
+        assert_eq!(
+            std::fs::read(config.state_dir.join("accounts.json")).unwrap(),
+            before
+        );
+        assert!(!config.state_dir.join("drafts.suspended").exists());
+    }
+}
+
+#[test]
 fn interrupted_restore_remains_fenced_and_can_be_repeated() {
     let installation = support::Installation::two_accounts();
     let config = Config::parse(&std::fs::read_to_string(installation.config()).unwrap()).unwrap();

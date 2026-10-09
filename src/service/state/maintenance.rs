@@ -202,8 +202,7 @@ pub(in crate::service) fn restore(
         return Err(invalid());
     }
     let registry_bytes = storage::read(&source)?.ok_or_else(invalid)?;
-    let registry: Registry = serde_json::from_slice(&registry_bytes).map_err(|_| invalid())?;
-    registry.validate()?;
+    let registry = decode_registry(&registry_bytes)?;
     let saved_config = Config::parse(
         &String::from_utf8(
             file_storage::read(&source.join("config.toml"), crate::config::MAX_BYTES)

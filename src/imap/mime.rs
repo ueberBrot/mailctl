@@ -5,7 +5,7 @@ use io_imap::types::{
     core::IString,
     fetch::Part,
 };
-use std::{fmt::Write, num::NonZeroU32};
+use std::fmt::Write;
 
 /// Count the complete server-provided structure before selection cuts off attached-message and
 /// attachment subtrees. Those subtrees are ineligible for rendering, but still consume the MIME
@@ -51,18 +51,6 @@ pub(super) fn attachment(disposition: Option<&Disposition<'_>>) -> bool {
 
 pub(super) fn imap_text<'a>(value: &'a IString<'_>) -> Result<&'a str, Error> {
     std::str::from_utf8(value.as_ref()).map_err(|_| Error::Protocol)
-}
-
-pub(super) fn child_path(parent: Option<&Part>, child: usize) -> Result<Part, Error> {
-    let child =
-        NonZeroU32::new(u32::try_from(child).map_err(|_| Error::Limit)?).ok_or(Error::Limit)?;
-    let parent = parent.map_or(&[][..], |parent| parent.0.as_ref());
-    let mut parts = Vec::with_capacity(parent.len() + 1);
-    parts.extend_from_slice(parent);
-    parts.push(child);
-    Ok(Part(
-        parts.try_into().expect("child makes the path nonempty"),
-    ))
 }
 
 pub(super) fn part_name(part: &Part) -> String {

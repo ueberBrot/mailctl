@@ -1,5 +1,5 @@
 //! Executes an operator-trusted helper without exposing its output to diagnostics.
-use super::{Availability, ResolutionLimits, Secret, SecretSource, SourceError};
+use super::{Availability, ResolutionLimits, Secret, SecretSource, SourceError, nonblocking};
 use crate::config::{CredentialCommand, Limits};
 use rustix::{
     event::{PollFd, PollFlags, Timespec, poll},
@@ -9,13 +9,10 @@ use std::{
     ffi::CString,
     fs,
     io::{self, Read},
-    os::{
-        fd::AsFd,
-        unix::{
-            ffi::OsStrExt,
-            fs::{MetadataExt, OpenOptionsExt},
-            process::CommandExt,
-        },
+    os::unix::{
+        ffi::OsStrExt,
+        fs::{MetadataExt, OpenOptionsExt},
+        process::CommandExt,
     },
     path::Path,
     process::{Child, Command, Stdio},
@@ -263,12 +260,6 @@ fn direct_execution(
         });
     }
     Ok(())
-}
-
-fn nonblocking(pipe: &impl AsFd) -> Result<(), SourceError> {
-    let flags = rustix::fs::fcntl_getfl(pipe).map_err(|_| SourceError::Unavailable)?;
-    rustix::fs::fcntl_setfl(pipe, flags | rustix::fs::OFlags::NONBLOCK)
-        .map_err(|_| SourceError::Unavailable)
 }
 
 #[derive(PartialEq)]

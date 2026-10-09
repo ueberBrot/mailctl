@@ -100,6 +100,8 @@ fn unchanged_registry_checks_do_not_allocate_for_every_retained_generation() {
 
 #[test]
 fn changed_registry_bytes_preserve_semantic_equality_and_corruption_errors() {
+    const ACCOUNT_ID: &str = "12345678-9abc-4def-8123-456789abcdef";
+
     let runtime = runtime();
     let fixture = RegistryFixture::retained(3);
     let service = fixture.open();
@@ -117,6 +119,9 @@ fn changed_registry_bytes_preserve_semantic_equality_and_corruption_errors() {
         "future_layout",
         "invalid_json",
         "duplicate_identity",
+        "uppercase_identity",
+        "simple_identity",
+        "duplicate_alternate_spelling",
         "generation_sequence",
         "unknown_field",
     ] {
@@ -138,6 +143,20 @@ fn changed_registry_bytes_preserve_semantic_equality_and_corruption_errors() {
             "duplicate_identity" => {
                 registry["accounts"]["personal"]["account_id"] =
                     registry["accounts"]["work"]["account_id"].clone();
+                Error::setup_required()
+            }
+            "uppercase_identity" => {
+                registry["accounts"]["work"]["account_id"] = ACCOUNT_ID.to_ascii_uppercase().into();
+                Error::setup_required()
+            }
+            "simple_identity" => {
+                registry["accounts"]["work"]["account_id"] = ACCOUNT_ID.replace('-', "").into();
+                Error::setup_required()
+            }
+            "duplicate_alternate_spelling" => {
+                registry["accounts"]["work"]["account_id"] = ACCOUNT_ID.into();
+                registry["accounts"]["personal"]["account_id"] =
+                    ACCOUNT_ID.to_ascii_uppercase().into();
                 Error::setup_required()
             }
             "generation_sequence" => {
@@ -162,6 +181,7 @@ fn changed_registry_bytes_preserve_semantic_equality_and_corruption_errors() {
             expected_error,
             "registry fault: {fault}"
         );
+        assert_eq!(fs::read(&fixture.path).unwrap(), bytes);
     }
 
     fs::write(&fixture.path, &fixture.bytes).unwrap();

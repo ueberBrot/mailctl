@@ -64,20 +64,18 @@ pub(super) fn human(result: &OperationResult) -> Result<String, serde_json::Erro
                     crate::domain::Metadata::Missing => "(missing subject)".into(),
                     crate::domain::Metadata::Malformed => "(malformed subject)".into(),
                 };
-                let from = match &message.metadata.from {
-                    crate::domain::Metadata::Present(addresses) => addresses
-                        .iter()
-                        .map(|address| label(&address.address))
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    crate::domain::Metadata::Missing => "(missing sender)".into(),
-                    crate::domain::Metadata::Malformed => "(malformed sender)".into(),
-                };
+                let _ = write!(output, "{}  ", label(&message.metadata.received_date));
+                match &message.metadata.from {
+                    crate::domain::Metadata::Present(addresses) => append_labels(
+                        &mut output,
+                        addresses.iter().map(|address| address.address.as_str()),
+                    ),
+                    crate::domain::Metadata::Missing => output.push_str("(missing sender)"),
+                    crate::domain::Metadata::Malformed => output.push_str("(malformed sender)"),
+                }
                 let _ = writeln!(
                     output,
-                    "{}  {}  {}\n  reference: {}",
-                    label(&message.metadata.received_date),
-                    from,
+                    "  {}\n  reference: {}",
                     subject,
                     label(&message.reference)
                 );
@@ -124,16 +122,12 @@ pub(super) fn human(result: &OperationResult) -> Result<String, serde_json::Erro
                 label(&capabilities.health.grant),
                 label(&capabilities.health.status)
             );
-            let _ = writeln!(
-                output,
-                "Operations: {}",
-                capabilities
-                    .operations
-                    .iter()
-                    .map(|operation| label(operation))
-                    .collect::<Vec<_>>()
-                    .join(", ")
+            output.push_str("Operations: ");
+            append_labels(
+                &mut output,
+                capabilities.operations.iter().map(String::as_str),
             );
+            output.push('\n');
             let _ = writeln!(
                 output,
                 "Permissions: {}",
@@ -236,7 +230,22 @@ pub(super) fn human_error(error: &Error) -> Result<String, serde_json::Error> {
 }
 
 fn label(text: &str) -> Cow<'_, str> {
-    let Some(start) = text.find(unsafe_character) else {
+    escape_characters(text, unsafe_character)
+}
+
+fn append_labels<'a>(output: &mut String, values: impl IntoIterator<Item = &'a str>) {
+    let mut values = values.into_iter();
+    if let Some(first) = values.next() {
+        output.push_str(&label(first));
+        for value in values {
+            output.push_str(", ");
+            output.push_str(&label(value));
+        }
+    }
+}
+
+fn escape_characters(text: &str, unsafe_character: impl Fn(char) -> bool) -> Cow<'_, str> {
+    let Some(start) = text.find(&unsafe_character) else {
         return Cow::Borrowed(text);
     };
     let mut output = String::with_capacity(text.len());
@@ -260,20 +269,12 @@ fn unsafe_character(character: char) -> bool {
 
 fn metadata_text(text: String) -> String {
     // Literal newlines belong to JSON layout; string newlines are already escaped.
-    let Some(start) = text.find(|character| character != '\n' && unsafe_character(character))
-    else {
-        return text;
-    };
-    let mut output = String::with_capacity(text.len());
-    output.push_str(&text[..start]);
-    for character in text[start..].chars() {
-        if character != '\n' && unsafe_character(character) {
-            let _ = write!(output, "\\u{{{:04x}}}", character as u32);
-        } else {
-            output.push(character);
-        }
+    match escape_characters(&text, |character| {
+        character != '\n' && unsafe_character(character)
+    }) {
+        Cow::Borrowed(_) => text,
+        Cow::Owned(output) => output,
     }
-    output
 }
 
 fn append_body(output: &mut String, text: &str) {

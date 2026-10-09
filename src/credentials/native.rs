@@ -9,7 +9,7 @@ use std::{
     collections::HashMap,
     ffi::OsStr,
     io::{ErrorKind, Read},
-    os::{fd::AsFd, unix::ffi::OsStrExt},
+    os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
     process::{Child, ChildStdout, Command, ExitStatus, Stdio},
     sync::{Arc, OnceLock},
@@ -155,7 +155,7 @@ fn default_user_keychain(deadline: Instant) -> Result<PathBuf, SourceError> {
             .map_err(|_| SourceError::Unavailable)?,
     );
     let mut stdout = child.0.stdout.take().ok_or(SourceError::Unavailable)?;
-    set_nonblocking(&stdout)?;
+    super::nonblocking(&stdout)?;
     let (status, output) = collect_stdout(&mut child.0, &mut stdout, deadline)?;
     if !status.success() {
         return Err(SourceError::Unavailable);
@@ -171,12 +171,6 @@ fn security_command() -> Command {
         .stdin(Stdio::null())
         .stderr(Stdio::null());
     command
-}
-
-fn set_nonblocking(stdout: &ChildStdout) -> Result<(), SourceError> {
-    let flags = rustix::fs::fcntl_getfl(stdout.as_fd()).map_err(|_| SourceError::Unavailable)?;
-    rustix::fs::fcntl_setfl(stdout.as_fd(), flags | rustix::fs::OFlags::NONBLOCK)
-        .map_err(|_| SourceError::Unavailable)
 }
 
 fn collect_stdout(

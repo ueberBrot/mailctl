@@ -18,6 +18,7 @@ use std::{
     pin::Pin,
     sync::{Arc, RwLock},
 };
+use uuid::Uuid;
 
 pub type DraftPreparation<'a> =
     Pin<Box<dyn Future<Output = Result<Box<dyn DraftAppend + 'a>, Error>> + Send + 'a>>;
@@ -50,7 +51,7 @@ pub trait DraftAppend: Send {
         Self: 'a;
 }
 #[derive(Default)]
-pub struct MemoryDrafts(RwLock<BTreeMap<(String, String), MemoryMailbox>>);
+pub struct MemoryDrafts(RwLock<BTreeMap<String, BTreeMap<String, MemoryMailbox>>>);
 struct MemoryMailbox {
     validity: u32,
     messages: Vec<MemoryMessage>,
@@ -63,21 +64,24 @@ struct MemoryMessage {
 }
 impl MemoryDrafts {
     pub fn set(&self, account: &str, mailbox: &str, uid_validity: u32) {
-        self.0.write().unwrap().insert(
-            (
-                account.into(),
+        self.0
+            .write()
+            .unwrap()
+            .entry(account.into())
+            .or_default()
+            .insert(
                 crate::domain::mailbox_identity(mailbox).into(),
-            ),
-            MemoryMailbox {
-                validity: uid_validity,
-                messages: Vec::new(),
-            },
-        );
+                MemoryMailbox {
+                    validity: uid_validity,
+                    messages: Vec::new(),
+                },
+            );
     }
 }
 struct MemoryAppend<'a> {
     backend: &'a MemoryDrafts,
-    key: (String, String),
+    account: &'a str,
+    mailbox: &'a str,
     validity: u32,
 }
 impl DraftAppend for MemoryAppend<'_> {
@@ -103,7 +107,8 @@ impl DraftAppend for MemoryAppend<'_> {
                 .0
                 .write()
                 .unwrap()
-                .get_mut(&self.key)
+                .get_mut(self.account)
+                .and_then(|mailboxes| mailboxes.get_mut(self.mailbox))
                 .ok_or_else(|| Error::new(ErrorCode::DraftMailboxUnavailable))?
                 .messages
                 .push(MemoryMessage {
@@ -124,21 +129,21 @@ impl DraftBackend for MemoryDrafts {
         _: &'a Limits,
     ) -> DraftPreparation<'a> {
         Box::pin(async move {
-            let key = (
-                target.config.key.clone(),
-                crate::domain::mailbox_identity(mailbox).into(),
-            );
+            let account = target.config.key.as_str();
+            let mailbox = crate::domain::mailbox_identity(mailbox);
             let validity = self
                 .0
                 .read()
                 .unwrap()
-                .get(&key)
+                .get(account)
+                .and_then(|mailboxes| mailboxes.get(mailbox))
                 .map(|m| m.validity)
                 .filter(|v| *v != 0)
                 .ok_or_else(|| Error::new(ErrorCode::DraftMailboxUnavailable))?;
             Ok(Box::new(MemoryAppend {
                 backend: self,
-                key,
+                account,
+                mailbox,
                 validity,
             }) as Box<dyn DraftAppend>)
         })
@@ -154,10 +159,8 @@ impl DraftBackend for MemoryDrafts {
             use crate::draft::DraftEvidence;
             let state = self.0.read().unwrap();
             let mailbox = state
-                .get(&(
-                    target.config.key.clone(),
-                    crate::domain::mailbox_identity(mailbox).into(),
-                ))
+                .get(&target.config.key)
+                .and_then(|mailboxes| mailboxes.get(crate::domain::mailbox_identity(mailbox)))
                 .ok_or_else(|| Error::new(ErrorCode::DraftMailboxUnavailable))?;
             if mailbox.validity != expected.uid_validity {
                 return Err(Error::new(ErrorCode::StaleReference));
@@ -213,8 +216,12 @@ impl Service {
         if !context.permissions().contains(&permission) {
             return Err(super::denied());
         }
-        let requested_account = identity.account_id.to_string();
-        let target = self.visible_account_target(context, &requested_account)?;
+        let mut account_buffer = Uuid::encode_buffer();
+        let requested_account: &str = identity
+            .account_id
+            .hyphenated()
+            .encode_lower(&mut account_buffer);
+        let target = self.visible_account_target(context, requested_account)?;
         if identity.operation_id.is_nil() {
             return Err(Error::new(ErrorCode::InvalidRequest));
         }
@@ -717,6 +724,7 @@ impl Service {
         limits: &Limits,
     ) -> Result<DraftReceipt, Error> {
         let operation = persisted.operation;
+        let mut account_buffer = Uuid::encode_buffer();
         let message_reference = match persisted.state {
             DraftOperationState::Created {
                 appended_message: Some(uid),
@@ -727,7 +735,11 @@ impl Service {
                 .encode(
                     "ms1",
                     &super::tokens::MessageReference {
-                        account: &operation.identity.account_id.to_string(),
+                        account: &*operation
+                            .identity
+                            .account_id
+                            .hyphenated()
+                            .encode_lower(&mut account_buffer),
                         generation: operation.identity.account_generation,
                         mailbox: &operation.mailbox_identity,
                         uid_validity: uid.uid_validity,

@@ -609,7 +609,8 @@ fn read_private_file(
     {
         return Err(Error::new(ErrorCode::BrokerUnavailable));
     }
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    // Reserve the EOF probe so an unchanged file needs no buffer growth.
+    let mut bytes = Vec::with_capacity((metadata.len() as usize).saturating_add(1));
     file.take(maximum as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| Error::new(ErrorCode::BrokerUnavailable))?;

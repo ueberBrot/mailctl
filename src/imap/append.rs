@@ -1,5 +1,6 @@
 use super::{AuthenticatedConnection, Error, Limits, Metrics, mailbox};
 use crate::draft::{DraftMessageIdentity, PreparedDraft};
+use io_imap::rfc3501::logout::ImapLogout;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AppendOutcome {
     Created {
@@ -18,7 +19,11 @@ impl AuthenticatedConnection {
         metrics: &mut Metrics,
     ) -> Result<u32, Error> {
         let (connection, validity) = self.select_draft_target(mailbox, limits, metrics).await?;
-        connection.disconnect().await?;
+        connection
+            .session
+            .resume(metrics)
+            .drive(ImapLogout::new())
+            .await?;
         Ok(validity)
     }
 

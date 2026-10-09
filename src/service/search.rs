@@ -29,12 +29,12 @@ pub trait SearchBackend: Send + Sync {
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct Cursor {
-    account: String,
+struct Cursor<S = String> {
+    account: S,
     generation: u64,
-    mailbox: String,
-    scope: String,
-    query: String,
+    mailbox: S,
+    scope: S,
+    query: S,
     position: SearchPosition,
 }
 
@@ -125,11 +125,11 @@ impl Service {
             Some(self.encode(
                 "sc1",
                 &Cursor {
-                    account: id.into(),
+                    account: id,
                     generation,
-                    mailbox: name.into(),
-                    scope,
-                    query,
+                    mailbox: name,
+                    scope: scope.as_str(),
+                    query: query.as_str(),
                     position: batch.position,
                 },
                 limits.token_bytes,
