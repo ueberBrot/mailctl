@@ -400,7 +400,6 @@ mod tests {
         let size = text.len();
         let config = Config::parse(&format!(
             r#"
-version = 1
 default_grant = "reader"
 state_dir = {state}
 [limits]
@@ -456,7 +455,6 @@ accounts = ["work"]
                 text,
                 selected_part: Some("1".into()),
                 source_media_type: Some("text/plain".into()),
-                representation_version: "1".into(),
                 converted: false,
                 replacements: false,
                 truncated: false,

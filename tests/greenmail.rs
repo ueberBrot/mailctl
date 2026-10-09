@@ -121,7 +121,6 @@ fn application_search_pages_and_predicates_preserve_independently_observed_mailb
         let contents = fixture.contents().await?;
         let configuration = Config::parse(&format!(
             r#"
-version = 1
 default_grant = "reader"
 state_dir = {state}
 [[accounts]]
@@ -643,8 +642,7 @@ fn application_mailbox_discovery_and_reference_reuse_preserve_independently_obse
         let contents = fixture.contents().await?;
         let snapshot = fixture.snapshot().await?;
         let config = Config::parse(&format!(
-            r#"version = 1
-default_grant = "reader"
+            r#"default_grant = "reader"
 state_dir = {state}
 [[accounts]]
 key = "fixture"

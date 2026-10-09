@@ -74,14 +74,12 @@ fn reconstruction(
         from_configuration_sha256: [43; 32],
         selected_from_sha256: Some([44; 32]),
         date_unix: 1_700_000_000,
-        encoder_version: 3,
-        facts_sha256: None,
+        encoder: "mail-builder/1.0.0".into(),
+        facts_sha256: [0; 32],
     };
-    frozen.facts_sha256 = Some(
-        frozen
-            .fingerprint(&operation.identity, &operation.mailbox_identity)
-            .unwrap(),
-    );
+    frozen.facts_sha256 = frozen
+        .fingerprint(&operation.identity, &operation.mailbox_identity)
+        .unwrap();
     frozen
 }
 
@@ -375,8 +373,8 @@ fn refusing_an_unknown_schema_preserves_it_before_pragmas_can_mutate_it() {
     ));
 
     let connection = Connection::open(&temporary.path).unwrap();
-    let version: i64 = connection
-        .query_row("PRAGMA user_version", [], |row| row.get(0))
+    let journal_mode: String = connection
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
         .unwrap();
     let unrelated_exists: bool = connection
         .query_row(
@@ -385,7 +383,7 @@ fn refusing_an_unknown_schema_preserves_it_before_pragmas_can_mutate_it() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, 0);
+    assert_eq!(journal_mode, "delete");
     assert!(unrelated_exists);
 }
 
@@ -632,7 +630,7 @@ fn dispatch_verification_borrows_retained_text_without_per_record_heap_growth() 
 }
 
 #[test]
-fn borrowed_verification_preserves_text_corruption_and_legacy_state_checks() {
+fn borrowed_verification_preserves_text_corruption_and_retained_state_checks() {
     for (assignment, expected) in [
         (
             "mailbox_identity = CAST(X'ff' AS TEXT)",
@@ -731,7 +729,7 @@ fn borrowed_verification_preserves_text_corruption_and_legacy_state_checks() {
                 .unwrap()
                 .operation,
             operation,
-            "legacy {state} reconstruction must stay optional"
+            "generic {state} reconstruction can remain absent"
         );
     }
 }
@@ -772,9 +770,19 @@ fn borrowed_verification_retains_mailbox_character_and_prepared_evidence_bounds(
             [&operation.mailbox_identity],
         )
         .unwrap();
-    for field in ["encoder", "validity", "selected-from"] {
+    for field in [
+        "empty-encoder",
+        "long-encoder",
+        "space-encoder",
+        "unicode-encoder",
+        "validity",
+        "selected-from",
+    ] {
         match field {
-            "encoder" => reconstruction.encoder_version = 999,
+            "empty-encoder" => reconstruction.encoder.clear(),
+            "long-encoder" => reconstruction.encoder = "x".repeat(129),
+            "space-encoder" => reconstruction.encoder = "mail builder/1.0.0".into(),
+            "unicode-encoder" => reconstruction.encoder = "mail-builder/東京".into(),
             "validity" => reconstruction.uid_validity = 0,
             "selected-from" => reconstruction.selected_from_sha256 = None,
             _ => unreachable!(),

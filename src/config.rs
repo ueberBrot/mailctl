@@ -1,4 +1,4 @@
-//! Versioned operator configuration. Parsing validates authority and resource ceilings.
+//! Operator configuration. Parsing validates authority and resource ceilings.
 use crate::{domain::Error, policy::Profile};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -313,7 +313,6 @@ struct RawGrant {
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct Config {
-    pub version: u32,
     pub default_grant: String,
     pub topology: Topology,
     pub state_dir: PathBuf,
@@ -325,7 +324,6 @@ pub struct Config {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
-    version: u32,
     #[serde(default = "default_grant")]
     default_grant: String,
     #[serde(default)]
@@ -347,21 +345,12 @@ impl Config {
             return Err(invalid());
         }
         let raw: RawConfig = toml::from_str(input).map_err(|_| {
-            // Future layouts may not decode as RawConfig. Preserve their version
-            // guidance while parsing a healthy configuration only once.
-            #[derive(Deserialize)]
-            struct SchemaVersion {
-                version: u32,
-            }
-            match toml::from_str::<SchemaVersion>(input) {
-                Ok(schema) if schema.version != 1 => Error::incompatible_schema(),
-                _ if obsolete_runtime_capacity(input) => Error::obsolete_runtime_capacity(),
-                _ => invalid(),
+            if obsolete_runtime_capacity(input) {
+                Error::obsolete_runtime_capacity()
+            } else {
+                invalid()
             }
         })?;
-        if raw.version != 1 {
-            return Err(Error::incompatible_schema());
-        }
         raw.limits.validate()?;
         let grants = raw
             .grants
@@ -378,7 +367,6 @@ impl Config {
             })
             .collect::<Result<_, Error>>()?;
         let config = Self {
-            version: raw.version,
             default_grant: raw.default_grant,
             topology: raw.topology,
             state_dir: raw.state_dir,
@@ -391,9 +379,6 @@ impl Config {
         Ok(config)
     }
     pub fn validate(&self) -> Result<(), Error> {
-        if self.version != 1 {
-            return Err(Error::incompatible_schema());
-        }
         self.limits.validate()?;
         if !safe_path(&self.state_dir)
             || self.export_roots.len() > 32

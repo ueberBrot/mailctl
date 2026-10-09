@@ -7,7 +7,6 @@ mod imap_support;
 fn config() -> mailctl::config::Config {
     mailctl::config::Config::parse(&format!(
         r#"
-version = 1
 default_grant = "reader"
 state_dir = {state}
 [[accounts]]
@@ -57,7 +56,7 @@ fn search_normalizes_and_terms_without_turning_repeated_fields_into_or() {
     let operation: Operation = serde_json::from_value(json!({
         "operation": "search_messages",
         "input": {
-            "mailbox": "mb1.fixture",
+            "mailbox": "mb.fixture",
             "criteria": [
                 {"field":"subject", "value":"second"},
                 {"field":"received_after", "date":"2024-02-29"},
@@ -546,7 +545,7 @@ async fn imap_normalizes_envelopes_and_marks_missing_or_malformed_optional_metad
     assert_eq!(good["message_id"]["value"], "<fixture@example.test>");
     assert_eq!(good["size"], 100);
     assert_eq!(good["flags"], json!(["\\Flagged", "\\Seen"]));
-    assert!(good["reference"].as_str().unwrap().starts_with("ms1."));
+    assert!(good["reference"].as_str().unwrap().starts_with("ms."));
     fixture.task.await.unwrap();
 }
 

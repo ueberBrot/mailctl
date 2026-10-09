@@ -10,8 +10,7 @@ use std::sync::Arc;
 
 fn config() -> Config {
     Config::parse(&format!(
-        r#"version = 1
-default_grant = "reader"
+        r#"default_grant = "reader"
 state_dir = {state}
 [[accounts]]
 key = "work"
@@ -288,7 +287,6 @@ async fn all_folder_reads_work_and_resources_cannot_widen_a_restricted_grant() {
             text: "abcdefgh".into(),
             selected_part: Some("1".into()),
             source_media_type: Some("text/plain".into()),
-            representation_version: "fixture-1".into(),
             converted: false,
             replacements: false,
             truncated: false,

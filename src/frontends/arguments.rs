@@ -153,7 +153,7 @@ pub(super) struct Options {
     /// Narrow accounts by exact alias; repeat to select more than one.
     #[arg(long = "account", global = true)]
     pub accounts: Vec<String>,
-    /// Write one versioned JSON result to stdout; diagnostics remain on stderr.
+    /// Write one JSON result to stdout; diagnostics remain on stderr.
     #[arg(long, global = true)]
     pub json: bool,
     #[command(flatten)]
@@ -204,9 +204,10 @@ outside installation state. Keep the complete private snapshot, including its
 manifest, unchanged. It preserves the journal, reference key, account history,
 configuration, and reconstruction metadata. Back up credentials separately through
 their configured source; callers must retain operation identities and draft input.
-Run verify before replacing binaries. Unknown schemas and unsupported prepared
-encoders fail safely. This unreleased package uses registry schema 2, journal
-schema 3, and encoder 2; earlier development formats have no automatic migration.
+Run verify before replacing binaries. Unknown history formats and malformed prepared
+records fail safely. Prepared records with verified frozen facts can be reencoded
+after dependency updates on retry before dispatch. Incompatible history formats
+have no automatic migration.
 Preserve incompatible files and use a compatible executable for offline inspection.
 
 RESTORE
@@ -229,7 +230,7 @@ A coherent rollback of all local state cannot be detected without an external
 witness. Checksums and successful verification do not prove history is current.
 
 Only after complete, independently supported recovery: run state verify, record
-the evidence outside the installation, restore drafts.initialized from ! to 2 if
+the evidence outside the installation, restore drafts.initialized from ! to r if
 needed, and durably remove drafts.suspended before restarting. Keep recovery copies.
 If completeness cannot be established, keep creation suspended. There is no agent
 journal editor or force-retry command. If every suspension write fails and files

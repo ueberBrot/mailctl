@@ -9,7 +9,6 @@ mod imap_support;
 fn config() -> mailctl::config::Config {
     mailctl::config::Config::parse(&format!(
         r#"
-version = 1
 default_grant = "reader"
 state_dir = {state}
 [[accounts]]
@@ -121,7 +120,6 @@ fn body(text: &str) -> BodyText {
         text: text.into(),
         selected_part: Some("1".into()),
         source_media_type: Some("text/plain".into()),
-        representation_version: "fixture-1".into(),
         converted: false,
         replacements: false,
         truncated: false,
@@ -333,12 +331,6 @@ async fn application_reads_short_body_without_fetching_large_attachment() {
         };
         assert_eq!(result.body.text, "Short body.\r\n");
         assert_eq!(result.body.selected_part.as_deref(), Some("1"));
-        assert!(
-            result
-                .body
-                .representation_version
-                .contains("html2text-0.17.1")
-        );
         assert!(!result.body.truncated);
         fixture.task.await.unwrap();
     }
@@ -623,11 +615,10 @@ async fn text_cursors_reject_tampering_and_changes_after_fresh_authorization() {
             .code,
         ErrorCode::StaleCursor
     );
-    for change in ["content", "version", "part", "media", "validity", "missing"] {
+    for change in ["content", "part", "media", "validity", "missing"] {
         let mut changed = original.clone();
         match change {
             "content" => changed.text = "b🦀éxyz".into(),
-            "version" => changed.representation_version = "fixture-2".into(),
             "part" => changed.selected_part = Some("2".into()),
             "media" => changed.source_media_type = Some("text/html".into()),
             _ => {}

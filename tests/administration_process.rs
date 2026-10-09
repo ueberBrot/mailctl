@@ -218,7 +218,7 @@ fn setup_guidance_is_actionable_without_a_sibling_executable() {
 }
 
 #[test]
-fn unsupported_configuration_and_state_versions_preserve_established_identities() {
+fn unknown_configuration_and_state_fields_preserve_established_identities() {
     for executable in executables() {
         let installation = Installation::two_accounts();
         assert_success(&run_bounded({
@@ -233,11 +233,7 @@ fn unsupported_configuration_and_state_versions_preserve_established_identities(
             .unwrap()
             .join("state/accounts.json");
         let state = std::fs::read(&state_path).unwrap();
-        let unsupported = original.replacen(
-            "version = 1",
-            "version = 999\nfuture_schema_field = true",
-            1,
-        );
+        let unsupported = format!("unknown_field = true\n{original}");
         std::fs::write(installation.config(), &unsupported).unwrap();
         let output = run_bounded({
             let mut command = installation.command(executable);
@@ -249,7 +245,7 @@ fn unsupported_configuration_and_state_versions_preserve_established_identities(
             envelope(&output)["error"]["message"]
                 .as_str()
                 .unwrap()
-                .contains("compatible")
+                .contains("setup subcommand")
         );
         assert_eq!(std::fs::read(&state_path).unwrap(), state);
         assert_eq!(
@@ -258,7 +254,6 @@ fn unsupported_configuration_and_state_versions_preserve_established_identities(
         );
         std::fs::write(installation.config(), &original).unwrap();
         let mut future_state: serde_json::Value = serde_json::from_slice(&state).unwrap();
-        future_state["version"] = serde_json::json!(999);
         future_state["future_schema_field"] = serde_json::json!(true);
         let future_state = serde_json::to_vec(&future_state).unwrap();
         std::fs::write(&state_path, &future_state).unwrap();
@@ -272,7 +267,7 @@ fn unsupported_configuration_and_state_versions_preserve_established_identities(
             envelope(&output)["error"]["message"]
                 .as_str()
                 .unwrap()
-                .contains("compatible")
+                .contains("setup subcommand")
         );
         assert_eq!(std::fs::read(&state_path).unwrap(), future_state);
         assert_eq!(
@@ -287,7 +282,7 @@ fn setup_rejects_an_oversized_replacement_without_changing_configuration() {
     for executable in executables() {
         let installation = Installation::two_accounts();
         let mut text = format!(
-            "version = 1\nstate_dir = {}\n",
+            "state_dir = {}\n",
             support::toml_string(&installation.config().parent().unwrap().join("state")),
         );
         let labels = (0..816)

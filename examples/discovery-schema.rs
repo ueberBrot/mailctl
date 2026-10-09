@@ -1,4 +1,4 @@
-//! Print the versioned discovery contract for consuming applications.
+//! Print the discovery contract for consuming applications.
 use mailctl::{
     domain::{
         AccountDiscovery, Capabilities, Envelope, Health, ListAccountsInput, ListMailboxesInput,

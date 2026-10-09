@@ -105,7 +105,6 @@ impl BodyBackend for MemoryBodies {
                     text: body.text[range].into(),
                     selected_part: body.selected_part.clone(),
                     source_media_type: body.source_media_type.clone(),
-                    representation_version: body.representation_version.clone(),
                     converted: body.converted,
                     replacements: body.replacements,
                     empty_reason: body.empty_reason,
@@ -152,7 +151,7 @@ impl Service {
             ErrorCode::StaleReference
         };
         let reference: MessageReference =
-            self.decode("ms1", &input.message, limits.token_bytes, stale)?;
+            self.decode("ms", &input.message, limits.token_bytes, stale)?;
         let name = mailbox_identity(&reference.mailbox);
         let target @ MailboxTarget {
             account_id: id,
@@ -167,7 +166,7 @@ impl Service {
             .as_ref()
             .map(|token| {
                 let cursor: TextCursor =
-                    self.decode("bt1", token, limits.token_bytes, ErrorCode::StaleCursor)?;
+                    self.decode("bt", token, limits.token_bytes, ErrorCode::StaleCursor)?;
                 if cursor.resource != resource || cursor.limits != limit_fingerprint {
                     return Err(Error::new(ErrorCode::StaleCursor));
                 }
@@ -216,7 +215,7 @@ impl Service {
             .continuation
             .map(|position| {
                 self.encode(
-                    "bt1",
+                    "bt",
                     &TextCursor {
                         resource,
                         limits: limit_fingerprint,

@@ -79,8 +79,8 @@ impl Service {
             return Err(invalid());
         }
         let (signed, tag) = token.rsplit_once('.').ok_or_else(invalid)?;
-        let (version, payload) = signed.split_once('.').ok_or_else(invalid)?;
-        if version != kind {
+        let (token_kind, payload) = signed.split_once('.').ok_or_else(invalid)?;
+        if token_kind != kind {
             return Err(invalid());
         }
         let mut signature = [0; 32];
@@ -108,7 +108,7 @@ mod tests {
     #[test]
     fn token_encoding_allocates_only_the_payload_and_complete_token() {
         let config = crate::config::Config::parse(&format!(
-            "version = 1\nstate_dir = {}\naccounts = []\n[[grants]]\nname = 'default'\naccounts = []\n",
+            "state_dir = {}\naccounts = []\n[[grants]]\nname = 'default'\naccounts = []\n",
             serde_json::to_string(&std::env::temp_dir().join("mailctl-token-test")).unwrap()
         ))
         .unwrap();
@@ -130,22 +130,22 @@ mod tests {
                 uid: 4,
             };
             let payload = serde_json::to_vec(&reference).unwrap();
-            let signed = format!("msg1.{}", URL_SAFE_NO_PAD.encode(&payload));
+            let signed = format!("msg.{}", URL_SAFE_NO_PAD.encode(&payload));
             let key = hmac::Key::new(hmac::HMAC_SHA256, service.registry.reference_key());
             let tag = hmac::sign(&key, signed.as_bytes());
             let expected = format!("{signed}.{}", URL_SAFE_NO_PAD.encode(tag.as_ref()));
             let mut token = None;
             let measured = allocation_counter::measure(|| {
-                token = Some(service.encode("msg1", &reference, 8192).unwrap());
+                token = Some(service.encode("msg", &reference, 8192).unwrap());
             });
             assert_eq!(token.as_deref(), Some(expected.as_str()));
             assert_eq!(
-                service.encode("msg1", &reference, expected.len()).unwrap(),
+                service.encode("msg", &reference, expected.len()).unwrap(),
                 expected
             );
             assert_eq!(
                 service
-                    .encode("msg1", &reference, expected.len() - 1)
+                    .encode("msg", &reference, expected.len() - 1)
                     .unwrap_err()
                     .code,
                 ErrorCode::ResponseTooLarge

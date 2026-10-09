@@ -211,7 +211,7 @@ impl Service {
             .as_ref()
             .map(|reference| {
                 self.decode(
-                    "mb1",
+                    "mb",
                     reference,
                     limits.token_bytes,
                     ErrorCode::StaleReference,
@@ -249,7 +249,7 @@ impl Service {
         let cursor: Option<Cursor> = input
             .cursor
             .as_ref()
-            .map(|cursor| self.decode("mc1", cursor, limits.token_bytes, ErrorCode::StaleCursor))
+            .map(|cursor| self.decode("mc", cursor, limits.token_bytes, ErrorCode::StaleCursor))
             .transpose()?;
         if cursor.as_ref().is_some_and(|cursor| {
             cursor.account != id || cursor.generation != generation || cursor.scope != scope
@@ -339,7 +339,7 @@ impl Service {
             None
         } else {
             Some(self.encode(
-                "mc1",
+                "mc",
                 &Cursor {
                     account: id,
                     generation,
@@ -360,7 +360,7 @@ impl Service {
             budget.count(&metadata)?;
             budget.count(&metadata.name)?;
             let reference = self.encode(
-                "mb1",
+                "mb",
                 &Reference {
                     account: id,
                     generation,

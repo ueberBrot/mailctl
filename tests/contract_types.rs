@@ -24,6 +24,10 @@ const _: for<'a> fn(&'a Service, &RequestContext) -> Result<&'a mailctl::config:
     Service::limits;
 const _: fn(Envelope<AccountDiscovery>) -> Result<AccountDiscovery, Error> = Envelope::into_result;
 const _: fn(Envelope<Capabilities>) -> Result<Capabilities, Error> = Envelope::into_result;
+const _: fn(mailctl::draft_journal::DraftReconstruction) = |frozen| {
+    let _: String = frozen.encoder;
+    let _: [u8; 32] = frozen.facts_sha256;
+};
 const _: fn(OperationResult) = |result| match result {
     OperationResult::Draft(value) => {
         let _: Option<String> = value.message_reference;

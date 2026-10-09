@@ -59,6 +59,23 @@ fn foreground_session_authenticates_without_echo_or_persistent_credentials() {
 }
 
 #[test]
+fn session_prompt_uses_byte_reads_and_restores_zero_minimum_terminal_settings() {
+    let (installation, mut server) = installation();
+    server.expect("work@example.test", "disposable-password");
+    let result = invoke_terminal(
+        &installation,
+        &server,
+        &["--interactive", "doctor", "--check-account"],
+        json!({"secret": "disposable-password", "read_minimum": 0, "read_timeout": 0}),
+    );
+    assert_prompt(&result, 0);
+    assert_eq!(result["read_minimum"], 0);
+    assert_eq!(result["read_timeout"], 0);
+    assert!(result["output"].as_str().unwrap().contains("authenticated"));
+    server.finish();
+}
+
+#[test]
 fn session_prompt_edits_utf8_characters_and_clears_input() {
     let (installation, mut server) = installation();
     for input in [

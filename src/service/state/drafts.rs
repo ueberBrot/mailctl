@@ -26,7 +26,7 @@ pub(super) fn initialize(directory: &Path) -> Result<(), Error> {
     )
     .map_err(|_| unavailable())?;
     let _journal = DraftJournal::open(&path).map_err(|_| unavailable())?;
-    crate::file_storage::replace(&directory.join(MARKER), b"2").map_err(|_| unavailable())
+    crate::file_storage::replace(&directory.join(MARKER), b"r").map_err(|_| unavailable())
 }
 fn unavailable() -> Error {
     Error::new(ErrorCode::JournalUnavailable)
@@ -122,7 +122,7 @@ impl DraftHistory {
             crate::file_storage::read(&directory.join(MARKER), 8)
                 .map_err(|_| unavailable())?
                 .as_deref(),
-            Some(b"2" | b"!")
+            Some(b"r" | b"!")
         ) || !directory.join(JOURNAL).exists()
         {
             let _ = Recovery::Suspended.persist(directory);

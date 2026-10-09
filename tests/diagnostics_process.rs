@@ -281,7 +281,7 @@ fn invalid_configuration_payloads_stay_private_and_schema_guidance_survives() {
             let _: Value = serde_json::from_str(line).unwrap();
         }
     }
-    std::fs::write(installation.config(), "version = 999\n").unwrap();
+    std::fs::write(installation.config(), "unknown_field = true\n").unwrap();
     let mut command = installation.cli();
     command.args(["--log-format", "json", "account", "list"]);
     let output = support::run_bounded(command);
@@ -290,6 +290,6 @@ fn invalid_configuration_payloads_stay_private_and_schema_guidance_survives() {
         serde_json::from_str(stderr.lines().find(|line| line.starts_with('{')).unwrap()).unwrap();
     assert_eq!(
         event["message"],
-        mailctl::domain::Error::incompatible_schema().message
+        mailctl::domain::Error::setup_required().message
     );
 }

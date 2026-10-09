@@ -10,6 +10,7 @@
 use crate::draft::DraftMessageIdentity;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::{
+    borrow::Cow,
     fmt,
     path::Path,
     time::{Duration, Instant},
@@ -17,8 +18,6 @@ use std::{
 use uuid::Uuid;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-const SCHEMA_VERSION: i64 = 3;
-const FACTS_VERSION: u32 = 3;
 
 pub use crate::domain::DraftIdentity as DraftOperationIdentity;
 
@@ -46,15 +45,74 @@ pub struct DraftReconstruction {
     #[serde(default)]
     pub selected_from_sha256: Option<[u8; 32]>,
     pub date_unix: i64,
-    pub encoder_version: u32,
+    /// Dependency provenance of the retained MIME encoding.
+    pub encoder: String,
     /// Encoder-independent integrity check of the operation's frozen facts.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub facts_sha256: Option<[u8; 32]>,
+    pub facts_sha256: [u8; 32],
 }
 
 impl DraftReconstruction {
+    pub(crate) fn encoder_is_valid(&self) -> bool {
+        self.borrowed().encoder_is_valid()
+    }
+
+    fn borrowed(&self) -> BorrowedReconstruction<'_> {
+        BorrowedReconstruction {
+            uid_validity: self.uid_validity,
+            input_sha256: self.input_sha256,
+            from_configuration_sha256: self.from_configuration_sha256,
+            selected_from_sha256: self.selected_from_sha256,
+            date_unix: self.date_unix,
+            encoder: Cow::Borrowed(&self.encoder),
+            facts_sha256: self.facts_sha256,
+        }
+    }
+
     /// Stable integrity fingerprint of the frozen facts, excluding MIME encoding.
     pub fn fingerprint(
+        &self,
+        identity: &DraftOperationIdentity,
+        mailbox: &str,
+    ) -> Result<[u8; 32], DraftJournalError> {
+        self.borrowed().fingerprint(identity, mailbox)
+    }
+}
+
+// Dispatch verification scans retained history without owning its text fields.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BorrowedReconstruction<'a> {
+    uid_validity: u32,
+    input_sha256: [u8; 32],
+    from_configuration_sha256: [u8; 32],
+    #[serde(default)]
+    selected_from_sha256: Option<[u8; 32]>,
+    date_unix: i64,
+    #[serde(borrow)]
+    encoder: Cow<'a, str>,
+    facts_sha256: [u8; 32],
+}
+
+impl BorrowedReconstruction<'_> {
+    fn encoder_is_valid(&self) -> bool {
+        !self.encoder.is_empty()
+            && self.encoder.len() <= 128
+            && self.encoder.bytes().all(|byte| byte.is_ascii_graphic())
+    }
+
+    fn into_owned(self) -> DraftReconstruction {
+        DraftReconstruction {
+            uid_validity: self.uid_validity,
+            input_sha256: self.input_sha256,
+            from_configuration_sha256: self.from_configuration_sha256,
+            selected_from_sha256: self.selected_from_sha256,
+            date_unix: self.date_unix,
+            encoder: self.encoder.into_owned(),
+            facts_sha256: self.facts_sha256,
+        }
+    }
+
+    fn fingerprint(
         &self,
         identity: &DraftOperationIdentity,
         mailbox: &str,
@@ -62,7 +120,7 @@ impl DraftReconstruction {
         // Keep this format fixed across encoder and reconstruction changes.
         crate::encoding::json_sha256(
             &(
-                "mailctl-draft-facts-1",
+                "mailctl-draft-facts",
                 identity.account_id,
                 identity.account_generation,
                 identity.operation_id,
@@ -190,9 +248,6 @@ impl DraftJournal {
             };
         let mut connection = Connection::open_with_flags(path, flags).map_err(unavailable)?;
         connection.busy_timeout(busy_timeout).map_err(unavailable)?;
-        let version: i64 = connection
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .map_err(unavailable)?;
         let tables: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_schema WHERE type IN ('table', 'index', 'trigger', 'view')",
@@ -200,10 +255,10 @@ impl DraftJournal {
                 |row| row.get(0),
             )
             .map_err(unavailable)?;
-        match (version, tables) {
-            (0, 0) if initialize => initialize_schema(&mut connection)?,
-            (SCHEMA_VERSION, _) if schema_is_current(&connection)? => {}
-            _ => return Err(DraftJournalError::InvalidDatabase),
+        if tables == 0 && initialize {
+            initialize_schema(&mut connection)?;
+        } else if !schema_is_current(&connection)? {
+            return Err(DraftJournalError::InvalidDatabase);
         }
 
         let journal_mode: String = connection
@@ -271,29 +326,21 @@ impl DraftJournal {
                 return Err(DraftJournalError::Unavailable);
             }
             let operation = decode_row(database_row(row)?)?;
+            // Damaged historical identities can otherwise make retries look new.
+            if let Some(frozen) = operation.reconstruction.as_ref()
+                && (!frozen.encoder_is_valid()
+                    || frozen.fingerprint(&operation.identity, operation.mailbox_identity)?
+                        != frozen.facts_sha256)
+            {
+                return Err(DraftJournalError::InvalidOperation);
+            }
             if operation.state == DraftOperationState::Prepared {
                 let frozen = operation
                     .reconstruction
                     .as_ref()
                     .ok_or(DraftJournalError::InvalidOperation)?;
-                if !(1..=crate::draft::ENCODER_VERSION).contains(&frozen.encoder_version)
-                    || frozen.uid_validity == 0
-                    || frozen.selected_from_sha256.is_none()
-                {
+                if frozen.uid_validity == 0 || frozen.selected_from_sha256.is_none() {
                     return Err(DraftJournalError::InvalidOperation);
-                }
-                match frozen.facts_sha256 {
-                    Some(expected)
-                        if frozen
-                            .fingerprint(&operation.identity, operation.mailbox_identity)?
-                            != expected =>
-                    {
-                        return Err(DraftJournalError::InvalidOperation);
-                    }
-                    None if frozen.encoder_version >= FACTS_VERSION => {
-                        return Err(DraftJournalError::InvalidOperation);
-                    }
-                    _ => {}
                 }
             }
         }
@@ -383,11 +430,12 @@ impl DraftJournal {
             .reconstruction
             .as_ref()
             .ok_or(DraftJournalError::InvalidOperation)?;
-        if !(1..crate::draft::ENCODER_VERSION).contains(&frozen.encoder_version)
+        if !frozen.encoder_is_valid()
+            || frozen.encoder == crate::draft::ENCODER
             || frozen.uid_validity == 0
             || frozen.selected_from_sha256.is_none()
             || frozen.facts_sha256
-                != Some(frozen.fingerprint(&expected.identity, &expected.mailbox_identity)?)
+                != frozen.fingerprint(&expected.identity, &expected.mailbox_identity)?
         {
             return Err(DraftJournalError::InvalidOperation);
         }
@@ -406,7 +454,7 @@ impl DraftJournal {
         let mut operation = prior.operation;
         operation.content_sha256 = content_sha256;
         let frozen = operation.reconstruction.as_mut().unwrap();
-        frozen.encoder_version = crate::draft::ENCODER_VERSION;
+        frozen.encoder = crate::draft::ENCODER.into();
         let changed = transaction
             .execute(
                 "UPDATE draft_operations SET content_sha256 = ?4, reconstruction = ?5
@@ -629,7 +677,6 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), DraftJournalErro
                     ),
                     PRIMARY KEY (account_id, account_generation, operation_id)
                 );
-                PRAGMA user_version = 3;
             ",
         )
         .map_err(unavailable)?;
@@ -750,7 +797,7 @@ struct DecodedRow<'row> {
     identity: DraftOperationIdentity,
     mailbox_identity: &'row str,
     content_sha256: [u8; 32],
-    reconstruction: Option<DraftReconstruction>,
+    reconstruction: Option<BorrowedReconstruction<'row>>,
     state: DraftOperationState,
 }
 impl DecodedRow<'_> {
@@ -760,7 +807,7 @@ impl DecodedRow<'_> {
                 identity: self.identity,
                 mailbox_identity: self.mailbox_identity.into(),
                 content_sha256: self.content_sha256,
-                reconstruction: self.reconstruction,
+                reconstruction: self.reconstruction.map(BorrowedReconstruction::into_owned),
             },
             state: self.state,
         }

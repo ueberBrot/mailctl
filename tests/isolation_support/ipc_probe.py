@@ -53,7 +53,7 @@ if mode in ("hold", "initialization-timeout", "null-hello", "account-hello", "un
     connection.connect(path)
 if mode in ("hold", "null-hello", "account-hello", "unauthorized-hello"):
     accounts = b'["work"]' if mode == "account-hello" else b"null"
-    hello = (b'{"type":"hello","version":1,"narrowing":'
+    hello = (b'{"type":"hello","narrowing":'
              b'{"read_only":false,"accounts":' + accounts + b"}}")
     try:
         connection.sendall(struct.pack(">I", len(hello)) + hello)

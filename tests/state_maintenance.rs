@@ -9,7 +9,9 @@ fn component_upgrade_verification_refuses_unknown_schema_without_replacing_histo
     Service::verify_state(&config).unwrap();
     let path = config.state_dir.join("drafts.sqlite");
     let database = rusqlite::Connection::open(&path).unwrap();
-    database.execute_batch("PRAGMA user_version = 999").unwrap();
+    database
+        .execute_batch("ALTER TABLE draft_operations ADD COLUMN unsupported TEXT;")
+        .unwrap();
     drop(database);
     let before = std::fs::read(&path).unwrap();
     assert_eq!(
@@ -98,7 +100,7 @@ fn restore_rejects_incomplete_tampered_and_foreign_snapshots_before_mutation() {
 }
 
 #[test]
-fn restore_reports_incompatible_registry_layout_before_mutation() {
+fn restore_rejects_unknown_registry_layout_before_mutation() {
     use sha2::{Digest, Sha256};
 
     for future_layout in [false, true] {
@@ -110,9 +112,9 @@ fn restore_reports_incompatible_registry_layout_before_mutation() {
         Service::backup(&config, &source).unwrap();
         let before = std::fs::read(config.state_dir.join("accounts.json")).unwrap();
         let mut registry: serde_json::Value = serde_json::from_slice(&before).unwrap();
-        registry["version"] = 999.into();
+        registry["unknown_field"] = true.into();
         if future_layout {
-            registry = serde_json::json!({"version": 999, "future": {"layout": true}});
+            registry = serde_json::json!({"future": {"layout": true}});
         }
         let bytes = serde_json::to_vec(&registry).unwrap();
         std::fs::write(source.join("accounts.json"), &bytes).unwrap();
@@ -128,7 +130,7 @@ fn restore_reports_incompatible_registry_layout_before_mutation() {
 
         assert_eq!(
             Service::restore(&config, &source).unwrap_err(),
-            mailctl::domain::Error::incompatible_schema()
+            mailctl::domain::Error::setup_required()
         );
         assert_eq!(
             std::fs::read(config.state_dir.join("accounts.json")).unwrap(),

@@ -120,7 +120,6 @@ async fn mcp_discovery_is_compact_and_output_schemas_validate_wire_results() {
         let envelope = support::assert_mcp_envelope(response);
         validator.validate(&envelope).unwrap();
         for (field, invalid) in [
-            ("schema_version", json!(2)),
             ("request_id", json!(42)),
             ("ok", json!("true")),
             ("fixture_extra_field", json!(true)),
@@ -134,7 +133,6 @@ async fn mcp_discovery_is_compact_and_output_schemas_validate_wire_results() {
             );
         }
         let malformed = json!({
-            "schema_version": 1,
             "request_id": "fixture",
             "ok": true,
             "result": 42
@@ -495,7 +493,6 @@ async fn standalone_mcp_negotiates_schemas_and_applies_configured_grant_scope() 
         .expect("call discovery");
     assert_eq!(response.is_error, Some(false));
     let envelope = response.structured_content.unwrap();
-    assert_eq!(envelope["schema_version"], 1);
     assert_eq!(envelope["ok"], true);
     assert_eq!(envelope["result"]["accounts"].as_array().unwrap().len(), 2);
 

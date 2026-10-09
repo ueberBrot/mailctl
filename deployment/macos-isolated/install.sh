@@ -220,7 +220,7 @@ install_artifact mailctl-isolated
 install_artifact mailctl
 install_artifact mailctl-mcp
 
-/usr/bin/printf '{\n  "version": 1,\n  "service_uid": %s,\n  "socket": "%s",\n  "callers": [\n    {"uid": %s, "grant": "isolated"}\n  ]\n}\n' \
+/usr/bin/printf '{\n  "service_uid": %s,\n  "socket": "%s",\n  "callers": [\n    {"uid": %s, "grant": "isolated"}\n  ]\n}\n' \
   "$SERVICE_UID" "$SOCKET_PATH" "$CALLER_UID" >"$ROUTE_TEMP"
 /usr/bin/install -o root -g wheel -m 0644 "$ROUTE_TEMP" "$ROUTE_PATH"
 /bin/chmod -N "$ROUTE_PATH"

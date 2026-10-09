@@ -115,7 +115,6 @@ fn changed_registry_bytes_preserve_semantic_equality_and_corruption_errors() {
 
     for fault in [
         "historical_route",
-        "future_version",
         "future_layout",
         "invalid_json",
         "duplicate_identity",
@@ -132,13 +131,9 @@ fn changed_registry_bytes_preserve_semantic_equality_and_corruption_errors() {
                     "changed.example.test".into();
                 Error::new(ErrorCode::OperationConflict)
             }
-            "future_version" => {
-                registry["version"] = 999.into();
-                Error::incompatible_schema()
-            }
             "future_layout" => {
-                registry = serde_json::json!({"version": 999, "future": {"layout": true}});
-                Error::incompatible_schema()
+                registry = serde_json::json!({"future": {"layout": true}});
+                Error::setup_required()
             }
             "duplicate_identity" => {
                 registry["accounts"]["personal"]["account_id"] =

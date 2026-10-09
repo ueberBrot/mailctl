@@ -1,7 +1,7 @@
 use crate::credentials::{Secret, SourceError};
 use rustix::{
     fs::{OFlags, fcntl_getfl, fcntl_setfl},
-    termios::{LocalModes, OptionalActions, Termios, tcgetattr, tcsetattr},
+    termios::{LocalModes, OptionalActions, SpecialCodeIndex, Termios, tcgetattr, tcsetattr},
 };
 use std::{
     fs::File,
@@ -95,6 +95,8 @@ pub(super) async fn prompt(maximum: usize) -> Result<Secret, SourceError> {
     quiet
         .local_modes
         .remove(LocalModes::ECHO | LocalModes::ECHONL | LocalModes::ICANON);
+    quiet.special_codes[SpecialCodeIndex::VMIN] = 1;
+    quiet.special_codes[SpecialCodeIndex::VTIME] = 0;
     let flags = fcntl_getfl(&input).map_err(|_| SourceError::InteractionRequired)?;
     fcntl_setfl(&input, flags | OFlags::NONBLOCK).map_err(|_| SourceError::InteractionRequired)?;
     let input = match AsyncFd::try_with_interest(input, Interest::READABLE) {

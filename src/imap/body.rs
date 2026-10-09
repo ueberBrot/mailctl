@@ -66,7 +66,6 @@ pub struct BodyPage {
     pub text: String,
     pub selected_part: Option<String>,
     pub source_media_type: Option<String>,
-    pub representation_version: &'static str,
     pub converted: bool,
     pub replacements: bool,
     pub truncated: bool,
@@ -74,7 +73,7 @@ pub struct BodyPage {
     pub metrics: Metrics,
 }
 
-const REPRESENTATION: &str = "mailctl-body-1/mail-parser-0.11.9/html2text-0.17.1";
+const REPRESENTATION: &str = "mailctl-body/mail-parser-0.11.9/html2text-0.17.1";
 
 impl super::AuthenticatedConnection {
     pub async fn read_body(
@@ -236,7 +235,6 @@ async fn read_selected(
         },
         selected_part,
         source_media_type: selected.map(|s| s.media_type),
-        representation_version: REPRESENTATION,
         converted,
         replacements,
         truncated: continuation.is_some(),

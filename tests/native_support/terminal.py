@@ -19,6 +19,12 @@ if pid == 0:
             _, status = os.waitpid(worker, 0)
             os._exit(os.waitstatus_to_exitcode(status))
         os.setpgid(0, 0)
+    if "read_minimum" in request or "read_timeout" in request:
+        attributes = termios.tcgetattr(sys.stdin.fileno())
+        for name, index in (("read_minimum", termios.VMIN), ("read_timeout", termios.VTIME)):
+            if name in request:
+                attributes[6][index] = request[name]
+        termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, attributes)
     os.environ.update(request.get("environment", {}))
     os.execv(request["command"][0], request["command"])
 
@@ -63,14 +69,21 @@ finally:
             _, child_status = os.waitpid(pid, 0)
         status = child_status
     try:
-        echo_enabled = bool(termios.tcgetattr(terminal)[3] & termios.ECHO)
+        attributes = termios.tcgetattr(terminal)
+        echo_enabled = bool(attributes[3] & termios.ECHO)
+        read_minimum, read_timeout = (
+            value if isinstance(value, int) else value[0]
+            for value in (attributes[6][termios.VMIN], attributes[6][termios.VTIME])
+        )
     except termios.error:
         echo_enabled = None
+        read_minimum = read_timeout = None
     os.close(terminal)
 
 text = output.decode("utf-8", "replace")
 json.dump({"exit": os.waitstatus_to_exitcode(status), "prompted": prompted,
            "echo_during_prompt": echo_during_prompt,
            "echo_enabled": echo_enabled,
+           "read_minimum": read_minimum, "read_timeout": read_timeout,
            "secret_disclosed": bool(request.get("secret")) and request["secret"] in text,
            "output": text}, sys.stdout)

@@ -236,7 +236,6 @@ async fn html_preserves_inert_link_targets_and_quotes_without_active_content() {
     assert!(!page.text.contains("active-secret"));
     assert!(!page.text.contains("style-secret"));
     assert!(page.converted);
-    assert!(page.representation_version.contains("html2text-0.17.1"));
     assert!(page.metrics.decode_steps > body.len());
 }
 

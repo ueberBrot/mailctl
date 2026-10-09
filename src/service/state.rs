@@ -69,7 +69,6 @@ impl Generation {
 #[derive(Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct Registry {
-    version: u32,
     draft_history_initialized: bool,
     installation: String,
     installation_key: [u8; 32],
@@ -81,7 +80,6 @@ impl Registry {
         let mut installation_key = [0; 32];
         getrandom::fill(&mut installation_key).map_err(|_| invalid())?;
         Ok(Self {
-            version: 2,
             draft_history_initialized: false,
             installation: Uuid::new_v4().to_string(),
             installation_key,
@@ -90,9 +88,6 @@ impl Registry {
         })
     }
     fn validate(&self) -> Result<(), Error> {
-        if self.version != 2 {
-            return Err(Error::incompatible_schema());
-        }
         if Uuid::parse_str(&self.installation).is_err()
             || self.installation_key == [0; 32]
             || self.configuration_revision.len() != 64
@@ -438,19 +433,7 @@ fn registry_digest(bytes: &[u8]) -> [u8; 32] {
 }
 
 fn decode_registry(bytes: &[u8]) -> Result<Registry, Error> {
-    let registry: Registry = serde_json::from_slice(bytes).map_err(|_| {
-        // A future layout may not deserialize as Registry. Read its version only
-        // on failure, retaining the upgrade guidance without scanning healthy
-        // retained history twice on every request.
-        #[derive(Deserialize)]
-        struct SchemaVersion {
-            version: u32,
-        }
-        match serde_json::from_slice::<SchemaVersion>(bytes) {
-            Ok(schema) if schema.version != 2 => Error::incompatible_schema(),
-            _ => invalid(),
-        }
-    })?;
+    let registry: Registry = serde_json::from_slice(bytes).map_err(|_| invalid())?;
     registry.validate()?;
     Ok(registry)
 }

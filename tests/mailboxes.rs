@@ -12,8 +12,7 @@ use std::sync::Arc;
 
 fn config() -> Config {
     Config::parse(&format!(
-        r#"version = 1
-default_grant = "reader"
+        r#"default_grant = "reader"
 state_dir = {state}
 [[accounts]]
 key = "work"

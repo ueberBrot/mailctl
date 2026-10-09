@@ -19,8 +19,7 @@ fn execute(
 }
 
 fn configuration() -> String {
-    r#"version = 1
-default_grant = "reader"
+    r#"default_grant = "reader"
 topology = "native"
 state_dir = "/tmp/mailctl-contract-state"
 [[accounts]]
@@ -302,10 +301,12 @@ fn discovery_and_health_exclude_private_routing_and_authentication_claims() {
 }
 
 #[test]
-fn configuration_rejects_unknown_fields_versions_and_unsafe_values() {
+fn configuration_rejects_unknown_fields_and_unsafe_values() {
     for (old, new) in [
-        ("version = 1", "version = 2"),
-        ("version = 1", "version = 1\nunknown = true"),
+        (
+            "default_grant = \"reader\"",
+            "default_grant = \"reader\"\nunknown = true",
+        ),
         (
             "source = \"native\"",
             "source = \"native\"\npassword = \"fixture-secret\"",
@@ -789,10 +790,10 @@ fn narrowing_rejects_oversized_scopes_while_deserializing() {
 fn wire_envelopes_reject_invalid_discriminators_and_mixed_outcomes() {
     use mailctl::domain::{AccountDiscovery, Envelope};
     for text in [
-        r#"{"schema_version":2,"request_id":"one","ok":true,"result":{"accounts":[],"complete":true}}"#,
-        r#"{"schema_version":1,"request_id":"one","ok":false,"result":{"accounts":[],"complete":true}}"#,
-        r#"{"schema_version":1,"request_id":"one","ok":true,"result":{"accounts":[],"complete":true},"error":{"code":"invalid_request","message":"Invalid request","retryable":false}}"#,
-        r#"{"schema_version":1,"request_id":"one","ok":true}"#,
+        r#"{"request_id":"one","ok":"true","result":{"accounts":[],"complete":true}}"#,
+        r#"{"request_id":"one","ok":false,"result":{"accounts":[],"complete":true}}"#,
+        r#"{"request_id":"one","ok":true,"result":{"accounts":[],"complete":true},"error":{"code":"invalid_request","message":"Invalid request","retryable":false}}"#,
+        r#"{"request_id":"one","ok":true}"#,
     ] {
         assert!(
             serde_json::from_str::<Envelope<AccountDiscovery>>(text).is_err(),

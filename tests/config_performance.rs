@@ -7,9 +7,8 @@ use std::fmt::Write;
 fn configuration() -> String {
     let state_dir =
         serde_json::to_string(&std::env::temp_dir().join("mailctl-config-performance")).unwrap();
-    let mut input = format!(
-        "version = 1\ndefault_grant = 'reader'\nstate_dir = {state_dir}\n[limits]\naccounts = 256\n",
-    );
+    let mut input =
+        format!("default_grant = 'reader'\nstate_dir = {state_dir}\n[limits]\naccounts = 256\n",);
     for account in 0..256 {
         writeln!(input, "[[accounts]]\nkey = 'account-{account}'\nalias = 'account-{account}'\nserver = 'imap.example.test'\nusername = 'synthetic-{account}@example.test'\nfrom_identities = [").unwrap();
         for identity in 0..100 {
@@ -53,20 +52,15 @@ fn valid_config_parsing_stays_within_the_allocation_budget() {
 }
 
 #[test]
-fn config_parse_fast_path_preserves_version_and_migration_error_precedence() {
+fn config_parse_fast_path_rejects_unknown_fields_and_preserves_migration_guidance() {
     let input = configuration();
-    let future = input.replacen("version = 1", "version = 999", 1).replacen(
-        "accounts = 256",
-        "accounts = 0",
-        1,
-    );
-    for future in [
-        future,
-        String::from("version = 999\nfuture_layout = true\n"),
+    for invalid in [
+        format!("unknown_field = true\n{input}"),
+        String::from("unknown_field = true\n"),
     ] {
-        let error = Config::parse(&future).unwrap_err();
-        assert_eq!(error.code, Error::incompatible_schema().code);
-        assert_eq!(error.message, Error::incompatible_schema().message);
+        let error = Config::parse(&invalid).unwrap_err();
+        assert_eq!(error.code, Error::setup_required().code);
+        assert_eq!(error.message, Error::setup_required().message);
     }
     let legacy = input.replacen("[limits]\n", "[limits]\nruntime_slots = 1\n", 1);
     let error = Config::parse(&legacy).unwrap_err();

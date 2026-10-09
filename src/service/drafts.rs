@@ -358,16 +358,13 @@ impl Service {
                 if prior.state != DraftOperationState::Prepared {
                     return self.draft_receipt(prior, limits);
                 }
-                if !(1..=crate::draft::ENCODER_VERSION).contains(&frozen.encoder_version) {
+                if !frozen.encoder_is_valid() {
                     return Err(Error::new(ErrorCode::UnsupportedCapability));
                 }
-                let expected = frozen
-                    .facts_sha256
-                    .ok_or_else(|| Error::new(ErrorCode::UnsupportedCapability))?;
                 if frozen
                     .fingerprint(&prior.operation.identity, &prior.operation.mailbox_identity)
                     .map_err(journal_error)?
-                    != expected
+                    != frozen.facts_sha256
                 {
                     return Err(Error::draft_conflict());
                 }
@@ -417,11 +414,11 @@ impl Service {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_err(|_| Error::new(ErrorCode::InternalError))?
                     .as_secs() as i64,
-                encoder_version: crate::draft::ENCODER_VERSION,
-                facts_sha256: None,
+                encoder: crate::draft::ENCODER.into(),
+                facts_sha256: [0; 32],
             },
         };
-        let reencoding = frozen.encoder_version != crate::draft::ENCODER_VERSION;
+        let reencoding = frozen.encoder != crate::draft::ENCODER;
         let mime = crate::draft::PreparedDraft::compose(
             crate::draft::DraftInput {
                 from,
@@ -486,7 +483,7 @@ impl Service {
                     ..frozen
                 };
                 if prior.is_none() {
-                    frozen.facts_sha256 = Some(frozen.fingerprint(&identity, mailbox)?);
+                    frozen.facts_sha256 = frozen.fingerprint(&identity, mailbox)?;
                 }
                 journal.prepare_with_limit(
                     PreparedDraftOperation {
@@ -760,7 +757,7 @@ impl Service {
                 appended_message: uid,
             } => self
                 .encode(
-                    "ms1",
+                    "ms",
                     &super::tokens::MessageReference {
                         account: &*operation
                             .identity

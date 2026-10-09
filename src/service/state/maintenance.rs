@@ -12,7 +12,6 @@ use std::{fs, fs::OpenOptions, io::Read};
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Manifest {
-    version: u32,
     files: BTreeMap<String, String>,
 }
 
@@ -120,8 +119,8 @@ pub(in crate::service) fn backup(
         for name in names {
             files.insert(name.into(), digest(&destination.join(name))?);
         }
-        let manifest = crate::encoding::serialize_bounded(&Manifest { version: 1, files }, 4096)
-            .map_err(|_| invalid())?;
+        let manifest =
+            crate::encoding::serialize_bounded(&Manifest { files }, 4096).map_err(|_| invalid())?;
         // A missing manifest identifies an incomplete snapshot after a crash.
         file_storage::replace(&destination.join("manifest.json"), &manifest)
             .map_err(|_| invalid())?;
@@ -181,9 +180,6 @@ pub(in crate::service) fn restore(
             .ok_or_else(invalid)?,
     )
     .map_err(|_| invalid())?;
-    if manifest.version != 1 {
-        return Err(Error::incompatible_schema());
-    }
     for (name, expected) in &manifest.files {
         if ![
             "accounts.json",
@@ -249,7 +245,7 @@ pub(in crate::service) fn restore(
             let _ = fs::remove_file(&temporary);
         }
         result?;
-        file_storage::replace(&maintenance.directory.join("drafts.initialized"), b"2")
+        file_storage::replace(&maintenance.directory.join("drafts.initialized"), b"r")
             .map_err(|_| invalid())?;
     }
     storage::persist(&maintenance.directory, &registry_bytes)?;

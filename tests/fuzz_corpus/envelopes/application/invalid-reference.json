@@ -1,1 +1,1 @@
-{"operation":"get_message","input":{"message":"msg1.fixture-private-content","cursor":"fixture-secret-canary"}}
+{"operation":"get_message","input":{"message":"msg.fixture-private-content","cursor":"fixture-secret-canary"}}

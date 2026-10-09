@@ -58,7 +58,7 @@ impl Service {
             return Err(Error::input_limit("limit", limits.search_page));
         }
         let reference: Reference = self.decode(
-            "mb1",
+            "mb",
             &input.mailbox,
             limits.token_bytes,
             ErrorCode::StaleReference,
@@ -80,7 +80,7 @@ impl Service {
         let cursor: Option<Cursor> = input
             .cursor
             .as_ref()
-            .map(|cursor| self.decode("sc1", cursor, limits.token_bytes, ErrorCode::StaleCursor))
+            .map(|cursor| self.decode("sc", cursor, limits.token_bytes, ErrorCode::StaleCursor))
             .transpose()?;
         if cursor.as_ref().is_some_and(|cursor| {
             cursor.account != id
@@ -123,7 +123,7 @@ impl Service {
             None
         } else {
             Some(self.encode(
-                "sc1",
+                "sc",
                 &Cursor {
                     account: id,
                     generation,
@@ -143,7 +143,7 @@ impl Service {
         for message in batch.messages {
             budget.count(&message.metadata)?;
             let reference = self.encode(
-                "ms1",
+                "ms",
                 &MessageReference {
                     account: id,
                     generation,

@@ -5,7 +5,6 @@ mod imap_support;
 fn config() -> mailctl::config::Config {
     mailctl::config::Config::parse(&format!(
         r#"
-version = 1
 default_grant = "reader"
 state_dir = {state}
 [[accounts]]
@@ -451,7 +450,7 @@ async fn metadata_lists_reusable_part_references_without_payload_reads() {
         Some("large.bin")
     );
     assert_eq!(list.attachments[0].media_type, "application/octet-stream");
-    assert!(list.attachments[0].reference.starts_with("at1."));
+    assert!(list.attachments[0].reference.starts_with("at."));
     fixture.task.await.unwrap();
 }
 
@@ -632,6 +631,118 @@ fn small_config() -> mailctl::config::Config {
     config.limits.transfers_per_account = 1;
     config.grants[0].limits.transfers_per_account = 1;
     config
+}
+
+#[tokio::test]
+async fn attachment_listing_budgets_actual_references_instead_of_the_token_ceiling() {
+    let mut configuration = config();
+    configuration.limits.token_bytes = 8192;
+    configuration.grants[0].limits.token_bytes = 8192;
+    let backend = Arc::new(mailctl::service::MemoryAttachments::default());
+    backend.set(
+        "work",
+        "INBOX",
+        77,
+        4,
+        (1..=8)
+            .map(|part| {
+                (
+                    mailctl::imap::AttachmentMetadata {
+                        part: part.to_string(),
+                        filename: Some(format!("fixture-{part}.bin")),
+                        media_type: "application/octet-stream".into(),
+                        declared_size: Some(1),
+                        available: true,
+                    },
+                    vec![b'x'],
+                )
+            })
+            .collect(),
+    );
+    let (service, message) = setup(configuration, backend).await;
+    let context = service
+        .context("reader", &Default::default())
+        .unwrap()
+        .with_response_limit(16 * 1024);
+    let list = || operation("list_attachments", json!({"message":message}));
+    let result = service.execute(&context, list()).await.unwrap();
+    let actual_bytes = serde_json::to_vec(&result).unwrap().len();
+    assert!(actual_bytes < 8 * 1024);
+    let OperationResult::Attachments(listed) = result else {
+        panic!()
+    };
+    assert_eq!(listed.attachments.len(), 8);
+    assert!(
+        listed
+            .attachments
+            .iter()
+            .all(|entry| entry.reference.len() < 512)
+    );
+    assert_eq!(
+        service
+            .execute(&context.with_response_limit(actual_bytes + 511), list())
+            .await
+            .unwrap_err()
+            .code,
+        mailctl::domain::ErrorCode::ResponseTooLarge
+    );
+}
+
+#[tokio::test]
+async fn attachment_chunks_budget_actual_progress_and_release_rejected_transfers() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use mailctl::domain::AttachmentProgress;
+
+    let mut configuration = small_config();
+    configuration.limits.token_bytes = 8192;
+    configuration.grants[0].limits.token_bytes = 8192;
+    let (service, message) = setup(configuration, memory()).await;
+    let context = service
+        .context("reader", &Default::default())
+        .unwrap()
+        .with_response_limit(3072);
+    let reference = attachment_reference(&service, &context, &message).await;
+    let get = || operation("get_attachment", json!({"attachment":reference}));
+    let mut request = get();
+    let mut first_size = None;
+    for (offset, bytes) in [(0, b"ab"), (2, b"cd"), (4, b"ef")] {
+        let result = service.execute(&context, request).await.unwrap();
+        first_size.get_or_insert_with(|| serde_json::to_vec(&result).unwrap().len());
+        let OperationResult::Attachment(chunk) = result else {
+            panic!()
+        };
+        assert_eq!(chunk.decoded_offset, offset);
+        assert_eq!(STANDARD.decode(chunk.bytes_base64).unwrap(), bytes);
+        request = match chunk.progress {
+            AttachmentProgress::Continue { next_token } => {
+                assert!(offset < 4);
+                operation("get_attachment", json!({"token":next_token}))
+            }
+            AttachmentProgress::Complete {
+                total_decoded_bytes,
+                ..
+            } => {
+                assert_eq!(offset, 4);
+                assert_eq!(total_decoded_bytes, 6);
+                get()
+            }
+        };
+    }
+    assert_eq!(
+        service
+            .execute(
+                &context
+                    .clone()
+                    .with_response_limit(first_size.unwrap() + 511),
+                get()
+            )
+            .await
+            .unwrap_err()
+            .code,
+        mailctl::domain::ErrorCode::ResponseTooLarge
+    );
+    // The failed start must release the single account slot before another start.
+    let _token = start(&service, &context, &reference).await;
 }
 #[tokio::test]
 async fn scope_session_replay_expiry_and_session_drop_preserve_account_quota() {

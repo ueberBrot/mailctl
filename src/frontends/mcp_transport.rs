@@ -13,6 +13,7 @@ use rmcp::{
 use std::{
     collections::{HashMap, hash_map::Entry},
     io,
+    pin::Pin,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -30,6 +31,16 @@ type Pending = Arc<Mutex<HashMap<rmcp::model::RequestId, PendingRequest>>>;
 struct PendingRequest {
     _permit: OwnedSemaphorePermit,
     cancellation: RequestCancellation,
+}
+
+struct DeferredRequest {
+    request: rmcp::model::JsonRpcRequest<ClientRequest>,
+    expires: Instant,
+}
+
+struct RejectedRequest {
+    send: Pin<Box<dyn Future<Output = io::Result<()>> + Send>>,
+    _control: OwnedSemaphorePermit,
 }
 
 #[derive(Clone)]
@@ -73,25 +84,43 @@ impl Bounds {
                 Self::reservations(input, envelope, limits.accounts, draft_mime, schema_bytes);
             control + request <= available
         };
-        // Keep room for useful discovery responses before maximizing input.
-        // Maximizing draft input against a 1 KiB envelope otherwise consumes
-        // the budget and rejects ordinary capabilities on a default grant.
+        if !fits(1024, 1024) {
+            return Err(Error::setup_required());
+        }
+        // Draft bodies and search predicates can expand sixfold in JSON.
+        let input_limit = limits.envelope_bytes.min(if drafts {
+            6 * limits.draft_mime_bytes + 256 * 1024
+        } else {
+            1024 * 1024
+        });
+        // Retain full search arguments while making room for large discovery
+        // results. Opaque references use a JSON-safe alphabet; the remaining
+        // space covers predicate wrappers and ordinary JSON-RPC metadata.
+        let reserved_input = if drafts {
+            1024
+        } else {
+            largest_fitting(
+                1024,
+                input_limit.min(6 * 32 * 4096 + 2 * limits.token_bytes + 4096),
+                |candidate| fits(candidate, 1024),
+            )
+        };
+        // Draft composition keeps input priority while reserving enough output
+        // for ordinary capabilities. Read-only sessions also accommodate large
+        // configured account inventories within the same fixed byte budget.
         let reserved_envelope = largest_fitting(
             1024,
-            response_bound.min(limits.envelope_bytes).min(64 * 1024),
-            |candidate| fits(1024, candidate),
-        );
-        // Draft bodies and search predicates can expand sixfold in JSON.
-        // Reserve bounded input and composition storage before sizing responses.
-        let input = largest_fitting(
-            1024,
-            limits.envelope_bytes.min(if drafts {
-                6 * limits.draft_mime_bytes + 256 * 1024
+            response_bound.min(limits.envelope_bytes).min(if drafts {
+                64 * 1024
             } else {
-                1024 * 1024
+                4 * 1024 * 1024
             }),
-            |candidate| fits(candidate, reserved_envelope),
+            |candidate| fits(reserved_input, candidate),
         );
+        // Reserve bounded input and composition storage before sizing responses.
+        let input = largest_fitting(1024, input_limit, |candidate| {
+            fits(candidate, reserved_envelope)
+        });
         let envelope = largest_fitting(0, response_bound.min(limits.envelope_bytes), |candidate| {
             fits(input, candidate)
         });
@@ -144,7 +173,9 @@ impl Bounds {
         // tighter generic estimate for small frames.
         let control_input = (272 * input).min(12 * input + 4 * 1024 * 1024);
         let request_input = (128 * input).min(4 * input + 2 * 1024 * 1024);
-        let control = control_input + 2 * output + 2 * output.min(2 * 1024 * 1024);
+        // One decoded request may wait for admission while the decoder continues
+        // handling cancellation and other control traffic independently.
+        let control = control_input + request_input + 2 * output + 2 * output.min(2 * 1024 * 1024);
         // The input/metadata survives to output completion. Domain-to-Value
         // conversion holds at most two copies of field bytes; Value plus text
         // holds at most three, including String capacity growth.
@@ -176,6 +207,8 @@ pub(super) struct BoundedStdio<W: AsyncWrite = tokio::io::Stdout> {
     receive_expires: Instant,
     initializing: bool,
     staged: Option<(RxJsonRpcMessage<RoleServer>, OwnedSemaphorePermit)>,
+    deferred: Option<DeferredRequest>,
+    rejected: Option<RejectedRequest>,
 }
 
 async fn forward_bounded_input(
@@ -245,6 +278,39 @@ impl<W: AsyncWrite + Unpin + Send + 'static> BoundedStdio<W> {
             receive_expires: Instant::now() + bounds.deadline,
             initializing: true,
             staged: None,
+            deferred: None,
+            rejected: None,
+        }
+    }
+
+    fn receive_deadline(&self) -> Instant {
+        self.deferred
+            .as_ref()
+            .map_or(self.receive_expires, |request| {
+                self.receive_expires.min(request.expires)
+            })
+    }
+
+    fn admit_request(
+        &self,
+        mut request: rmcp::model::JsonRpcRequest<ClientRequest>,
+        permit: OwnedSemaphorePermit,
+    ) -> Option<RxJsonRpcMessage<RoleServer>> {
+        let mut pending = self.pending.lock().ok()?;
+        match pending.entry(request.id.clone()) {
+            Entry::Vacant(entry) => {
+                let cancellation = RequestCancellation::new();
+                request
+                    .request
+                    .extensions_mut()
+                    .insert(cancellation.clone());
+                entry.insert(PendingRequest {
+                    _permit: permit,
+                    cancellation,
+                });
+                Some(JsonRpcMessage::Request(request))
+            }
+            Entry::Occupied(_) => None,
         }
     }
 }
@@ -304,20 +370,66 @@ impl<W: AsyncWrite + Unpin + Send + 'static> Transport<RoleServer> for BoundedSt
     }
     async fn receive(&mut self) -> Option<RxJsonRpcMessage<RoleServer>> {
         loop {
-            // This parsing uses the permanent control reservation. Transfer ownership
-            // to a request reservation before returning to the SDK's task scheduler.
-            // Notifications retain it in SDK extensions through their handler's return,
-            // so a flood cannot accumulate detached notification tasks. This permit is
-            // independent of request saturation; acquire it before consuming any input.
+            let expires = self.receive_deadline();
+            if let Some(rejected) = &mut self.rejected {
+                // SDK select can interrupt receive while output is partially
+                // written. Retain this single control response until completion.
+                timeout_at(expires, &mut rejected.send).await.ok()?.ok()?;
+                self.rejected = None;
+            }
+            if self
+                .deferred
+                .as_ref()
+                .is_some_and(|request| request.expires <= Instant::now())
+            {
+                return None;
+            }
+            // Process decoded control traffic before admitting its canceled
+            // request, but keep older waiting work ahead of fresh requests.
+            if self
+                .staged
+                .as_ref()
+                .is_none_or(|(item, _)| matches!(item, JsonRpcMessage::Request(_)))
+                && self.deferred.is_some()
+            {
+                match self.slots.clone().try_acquire_owned() {
+                    Ok(permit) => {
+                        let request = self.deferred.take()?.request;
+                        return self.admit_request(request, permit);
+                    }
+                    Err(tokio::sync::TryAcquireError::NoPermits) => {}
+                    Err(tokio::sync::TryAcquireError::Closed) => return None,
+                }
+            }
+            // Decode/control storage is independent of request saturation.
+            // Notifications keep its permit through their SDK handler's return,
+            // so a flood cannot accumulate detached notification tasks.
             if self.staged.is_none() {
-                let control = self.control.clone().acquire_owned().await.ok()?;
-                // SDK receive is cancellation-safe; keep the same deadline when the SDK
-                // service loop interrupts it to send a response.
-                let item = timeout_at(self.receive_expires, self.sdk.receive())
-                    .await
-                    .ok()??;
-                self.receive_expires = Instant::now() + self.deadline;
-                self.staged = Some((item, control));
+                let slots = self.slots.clone();
+                let control = self.control.clone();
+                let waiting = self.deferred.is_some();
+                let input = async {
+                    let control = control.acquire_owned().await.ok()?;
+                    // Keep the deadline and SDK decoder scratch across select
+                    // interruption by outgoing responses or released admission.
+                    let item = timeout_at(expires, self.sdk.receive()).await.ok()??;
+                    Some((item, control))
+                };
+                tokio::select! {
+                    biased;
+                    permit = timeout_at(expires, slots.acquire_owned()), if waiting => {
+                        let permit = permit.ok()?.ok()?;
+                        let request = self.deferred.take()?.request;
+                        return self.admit_request(request, permit);
+                    }
+                    item = input => {
+                        self.staged = Some(item?);
+                        self.receive_expires = Instant::now() + self.deadline;
+                    }
+                }
+                // Released admission belongs to the oldest waiting request,
+                // including when a fresh frame was decoded at the same time.
+                continue;
             }
             let (item, _) = self.staged.as_mut()?;
             if let JsonRpcMessage::Notification(notification) = item
@@ -338,38 +450,74 @@ impl<W: AsyncWrite + Unpin + Send + 'static> Transport<RoleServer> for BoundedSt
                 self.staged.take();
                 continue;
             }
+            if let JsonRpcMessage::Notification(notification) = item
+                && let ClientNotification::CancelledNotification(notification) =
+                    &notification.notification
+                && self.deferred.as_ref().is_some_and(|request| {
+                    notification.params.request_id.as_ref() == Some(&request.request.id)
+                })
+            {
+                // This request has never reached a handler or provider.
+                self.deferred = None;
+                self.staged.take();
+                continue;
+            }
             if let JsonRpcMessage::Request(request) = item {
                 if self.initializing {
                     match &request.request {
                         ClientRequest::InitializeRequest(_) => self.initializing = false,
                         ClientRequest::PingRequest(_) => {}
-                        // Newer SDKs also support initialization through per-request
-                        // metadata; this server pins the 2025 initialize lifecycle.
+                        // This server uses the pinned initialize lifecycle.
                         _ => return None,
                     }
                 }
-                // A peer can receive a response before its send future releases the
-                // request reservation. Keep this one decoded request in the control
-                // reservation while waiting; SDK select cancellation must not lose it.
-                let permit = timeout_at(self.receive_expires, self.slots.clone().acquire_owned())
-                    .await
-                    .ok()?
-                    .ok()?;
-                let mut pending = self.pending.lock().ok()?;
-                match pending.entry(request.id.clone()) {
-                    Entry::Vacant(entry) => {
-                        let cancellation = RequestCancellation::new();
-                        request
-                            .request
-                            .extensions_mut()
-                            .insert(cancellation.clone());
-                        entry.insert(PendingRequest {
-                            _permit: permit,
-                            cancellation,
-                        });
-                    }
-                    Entry::Occupied(_) => return None,
+                // Never correlate an overload response with an admitted or waiting ID.
+                if self.pending.lock().ok()?.contains_key(&request.id)
+                    || self
+                        .deferred
+                        .as_ref()
+                        .is_some_and(|waiting| waiting.request.id == request.id)
+                {
+                    return None;
                 }
+                let permit = if self.deferred.is_none() {
+                    match self.slots.clone().try_acquire_owned() {
+                        Ok(permit) => Some(permit),
+                        Err(tokio::sync::TryAcquireError::NoPermits) => None,
+                        Err(tokio::sync::TryAcquireError::Closed) => return None,
+                    }
+                } else {
+                    None
+                };
+                let (JsonRpcMessage::Request(request), control) = self.staged.take()? else {
+                    unreachable!();
+                };
+                if let Some(permit) = permit {
+                    return self.admit_request(request, permit);
+                }
+                if self.deferred.is_none() {
+                    self.deferred = Some(DeferredRequest {
+                        request,
+                        expires: self.receive_expires,
+                    });
+                    drop(control);
+                    continue;
+                }
+                // Keep one waiting request without blocking cancellation. Only
+                // further excess requests need a response from the control budget.
+                let response = TxJsonRpcMessage::<RoleServer>::error(
+                    rmcp::model::ErrorData::new(
+                        rmcp::model::ErrorCode(-32000),
+                        "Request capacity exhausted",
+                        Some(serde_json::json!({"code": "rate_limited"})),
+                    ),
+                    Some(request.id),
+                );
+                self.rejected = Some(RejectedRequest {
+                    send: Box::pin(self.sdk.send(response)),
+                    _control: control,
+                });
+                continue;
             }
             let (mut item, control) = self.staged.take()?;
             if let JsonRpcMessage::Notification(notification) = &mut item {
@@ -383,6 +531,8 @@ impl<W: AsyncWrite + Unpin + Send + 'static> Transport<RoleServer> for BoundedSt
     }
     async fn close(&mut self) -> io::Result<()> {
         self.ingress.abort();
+        // A paused rejection can own the SDK writer lock while output is blocked.
+        self.rejected = None;
         self.sdk.close().await
     }
 }
@@ -401,6 +551,330 @@ mod tests {
     };
     use serde_json::json;
     use tokio::io::{AsyncBufReadExt, BufReader};
+
+    fn one_request_bounds() -> Bounds {
+        Bounds {
+            input: 4096,
+            envelope: 1024,
+            output: 32 * 1024,
+            requests: 1,
+            nesting: 32,
+            deadline: Duration::from_secs(2),
+        }
+    }
+
+    #[tokio::test]
+    async fn discovery_budget_retains_maximally_escaped_search_arguments() {
+        let limits = Limits {
+            accounts: 40,
+            ..Limits::default()
+        };
+        let bounds = Bounds::new(&limits, limits.envelope_bytes, false, 64 * 1024).unwrap();
+        let arguments = json!({
+            "mailbox": "m".repeat(limits.token_bytes),
+            "cursor": "c".repeat(limits.token_bytes),
+            "criteria": (0..32)
+                .map(|_| json!({"field": "subject", "value": "\u{1}".repeat(4096)}))
+                .collect::<Vec<_>>(),
+            "limit": 200,
+        });
+        serde_json::from_value::<crate::domain::SearchMessagesInput>(arguments.clone()).unwrap();
+        let mut request = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0",
+            "id": "i".repeat(1024),
+            "method": "tools/call",
+            "params": {"name": "email_search_messages", "arguments": arguments},
+        }))
+        .unwrap();
+        request.push(b'\n');
+        let (input, mut writer) = tokio::io::duplex(8192);
+        let sending = tokio::spawn(async move { writer.write_all(&request).await.unwrap() });
+        let mut transport =
+            BoundedStdio::with_io(bounds, CancellationToken::new(), input, tokio::io::sink());
+        transport.initializing = false;
+        assert!(matches!(
+            timeout(Duration::from_secs(2), transport.receive())
+                .await
+                .unwrap(),
+            Some(JsonRpcMessage::Request(_)),
+        ));
+        sending.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn duplicate_ids_do_not_reject_or_release_an_admitted_request() {
+        let mut transport = BoundedStdio::with_io(
+            one_request_bounds(),
+            CancellationToken::new(),
+            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n".as_slice(),
+            tokio::io::sink(),
+        );
+        transport.initializing = false;
+        assert!(transport.receive().await.is_some());
+        assert!(transport.receive().await.is_none());
+        assert_eq!(transport.slots.available_permits(), 0);
+        assert!(transport.rejected.is_none());
+        let pending = transport.pending.lock().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(pending.contains_key(&RequestId::Number(1)));
+    }
+
+    #[tokio::test]
+    async fn duplicate_ids_do_not_reject_or_replace_a_waiting_request() {
+        let mut transport = BoundedStdio::with_io(
+            one_request_bounds(),
+            CancellationToken::new(),
+            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n".as_slice(),
+            tokio::io::sink(),
+        );
+        transport.initializing = false;
+        assert!(transport.receive().await.is_some());
+        assert!(transport.receive().await.is_none());
+        assert_eq!(transport.slots.available_permits(), 0);
+        assert!(transport.rejected.is_none());
+        assert_eq!(
+            transport.deferred.as_ref().unwrap().request.id,
+            RequestId::Number(2)
+        );
+        let pending = transport.pending.lock().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(pending.contains_key(&RequestId::Number(1)));
+    }
+
+    #[tokio::test]
+    async fn cancellation_drops_waiting_requests_before_dispatch() {
+        let (input, mut writer) = tokio::io::duplex(8192);
+        writer.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":2}}\n{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"ping\"}\n").await.unwrap();
+        let mut transport = BoundedStdio::with_io(
+            one_request_bounds(),
+            CancellationToken::new(),
+            input,
+            tokio::io::sink(),
+        );
+        transport.initializing = false;
+        assert!(transport.receive().await.is_some());
+        assert!(
+            timeout(Duration::from_millis(20), transport.receive())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            transport.deferred.as_ref().unwrap().request.id,
+            RequestId::Number(3)
+        );
+        assert!(transport.rejected.is_none());
+        transport
+            .send(TxJsonRpcMessage::<RoleServer>::response(
+                rmcp::model::ServerResult::empty(()),
+                RequestId::Number(1),
+            ))
+            .await
+            .unwrap();
+        let Some(JsonRpcMessage::Request(request)) = transport.receive().await else {
+            panic!("uncanceled waiting request remains usable");
+        };
+        assert_eq!(request.id, RequestId::Number(3));
+        let pending = transport.pending.lock().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(!pending.contains_key(&RequestId::Number(2)));
+    }
+
+    #[tokio::test]
+    async fn decoded_cancellation_precedes_admission_released_at_the_same_time() {
+        let (input, mut writer) = tokio::io::duplex(8192);
+        writer.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n").await.unwrap();
+        let mut transport = BoundedStdio::with_io(
+            one_request_bounds(),
+            CancellationToken::new(),
+            input,
+            tokio::io::sink(),
+        );
+        transport.initializing = false;
+        assert!(transport.receive().await.is_some());
+        assert!(
+            timeout(Duration::from_millis(20), transport.receive())
+                .await
+                .is_err()
+        );
+        // Reproduce SDK select interruption after decoding cancellation but
+        // before dispatching it, followed by an outgoing response releasing a slot.
+        let cancellation = serde_json::from_slice::<RxJsonRpcMessage<RoleServer>>(
+            b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":2}}",
+        ).unwrap();
+        transport.staged = Some((
+            cancellation,
+            transport.control.clone().try_acquire_owned().unwrap(),
+        ));
+        transport
+            .send(TxJsonRpcMessage::<RoleServer>::response(
+                rmcp::model::ServerResult::empty(()),
+                RequestId::Number(1),
+            ))
+            .await
+            .unwrap();
+        drop(writer);
+        assert!(
+            timeout(Duration::from_secs(2), transport.receive())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(transport.deferred.is_none());
+        assert!(transport.pending.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn control_notifications_do_not_extend_a_waiting_requests_deadline() {
+        let (input, mut writer) = tokio::io::duplex(8192);
+        writer.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n").await.unwrap();
+        let mut transport = BoundedStdio::with_io(
+            Bounds {
+                deadline: Duration::from_millis(100),
+                ..one_request_bounds()
+            },
+            CancellationToken::new(),
+            input,
+            tokio::io::sink(),
+        );
+        transport.initializing = false;
+        assert!(transport.receive().await.is_some());
+        assert!(
+            timeout(Duration::from_millis(20), transport.receive())
+                .await
+                .is_err()
+        );
+        let expires = transport.deferred.as_ref().unwrap().expires;
+        writer
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+            .await
+            .unwrap();
+        let notification = transport.receive().await.unwrap();
+        assert!(matches!(notification, JsonRpcMessage::Notification(_)));
+        drop(notification);
+        assert_eq!(transport.deferred.as_ref().unwrap().expires, expires);
+        assert!(transport.receive_expires > expires);
+        tokio::time::sleep_until(expires).await;
+        assert!(
+            timeout(Duration::from_millis(20), transport.receive())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupted_overload_output_resumes_once_before_later_cancellation() {
+        let (output, reader) = tokio::io::duplex(1);
+        let mut transport = BoundedStdio::with_io(
+            one_request_bounds(),
+            CancellationToken::new(),
+            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"ping\"}\n{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":1}}\n{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":2}}\n".as_slice(),
+            output,
+        );
+        transport.initializing = false;
+        assert!(transport.receive().await.is_some());
+        let cancellation = transport.pending.lock().unwrap()[&RequestId::Number(1)]
+            .cancellation
+            .clone();
+        assert!(
+            timeout(Duration::from_millis(20), transport.receive())
+                .await
+                .is_err(),
+        );
+        assert!(transport.rejected.is_some());
+        assert!(!cancellation.0.is_cancelled());
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+        let (received, written) = timeout(Duration::from_secs(2), async {
+            tokio::join!(transport.receive(), reader.read_line(&mut line))
+        })
+        .await
+        .unwrap();
+        assert!(received.is_none());
+        assert!(written.unwrap() > 0);
+        let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(response["id"], 3);
+        assert_eq!(response["error"]["data"]["code"], "rate_limited");
+        assert!(transport.rejected.is_none());
+        assert!(transport.deferred.is_none());
+        assert!(cancellation.0.is_cancelled());
+        assert_eq!(transport.slots.available_permits(), 0);
+        drop(transport);
+        line.clear();
+        assert_eq!(reader.read_line(&mut line).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn closing_discards_a_blocked_overload_response_before_closing_the_writer() {
+        let (output, _reader) = tokio::io::duplex(1);
+        let mut transport = BoundedStdio::with_io(
+            one_request_bounds(),
+            CancellationToken::new(),
+            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"ping\"}\n".as_slice(),
+            output,
+        );
+        transport.initializing = false;
+        assert!(transport.receive().await.is_some());
+        assert!(
+            timeout(Duration::from_millis(20), transport.receive())
+                .await
+                .is_err(),
+        );
+        assert!(transport.rejected.is_some());
+        timeout(Duration::from_secs(1), transport.close())
+            .await
+            .expect("blocked rejection must not keep the writer mutex locked during close")
+            .unwrap();
+        assert!(transport.rejected.is_none());
+    }
+
+    #[tokio::test]
+    async fn sequential_requests_wait_for_started_output_to_release_admission() {
+        let (output, reader) = tokio::io::duplex(1);
+        let (input, mut writer) = tokio::io::duplex(8192);
+        writer.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n").await.unwrap();
+        let mut transport = BoundedStdio::with_io(
+            one_request_bounds(),
+            CancellationToken::new(),
+            input,
+            output,
+        );
+        transport.initializing = false;
+        assert!(transport.receive().await.is_some());
+        let mut send = Box::pin(transport.send(TxJsonRpcMessage::<RoleServer>::response(
+            rmcp::model::ServerResult::empty(()),
+            RequestId::Number(1),
+        )));
+        assert!(timeout(Duration::from_millis(20), &mut send).await.is_err(),);
+        assert!(
+            timeout(Duration::from_millis(20), transport.receive())
+                .await
+                .is_err(),
+        );
+        assert!(transport.deferred.is_some());
+        assert!(transport.rejected.is_none());
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+        let (sent, received, written) = timeout(Duration::from_secs(2), async {
+            tokio::join!(send, transport.receive(), reader.read_line(&mut line))
+        })
+        .await
+        .unwrap();
+        sent.unwrap();
+        assert!(written.unwrap() > 0);
+        let Some(JsonRpcMessage::Request(request)) = received else {
+            panic!("sequential request remains admitted");
+        };
+        assert_eq!(request.id, RequestId::Number(2));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&line).unwrap()["id"],
+            1,
+        );
+        assert!(transport.rejected.is_none());
+        let pending = transport.pending.lock().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(pending.contains_key(&RequestId::Number(2)));
+    }
 
     struct GatedRequests {
         entered: tokio::sync::mpsc::UnboundedSender<RequestId>,
@@ -437,18 +911,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn saturated_requests_do_not_hide_later_cancellation_notifications() {
+        let (client_io, server_io) = tokio::io::duplex(8192);
+        let (input, output) = tokio::io::split(server_io);
+        let transport = BoundedStdio::with_io(
+            one_request_bounds(),
+            CancellationToken::new(),
+            input,
+            output,
+        );
+        let slots = transport.slots.clone();
+        let (entered, mut entries) = tokio::sync::mpsc::unbounded_channel();
+        let (cancelled, mut cancellations) = tokio::sync::mpsc::unbounded_channel();
+        let cleanup = Arc::new(Semaphore::new(0));
+        let handler = GatedRequests {
+            entered,
+            cancelled,
+            cleanup: cleanup.clone(),
+        };
+        let serving = tokio::spawn(async move { handler.serve(transport).await.unwrap() });
+        let (reader, mut writer) = tokio::io::split(client_io);
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+        writer.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"saturation-test\",\"version\":\"1\"}}}\n").await.unwrap();
+        timeout(Duration::from_secs(2), reader.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        writer
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+            .await
+            .unwrap();
+        let server = timeout(Duration::from_secs(2), serving)
+            .await
+            .unwrap()
+            .unwrap();
+        writer.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"gated\"}}\n").await.unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(2), entries.recv())
+                .await
+                .unwrap(),
+            Some(RequestId::Number(1)),
+        );
+        // The excess request arrives before cancellation while the admitted
+        // handler cannot finish until it receives that cancellation.
+        writer.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"ping\"}\n{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":1}}\n").await.unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(1), cancellations.recv())
+                .await
+                .expect("saturation must leave the cancellation control path available"),
+            Some(RequestId::Number(1)),
+        );
+        assert_eq!(slots.available_permits(), 0);
+        line.clear();
+        timeout(Duration::from_secs(2), reader.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(response["id"], 3);
+        assert_eq!(response["error"]["data"]["code"], "rate_limited");
+        cleanup.add_permits(1);
+        line.clear();
+        timeout(Duration::from_secs(2), reader.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&line).unwrap()["id"],
+            2,
+        );
+        server.cancel().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn repeated_cancellation_retains_admission_until_cleanup_and_keeps_stdio_usable() {
         let (client_io, server_io) = tokio::io::duplex(8192);
         let (input, output) = tokio::io::split(server_io);
         let transport = BoundedStdio::with_io(
-            Bounds {
-                input: 4096,
-                envelope: 1024,
-                output: 32 * 1024,
-                requests: 1,
-                nesting: 32,
-                deadline: Duration::from_secs(2),
-            },
+            one_request_bounds(),
             CancellationToken::new(),
             input,
             output,
@@ -656,7 +1197,7 @@ mod tests {
     #[test]
     fn bounded_sdk_decoding_fits_the_input_reservation_for_large_strings_and_many_nodes() {
         for arguments in [
-            json!({"mailbox":"mb1.synthetic","criteria":vec![json!({"field":"text","value":"\u{1}".repeat(4096)});32]}),
+            json!({"mailbox":"mb.synthetic","criteria":vec![json!({"field":"text","value":"\u{1}".repeat(4096)});32]}),
             json!({"values":vec![json!({"a":0,"b":1});500]}),
         ] {
             let frame = serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"email_search_messages","arguments":arguments}})).unwrap();

@@ -198,7 +198,6 @@ impl From<crate::imap::BodyPage> for super::BodyRead {
                 text: page.text,
                 selected_part: page.selected_part,
                 source_media_type: page.source_media_type,
-                representation_version: page.representation_version.into(),
                 converted: page.converted,
                 replacements: page.replacements,
                 truncated: page.truncated,
@@ -426,7 +425,6 @@ mod tests {
     fn configuration() -> Config {
         Config::parse(&format!(
             r#"
-version = 1
 default_grant = "reader"
 state_dir = {state_dir}
 [[accounts]]

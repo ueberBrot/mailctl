@@ -92,7 +92,6 @@ impl Tokens {
                 text: "a🦀éxyz".into(),
                 selected_part: Some("1".into()),
                 source_media_type: Some("text/plain".into()),
-                representation_version: "fixture-1".into(),
                 converted: false,
                 replacements: false,
                 truncated: false,

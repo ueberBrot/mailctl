@@ -159,7 +159,6 @@ pub(super) fn result(request_id: &str, error: Option<&Error>) {
         let message = [
             Error::setup_required,
             Error::obsolete_runtime_capacity,
-            Error::incompatible_schema,
             Error::draft_conflict,
             #[cfg(feature = "mcp")]
             Error::mcp_response_limit_setup_required,

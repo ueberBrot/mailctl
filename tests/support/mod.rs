@@ -68,8 +68,7 @@ impl Installation {
         fs::write(
             &self.config,
             format!(
-                r#"version = 1
-default_grant = {default_grant:?}
+                r#"default_grant = {default_grant:?}
 state_dir = {state}
 
 [[accounts]]

@@ -41,7 +41,6 @@ pub struct BodyText {
     pub text: String,
     pub selected_part: Option<String>,
     pub source_media_type: Option<String>,
-    pub representation_version: String,
     pub converted: bool,
     pub replacements: bool,
     pub truncated: bool,

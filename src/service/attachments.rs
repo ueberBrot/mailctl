@@ -58,7 +58,7 @@ impl Service {
             return Err(super::denied());
         }
         let reference: MessageReference = self.decode(
-            "ms1",
+            "ms",
             &input.message,
             limits.token_bytes,
             ErrorCode::StaleReference,
@@ -95,15 +95,14 @@ impl Service {
         let attachments = entries
             .into_iter()
             .map(|entry| {
-                budget.reserve(128 + limits.token_bytes)?;
+                budget.reserve(128)?;
                 budget.count(&entry.filename)?;
                 budget.count(&entry.media_type)?;
+                let reference =
+                    self.encode("at", &(&reference, &entry.part), limits.token_bytes)?;
+                budget.count(&reference)?;
                 Ok(domain::AttachmentMetadata {
-                    reference: self.encode(
-                        "at1",
-                        &(&reference, &entry.part),
-                        limits.token_bytes,
-                    )?,
+                    reference,
                     display_name: entry.filename,
                     media_type: entry.media_type,
                     declared_size: entry.declared_size,
@@ -160,7 +159,7 @@ impl Service {
         let (reservation, mut entry) = match input {
             domain::GetAttachmentInput::Start(input) => {
                 let (resource, part): (MessageReference, String) = self.decode(
-                    "at1",
+                    "at",
                     &input.attachment,
                     limits.token_bytes,
                     ErrorCode::StaleReference,
@@ -202,7 +201,7 @@ impl Service {
             }
             domain::GetAttachmentInput::Continue(input) => {
                 let (session, id, offset): (Uuid, Uuid, u64) = self.decode(
-                    "tx1",
+                    "tx",
                     &input.token,
                     limits.token_bytes,
                     ErrorCode::TransferExpired,
@@ -261,7 +260,7 @@ impl Service {
         }
         let mut budget =
             crate::encoding::OutputBudget::new(context.response_limit().saturating_sub(512));
-        budget.reserve(512 + limits.token_bytes + page.bytes.len().div_ceil(3) * 4)?;
+        budget.reserve(512 + page.bytes.len().div_ceil(3) * 4)?;
         budget.count(&entry.reference)?;
         let progress = match page.integrity {
             Some(integrity) => domain::AttachmentProgress::Complete {
@@ -270,12 +269,13 @@ impl Service {
             },
             None => domain::AttachmentProgress::Continue {
                 next_token: self.encode(
-                    "tx1",
+                    "tx",
                     &(context.session_id(), reservation.id(), next_offset),
                     limits.token_bytes,
                 )?,
             },
         };
+        budget.count(&progress)?;
         let result = domain::AttachmentChunk {
             account_id: entry.resource.account.clone(),
             generation: entry.resource.generation,

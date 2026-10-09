@@ -183,7 +183,6 @@ mod tests {
     async fn download_fixture(bytes: Vec<u8>) -> (Application, GetAttachmentInput) {
         let config = Config::parse(&format!(
             r#"
-version = 1
 default_grant = "reader"
 state_dir = {state}
 [limits]

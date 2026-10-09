@@ -159,8 +159,7 @@ async fn application_case(service: &Service, input: &[u8], case: usize) -> Envel
         "application output exceeded in case {case}"
     );
     safe_output(&output, case);
-    let decoded: Envelope =
-        serde_json::from_slice(&output).expect("versioned application envelope");
+    let decoded: Envelope = serde_json::from_slice(&output).expect("application envelope");
     assert_eq!(decoded.is_success(), envelope.is_success());
     decoded
 }
@@ -387,13 +386,10 @@ mod mcp {
             .filter(|line| !line.is_empty())
         {
             let frame: Value = serde_json::from_slice(line).expect("SDK JSON-RPC output framing");
-            assert_eq!(
-                frame["jsonrpc"], "2.0",
-                "versioned SDK frame in case {case}"
-            );
+            assert_eq!(frame["jsonrpc"], "2.0", "SDK frame in case {case}");
             if let Some(envelope) = frame["result"].get("structuredContent") {
-                let _: Envelope<Value> = serde::Deserialize::deserialize(envelope)
-                    .expect("versioned normalized MCP envelope");
+                let _: Envelope<Value> =
+                    serde::Deserialize::deserialize(envelope).expect("normalized MCP envelope");
             }
         }
         for line in output

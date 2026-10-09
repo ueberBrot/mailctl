@@ -677,7 +677,7 @@ mod tests {
             "fixture did not run: {output}"
         );
         assert!(
-            !output.contains("\"schema_version\""),
+            !output.contains("\"request_id\""),
             "failed serialization must not emit a partial JSON envelope: {output}"
         );
     }
@@ -727,7 +727,6 @@ mod tests {
                     text: "x".repeat(size),
                     selected_part: Some("1".into()),
                     source_media_type: Some("text/plain".into()),
-                    representation_version: "1".into(),
                     converted: false,
                     replacements: false,
                     truncated: false,

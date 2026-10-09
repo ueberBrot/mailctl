@@ -76,7 +76,6 @@ pub(super) fn setup(
     let mut config = match &previous {
         Some(text) => Config::parse(text)?,
         None => Config {
-            version: 1,
             topology: Topology::Native,
             state_dir: if path == default_path() {
                 directories()?.in_data_dir("state")

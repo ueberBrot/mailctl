@@ -95,12 +95,6 @@ impl Error {
             )
         }
     }
-    pub fn incompatible_schema() -> Self {
-        Self::with_message(
-            ErrorCode::InvalidRequest,
-            "Unsupported configuration or state schema; install compatible CLI/MCP versions and restart active processes. Preserve existing configuration and history",
-        )
-    }
     pub fn setup_required() -> Self {
         Self::with_message(
             ErrorCode::InvalidRequest,
@@ -123,7 +117,7 @@ impl Error {
     pub fn new(code: ErrorCode) -> Self {
         let message = match code {
             ErrorCode::InvalidRequest => "Invalid request or configuration",
-            ErrorCode::ProtocolMismatch => "Unsupported protocol version",
+            ErrorCode::ProtocolMismatch => "Unexpected protocol message",
             ErrorCode::PermissionDenied
             | ErrorCode::AccountNotAllowed
             | ErrorCode::MailboxNotAllowed => "Access denied",
@@ -353,13 +347,11 @@ pub struct Envelope<T = OperationResult>(EnvelopeData<T>);
 #[serde(untagged, deny_unknown_fields)]
 enum EnvelopeData<T> {
     Success {
-        schema_version: Version1,
         request_id: String,
         ok: True,
         result: T,
     },
     Failure {
-        schema_version: Version1,
         request_id: String,
         ok: False,
         error: Error,
@@ -390,7 +382,6 @@ macro_rules! literal {
         }
     }
 }
-literal!(Version1, u32, 1u32, "integer");
 literal!(True, bool, true, "boolean");
 literal!(False, bool, false, "boolean");
 
@@ -398,21 +389,16 @@ impl<T> Envelope<T> {
     pub fn from_result(request_id: String, result: Result<T, Error>) -> Self {
         Self(match result {
             Ok(result) => EnvelopeData::Success {
-                schema_version: Version1,
                 request_id,
                 ok: True,
                 result,
             },
             Err(error) => EnvelopeData::Failure {
-                schema_version: Version1,
                 request_id,
                 ok: False,
                 error,
             },
         })
-    }
-    pub fn schema_version(&self) -> u32 {
-        1
     }
     pub fn request_id(&self) -> &str {
         match &self.0 {

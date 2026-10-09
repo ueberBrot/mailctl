@@ -51,7 +51,6 @@ const SESSIONS: usize = 4;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Route {
-    version: u32,
     service_uid: u32,
     socket: PathBuf,
     callers: Vec<Caller>,
@@ -69,10 +68,7 @@ impl Route {
         let bytes = read_root_file(Path::new(ROUTE), ROUTE_BYTES)?;
         let route: Self =
             serde_json::from_slice(&bytes).map_err(|_| Error::new(ErrorCode::BrokerUnavailable))?;
-        if route.version != 1
-            || route.service_uid == 0
-            || route.socket != Path::new(SOCKET)
-            || route.callers.len() > 256
+        if route.service_uid == 0 || route.socket != Path::new(SOCKET) || route.callers.len() > 256
         {
             return Err(Error::new(ErrorCode::BrokerUnavailable));
         }
@@ -101,7 +97,6 @@ impl Route {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum ClientFrame {
     Hello {
-        version: u32,
         narrowing: Narrowing,
     },
     Operation {
@@ -118,7 +113,6 @@ enum ClientFrame {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum ServerFrame {
     Hello {
-        version: u32,
         limits: Limits,
         response_bound: usize,
     },
@@ -155,24 +149,17 @@ impl Client {
             }
             write_frame(
                 &mut stream,
-                &ClientFrame::Hello {
-                    version: 1,
-                    narrowing,
-                },
+                &ClientFrame::Hello { narrowing },
                 REQUEST_BYTES,
             )
             .await?;
             let ServerFrame::Hello {
-                version,
                 limits,
                 response_bound,
             } = read_frame(&mut stream, REQUEST_BYTES, 32).await?
             else {
                 return Err(Error::new(ErrorCode::ProtocolMismatch));
             };
-            if version != 1 {
-                return Err(Error::new(ErrorCode::ProtocolMismatch));
-            }
             Ok((stream, limits, response_bound))
         })
         .await
@@ -243,24 +230,23 @@ impl Client {
         let mut stream = retained
             .take()
             .ok_or_else(|| Error::new(ErrorCode::BrokerUnavailable))?;
-        let response = tokio::time::timeout_at(expires, async {
+        let envelope = tokio::time::timeout_at(expires, async {
             write_bytes(&mut stream, &bytes).await?;
             read_frame(&mut stream, self.response_bound, 32).await
         })
         .await
         .map_err(|_| Error::new(ErrorCode::Timeout))
         .flatten()
+        .and_then(|response| match response {
+            ServerFrame::Result { envelope } => Ok(envelope),
+            ServerFrame::Hello { .. } => Err(Error::new(ErrorCode::ProtocolMismatch)),
+        })
         .map_err(|error| match draft_identity {
             Some(identity) => Error::draft_outcome(ErrorCode::OutcomeUnknown, identity),
             None => error,
         })?;
-        match response {
-            ServerFrame::Result { envelope } => {
-                *retained = Some(stream);
-                envelope.into_result()
-            }
-            ServerFrame::Hello { .. } => Err(Error::new(ErrorCode::ProtocolMismatch)),
-        }
+        *retained = Some(stream);
+        envelope.into_result()
     }
 }
 
@@ -375,10 +361,7 @@ async fn serve_session(
 ) -> Result<(), Error> {
     let base = service.context(&grant, &Narrowing::default())?;
     let (base_limits, _) = session_limits(service.limits(&base)?)?;
-    let ClientFrame::Hello {
-        version: 1,
-        narrowing,
-    } = timeout(
+    let ClientFrame::Hello { narrowing } = timeout(
         Duration::from_secs(base_limits.initialization_seconds as u64),
         read_frame(&mut stream, REQUEST_BYTES, base_limits.json_nesting),
     )
@@ -393,7 +376,6 @@ async fn serve_session(
     write_frame(
         &mut stream,
         &ServerFrame::Hello {
-            version: 1,
             limits: limits.clone(),
             response_bound,
         },
@@ -918,6 +900,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unexpected_hello_after_draft_dispatch_preserves_the_uncertain_operation() {
+        let (client, mut peer) = client_pair();
+        let Operation::SaveDraft(input) = draft("frozen body".into()) else {
+            unreachable!();
+        };
+        let identity = input.operation_details();
+        let reply = async {
+            let request: ClientFrame = read_frame(&mut peer, REQUEST_BYTES, 32).await.unwrap();
+            assert!(matches!(
+                request,
+                ClientFrame::Operation {
+                    operation: Operation::SaveDraft(_),
+                    ..
+                }
+            ));
+            write_frame(
+                &mut peer,
+                &ServerFrame::Hello {
+                    limits: Limits::default(),
+                    response_bound: REQUEST_BYTES,
+                },
+                REQUEST_BYTES,
+            )
+            .await
+            .unwrap();
+        };
+        let (result, ()) = tokio::join!(client.execute(Operation::SaveDraft(input)), reply);
+        let error = result.unwrap_err();
+        assert_eq!(error.code, ErrorCode::OutcomeUnknown);
+        assert_eq!(error.draft_operation.as_deref(), Some(&identity));
+        assert!(client.stream.lock().await.is_none());
+        assert_eq!(
+            client.doctor(false).await.unwrap_err().code,
+            ErrorCode::BrokerUnavailable,
+        );
+    }
+
+    #[tokio::test]
+    async fn unexpected_hello_after_a_read_remains_a_protocol_mismatch() {
+        let (client, mut peer) = client_pair();
+        let reply = async {
+            let request: ClientFrame = read_frame(&mut peer, REQUEST_BYTES, 32).await.unwrap();
+            assert!(matches!(request, ClientFrame::Doctor { .. }));
+            write_frame(
+                &mut peer,
+                &ServerFrame::Hello {
+                    limits: Limits::default(),
+                    response_bound: REQUEST_BYTES,
+                },
+                REQUEST_BYTES,
+            )
+            .await
+            .unwrap();
+        };
+        let (result, ()) = tokio::join!(client.doctor(false), reply);
+        let error = result.unwrap_err();
+        assert_eq!(error.code, ErrorCode::ProtocolMismatch);
+        assert!(error.draft_operation.is_none());
+        assert!(client.stream.lock().await.is_none());
+    }
+
+    #[tokio::test]
     async fn draft_waiting_for_the_session_times_out_without_claiming_dispatch() {
         let (client, _peer) = client_pair();
         let retained = client.stream.lock().await;
@@ -965,7 +1009,7 @@ mod tests {
         limits.validate().unwrap();
         let request_reservation = limits.buffered_bytes / SESSIONS - 16 * response_bound;
         let payload = format!(
-            r#"{{"type":"hello","version":1,"narrowing":{{}},"padding":[{}0]}}"#,
+            r#"{{"type":"hello","narrowing":{{}},"padding":[{}0]}}"#,
             "0,".repeat(32_000),
         );
         assert!(payload.len() <= REQUEST_BYTES);
