@@ -1771,6 +1771,7 @@ dependencies = [
  "greenmail-support",
  "html2text",
  "io-imap",
+ "jsonschema",
  "keyring-core",
  "libc",
  "mail-builder",

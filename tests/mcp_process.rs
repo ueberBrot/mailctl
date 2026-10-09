@@ -79,6 +79,92 @@ async fn default_read_and_drafts_grant_can_discover_capabilities() {
 }
 
 #[tokio::test]
+async fn mcp_discovery_is_compact_and_output_schemas_validate_wire_results() {
+    let installation = Installation::two_accounts();
+    let configuration = std::fs::read_to_string(installation.config()).unwrap();
+    std::fs::write(
+        installation.config(),
+        configuration.replace("profile = \"drafts_only\"", "profile = \"read_and_drafts\""),
+    )
+    .unwrap();
+    setup(&installation);
+    let client = client(
+        &installation,
+        &["--grant", "writer", "--use-configured-grant"],
+    )
+    .await;
+    let tools = client.list_all_tools().await.unwrap();
+    assert_eq!(tools.len(), 9, "discovery retains every authorized tool");
+    let bytes = serde_json::to_vec(&tools).unwrap().len();
+    assert!(bytes <= 48 * 1024, "tool discovery uses {bytes} bytes");
+    for tool in &tools {
+        let schema = serde_json::to_value(tool.output_schema.as_ref().unwrap()).unwrap();
+        assert_eq!(schema["type"], "object", "{}", tool.name);
+        let validator = jsonschema::validator_for(&schema).expect("self-contained output schema");
+        let arguments = match tool.name.as_ref() {
+            "email_list_accounts" | "email_capabilities" => None,
+            _ => Some(
+                json!({"fixture_invalid_argument": true})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        };
+        let response = client
+            .call_tool(
+                CallToolRequestParams::new(tool.name.clone())
+                    .with_arguments(arguments.unwrap_or_default()),
+            )
+            .await
+            .unwrap();
+        let envelope = support::assert_mcp_envelope(response);
+        validator.validate(&envelope).unwrap();
+        for (field, invalid) in [
+            ("schema_version", json!(2)),
+            ("request_id", json!(42)),
+            ("ok", json!("true")),
+            ("fixture_extra_field", json!(true)),
+        ] {
+            let mut malformed = envelope.clone();
+            malformed[field] = invalid;
+            assert!(
+                !validator.is_valid(&malformed),
+                "{} accepts invalid {field}",
+                tool.name
+            );
+        }
+        let malformed = json!({
+            "schema_version": 1,
+            "request_id": "fixture",
+            "ok": true,
+            "result": 42
+        });
+        assert!(
+            !validator.is_valid(&malformed),
+            "{} accepts an invalid result",
+            tool.name
+        );
+        if envelope["ok"] == false {
+            let mut malformed = envelope.clone();
+            malformed["error"]["code"] = json!("fixture_unknown_error");
+            assert!(
+                !validator.is_valid(&malformed),
+                "{} accepts an unknown error code",
+                tool.name
+            );
+            malformed = envelope.clone();
+            malformed.as_object_mut().unwrap().remove("error");
+            assert!(
+                !validator.is_valid(&malformed),
+                "{} accepts a missing error",
+                tool.name
+            );
+        }
+    }
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
 async fn mcp_discovery_provides_guides_and_effective_limits() {
     let installation = Installation::two_accounts();
     let mut config: toml::Value =

@@ -13,6 +13,8 @@ use std::{borrow::Cow, time::Duration};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
+mod schema;
+
 struct EmailTools {
     tools: Vec<Tool>,
     application: Application,
@@ -27,7 +29,7 @@ fn tool<I: schemars::JsonSchema + 'static, O: schemars::JsonSchema + 'static>(
     let journal_mutation = matches!(name, "email_save_draft" | "email_draft_status");
     Tool::new(name, description, serde_json::Map::new())
         .with_input_schema::<I>()
-        .with_output_schema::<Envelope<O>>()
+        .with_raw_output_schema(schema::output::<O>())
         .with_annotations(
             ToolAnnotations::new()
                 .read_only(!journal_mutation)
@@ -58,7 +60,7 @@ fn definitions(operations: &[String]) -> Vec<Tool> {
             "Show callable MCP operations, effective permissions, health, and operation limits.",
             empty.as_object().unwrap().clone(),
         )
-        .with_output_schema::<Envelope<Capabilities>>()
+        .with_raw_output_schema(schema::output::<Capabilities>())
         .with_annotations(ToolAnnotations::new().read_only(true).open_world(false)),
         tool::<ListMailboxesInput, MailboxDiscovery>(
             "email_list_mailboxes",

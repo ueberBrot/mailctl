@@ -65,6 +65,7 @@ windows-sys = { version = "=0.61.2", features = ["Wdk_Foundation", "Wdk_Storage_
 
 [dev-dependencies]
 allocation-counter = "=0.8.1"
+jsonschema = { version = "=0.55.0", default-features = false }
 rcgen = { version = "=0.14.7", default-features = false, features = ["ring", "pem"] }
 rmcp = { version = "=3.2.0", default-features = false, features = ["client", "transport-child-process"] }
 cargo_metadata = "0.23.1"
