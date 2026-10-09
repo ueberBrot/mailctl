@@ -9,6 +9,40 @@ use mailctl::{
 use std::time::Duration;
 
 #[tokio::test]
+async fn unicode_draft_targets_preserve_exact_modified_utf7_identity() {
+    for (target, wire_target) in [
+        ("é", "&AOk-"),
+        ("é&", "&AOk-&-"),
+        ("🦀", "&2D7dgA-"),
+        ("A&B", "A&-B"),
+        ("Draft folder", "Draft folder"),
+        ("Draft\"quote", "Draft\"quote"),
+        ("Draft\\slash", "Draft\\slash"),
+    ] {
+        let draft = draft();
+        let bytes = draft.bytes().to_vec();
+        let mut fixture = fixture(TlsMode::Implicit, Limits::default(), move |mut wire| {
+            Box::pin(async move {
+                authenticate(&mut wire).await;
+                let tag = receive(&mut wire, wire_target, &bytes).await;
+                write(&mut wire, &format!("{tag} OK accepted\r\n")).await;
+            })
+        })
+        .await;
+        let result = fixture
+            .probe
+            .append_draft("fixture", "disposable-password", target, &draft)
+            .await;
+        assert_eq!(
+            result,
+            Ok(AppendOutcome::Created { uid: None }),
+            "legal draft mailbox {target:?} must reach exact-target APPEND"
+        );
+        fixture.task.await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn tagged_acknowledgement_survives_missing_uid_and_connection_close() {
     for (capabilities, code, uid) in [
         (

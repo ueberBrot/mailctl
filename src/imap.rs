@@ -606,6 +606,8 @@ impl From<Error> for crate::domain::Error {
             Error::Limit => ErrorCode::ResponseTooLarge,
             Error::InvalidInput => ErrorCode::InvalidRequest,
             Error::StaleReference => ErrorCode::StaleReference,
+            Error::StaleCursor => ErrorCode::StaleCursor,
+            Error::TransferExpired => ErrorCode::TransferExpired,
             Error::MessageNotFound => ErrorCode::MessageNotFound,
             _ => ErrorCode::ProviderUnavailable,
         })

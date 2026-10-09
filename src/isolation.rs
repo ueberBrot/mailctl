@@ -596,7 +596,7 @@ fn read_private_file(
 ) -> Result<Vec<u8>, Error> {
     let file = OpenOptions::new()
         .read(true)
-        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+        .custom_flags((rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32)
         .open(path)
         .map_err(|_| Error::new(ErrorCode::BrokerUnavailable))?;
     let metadata = file
@@ -743,6 +743,121 @@ async fn shutdown_signal() {
 #[cfg(all(test, feature = "isolated"))]
 mod tests {
     use super::*;
+
+    struct PrivateFileFixture(PathBuf);
+    impl PrivateFileFixture {
+        fn new(label: &str) -> Self {
+            Self(std::env::temp_dir().join(format!(
+                "mailctl-isolation-{label}-{}",
+                uuid::Uuid::new_v4()
+            )))
+        }
+    }
+    impl Drop for PrivateFileFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    #[test]
+    fn private_ipc_file_reader_rejects_fifos_without_waiting_for_a_writer() {
+        const CHILD_PATH: &str = "MAILCTL_ISOLATION_FIFO_TEST_PATH";
+        if let Some(path) = std::env::var_os(CHILD_PATH) {
+            assert_eq!(
+                read_private_file(
+                    Path::new(&path),
+                    ROUTE_BYTES,
+                    rustix::process::geteuid().as_raw(),
+                    0o077,
+                )
+                .unwrap_err()
+                .code,
+                ErrorCode::BrokerUnavailable
+            );
+            return;
+        }
+        let fixture = PrivateFileFixture::new("fifo");
+        assert!(
+            std::process::Command::new("/usr/bin/mkfifo")
+                .args(["-m", "600"])
+                .arg(&fixture.0)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "isolation::tests::private_ipc_file_reader_rejects_fifos_without_waiting_for_a_writer",
+                "--nocapture",
+            ])
+            .env(CHILD_PATH, &fixture.0)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(
+                    status.success(),
+                    "private FIFO rejection child failed: {status}"
+                );
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("private IPC file reader blocked opening a FIFO without a writer");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn private_ipc_file_reader_preserves_size_owner_permissions_and_symlink_checks() {
+        let fixture = PrivateFileFixture::new("boundaries");
+        let link = PrivateFileFixture::new("symlink");
+        crate::file_storage::replace(&fixture.0, b"fixture").unwrap();
+        let owner = rustix::process::geteuid().as_raw();
+        assert_eq!(
+            read_private_file(&fixture.0, 7, owner, 0o077).unwrap(),
+            b"fixture"
+        );
+        for (maximum, uid) in [(6, owner), (7, owner.wrapping_add(1))] {
+            assert_eq!(
+                read_private_file(&fixture.0, maximum, uid, 0o077)
+                    .unwrap_err()
+                    .code,
+                ErrorCode::BrokerUnavailable
+            );
+        }
+        std::os::unix::fs::symlink(&fixture.0, &link.0).unwrap();
+        assert_eq!(
+            read_private_file(&link.0, 7, owner, 0o077)
+                .unwrap_err()
+                .code,
+            ErrorCode::BrokerUnavailable
+        );
+        fs::set_permissions(&fixture.0, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            read_private_file(&fixture.0, 7, owner, 0o077)
+                .unwrap_err()
+                .code,
+            ErrorCode::BrokerUnavailable
+        );
+        // Root route files use the narrower write prohibition; public read bits remain allowed.
+        assert_eq!(
+            read_private_file(&fixture.0, 7, owner, 0o022).unwrap(),
+            b"fixture"
+        );
+        crate::file_storage::replace(&fixture.0, b"").unwrap();
+        assert!(
+            read_private_file(&fixture.0, 0, owner, 0o077)
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     fn client_pair() -> (Client, UnixStream) {
         let (stream, peer) = UnixStream::pair().unwrap();

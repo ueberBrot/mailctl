@@ -9,6 +9,7 @@ use crate::{
     domain::{Error, ErrorCode},
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     borrow::Cow,
     collections::{BTreeMap, HashSet},
@@ -158,6 +159,7 @@ impl Registry {
 
 struct Lease {
     directory: PathBuf,
+    registry_digest: [u8; 32],
     _maintenance: File,
 }
 
@@ -167,6 +169,7 @@ struct Initialization<'a> {
     revision: String,
     marker: Vec<u8>,
     registry: Registry,
+    registry_digest: Option<[u8; 32]>,
     maintenance: File,
     initialization: File,
     exclusive: bool,
@@ -187,7 +190,13 @@ impl<'a> Initialization<'a> {
         let mut initialization = storage::open_lock(&directory, "initialization.lock")?;
         storage::lock(&initialization, LockMode::Exclusive, deadline)?;
         let marker = storage::initialization_marker(&mut initialization)?;
-        let persisted = load(&directory)?;
+        let persisted_bytes = storage::read(&directory)?;
+        let persisted = persisted_bytes
+            .as_deref()
+            .map(decode_registry)
+            .transpose()?;
+        let registry_digest = persisted_bytes.as_deref().map(registry_digest);
+        drop(persisted_bytes);
         if persisted.is_none() && !marker.is_empty() {
             return Err(invalid());
         }
@@ -238,6 +247,7 @@ impl<'a> Initialization<'a> {
             revision,
             marker,
             registry,
+            registry_digest,
             maintenance,
             initialization,
             exclusive,
@@ -265,6 +275,7 @@ impl<'a> Initialization<'a> {
         let updated = update_configuration()?;
         if let Some(bytes) = bytes {
             storage::persist(&self.directory, &bytes)?;
+            self.registry_digest = Some(registry_digest(&bytes));
         }
         if self.marker.len() != self.registry.installation.len() {
             storage::mark_initialized(&mut self.initialization, &self.registry.installation)?;
@@ -311,6 +322,7 @@ impl AccountRegistry {
         let Initialization {
             directory,
             registry,
+            registry_digest,
             maintenance,
             ..
         } = initialization;
@@ -318,6 +330,7 @@ impl AccountRegistry {
             registry,
             lease: Some(std::sync::Arc::new(Lease {
                 directory,
+                registry_digest: registry_digest.ok_or_else(invalid)?,
                 _maintenance: maintenance,
             })),
         })
@@ -339,7 +352,13 @@ impl AccountRegistry {
             return Ok(());
         };
         storage::directory(&lease.directory, false)?;
-        let persisted = load(&lease.directory)?.ok_or_else(invalid)?;
+        let bytes = storage::read(&lease.directory)?.ok_or_else(invalid)?;
+        // The complete private-file hash matches its validated startup contents.
+        // Changed representations still receive full schema and history validation.
+        if registry_digest(&bytes) == lease.registry_digest {
+            return Ok(());
+        }
+        let persisted = decode_registry(&bytes)?;
         if persisted != self.registry {
             return Err(Error::new(ErrorCode::OperationConflict));
         }
@@ -408,7 +427,15 @@ fn load(directory: &Path) -> Result<Option<Registry>, Error> {
     let Some(bytes) = storage::read(directory)? else {
         return Ok(None);
     };
-    let registry: Registry = serde_json::from_slice(&bytes).map_err(|_| {
+    decode_registry(&bytes).map(Some)
+}
+
+fn registry_digest(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
+}
+
+fn decode_registry(bytes: &[u8]) -> Result<Registry, Error> {
+    let registry: Registry = serde_json::from_slice(bytes).map_err(|_| {
         // A future layout may not deserialize as Registry. Read its version only
         // on failure, retaining the upgrade guidance without scanning healthy
         // retained history twice on every request.
@@ -416,11 +443,11 @@ fn load(directory: &Path) -> Result<Option<Registry>, Error> {
         struct SchemaVersion {
             version: u32,
         }
-        match serde_json::from_slice::<SchemaVersion>(&bytes) {
+        match serde_json::from_slice::<SchemaVersion>(bytes) {
             Ok(schema) if schema.version != 2 => Error::incompatible_schema(),
             _ => invalid(),
         }
     })?;
     registry.validate()?;
-    Ok(Some(registry))
+    Ok(registry)
 }

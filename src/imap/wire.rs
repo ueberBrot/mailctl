@@ -705,8 +705,7 @@ impl CommandState {
         else {
             return Err(Error::Unsupported);
         };
-        let expected: io_imap::types::mailbox::Mailbox<'_> = target
-            .replace('&', "&-")
+        let expected: io_imap::types::mailbox::Mailbox<'_> = super::mailbox_pattern(target)
             .try_into()
             .map_err(|_| Error::InvalidInput)?;
         if mailbox != &expected || flags != &[Flag::Draft] {

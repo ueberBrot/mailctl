@@ -404,6 +404,92 @@ fn selected_body_allocations_do_not_follow_attachment_metadata_size() {
 }
 
 #[test]
+fn body_buffer_capacity_does_not_double_above_a_power_of_two() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut peaks = Vec::new();
+    for (size, declared_size) in [
+        (1024 * 1024 - 1, 1024 * 1024 - 1),
+        (1024 * 1024, 1024 * 1024),
+        (1024 * 1024 + 1, 1024 * 1024 + 1),
+        (13, 2 * 1024 * 1024),
+    ] {
+        let source = vec![b'x'; size];
+        let limits = Limits::default();
+        let max_text = limits.max_text_bytes;
+        let (mut probe, server) = dedicated_fixture(TlsMode::Implicit, limits, move |mut wire| {
+            Box::pin(async move {
+                authenticate(&mut wire).await;
+                examine(&mut wire).await;
+                let structure = format!(
+                    "((\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" {declared_size} 1 NIL NIL NIL NIL)(\"APPLICATION\" \"OCTET-STREAM\" NIL NIL NIL \"BASE64\" 3000000 NIL (\"ATTACHMENT\" NIL) NIL NIL) \"MIXED\" NIL NIL NIL NIL)"
+                );
+                metadata(
+                        &mut wire,
+                        &format!(
+                            "* 1 FETCH (UID 4 RFC822.SIZE 4000000 BODYSTRUCTURE {structure})\r\n{{tag}} OK fetched\r\n"
+                        ),
+                    )
+                    .await;
+                literal_bytes(&mut wire, "HEADER", 0, 16 * 1024, ROOT_HEADERS.as_bytes()).await;
+                let mut offset = 0;
+                loop {
+                    let count = (declared_size + 1 - offset).min(16 * 1024);
+                    let length = count.min(size - offset);
+                    literal_bytes(
+                        &mut wire,
+                        "1",
+                        offset,
+                        count,
+                        &source[offset..offset + length],
+                    )
+                    .await;
+                    offset += length;
+                    if length < count {
+                        break;
+                    }
+                }
+                logout(&mut wire).await;
+            })
+        });
+        let allocations = allocation_counter::measure(|| {
+            let page = runtime
+                .block_on(probe.read_body(
+                    "fixture",
+                    "disposable-password",
+                    "INBOX",
+                    BodyRequest::new(4, 77),
+                ))
+                .unwrap();
+            assert_eq!(page.text.len(), size.min(max_text));
+            assert!(page.text.bytes().all(|byte| byte == b'x'));
+            assert_eq!(page.continuation.is_some(), size > max_text);
+            assert_eq!(page.metrics.decoded_bytes, size);
+            assert_eq!(page.metrics.decode_steps, size * 7);
+        });
+        server.join().unwrap();
+        eprintln!(
+            "body capacity bytes={size} declared={declared_size} cumulative={} peak={} allocations={}",
+            allocations.bytes_total, allocations.bytes_max, allocations.count_total
+        );
+        if size == declared_size {
+            peaks.push(allocations.bytes_max);
+        } else {
+            assert!(
+                allocations.bytes_max < 512 * 1024,
+                "an overreported size must not cause eager wire-buffer allocation: {allocations:?}"
+            );
+        }
+    }
+    assert!(
+        peaks[2].saturating_sub(peaks[1]) < 256 * 1024,
+        "one additional byte must not retain a second MiB of wire-buffer capacity: {peaks:?}"
+    );
+}
+
+#[test]
 fn whole_and_partial_continuation_have_measured_finite_costs() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()

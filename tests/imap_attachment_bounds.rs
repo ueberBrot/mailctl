@@ -112,14 +112,16 @@ async fn cancellation_during_a_literal_closes_transport_and_invalidates_decoder(
             result = &mut read => panic!("unexpected completion: {result:?}"),
         }
     }
-    assert_eq!(
-        fixture
-            .probe
-            .read_attachment("fixture", "disposable-password", &mut request)
-            .await
-            .unwrap_err(),
-        Error::TransferExpired
-    );
+    let error = fixture
+        .probe
+        .read_attachment("fixture", "disposable-password", &mut request)
+        .await
+        .unwrap_err();
+    assert_eq!(error, Error::TransferExpired);
+    let error = mailctl::domain::Error::from(error);
+    assert_eq!(error.code, mailctl::domain::ErrorCode::TransferExpired);
+    assert!(!error.retryable);
+    assert_eq!(error.exit_code(), 6);
     fixture.task.await.unwrap();
 }
 

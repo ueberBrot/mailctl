@@ -367,6 +367,58 @@ async fn application_checks_uidvalidity_on_the_fetch_lease() {
 }
 
 #[tokio::test]
+async fn changed_imap_body_continuations_return_stale_cursor_without_retry() {
+    use imap_support::*;
+    let mut session = 0;
+    let fixture = repeating_fixture(Default::default(), 2, move |mut wire| {
+        session += 1;
+        let text: &[u8] = if session == 1 { b"abcdefgh" } else { b"ijklmnop" };
+        Box::pin(async move {
+            authenticate(&mut wire).await;
+            examine(&mut wire).await;
+            let tag = expect(&mut wire, "UID FETCH 4 (UID RFC822.SIZE BODYSTRUCTURE)").await;
+            write(&mut wire, &format!("* 1 FETCH (UID 4 RFC822.SIZE 3000300 BODYSTRUCTURE ((\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" 8 1 NIL NIL NIL NIL)(\"APPLICATION\" \"OCTET-STREAM\" NIL NIL NIL \"BASE64\" 3000000 NIL (\"ATTACHMENT\" NIL) NIL NIL) \"MIXED\" NIL NIL NIL NIL))\r\n{tag} OK fetched\r\n")).await;
+            literal_bytes(&mut wire, "HEADER", 0, 16384, b"Content-Type: multipart/mixed; boundary=fixture\r\n\r\n").await;
+            literal_bytes(&mut wire, "1", 0, 9, text).await;
+            logout(&mut wire).await;
+        })
+    })
+    .await;
+    let (service, reference) = live(&fixture, config()).await;
+    let context = service.context("reader", &Default::default()).unwrap();
+    let OperationResult::Message(page) = service
+        .execute(
+            &context,
+            Operation::GetMessage(GetMessageInput {
+                message: reference.clone(),
+                max_bytes: Some(4),
+                cursor: None,
+            }),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(page.body.text, "abcd");
+    let error = service
+        .execute(
+            &context,
+            Operation::GetMessage(GetMessageInput {
+                message: reference,
+                max_bytes: Some(4),
+                cursor: page.body.next_cursor,
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, mailctl::domain::ErrorCode::StaleCursor);
+    assert!(!error.retryable);
+    assert_eq!(error.exit_code(), 6);
+    fixture.task.await.unwrap();
+}
+
+#[tokio::test]
 async fn application_distinguishes_missing_messages_from_unsupported_bodies() {
     use imap_support::*;
     for missing in [true, false] {
