@@ -1,5 +1,6 @@
 //! Controlled email discovery through a shared embedded application contract.
 pub mod authentication;
+mod cleanup;
 pub mod config;
 pub mod credentials;
 pub mod domain;

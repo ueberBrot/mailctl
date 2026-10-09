@@ -32,7 +32,7 @@ use uuid::Uuid;
 
 pub struct Service {
     draft_backend: Option<std::sync::Arc<dyn DraftBackend>>,
-    config: Config,
+    config: std::sync::Arc<Config>,
     host: std::sync::Arc<dyn crate::host::HostEnvironment>,
     registry: AccountRegistry,
     context_id: Uuid,
@@ -102,7 +102,7 @@ impl Service {
     }
     fn build(config: Config, registry: AccountRegistry) -> Self {
         Self {
-            config,
+            config: std::sync::Arc::new(config),
             host: std::sync::Arc::new(crate::host::NativeEnvironment),
             registry,
             context_id: Uuid::new_v4(),
@@ -166,7 +166,9 @@ impl Service {
         ))
     }
     pub fn limits(&self, context: &RequestContext) -> Result<&crate::config::Limits, Error> {
-        Ok(&self.grant(context)?.limits)
+        let grant = self.grant(context)?;
+        self.transfers.restart_expiry();
+        Ok(&grant.limits)
     }
     /// Bound the currently implemented discovery envelopes without cloning labels.
     #[cfg(feature = "mcp")]

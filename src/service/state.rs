@@ -408,15 +408,19 @@ fn load(directory: &Path) -> Result<Option<Registry>, Error> {
     let Some(bytes) = storage::read(directory)? else {
         return Ok(None);
     };
-    #[derive(Deserialize)]
-    struct SchemaVersion {
-        version: u32,
-    }
-    let schema: SchemaVersion = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
-    if schema.version != 2 {
-        return Err(Error::incompatible_schema());
-    }
-    let registry: Registry = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+    let registry: Registry = serde_json::from_slice(&bytes).map_err(|_| {
+        // A future layout may not deserialize as Registry. Read its version only
+        // on failure, retaining the upgrade guidance without scanning healthy
+        // retained history twice on every request.
+        #[derive(Deserialize)]
+        struct SchemaVersion {
+            version: u32,
+        }
+        match serde_json::from_slice::<SchemaVersion>(&bytes) {
+            Ok(schema) if schema.version != 2 => Error::incompatible_schema(),
+            _ => invalid(),
+        }
+    })?;
     registry.validate()?;
     Ok(Some(registry))
 }

@@ -2,6 +2,7 @@
 use crate::domain::dot_atom;
 use mail_builder::MessageBuilder;
 use sha2::{Digest, Sha256};
+use std::io::{self, Write};
 
 pub(crate) const ENCODER_VERSION: u32 = 2;
 
@@ -99,6 +100,19 @@ impl PreparedDraft {
         {
             return Err(Error::InvalidInput);
         }
+        let input_bytes = input.to.iter().chain(&input.cc).chain(&input.bcc).fold(
+            input.body.len() + input.subject.len() + input.from.len() + input.message_id.len(),
+            |bytes, address| {
+                bytes + address.address.len() + address.name.as_ref().map_or(0, String::len)
+            },
+        ) + input.in_reply_to.as_ref().map_or(0, String::len)
+            + input.references.iter().map(String::len).sum::<usize>();
+        // MIME encoding can expand text. Reserve from this draft's input, while
+        // the writer enforces the ceiling before every allocation and write.
+        let capacity = input_bytes
+            .saturating_mul(3)
+            .saturating_add(4096)
+            .min(max_mime_bytes);
         let mut builder = MessageBuilder::new()
             .from(input.from)
             .subject(input.subject)
@@ -120,11 +134,12 @@ impl PreparedDraft {
         if !input.references.is_empty() {
             builder = builder.references(input.references);
         }
-        let mut bytes = vec![0; max_mime_bytes];
-        let mut output = bytes.as_mut_slice();
+        let mut output = MimeOutput {
+            bytes: Vec::with_capacity(capacity),
+            maximum: max_mime_bytes,
+        };
         builder.write_to(&mut output).map_err(|_| Error::Limit)?;
-        let written = max_mime_bytes - output.len();
-        bytes.truncate(written);
+        let bytes = output.bytes;
         let header_bytes = bytes
             .windows(4)
             .position(|bytes| bytes == b"\r\n\r\n")
@@ -148,6 +163,32 @@ impl PreparedDraft {
     }
     pub fn sha256(&self) -> [u8; 32] {
         self.sha256
+    }
+}
+
+struct MimeOutput {
+    bytes: Vec<u8>,
+    maximum: usize,
+}
+impl Write for MimeOutput {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let required = self
+            .bytes
+            .len()
+            .checked_add(bytes.len())
+            .filter(|length| *length <= self.maximum)
+            .ok_or_else(|| io::Error::other("MIME exceeds its byte limit"))?;
+        if required > self.bytes.capacity() {
+            let capacity = required
+                .max(self.bytes.capacity().saturating_mul(2))
+                .min(self.maximum);
+            self.bytes.reserve_exact(capacity - self.bytes.len());
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 

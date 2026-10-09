@@ -77,7 +77,15 @@ pub(super) fn validate_headers(
         }
         return Ok(None);
     }
-    let message = MessageParser::default()
+    // Body selection does not need Subject, addresses, or descriptive fields.
+    // Their encoded-word normalization can retry malformed suffixes; skip them
+    // rather than spending the body-read budget on unrelated metadata.
+    let message = MessageParser::new()
+        .default_header_ignore()
+        .header_content_type(mail_parser::HeaderName::ContentType)
+        .header_content_type(mail_parser::HeaderName::ContentDisposition)
+        .header_id(mail_parser::HeaderName::ContentId)
+        .header_raw(mail_parser::HeaderName::ContentTransferEncoding)
         .parse_headers(raw)
         .ok_or(Error::Protocol)?;
     let headers = message.parts.first().ok_or(Error::Protocol)?;
@@ -241,37 +249,88 @@ fn select_part(
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BodyKind {
+    Plain,
+    Html,
+}
+
 fn related_headers(
     structure: &BodyStructure<'_>,
     path: Option<&Part>,
     paths: &mut Vec<Part>,
-) -> Result<(), Error> {
+) -> Result<Option<BodyKind>, Error> {
     match structure {
-        BodyStructure::Single { .. } => Ok(()),
+        BodyStructure::Single {
+            body,
+            extension_data,
+        } => {
+            if attachment(extension_data.as_ref().and_then(|data| data.tail.as_ref())) {
+                return Ok(None);
+            }
+            let SpecificFields::Text { subtype, .. } = &body.specific else {
+                return Ok(None);
+            };
+            let subtype = imap_text(subtype)?;
+            Ok(if subtype.eq_ignore_ascii_case("plain") {
+                Some(BodyKind::Plain)
+            } else if subtype.eq_ignore_ascii_case("html") {
+                Some(BodyKind::Html)
+            } else {
+                None
+            })
+        }
         BodyStructure::Multi {
             bodies,
             subtype,
             extension_data,
         } => {
             if attachment(extension_data.as_ref().and_then(|data| data.tail.as_ref())) {
-                return Ok(());
+                return Ok(None);
             }
-            let related = imap_text(subtype)?.eq_ignore_ascii_case("related")
-                && parameter(
+            let subtype = imap_text(subtype)?;
+            let root = if subtype.eq_ignore_ascii_case("related") {
+                parameter(
                     extension_data
                         .as_ref()
                         .map_or(&[][..], |data| data.parameter_list.as_slice()),
                     "start",
                 )?
-                .is_some();
+                .map(normalize_content_id)
+                .transpose()?
+            } else {
+                None
+            };
+            let alternative = subtype.eq_ignore_ascii_case("alternative");
+            let first_wins = !alternative && root.is_none();
+            let mut selected = None;
+            let mut matched_root = false;
             for (index, child) in bodies.as_ref().iter().enumerate() {
                 let child_path = child_path(path, index + 1)?;
-                if related && matches!(child, BodyStructure::Multi { .. }) {
+                let before = paths.len();
+                if root.is_some() && matches!(child, BodyStructure::Multi { .. }) {
                     paths.push(child_path.clone());
                 }
-                related_headers(child, Some(&child_path), paths)?;
+                let candidate = related_headers(child, Some(&child_path), paths)?;
+                // Eligibility is stable without Content-IDs: a related child
+                // falls back to its first readable candidate. Return its type
+                // from this traversal so ancestors need no repeated selection.
+                if selected.is_none() || alternative && candidate == Some(BodyKind::Plain) {
+                    selected = candidate;
+                }
+                if root.is_some() && !matched_root && structure_content_id(child)? == root {
+                    matched_root = true;
+                    // A matching unreadable root uses the first readable
+                    // fallback, exactly like selection after headers arrive.
+                    selected = candidate.or(selected);
+                }
+                if (first_wins || matched_root) && selected.is_some()
+                    || alternative && paths.len() == before && candidate == Some(BodyKind::Plain)
+                {
+                    break;
+                }
             }
-            Ok(())
+            Ok(selected)
         }
     }
 }
@@ -560,4 +619,73 @@ fn add_work(work: usize, additional: usize, limits: &Limits) -> Result<usize, Er
     let work = work.checked_add(additional).ok_or(Error::Limit)?;
     require_work(work, limits)?;
     Ok(work)
+}
+
+#[cfg(test)]
+mod planner_performance_tests {
+    use super::*;
+    use io_imap::types::{body::BasicFields, core::NString};
+
+    fn deep_structure(depth: usize, parts: usize) -> BodyStructure<'static> {
+        let leaf = BodyStructure::Single {
+            body: Body {
+                basic: BasicFields {
+                    parameter_list: vec![],
+                    id: NString::NIL,
+                    description: NString::NIL,
+                    content_transfer_encoding: "7BIT".try_into().unwrap(),
+                    size: 5,
+                },
+                specific: SpecificFields::Text {
+                    subtype: "PLAIN".try_into().unwrap(),
+                    number_of_lines: 1,
+                },
+            },
+            extension_data: None,
+        };
+        let mut structure = BodyStructure::Multi {
+            bodies: vec![leaf; parts - depth + 1].try_into().unwrap(),
+            subtype: "MIXED".try_into().unwrap(),
+            extension_data: None,
+        };
+        for _ in 2..depth {
+            structure = BodyStructure::Multi {
+                bodies: vec![structure].try_into().unwrap(),
+                subtype: "MIXED".try_into().unwrap(),
+                extension_data: None,
+            };
+        }
+        structure
+    }
+
+    #[test]
+    fn related_header_planning_allocations_do_not_multiply_by_depth() {
+        let mut measurements = Vec::new();
+        for (depth, parts) in [(20, 200), (40, 1_000)] {
+            let structure = deep_structure(depth, parts);
+            let limits = Limits {
+                max_nesting: depth,
+                max_mime_parts: parts,
+                ..Limits::default()
+            };
+            let measured = allocation_counter::measure(|| {
+                assert!(
+                    related_multipart_headers(&structure, &limits)
+                        .unwrap()
+                        .is_empty()
+                );
+            });
+            eprintln!(
+                "related planner depth={depth} parts={parts} allocations={} total={} peak={}",
+                measured.count_total, measured.bytes_total, measured.bytes_max
+            );
+            measurements.push((parts, measured));
+        }
+        for (parts, measured) in measurements {
+            assert!(
+                measured.count_total < parts as u64 * 4,
+                "header planning must not repeatedly select every descendant: {measured:?}"
+            );
+        }
+    }
 }

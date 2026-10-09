@@ -56,6 +56,67 @@ fn command_status_is_metadata_only_and_secret_output_is_bounded() {
 }
 
 #[test]
+fn command_secret_limit_preserves_a_full_sized_value_and_rejects_overflow() {
+    let installation = Installation::empty();
+    let path = installation.config().with_file_name("synthetic-secret");
+    let source = source_for(&CredentialSource::Command(configuration(
+        &installation,
+        vec!["file".into(), path.to_str().unwrap().into()],
+    )));
+    let limits = ResolutionLimits::try_from(&Limits {
+        secret_bytes: mailctl::credentials::MAX_SECRET_BYTES,
+        ..Limits::default()
+    })
+    .unwrap();
+    let id = Uuid::new_v4();
+    for suffix in [b"".as_slice(), b"\n", b"\r\n"] {
+        let mut bytes = vec![b'x'; limits.secret_bytes()];
+        bytes.extend_from_slice(suffix);
+        fs::write(&path, bytes).unwrap();
+        assert_eq!(
+            source.resolve_with_limits(id, &limits).unwrap().len(),
+            limits.secret_bytes()
+        );
+    }
+    fs::write(&path, vec![b'x'; limits.secret_bytes() + 3]).unwrap();
+    assert_eq!(
+        source.resolve_with_limits(id, &limits).unwrap_err(),
+        SourceError::InvalidSecret
+    );
+}
+
+#[test]
+fn ready_command_streams_are_drained_fairly_with_inclusive_limits() {
+    let installation = Installation::empty();
+    let limits = ResolutionLimits::try_from(&Limits {
+        secret_bytes: mailctl::credentials::MAX_SECRET_BYTES,
+        command_stderr_bytes: 32 * 1024,
+        ..Limits::default()
+    })
+    .unwrap();
+    for extra_stderr in [0, 1] {
+        let source = source_for(&CredentialSource::Command(configuration(
+            &installation,
+            vec![
+                "streams".into(),
+                limits.secret_bytes().to_string(),
+                (limits.stderr_bytes() + extra_stderr).to_string(),
+            ],
+        )));
+        assert_eq!(
+            source
+                .resolve_with_limits(Uuid::new_v4(), &limits)
+                .map(|secret| secret.len()),
+            if extra_stderr == 0 {
+                Ok(limits.secret_bytes())
+            } else {
+                Err(SourceError::Unavailable)
+            }
+        );
+    }
+}
+
+#[test]
 fn command_execution_closes_unrelated_handles_and_controls_its_context() {
     use std::os::fd::AsRawFd;
     let installation = Installation::empty();

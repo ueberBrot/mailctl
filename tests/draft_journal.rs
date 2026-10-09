@@ -538,3 +538,47 @@ fn dispatch_verification_refuses_expired_time_and_excess_history_without_changes
         Some(original)
     );
 }
+
+#[test]
+fn retained_history_verification_avoids_heap_copies_of_fixed_identity_fields() {
+    let temporary = TemporaryJournal::new();
+    let journal = DraftJournal::open(&temporary.path).unwrap();
+    let database = Connection::open(&temporary.path).unwrap();
+    let records = 5000;
+    database.execute_batch(&format!(
+        "WITH RECURSIVE records(number) AS (VALUES(1) UNION ALL SELECT number + 1 FROM records WHERE number < {records})
+         INSERT INTO draft_operations(operation_id, account_id, account_generation, mailbox_identity, content_sha256, state)
+         SELECT randomblob(16), zeroblob(16), 1, 'retained-mailbox', zeroblob(32), 'created' FROM records;"
+    )).unwrap();
+    let allocations = allocation_counter::measure(|| {
+        journal
+            .verify_for_dispatch(Instant::now() + Duration::from_secs(5), records)
+            .unwrap();
+    });
+    eprintln!("retained history verification: {allocations:?}");
+    assert!(
+        allocations.count_total < 3 * records as u64,
+        "{allocations:?}"
+    );
+}
+
+#[test]
+fn retained_history_verification_rejects_incorrect_fixed_blob_lengths() {
+    for column in ["operation_id", "account_id", "content_sha256"] {
+        let temporary = TemporaryJournal::new();
+        let mut journal = DraftJournal::open(&temporary.path).unwrap();
+        journal.prepare(child_operation()).unwrap();
+        let database = Connection::open(&temporary.path).unwrap();
+        database
+            .execute_batch(&format!(
+                "PRAGMA ignore_check_constraints = ON;
+             UPDATE draft_operations SET {column} = zeroblob(3);"
+            ))
+            .unwrap();
+        assert_eq!(
+            journal.verify_for_dispatch(Instant::now() + Duration::from_secs(5), 1),
+            Err(DraftJournalError::InvalidDatabase),
+            "malformed {column} must not become dispatchable",
+        );
+    }
+}

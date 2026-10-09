@@ -112,6 +112,248 @@ async fn setup_service(name: String, service: Service) -> (Service, String) {
     };
     (service, page.messages[0].reference.clone())
 }
+
+mod drop_reader {
+    use super::Arc;
+    use mailctl::{
+        config::Limits,
+        domain::Error,
+        service::{AttachmentBackend, AttachmentReader, MailboxTarget},
+    };
+    use std::{future::Future, pin::Pin};
+    use tokio::sync::Notify;
+    pub(super) struct Backend(pub(super) Arc<Notify>);
+    struct Reader {
+        dropped: Arc<Notify>,
+        offset: u64,
+    }
+    impl Drop for Reader {
+        fn drop(&mut self) {
+            self.dropped.notify_one();
+        }
+    }
+    impl AttachmentReader for Reader {
+        fn next<'a>(
+            &'a mut self,
+            _: &'a Limits,
+        ) -> Pin<Box<dyn Future<Output = Result<mailctl::imap::AttachmentData, Error>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                let decoded_offset = self.offset;
+                self.offset += 1;
+                Ok(mailctl::imap::AttachmentData {
+                    bytes: vec![b'x'],
+                    decoded_offset,
+                    integrity: None,
+                })
+            })
+        }
+    }
+    impl AttachmentBackend for Backend {
+        fn start(
+            &self,
+            _: MailboxTarget<'_>,
+            _: &str,
+            _: u32,
+            _: u32,
+            _: &str,
+            _: &Limits,
+        ) -> Result<Box<dyn AttachmentReader>, Error> {
+            Ok(Box::new(Reader {
+                dropped: self.0.clone(),
+                offset: 0,
+            }))
+        }
+        fn list<'a>(
+            &'a self,
+            _: MailboxTarget<'a>,
+            _: &'a str,
+            _: mailctl::imap::AttachmentListRequest,
+            _: &'a Limits,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<Vec<mailctl::imap::AttachmentMetadata>, Error>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async {
+                Ok(vec![mailctl::imap::AttachmentMetadata {
+                    part: "2".into(),
+                    filename: None,
+                    media_type: "application/octet-stream".into(),
+                    declared_size: Some(2),
+                    available: true,
+                }])
+            })
+        }
+    }
+}
+
+#[tokio::test]
+async fn expired_idle_transfers_release_readers_without_another_request() {
+    use std::time::Duration;
+    use tokio::sync::Notify;
+    let dropped = Arc::new(Notify::new());
+    let mut configuration = config();
+    configuration.limits.transfer_seconds = 1;
+    configuration.grants[0].limits.transfer_seconds = 1;
+    let (service, message) = setup(
+        configuration,
+        Arc::new(drop_reader::Backend(dropped.clone())),
+    )
+    .await;
+    let context = service.context("reader", &Default::default()).unwrap();
+    let OperationResult::Attachments(list) = service
+        .execute(
+            &context,
+            serde_json::from_value(
+                json!({"operation":"list_attachments","input":{"message":message}}),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    let OperationResult::Attachment(page) = service.execute(&context, serde_json::from_value(json!({"operation":"get_attachment","input":{"attachment":list.attachments[0].reference}})).unwrap()).await.unwrap() else { panic!() };
+    assert!(matches!(
+        page.progress,
+        mailctl::domain::AttachmentProgress::Continue { .. }
+    ));
+    tokio::time::timeout(Duration::from_millis(1500), dropped.notified())
+        .await
+        .expect("an expired transfer must release its reader while the session stays live");
+    // Keep both owners alive throughout the observed expiry interval.
+    drop((context, service));
+}
+
+fn transfer_cleanup_across_runtime_shutdown(overlap: bool) {
+    use std::time::Duration;
+    use tokio::sync::Notify;
+    let runtime = || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    };
+    let runtime_a = runtime();
+    let dropped = Arc::new(Notify::new());
+    let mut configuration = config();
+    configuration.limits.transfer_seconds = 1;
+    configuration.grants[0].limits.transfer_seconds = 1;
+    let (service, message) = runtime_a.block_on(setup(
+        configuration,
+        Arc::new(drop_reader::Backend(dropped.clone())),
+    ));
+    runtime_a.block_on(async {
+        let context = service.context("reader", &Default::default()).unwrap();
+        let reference = attachment_reference(&service, &context, &message).await;
+        let _token = start(&service, &context, &reference).await;
+        tokio::task::yield_now().await;
+        drop(context);
+        tokio::time::timeout(Duration::from_millis(100), dropped.notified())
+            .await
+            .expect("the first session must release its reader");
+        tokio::task::yield_now().await;
+    });
+    let mut runtime_a = Some(runtime_a);
+    if !overlap {
+        drop(runtime_a.take());
+    }
+    let runtime_b = runtime();
+    let context = runtime_b.block_on(async {
+        let context = service.context("reader", &Default::default()).unwrap();
+        let reference = attachment_reference(&service, &context, &message).await;
+        let _token = start(&service, &context, &reference).await;
+        context
+    });
+    drop(runtime_a.take());
+    runtime_b.block_on(async {
+        tokio::time::timeout(Duration::from_millis(1500), dropped.notified())
+            .await
+            .expect("the second runtime must expire its idle reader after the first shuts down");
+    });
+    drop((context, service));
+}
+
+#[test]
+fn expired_idle_transfers_restart_cleanup_after_runtime_shutdown() {
+    transfer_cleanup_across_runtime_shutdown(false);
+}
+
+#[test]
+fn expired_idle_transfers_keep_cleanup_when_another_runtime_shuts_down() {
+    transfer_cleanup_across_runtime_shutdown(true);
+}
+
+fn retained_transfer_after_executor_change(continue_transfer: bool) {
+    use std::time::Duration;
+    use tokio::sync::Notify;
+    let runtime = || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    };
+    let first = runtime();
+    let dropped = Arc::new(Notify::new());
+    let mut configuration = config();
+    configuration.limits.transfer_seconds = 1;
+    configuration.grants[0].limits.transfer_seconds = 1;
+    let (service, message) = first.block_on(setup(
+        configuration,
+        Arc::new(drop_reader::Backend(dropped.clone())),
+    ));
+    let (context, token) = first.block_on(async {
+        let context = service.context("reader", &Default::default()).unwrap();
+        let reference = attachment_reference(&service, &context, &message).await;
+        let token = start(&service, &context, &reference).await;
+        tokio::task::yield_now().await;
+        (context, token)
+    });
+    drop(first);
+    let second = runtime();
+    second.block_on(async {
+        if continue_transfer {
+            let OperationResult::Attachment(page) = service
+                .execute(
+                    &context,
+                    operation("get_attachment", json!({"token":token})),
+                )
+                .await
+                .unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(page.decoded_offset, 1);
+            assert!(matches!(
+                page.progress,
+                mailctl::domain::AttachmentProgress::Continue { .. }
+            ));
+        } else {
+            service
+                .execute(&context, Operation::ListMailboxes(Default::default()))
+                .await
+                .unwrap();
+        }
+        tokio::time::timeout(Duration::from_millis(1500), dropped.notified())
+            .await
+            .expect("the retained reader must expire after an operation on the new executor");
+    });
+    drop((context, service));
+}
+
+#[test]
+fn expired_idle_transfers_rearm_after_an_unrelated_service_operation() {
+    retained_transfer_after_executor_change(false);
+}
+
+#[test]
+fn unexpired_idle_transfers_continue_after_their_original_executor_stops() {
+    retained_transfer_after_executor_change(true);
+}
 async fn live(
     fixture: &imap_support::Fixture,
     mut config: mailctl::config::Config,

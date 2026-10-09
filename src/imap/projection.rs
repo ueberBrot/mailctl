@@ -147,6 +147,9 @@ fn header_text(bytes: &[u8]) -> Option<String> {
     let mut line = Vec::with_capacity(bytes.len() + 2);
     line.extend_from_slice(bytes);
     line.extend_from_slice(b"\r\n");
+    if !encoded_word_work_is_bounded(&line) {
+        return None;
+    }
     let parsed = mail_parser::parsers::MessageStream::new(&line).parse_unstructured();
     match parsed {
         mail_parser::HeaderValue::Text(value) => Some(value.into_owned()),
@@ -156,6 +159,37 @@ fn header_text(bytes: &[u8]) -> Option<String> {
         _ => None,
     }
 }
+
+// The pinned parser restores its position after a failed encoded word. Repeated
+// malformed prefixes can otherwise decode and allocate each remaining suffix.
+// Admit the same candidate attempts with a linear aggregate work allowance;
+// cap each decoder's input before it can allocate that suffix.
+fn encoded_word_work_is_bounded(bytes: &[u8]) -> bool {
+    let mut remaining = bytes.len().saturating_mul(8);
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index..].starts_with(b"=?") {
+            let start = index + 1;
+            let available = bytes.len() - start;
+            let admitted = remaining.min(available);
+            let mut stream =
+                mail_parser::parsers::MessageStream::new(&bytes[start..start + admitted]);
+            let decoded = stream.decode_rfc2047();
+            let consumed = stream.offset();
+            remaining -= consumed;
+            if admitted < available && consumed == admitted {
+                return false;
+            }
+            if decoded.is_some() {
+                index = start + consumed;
+                continue;
+            }
+        }
+        index += 1;
+    }
+    true
+}
+
 fn parsed_addresses(
     values: &[io_imap::types::envelope::Address<'_>],
 ) -> crate::domain::Metadata<Vec<crate::domain::MessageAddress>> {

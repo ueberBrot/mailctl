@@ -575,3 +575,174 @@ async fn generations_share_capacity_but_never_reuse_each_others_connections() {
     assert_eq!(source.calls.load(Ordering::SeqCst), 2);
     fixture.await.unwrap();
 }
+
+fn idle_connections_expire_after_executor_change(overlap: bool) {
+    // Keep the synthetic provider independent of either client executor so its
+    // EOF observation proves that the retained connection was actually closed.
+    let provider = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (port, roots, mut fixture) = provider.block_on(fixture(2, false));
+    let limits = Limits {
+        connection_lifetime_seconds: 1,
+        ..Limits::default()
+    };
+    let authentication = Runtime::new(limits.clone(), roots).unwrap();
+    let source = Source::new(false);
+    let account = account(port, source.clone());
+    let executor = || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    };
+    let mut first = Some(executor());
+    // Initialize the same account pool, then dispose its first connection.
+    drop(
+        first
+            .as_ref()
+            .unwrap()
+            .block_on(authentication.acquire(&account, &limits))
+            .unwrap(),
+    );
+    if !overlap {
+        drop(first.take());
+    }
+    let second = executor();
+    second.block_on(async {
+        authentication
+            .acquire(&account, &limits)
+            .await
+            .unwrap()
+            .release();
+    });
+    // In the overlap case the new idle connection exists before its original
+    // cleanup executor shuts down.
+    drop(first);
+    assert_eq!(source.calls.load(Ordering::SeqCst), 2);
+    if overlap {
+        second.block_on(async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(
+                !fixture.is_finished(),
+                "stopping the original executor must preserve the new executor's idle connection"
+            );
+        });
+    }
+    let closed = second
+        .block_on(async { tokio::time::timeout(Duration::from_millis(1400), &mut fixture).await });
+    // Release the resource even on a failing regression, then finish the fixture.
+    drop(authentication);
+    if closed.is_err() {
+        second.block_on(fixture).unwrap();
+    }
+    closed
+        .expect("an idle provider connection must expire on the live executor")
+        .unwrap();
+}
+
+#[test]
+fn idle_connections_expire_when_authentication_moves_to_a_new_executor() {
+    idle_connections_expire_after_executor_change(false);
+}
+
+#[test]
+fn idle_connections_expire_when_the_original_executor_stops_during_reuse() {
+    idle_connections_expire_after_executor_change(true);
+}
+
+#[test]
+fn idle_connections_expire_for_an_unused_account_after_executor_shutdown() {
+    struct MissingSource;
+    impl SecretSource for MissingSource {
+        fn availability(&self, _: Uuid) -> Availability {
+            Availability::Missing
+        }
+        fn resolve(&self, _: Uuid) -> Result<Secret, SourceError> {
+            Err(SourceError::Missing)
+        }
+    }
+    let provider = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (port, roots, mut fixture) = provider.block_on(fixture(1, false));
+    let limits = Limits {
+        connection_lifetime_seconds: 1,
+        ..Limits::default()
+    };
+    let authentication = Runtime::new(limits.clone(), roots).unwrap();
+    let original = account(port, Source::new(false));
+    let executor = || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    };
+    let first = executor();
+    first.block_on(async {
+        authentication
+            .acquire(&original, &limits)
+            .await
+            .unwrap()
+            .release();
+    });
+    drop(first);
+    let second = executor();
+    let different = account(port, Arc::new(MissingSource));
+    assert_ne!(original.id, different.id);
+    second.block_on(async {
+        assert!(matches!(
+            authentication.acquire(&different, &limits).await,
+            Err(Error::Source(SourceError::Missing))
+        ));
+    });
+    // The original account receives no further request. Cleanup on the live
+    // executor must still close its retained provider connection by its expiry.
+    let closed = second
+        .block_on(async { tokio::time::timeout(Duration::from_millis(1400), &mut fixture).await });
+    drop(authentication);
+    if closed.is_err() {
+        second.block_on(fixture).unwrap();
+    }
+    closed
+        .expect("an unused account's idle connection must survive no longer than its lifetime")
+        .unwrap();
+}
+
+#[test]
+fn released_connections_close_after_their_creator_executor_stops() {
+    let provider = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (port, roots, mut fixture) = provider.block_on(fixture(1, false));
+    let limits = Limits::default();
+    let authentication = Runtime::new(limits.clone(), roots).unwrap();
+    let account = account(port, Source::new(false));
+    let creator = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let lease = creator
+        .block_on(authentication.acquire(&account, &limits))
+        .unwrap();
+    drop(creator);
+    // A checked-out lease stays admitted until its owner finishes. Returning it
+    // after its I/O executor stops must dispose it, without requiring a runtime.
+    assert!(tokio::runtime::Handle::try_current().is_err());
+    lease.release();
+    let closed = provider
+        .block_on(async { tokio::time::timeout(Duration::from_millis(400), &mut fixture).await });
+    drop(authentication);
+    if closed.is_err() {
+        provider.block_on(fixture).unwrap();
+    }
+    closed
+        .expect("a connection cannot return to an idle pool after its I/O executor stops")
+        .unwrap();
+}

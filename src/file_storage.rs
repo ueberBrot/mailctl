@@ -132,10 +132,13 @@ pub(crate) fn read(path: &Path, maximum: usize) -> io::Result<Option<Vec<u8>>> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
-    if file.metadata()?.len() > maximum as u64 {
+    let length = file.metadata()?.len();
+    if length > maximum as u64 {
         return Err(io::ErrorKind::InvalidData.into());
     }
-    let mut bytes = Vec::new();
+    // Leave room for the EOF probe so a stable, exactly-sized file does not
+    // trigger another growth allocation after filling its buffer.
+    let mut bytes = Vec::with_capacity((length as usize).saturating_add(1));
     file.take(maximum as u64 + 1).read_to_end(&mut bytes)?;
     if bytes.len() > maximum {
         return Err(io::ErrorKind::InvalidData.into());
@@ -158,4 +161,30 @@ pub(crate) fn replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
         let _ = fs::remove_file(temporary);
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounded_read_allocates_for_the_existing_private_file() {
+        let path = std::env::temp_dir().join(format!(
+            "mailctl-file-allocation-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let length = 1024 * 1024;
+        replace(&path, &vec![b'x'; length]).unwrap();
+        let mut bytes = None;
+        let allocations = allocation_counter::measure(|| {
+            bytes = read(&path, 4 * length).unwrap();
+        });
+        eprintln!("bounded private file read: {allocations:?}");
+        fs::remove_file(path).unwrap();
+        assert_eq!(bytes.unwrap().len(), length);
+        assert!(
+            allocations.bytes_total <= length as u64 + 4096,
+            "{allocations:?}"
+        );
+    }
 }

@@ -386,3 +386,63 @@ fn valid_subject_text_can_contain_an_encoded_word_marker() {
     ));
     server.join().unwrap();
 }
+
+#[test]
+fn malformed_encoded_word_prefixes_have_linear_normalization_allocation() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    for repeats in [512, 1024] {
+        let subject = "=?AB?q?x".repeat(repeats);
+        let source_bytes = subject.len();
+        let (mut probe, server) =
+            dedicated_fixture(TlsMode::Implicit, Limits::default(), move |mut wire| {
+                Box::pin(async move {
+                    authenticate(&mut wire).await;
+                    select(&mut wire, 1).await;
+                    let tag = expect(&mut wire, "UID SEARCH UID 1").await;
+                    write(&mut wire, &format!("* SEARCH 1\r\n{tag} OK searched\r\n")).await;
+                    let tag = expect(
+                        &mut wire,
+                        "UID FETCH 1 (UID ENVELOPE FLAGS INTERNALDATE RFC822.SIZE)",
+                    )
+                    .await;
+                    row(&mut wire, 1, &subject).await;
+                    write(&mut wire, &format!("{tag} OK fetched\r\n")).await;
+                    logout(&mut wire).await;
+                })
+            });
+        let criteria = SearchCriteria::default();
+        let allocations = allocation_counter::measure(|| {
+            let batch = runtime
+                .block_on(probe.search_messages(
+                    "fixture",
+                    "disposable-password",
+                    SearchRequest {
+                        mailbox: "INBOX",
+                        criteria: &criteria,
+                        position: None,
+                        limit: 1,
+                        response_bytes: 1024 * 1024,
+                    },
+                    &config::Limits::default(),
+                ))
+                .unwrap();
+            assert_eq!(batch.messages.len(), 1);
+            assert!(matches!(
+                batch.messages[0].metadata.subject,
+                mailctl::domain::Metadata::Malformed
+            ));
+        });
+        server.join().unwrap();
+        eprintln!(
+            "malformed encoded words source={source_bytes} allocations={} total={} peak={}",
+            allocations.count_total, allocations.bytes_total, allocations.bytes_max
+        );
+        assert!(
+            allocations.bytes_total < 512 * 1024 + source_bytes as u64 * 64,
+            "normalizing malformed encoded words must remain linear: {allocations:?}"
+        );
+    }
+}

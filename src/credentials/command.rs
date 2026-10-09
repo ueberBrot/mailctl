@@ -1,7 +1,10 @@
 //! Executes an operator-trusted helper without exposing its output to diagnostics.
 use super::{Availability, ResolutionLimits, Secret, SecretSource, SourceError};
 use crate::config::{CredentialCommand, Limits};
-use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group, waitid};
+use rustix::{
+    event::{PollFd, PollFlags, Timespec, poll},
+    process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group, waitid},
+};
 use std::{
     ffi::CString,
     fs,
@@ -127,23 +130,28 @@ impl SecretSource for CommandSource {
                 return Err(SourceError::Unavailable);
             }
             // One read per stream keeps a noisy helper from starving either pipe or the deadline.
+            let mut progressed = false;
             if !stdout_eof {
-                stdout_eof = read_chunk(&mut stdout, |bytes| {
+                let read = read_chunk(&mut stdout, |bytes| {
                     if output.len() + bytes.len() > limits.secret_bytes + 2 {
                         return Err(SourceError::InvalidSecret);
                     }
                     output.extend_from_slice(bytes);
                     Ok(())
                 })?;
+                stdout_eof = read == ReadState::Eof;
+                progressed |= read == ReadState::Data;
             }
             if !stderr_eof {
-                stderr_eof = read_chunk(&mut stderr, |bytes| {
+                let read = read_chunk(&mut stderr, |bytes| {
                     stderr_bytes += bytes.len();
                     if stderr_bytes > limits.stderr_bytes {
                         return Err(SourceError::Unavailable);
                     }
                     Ok(())
                 })?;
+                stderr_eof = read == ReadState::Eof;
+                progressed |= read == ReadState::Data;
             }
             // Leave the leader unreaped until group cleanup so its process ID cannot be reused.
             if let Some(status) = waitid(
@@ -159,7 +167,32 @@ impl SecretSource for CommandSource {
                     break;
                 }
             }
-            std::thread::sleep(Duration::from_millis(1));
+            if !progressed {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let mut descriptors = [
+                    PollFd::new(&stdout, PollFlags::IN),
+                    PollFd::new(&stderr, PollFlags::IN),
+                ];
+                let live = match (stdout_eof, stderr_eof) {
+                    (false, false) => &mut descriptors[..],
+                    (false, true) => &mut descriptors[..1],
+                    (true, false) => &mut descriptors[1..],
+                    // Closed pipes cannot signal the leader's eventual exit.
+                    // Check only that rare case at a bounded interval.
+                    (true, true) => &mut descriptors[..0],
+                };
+                let timeout = Timespec::try_from(if live.is_empty() {
+                    remaining.min(Duration::from_millis(10))
+                } else {
+                    remaining
+                })
+                .map_err(|_| SourceError::Unavailable)?;
+                if let Err(error) = poll(live, Some(&timeout))
+                    && error != rustix::io::Errno::INTR
+                {
+                    return Err(SourceError::Unavailable);
+                }
+            }
         }
         if output.last() == Some(&b'\n') {
             output.pop();
@@ -238,16 +271,23 @@ fn nonblocking(pipe: &impl AsFd) -> Result<(), SourceError> {
         .map_err(|_| SourceError::Unavailable)
 }
 
+#[derive(PartialEq)]
+enum ReadState {
+    Eof,
+    Data,
+    Pending,
+}
+
 fn read_chunk(
     pipe: &mut impl Read,
     accept: impl FnOnce(&[u8]) -> Result<(), SourceError>,
-) -> Result<bool, SourceError> {
+) -> Result<ReadState, SourceError> {
     let mut buffer = Zeroizing::new([0; 1024]);
     match pipe.read(&mut *buffer) {
-        Ok(0) => Ok(true),
+        Ok(0) => Ok(ReadState::Eof),
         Ok(count) => {
             accept(&buffer[..count])?;
-            Ok(false)
+            Ok(ReadState::Data)
         }
         Err(error)
             if matches!(
@@ -255,7 +295,7 @@ fn read_chunk(
                 io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
             ) =>
         {
-            Ok(false)
+            Ok(ReadState::Pending)
         }
         Err(_) => Err(SourceError::Unavailable),
     }

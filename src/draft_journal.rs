@@ -532,11 +532,11 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), DraftJournalErro
 }
 
 struct DatabaseRow {
-    operation_id: Vec<u8>,
-    account_id: Vec<u8>,
+    operation_id: [u8; 16],
+    account_id: [u8; 16],
     account_generation: i64,
     mailbox_identity: String,
-    content_sha256: Vec<u8>,
+    content_sha256: [u8; 32],
     reconstruction: Option<String>,
     state: String,
     appended_uid_validity: Option<i64>,
@@ -617,16 +617,11 @@ fn database_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DatabaseRow> {
 }
 
 fn decode_row(row: DatabaseRow) -> Result<PersistedDraftOperation, DraftJournalError> {
-    let operation_id =
-        Uuid::from_slice(&row.operation_id).map_err(|_| DraftJournalError::InvalidDatabase)?;
-    let account_id =
-        Uuid::from_slice(&row.account_id).map_err(|_| DraftJournalError::InvalidDatabase)?;
+    let operation_id = Uuid::from_bytes(row.operation_id);
+    let account_id = Uuid::from_bytes(row.account_id);
     let account_generation =
         u64::try_from(row.account_generation).map_err(|_| DraftJournalError::InvalidDatabase)?;
-    let content_sha256: [u8; 32] = row
-        .content_sha256
-        .try_into()
-        .map_err(|_| DraftJournalError::InvalidDatabase)?;
+    let content_sha256 = row.content_sha256;
     let appended_message = match (row.appended_uid_validity, row.appended_uid) {
         (None, None) => None,
         (Some(uid_validity), Some(uid)) => {

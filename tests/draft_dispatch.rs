@@ -31,6 +31,32 @@ fn draft_deserialization_reuses_the_owned_body_input() {
 }
 
 #[test]
+fn small_draft_composition_allocates_for_content_instead_of_the_mime_ceiling() {
+    let input = mailctl::draft::DraftInput {
+        from: "work@example.test".into(),
+        message_id: "small@mailctl.invalid".into(),
+        date_unix: 1_700_000_000,
+        body: "A short synthetic draft.".into(),
+        ..Default::default()
+    };
+    let mut draft = None;
+    let allocations = allocation_counter::measure(|| {
+        draft = Some(PreparedDraft::compose(input, 8 * 1024 * 1024).unwrap());
+    });
+    eprintln!("small draft composition: {allocations:?}");
+    assert!(allocations.bytes_total < 64 * 1024, "{allocations:?}");
+    let draft = draft.unwrap();
+    assert!(draft.bytes().len() < 1024);
+    let parsed = mail_parser::MessageParser::default()
+        .parse(draft.bytes())
+        .unwrap();
+    assert_eq!(
+        parsed.body_text(0).unwrap().trim_end(),
+        "A short synthetic draft."
+    );
+}
+
+#[test]
 fn mixed_line_endings_are_normalized_with_one_bounded_body_allocation() {
     let repetitions = 65_536;
     let body = "one\r\ntwo\rthree\n".repeat(repetitions);

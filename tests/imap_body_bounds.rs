@@ -39,6 +39,57 @@ async fn successful_large_attachment_route(wire: &mut Wire, size: u32) {
     logout(wire).await;
 }
 
+#[test]
+fn body_headers_ignore_unrelated_encoded_words_with_linear_allocation() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let subject = "=?AB?q?x".repeat(1024);
+    let root_headers = format!("Subject: {subject}\r\n{ROOT_HEADERS}");
+    let header_bytes = root_headers.len();
+    let (mut probe, server) = dedicated_fixture(
+        TlsMode::Implicit,
+        Limits::default(),
+        move |mut wire| {
+            Box::pin(async move {
+                authenticate(&mut wire).await;
+                examine(&mut wire).await;
+                metadata(
+                    &mut wire,
+                    &format!(
+                        "* 1 FETCH (UID 4 RFC822.SIZE 3000300 BODYSTRUCTURE {MIXED})\r\n{{tag}} OK fetched\r\n"
+                    ),
+                )
+                .await;
+                literal(&mut wire, "HEADER", 0, 16 * 1024, &root_headers).await;
+                literal(&mut wire, "1", 0, 14, SHORT_BODY).await;
+                logout(&mut wire).await;
+            })
+        },
+    );
+    let allocations = allocation_counter::measure(|| {
+        let page = runtime
+            .block_on(probe.read_body(
+                "fixture",
+                "disposable-password",
+                "INBOX",
+                BodyRequest::new(4, 77),
+            ))
+            .unwrap();
+        assert_eq!(page.text, SHORT_BODY);
+    });
+    server.join().unwrap();
+    eprintln!(
+        "irrelevant body subject source={header_bytes} allocations={} total={} peak={}",
+        allocations.count_total, allocations.bytes_total, allocations.bytes_max
+    );
+    assert!(
+        allocations.bytes_total < 512 * 1024 + header_bytes as u64 * 64,
+        "unused message headers must not invoke encoded-word normalization: {allocations:?}"
+    );
+}
+
 #[tokio::test]
 async fn body_read_rejects_uidvalidity_before_any_fetch() {
     let mut validity_fixture = fixture(TlsMode::Implicit, Limits::default(), |mut wire| {

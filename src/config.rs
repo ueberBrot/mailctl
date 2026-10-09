@@ -292,22 +292,22 @@ impl Config {
         if input.len() > MAX_BYTES {
             return Err(invalid());
         }
-        #[derive(Deserialize)]
-        struct SchemaVersion {
-            version: u32,
-        }
-        let parse_error = |_| {
-            if obsolete_runtime_capacity(input) {
-                Error::obsolete_runtime_capacity()
-            } else {
-                invalid()
+        let raw: RawConfig = toml::from_str(input).map_err(|_| {
+            // Future layouts may not decode as RawConfig. Preserve their version
+            // guidance while parsing a healthy configuration only once.
+            #[derive(Deserialize)]
+            struct SchemaVersion {
+                version: u32,
             }
-        };
-        let schema: SchemaVersion = toml::from_str(input).map_err(parse_error)?;
-        if schema.version != 1 {
+            match toml::from_str::<SchemaVersion>(input) {
+                Ok(schema) if schema.version != 1 => Error::incompatible_schema(),
+                _ if obsolete_runtime_capacity(input) => Error::obsolete_runtime_capacity(),
+                _ => invalid(),
+            }
+        })?;
+        if raw.version != 1 {
             return Err(Error::incompatible_schema());
         }
-        let raw: RawConfig = toml::from_str(input).map_err(parse_error)?;
         raw.limits.validate()?;
         let grants = raw
             .grants

@@ -323,10 +323,20 @@ impl ImapEndpoint {
         roots: RootCertStore,
         limits: Limits,
     ) -> Result<Self, Error> {
+        Self::new_with_shared_roots(host, port, mode, Arc::new(roots), limits)
+    }
+    pub(crate) fn new_with_shared_roots(
+        host: String,
+        port: u16,
+        mode: TlsMode,
+        roots: Arc<RootCertStore>,
+        limits: Limits,
+    ) -> Result<Self, Error> {
         limits.validate()?;
         if host.is_empty() || host.len() > 253 || port == 0 {
             return Err(Error::InvalidInput);
         }
+        // Trust is immutable; each endpoint still owns a fresh client configuration.
         let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
         ))

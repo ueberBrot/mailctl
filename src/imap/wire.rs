@@ -1,5 +1,6 @@
 use super::{
-    AppendOutcome, Error, Limits, Metrics, TlsMode, fetch::Fetch as BodyFetch,
+    AppendOutcome, Error, Limits, Metrics, TlsMode,
+    fetch::{Fetch as BodyFetch, MAX_CHUNK_BYTES},
     projection::Projection,
 };
 use io_imap::{
@@ -27,7 +28,7 @@ use io_imap::{
 };
 use std::{collections::BTreeSet, io, num::NonZeroU32, sync::Arc};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
     net::TcpStream,
 };
 use tokio_rustls::{
@@ -35,6 +36,11 @@ use tokio_rustls::{
     rustls::{ClientConfig, pki_types::ServerName},
 };
 use zeroize::Zeroizing;
+
+// Keep storage for ordinary 16 KiB FETCH frames. Accepted response sizes still
+// follow the configured protocol limits; this threshold controls reuse only.
+const REUSED_FRAME_BYTES: usize = MAX_CHUNK_BYTES * 2;
+
 trait Stream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Stream for T {}
 
@@ -46,6 +52,7 @@ pub(super) struct Connection<'a> {
 pub(super) struct Session {
     stream: BufReader<Box<dyn Stream>>,
     fragmentizer: Fragmentizer,
+    response_guard: Fragmentizer,
     limits: Limits,
     command: CommandState,
     uid_validity: Option<NonZeroU32>,
@@ -85,6 +92,7 @@ impl<'a> Connection<'a> {
         Ok(Session {
             stream: BufReader::with_capacity(4096, stream),
             fragmentizer: Fragmentizer::new(limits.max_response_bytes as u32),
+            response_guard: Fragmentizer::new(limits.max_response_bytes as u32),
             limits,
             command: CommandState::greeting(),
             uid_validity: None,
@@ -100,6 +108,7 @@ impl<'a> Connection<'a> {
     pub(super) fn limit_body(&mut self, limits: &Limits) {
         self.session.limits = limits.clone();
         self.session.fragmentizer = Fragmentizer::new(limits.max_response_bytes as u32);
+        self.session.response_guard = Fragmentizer::new(limits.max_response_bytes as u32);
     }
     pub(super) fn limit_search(&mut self, limits: &crate::config::Limits) {
         self.session.limits.max_literal_bytes = limits.header_bytes;
@@ -113,6 +122,8 @@ impl<'a> Connection<'a> {
         // Authentication completed at a clean command boundary. Both parsers
         // must apply the selected operation's frame ceiling.
         self.session.fragmentizer =
+            Fragmentizer::new(self.session.limits.max_response_bytes as u32);
+        self.session.response_guard =
             Fragmentizer::new(self.session.limits.max_response_bytes as u32);
     }
     pub(super) async fn upper_uid(&mut self, uid_next: Option<u32>) -> Result<u32, Error> {
@@ -176,6 +187,8 @@ impl<'a> Connection<'a> {
         .map_err(|_| Error::Tls)?;
         self.session.stream = BufReader::with_capacity(4096, Box::new(tls));
         self.session.fragmentizer =
+            Fragmentizer::new(self.session.limits.max_response_bytes as u32);
+        self.session.response_guard =
             Fragmentizer::new(self.session.limits.max_response_bytes as u32);
         Ok(self)
     }
@@ -458,9 +471,11 @@ impl<'a> Connection<'a> {
         Ok(())
     }
     async fn frame(&mut self) -> Result<Vec<u8>, Error> {
-        let mut guard = Fragmentizer::new(self.session.limits.max_response_bytes as u32);
+        // The guard and backend parser have separate state, but both retain bounded
+        // storage across frames rather than reallocating it for every response.
         let mut bytes = 0usize;
         let mut nesting = 0usize;
+        let mut literal_bytes = 0usize;
         if self.metrics.responses >= self.session.limits.max_responses {
             return Err(Error::Limit);
         }
@@ -477,19 +492,60 @@ impl<'a> Connection<'a> {
             {
                 return Err(Error::Limit);
             }
-            let byte = self.session.stream.read_u8().await.map_err(|e| {
-                if e.kind() == io::ErrorKind::UnexpectedEof {
-                    Error::Eof
-                } else {
-                    Error::Transport
+            let parser_remaining = self
+                .session
+                .limits
+                .max_parser_steps
+                .saturating_sub(self.metrics.parser_steps);
+            let remaining = (self.session.limits.max_response_bytes - bytes)
+                .min(
+                    self.session
+                        .limits
+                        .max_operation_bytes
+                        .saturating_sub(self.metrics.wire_bytes)
+                        .saturating_sub(self.metrics.append_wire_bytes),
+                )
+                .min(parser_remaining.saturating_add(1));
+            let received = {
+                let available = self.session.stream.fill_buf().await.map_err(|e| {
+                    if e.kind() == io::ErrorKind::UnexpectedEof {
+                        Error::Eof
+                    } else {
+                        Error::Transport
+                    }
+                })?;
+                if available.is_empty() {
+                    return Err(Error::Eof);
                 }
-            })?;
-            bytes += 1;
-            self.metrics.wire_bytes += 1;
+                // Stop at each syntax line so its literal announcement is checked
+                // before consuming payload. Literal bytes have no syntax meaning.
+                let count = if literal_bytes == 0 {
+                    available
+                        .iter()
+                        .position(|byte| *byte == b'\n')
+                        .map_or(available.len(), |end| end + 1)
+                } else {
+                    available.len().min(literal_bytes)
+                }
+                .min(remaining);
+                self.session
+                    .response_guard
+                    .enqueue_bytes(&available[..count]);
+                self.session.stream.consume(count);
+                count
+            };
+            bytes += received;
+            self.metrics.wire_bytes += received;
             self.metrics.max_response_bytes = self.metrics.max_response_bytes.max(bytes);
-            self.step(1)?;
-            guard.enqueue_bytes(&[byte]);
-            while let Some(info) = guard.progress() {
+            let admitted = received.min(parser_remaining);
+            self.step(admitted)?;
+            if admitted < received {
+                // Preserve the counter for the last consumed byte even when its
+                // parser step cannot be admitted.
+                return Err(Error::Limit);
+            }
+            literal_bytes = literal_bytes.saturating_sub(received);
+            while let Some(info) = self.session.response_guard.progress() {
                 if let FragmentInfo::Line {
                     announcement,
                     ending,
@@ -503,7 +559,7 @@ impl<'a> Connection<'a> {
                     // bytes are separate fragments and cannot affect this depth counter.
                     let mut quoted = false;
                     let mut escaped = false;
-                    for &b in guard.fragment_bytes(info) {
+                    for &b in self.session.response_guard.fragment_bytes(info) {
                         if escaped {
                             escaped = false;
                             continue;
@@ -547,14 +603,15 @@ impl<'a> Connection<'a> {
                             return Err(Error::Limit);
                         }
                         self.metrics.max_literal_bytes = self.metrics.max_literal_bytes.max(length);
+                        literal_bytes = length;
                     }
                 }
-                if guard.is_message_complete() {
+                if self.session.response_guard.is_message_complete() {
                     self.step(bytes * 2)?;
                     let repaired = match &self.session.command.kind {
                         CommandKind::BodyFetch { contract, .. } => contract
                             .repair_partial_separator(
-                                guard.message_bytes(),
+                                self.session.response_guard.message_bytes(),
                                 self.session.limits.max_response_bytes,
                             )?,
                         _ => None,
@@ -562,7 +619,9 @@ impl<'a> Connection<'a> {
                     if repaired.is_some() {
                         self.step(bytes + 1)?;
                     }
-                    let input = repaired.as_deref().unwrap_or_else(|| guard.message_bytes());
+                    let input = repaired
+                        .as_deref()
+                        .unwrap_or_else(|| self.session.response_guard.message_bytes());
                     let (remaining, response) = ResponseCodec::new()
                         .decode(input)
                         .map_err(|_| Error::Protocol)?;
@@ -577,7 +636,13 @@ impl<'a> Connection<'a> {
                     if let CommandKind::Append { outcome, .. } = self.session.command.kind {
                         self.metrics.append_outcome = Some(outcome);
                     }
-                    return Ok(repaired.unwrap_or_else(|| guard.message_bytes().to_vec()));
+                    let frame = repaired
+                        .unwrap_or_else(|| self.session.response_guard.message_bytes().to_vec());
+                    if frame.len() > REUSED_FRAME_BYTES {
+                        self.session.response_guard =
+                            Fragmentizer::new(self.session.limits.max_response_bytes as u32);
+                    }
+                    return Ok(frame);
                 }
             }
         }

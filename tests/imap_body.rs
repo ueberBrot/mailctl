@@ -43,6 +43,65 @@ async fn short_body_does_not_download_the_oversized_attachment() {
 }
 
 #[tokio::test]
+async fn body_read_avoids_related_header_fetches_outside_the_selected_branch() {
+    let text = "(\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") \"<selected>\" NIL \"7BIT\" 13 1 NIL NIL NIL NIL)";
+    let other_text =
+        "(\"TEXT\" \"HTML\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" 4 1 NIL NIL NIL NIL)";
+    for (subtype, parameters) in [
+        ("MIXED", "NIL"),
+        ("ALTERNATIVE", "NIL"),
+        ("RELATED", "NIL"),
+        ("RELATED", "(\"START\" \"<selected>\")"),
+    ] {
+        let structure = format!(
+            "({text}(({other_text} \"ALTERNATIVE\" NIL NIL NIL NIL) \"RELATED\" (\"START\" \"<other-root>\") NIL NIL NIL) \"{subtype}\" {parameters} NIL NIL NIL)"
+        );
+        let root_headers = format!(
+            "MIME-Version: 1.0\r\nContent-Type: multipart/{}; boundary=fixture{}\r\n\r\n",
+            subtype.to_ascii_lowercase(),
+            if parameters == "NIL" {
+                ""
+            } else {
+                "; start=\"<selected>\""
+            },
+        );
+        let mut fixture = fixture(TlsMode::Implicit, Limits::default(), move |mut wire| {
+        Box::pin(async move {
+            authenticate(&mut wire).await;
+            examine(&mut wire).await;
+            let tag = expect(&mut wire, "UID FETCH 4 (UID RFC822.SIZE BODYSTRUCTURE)").await;
+            write(
+                &mut wire,
+                &format!(
+                    "* 1 FETCH (UID 4 RFC822.SIZE 3000300 BODYSTRUCTURE {structure})\r\n{tag} OK fetched\r\n"
+                ),
+            )
+            .await;
+            literal(&mut wire, "HEADER", 0, 16384, &root_headers).await;
+            literal(&mut wire, "1", 0, 14, "Short body.\r\n").await;
+            logout(&mut wire).await;
+        })
+    })
+    .await;
+        let page = fixture
+            .probe
+            .read_body(
+                "fixture",
+                "disposable-password",
+                "INBOX",
+                BodyRequest::new(4, 77),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.text, "Short body.\r\n");
+        assert_eq!(page.selected_part.as_deref(), Some("1"));
+        assert!(page.metrics.wire_bytes < 4096);
+        assert_eq!(page.metrics.responses, 18);
+        fixture.task.await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn decoded_text_can_exceed_one_page_and_ends_on_a_utf8_boundary() {
     let mut fixture = fixture(TlsMode::Implicit, Limits { max_text_bytes: 4, ..Limits::default() }, |mut wire| Box::pin(async move {
         authenticate(&mut wire).await;
@@ -407,6 +466,54 @@ async fn related_can_identify_a_multipart_root_from_its_bounded_mime_headers() {
     assert_eq!(page.text, "Second");
     assert_eq!(page.selected_part.as_deref(), Some("2.2"));
     fixture.task.await.unwrap();
+}
+
+#[tokio::test]
+async fn alternative_selection_waits_for_related_multipart_root_headers() {
+    for root_subtype in ["HTML", "PLAIN"] {
+        let html = text_part("HTML", "UTF-8", "7BIT", 12, "NIL", "NIL");
+        let plain = text_part("PLAIN", "UTF-8", "7BIT", 5, "NIL", "NIL");
+        let fallback = if root_subtype == "HTML" {
+            &plain
+        } else {
+            &html
+        };
+        let root = if root_subtype == "HTML" {
+            &html
+        } else {
+            &plain
+        };
+        let related = format!(
+            "({fallback}({root} \"MIXED\" NIL NIL NIL NIL) \"RELATED\" (\"START\" \"<root>\") NIL NIL NIL)"
+        );
+        let structure = format!("({html}{related}{plain} \"ALTERNATIVE\" NIL NIL NIL NIL)");
+        let selected_part = if root_subtype == "HTML" { "3" } else { "2.2.1" };
+        let mut fixture = fixture(TlsMode::Implicit, Limits::default(), move |mut wire| {
+            Box::pin(async move {
+                authenticate(&mut wire).await;
+                examine(&mut wire).await;
+                let tag = expect(&mut wire, "UID FETCH 4 (UID RFC822.SIZE BODYSTRUCTURE)").await;
+                write(&mut wire, &format!("* 1 FETCH (UID 4 RFC822.SIZE 3000300 BODYSTRUCTURE {structure})\r\n{tag} OK fetched\r\n")).await;
+                literal(&mut wire, "HEADER", 0, 16384, "Content-Type: multipart/alternative; boundary=outer\r\n\r\n").await;
+                literal(&mut wire, "2.2.MIME", 0, 16384, "Content-Type: multipart/mixed; boundary=root\r\nContent-ID: <root>\r\n\r\n").await;
+                literal(&mut wire, selected_part, 0, 6, "Final").await;
+                logout(&mut wire).await;
+            })
+        }).await;
+        let page = fixture
+            .probe
+            .read_body(
+                "fixture",
+                "disposable-password",
+                "INBOX",
+                BodyRequest::new(4, 77),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.text, "Final");
+        assert_eq!(page.selected_part.as_deref(), Some(selected_part));
+        fixture.task.await.unwrap();
+    }
 }
 
 #[tokio::test]

@@ -32,6 +32,20 @@ fn main() {
                 .unwrap();
             print!("disposable-password");
         }
+        "streams" => {
+            let stdout: usize = args[2].parse().unwrap();
+            let stderr: usize = args[3].parse().unwrap();
+            let mut written_stdout = 0;
+            let mut written_stderr = 0;
+            while written_stdout < stdout || written_stderr < stderr {
+                let count = (stdout - written_stdout).min(1024);
+                std::io::stdout().write_all(&vec![b'x'; count]).unwrap();
+                written_stdout += count;
+                let count = (stderr - written_stderr).min(1024);
+                std::io::stderr().write_all(&vec![b'x'; count]).unwrap();
+                written_stderr += count;
+            }
+        }
         "fail" => {
             eprintln!("private-command-error-secret");
             print!("private-command-output-secret");

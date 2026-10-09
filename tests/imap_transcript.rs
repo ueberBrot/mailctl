@@ -852,6 +852,18 @@ fn client_allocations_remain_bounded_for_discovery_envelopes_and_oversized_liter
             "{route}: {allocations:?}"
         );
         assert!(allocations.count_total < 100_000);
+        if route == "all-discovery" {
+            assert!(
+                allocations.count_total < 9_000,
+                "mailbox discovery must avoid repeated frame allocation: {allocations:?}"
+            );
+        }
+        if route == "large-envelope" {
+            assert!(
+                allocations.bytes_max < 440 * 1024,
+                "large source headers must not retain an extra frame-sized buffer: {allocations:?}"
+            );
+        }
         assert!(metrics.wire_bytes < 64 * 1024);
         assert!(metrics.parser_steps < 256 * 1024);
         if route == "oversized-literal" {

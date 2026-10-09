@@ -1,15 +1,74 @@
 //! Transfer reservations own quota, checkout, expiry, and session cleanup.
 use super::{AttachmentReader, Error, ErrorCode, Limits, MessageReference, expired};
+use crate::cleanup::CleanupTasks;
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, MutexGuard, Weak},
+    sync::{
+        Arc, Mutex, MutexGuard, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
+use tokio::sync::Notify;
 use tokio::time::Instant;
 use uuid::Uuid;
 
 #[derive(Default)]
-pub(in crate::service) struct Transfers(Arc<Mutex<HashMap<Uuid, Slot>>>);
+pub(in crate::service) struct Transfers(Arc<Store>);
+#[derive(Default)]
+struct Store {
+    slots: Mutex<HashMap<Uuid, Slot>>,
+    expiry_changed: Arc<Notify>,
+    expiry_tasks: CleanupTasks,
+    has_idle: AtomicBool,
+}
+impl Drop for Store {
+    fn drop(&mut self) {
+        self.expiry_changed.notify_waiters();
+    }
+}
+impl Store {
+    async fn expire_idle(store: Weak<Self>, changed: Arc<Notify>) {
+        loop {
+            let notified = changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let Some(store) = store.upgrade() else { return };
+            let next_expiry = {
+                let mut slots = store.slots.lock().unwrap();
+                let now = Instant::now();
+                // Active reads own their reservation until completion/cancellation.
+                slots.retain(|_, slot| slot.entry.is_none() || slot.expires > now);
+                let next = slots
+                    .values()
+                    .filter(|slot| slot.entry.is_some())
+                    .map(|slot| slot.expires)
+                    .min();
+                store.has_idle.store(next.is_some(), Ordering::Release);
+                next
+            };
+            // Sleeping cleanup must not keep the process-local transfer store alive.
+            drop(store);
+            match next_expiry {
+                Some(expiry) => tokio::select! {
+                    _ = tokio::time::sleep_until(expiry) => {},
+                    _ = notified => {},
+                },
+                None => notified.await,
+            }
+        }
+    }
+    fn start_expiry(self: &Arc<Self>) {
+        self.expiry_tasks
+            .start(|_| Self::expire_idle(Arc::downgrade(self), self.expiry_changed.clone()));
+    }
+    fn observe_idle(&self, slots: &HashMap<Uuid, Slot>) {
+        self.has_idle.store(
+            slots.values().any(|slot| slot.entry.is_some()),
+            Ordering::Release,
+        );
+    }
+}
 struct Slot {
     session: Uuid,
     account: String,
@@ -25,7 +84,7 @@ pub(super) struct Entry {
 }
 // A checked-out slot remains admitted until its request completes or is dropped.
 pub(super) struct Reservation {
-    store: Arc<Mutex<HashMap<Uuid, Slot>>>,
+    store: Arc<Store>,
     id: Uuid,
     expires: Instant,
     retained: bool,
@@ -33,7 +92,7 @@ pub(super) struct Reservation {
 impl Drop for Reservation {
     fn drop(&mut self) {
         if !self.retained {
-            self.store.lock().unwrap().remove(&self.id);
+            self.store.slots.lock().unwrap().remove(&self.id);
         }
     }
 }
@@ -45,22 +104,39 @@ impl Reservation {
         self.expires
     }
     pub fn retain(mut self, entry: Entry) -> Result<(), Error> {
-        let mut store = self.store.lock().unwrap();
+        let mut store = self.store.slots.lock().unwrap();
         let slot = store.get_mut(&self.id).ok_or_else(expired)?;
         if slot.expires <= Instant::now() {
             return Err(expired());
         }
         slot.entry = Some(entry);
+        self.store.has_idle.store(true, Ordering::Release);
         self.retained = true;
+        drop(store);
+        self.store.start_expiry();
+        self.store.expiry_changed.notify_waiters();
         Ok(())
     }
 }
 impl Transfers {
     fn live(&self) -> MutexGuard<'_, HashMap<Uuid, Slot>> {
-        let mut store = self.0.lock().unwrap();
+        let mut store = self.0.slots.lock().unwrap();
         let now = Instant::now();
         store.retain(|_, slot| slot.entry.is_none() || slot.expires > now);
+        self.0.observe_idle(&store);
         store
+    }
+    pub(in crate::service) fn restart_expiry(&self) {
+        if !self.0.has_idle.load(Ordering::Acquire)
+            || tokio::runtime::Handle::try_current().is_err()
+        {
+            return;
+        }
+        // Recheck under the slot lock so metadata calls never start an empty timer.
+        let _slots = self.0.slots.lock().unwrap();
+        if self.0.has_idle.load(Ordering::Relaxed) {
+            self.0.start_expiry();
+        }
     }
     pub(super) fn reserve(
         &self,
@@ -116,11 +192,13 @@ impl Transfers {
         }
         authorize(entry)?;
         let entry = slot.entry.take().ok_or_else(expired)?;
+        let expires = slot.expires;
+        self.0.observe_idle(&store);
         Ok((
             Reservation {
                 store: self.0.clone(),
                 id,
-                expires: slot.expires,
+                expires,
                 retained: false,
             },
             entry,
@@ -136,15 +214,16 @@ impl Transfers {
 #[derive(Debug)]
 pub(crate) struct TransferSession {
     pub id: Uuid,
-    store: Weak<Mutex<HashMap<Uuid, Slot>>>,
+    store: Weak<Store>,
 }
 impl Drop for TransferSession {
     fn drop(&mut self) {
         if let Some(store) = self.store.upgrade() {
-            store
-                .lock()
-                .unwrap()
-                .retain(|_, slot| slot.session != self.id);
+            let mut slots = store.slots.lock().unwrap();
+            slots.retain(|_, slot| slot.session != self.id);
+            store.observe_idle(&slots);
+            drop(slots);
+            store.expiry_changed.notify_waiters();
         }
     }
 }

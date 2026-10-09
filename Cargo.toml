@@ -49,7 +49,7 @@ rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled
 mail-builder = { version = "=0.5.0", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1.1.4", features = ["fs", "process", "termios"] }
+rustix = { version = "1.1.4", features = ["event", "fs", "process", "termios"] }
 close_fds = "=0.3.2"
 libc = "=0.2.189"
 

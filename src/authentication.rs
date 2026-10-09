@@ -1,6 +1,7 @@
 //! Process-local authentication admission, credential work, and IMAP connections.
 
 use crate::{
+    cleanup::{CleanupOwner, CleanupTasks},
     config::{AccountConfig, Limits, TlsMode},
     credentials::{Availability, ResolutionLimits, Secret, SecretSource, SourceError},
     imap::{self, AuthenticatedConnection, ImapEndpoint},
@@ -35,9 +36,27 @@ pub struct Account {
     pub source: Arc<dyn SecretSource>,
 }
 
+/// Authentication borrows immutable routing without copying authorization inventories.
+pub(crate) struct BorrowedAccount<'a> {
+    pub id: Uuid,
+    pub generation: u64,
+    pub config: &'a AccountConfig,
+    pub source: &'a Arc<dyn SecretSource>,
+}
+impl<'a> From<&'a Account> for BorrowedAccount<'a> {
+    fn from(account: &'a Account) -> Self {
+        Self {
+            id: account.id,
+            generation: account.generation,
+            config: &account.config,
+            source: &account.source,
+        }
+    }
+}
+
 pub struct Runtime {
     limits: Limits,
-    roots: RootCertStore,
+    roots: Arc<RootCertStore>,
     workers: Arc<Gate>,
     flights: Mutex<HashMap<(Uuid, u64, WorkKind), Weak<Flight>>>,
     accounts: Mutex<HashMap<Uuid, Arc<Pool>>>,
@@ -103,13 +122,29 @@ struct Pool {
     state: Mutex<PoolState>,
     gate: Arc<Gate>,
     expiry_changed: Arc<Notify>,
+    expiry_tasks: CleanupTasks,
 }
 impl Drop for Pool {
     fn drop(&mut self) {
-        self.expiry_changed.notify_one();
+        self.expiry_changed.notify_waiters();
     }
 }
 impl Pool {
+    fn start_expiry(self: &Arc<Self>) -> Arc<CleanupOwner> {
+        self.expiry_tasks.start(|owner| {
+            // Construct before spawn so cancellation also cleans an unpolled task.
+            let guard = PoolExpiry {
+                pool: Arc::downgrade(self),
+                owner,
+            };
+            let pool = Arc::downgrade(self);
+            let changed = self.expiry_changed.clone();
+            async move {
+                let _guard = guard;
+                Self::expire_idle(pool, changed).await;
+            }
+        })
+    }
     async fn expire_idle(pool: Weak<Self>, changed: Arc<Notify>) {
         loop {
             let notified = changed.notified();
@@ -133,6 +168,24 @@ impl Pool {
         }
     }
 }
+struct PoolExpiry {
+    pool: Weak<Pool>,
+    owner: Arc<CleanupOwner>,
+}
+impl Drop for PoolExpiry {
+    fn drop(&mut self) {
+        // Release can race executor shutdown, including outside any Tokio context.
+        self.owner.stop();
+        if let Some(pool) = self.pool.upgrade() {
+            pool.state
+                .lock()
+                .unwrap()
+                .idle
+                .retain(|idle| !Arc::ptr_eq(&idle.owner, &self.owner));
+            pool.expiry_changed.notify_waiters();
+        }
+    }
+}
 struct PoolState {
     idle: Vec<Idle>,
     last_doctor: Option<Instant>,
@@ -142,6 +195,7 @@ struct Idle {
     connection: AuthenticatedConnection,
     established: Instant,
     expires_at: Instant,
+    owner: Arc<CleanupOwner>,
 }
 
 /// Dropping a lease disposes its connection. Return it only at a clean operation boundary.
@@ -178,11 +232,12 @@ impl Lease {
     }
     pub fn release(self) {
         let mut state = self.pool.state.lock().unwrap();
-        if self.idle.expires_at > Instant::now()
+        if self.idle.owner.is_alive()
+            && self.idle.expires_at > Instant::now()
             && state.idle.len() + self.admission.gate.state.lock().unwrap().active <= self.capacity
         {
             state.idle.push(self.idle);
-            self.pool.expiry_changed.notify_one();
+            self.pool.expiry_changed.notify_waiters();
         }
     }
 }
@@ -190,28 +245,43 @@ impl Lease {
 #[derive(Default)]
 struct Gate {
     state: Mutex<GateState>,
-    changed: Notify,
 }
 #[derive(Default)]
 struct GateState {
     active: usize,
-    waiting: VecDeque<u64>,
+    waiting: VecDeque<GateWaiter>,
     next_ticket: u64,
+}
+struct GateWaiter {
+    ticket: u64,
+    active_limit: usize,
+    changed: Arc<Notify>,
+}
+impl GateState {
+    fn next_notification(&self) -> Option<Arc<Notify>> {
+        self.waiting
+            .front()
+            .filter(|waiter| self.active < waiter.active_limit)
+            .map(|waiter| waiter.changed.clone())
+    }
 }
 struct Admission {
     gate: Arc<Gate>,
-    ticket: Option<u64>,
+    ticket: Option<(u64, Arc<Notify>)>,
 }
 impl Drop for Admission {
     fn drop(&mut self) {
         let mut state = self.gate.state.lock().unwrap();
-        if let Some(ticket) = self.ticket {
-            state.waiting.retain(|entry| *entry != ticket);
+        if let Some((ticket, _)) = &self.ticket {
+            state.waiting.retain(|entry| entry.ticket != *ticket);
         } else {
             state.active -= 1;
         }
+        let changed = state.next_notification();
         drop(state);
-        self.gate.changed.notify_waiters();
+        if let Some(changed) = changed {
+            changed.notify_one();
+        }
     }
 }
 impl Gate {
@@ -227,8 +297,13 @@ impl Gate {
                 }
                 let ticket = state.next_ticket;
                 state.next_ticket = state.next_ticket.wrapping_add(1);
-                state.waiting.push_back(ticket);
-                Some(ticket)
+                let changed = Arc::new(Notify::new());
+                state.waiting.push_back(GateWaiter {
+                    ticket,
+                    active_limit: active,
+                    changed: changed.clone(),
+                });
+                Some((ticket, changed))
             }
         };
         Ok(Admission { gate: self, ticket })
@@ -239,22 +314,34 @@ impl Gate {
 }
 impl Admission {
     async fn wait(mut self, active: usize) -> Self {
-        let Some(ticket) = self.ticket else {
+        let Some((ticket, notification)) = self
+            .ticket
+            .as_ref()
+            .map(|(ticket, changed)| (*ticket, changed.clone()))
+        else {
             return self;
         };
         let gate = self.gate.clone();
         loop {
-            let changed = gate.changed.notified();
+            let changed = notification.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
             {
                 let mut state = gate.state.lock().unwrap();
-                if state.waiting.front() == Some(&ticket) && state.active < active {
+                if state
+                    .waiting
+                    .front()
+                    .is_some_and(|entry| entry.ticket == ticket)
+                    && state.active < active
+                {
                     state.waiting.pop_front();
                     state.active += 1;
                     self.ticket = None;
+                    let next = state.next_notification();
                     drop(state);
-                    gate.changed.notify_waiters();
+                    if let Some(next) = next {
+                        next.notify_one();
+                    }
                     return self;
                 }
             }
@@ -269,7 +356,7 @@ impl Runtime {
         Ok(Self {
             workers: Arc::new(Gate::default()),
             limits,
-            roots,
+            roots: Arc::new(roots),
             flights: Mutex::new(HashMap::new()),
             accounts: Mutex::new(HashMap::new()),
         })
@@ -304,6 +391,14 @@ impl Runtime {
 
     /// Checks one explicitly authorized email account, then disconnects without mailbox work.
     pub async fn doctor(&self, account: &Account, limits: &Limits) -> Result<(), Error> {
+        self.doctor_borrowed(account.into(), limits).await
+    }
+
+    pub(crate) async fn doctor_borrowed(
+        &self,
+        account: BorrowedAccount<'_>,
+        limits: &Limits,
+    ) -> Result<(), Error> {
         self.validate_limits(limits)?;
         let pool = self.pool(account.id)?;
         {
@@ -337,7 +432,7 @@ impl Runtime {
         account: &Account,
         limits: &Limits,
     ) -> Result<Vec<imap::Mailbox>, Error> {
-        self.discover_inventory(account, None, limits).await
+        self.discover_inventory(account.into(), None, limits).await
     }
 
     /// Discover exact approved names on one admitted connection, then log out.
@@ -347,12 +442,13 @@ impl Runtime {
         names: &[String],
         limits: &Limits,
     ) -> Result<Vec<imap::Mailbox>, Error> {
-        self.discover_inventory(account, Some(names), limits).await
+        self.discover_inventory(account.into(), Some(names), limits)
+            .await
     }
 
-    async fn discover_inventory(
+    pub(crate) async fn discover_inventory(
         &self,
-        account: &Account,
+        account: BorrowedAccount<'_>,
         names: Option<&[String]>,
         limits: &Limits,
     ) -> Result<Vec<imap::Mailbox>, Error> {
@@ -393,6 +489,14 @@ impl Runtime {
     }
 
     pub async fn acquire(&self, account: &Account, limits: &Limits) -> Result<Lease, Error> {
+        self.acquire_borrowed(account.into(), limits).await
+    }
+
+    pub(crate) async fn acquire_borrowed(
+        &self,
+        account: BorrowedAccount<'_>,
+        limits: &Limits,
+    ) -> Result<Lease, Error> {
         self.validate_limits(limits)?;
         let pool = self.pool(account.id)?;
         tokio::time::timeout(
@@ -439,6 +543,7 @@ impl Runtime {
     fn pool(&self, id: Uuid) -> Result<Arc<Pool>, Error> {
         let mut accounts = self.accounts.lock().unwrap();
         if let Some(pool) = accounts.get(&id) {
+            pool.start_expiry();
             return Ok(pool.clone());
         }
         if accounts.len() == self.limits.accounts {
@@ -451,18 +556,16 @@ impl Runtime {
             }),
             gate: Arc::new(Gate::default()),
             expiry_changed: Arc::new(Notify::new()),
+            expiry_tasks: CleanupTasks::default(),
         });
-        tokio::spawn(Pool::expire_idle(
-            Arc::downgrade(&pool),
-            pool.expiry_changed.clone(),
-        ));
+        pool.start_expiry();
         accounts.insert(id, pool.clone());
         Ok(pool)
     }
 
     async fn acquire_inner(
         &self,
-        account: &Account,
+        account: BorrowedAccount<'_>,
         limits: &Limits,
         pool: Arc<Pool>,
         fresh: bool,
@@ -476,7 +579,9 @@ impl Runtime {
         let idle = {
             let mut state = pool.state.lock().unwrap();
             state.idle.retain(|idle| {
-                idle.expires_at > Instant::now() && idle.established.elapsed() < lifetime
+                idle.owner.is_alive()
+                    && idle.expires_at > Instant::now()
+                    && idle.established.elapsed() < lifetime
             });
             let spare = limits
                 .account_connections
@@ -517,21 +622,7 @@ impl Runtime {
                 if secret.len() > limits.secret_bytes {
                     return Err(Error::Source(SourceError::InvalidSecret));
                 }
-                let endpoint = ImapEndpoint::new(
-                    account.config.server.clone(),
-                    account.config.port,
-                    match account.config.tls {
-                        TlsMode::Implicit => imap::TlsMode::Implicit,
-                        TlsMode::Starttls => imap::TlsMode::StartTls,
-                    },
-                    self.roots.clone(),
-                    imap::Limits {
-                        operation_timeout: Duration::from_secs(limits.operation_seconds as u64),
-                        connect_timeout: Duration::from_secs(limits.connection_seconds as u64),
-                        ..Default::default()
-                    },
-                )
-                .map_err(Error::Imap)?;
+                let endpoint = self.endpoint(account.config, limits)?;
                 let connection = endpoint
                     .connect_authenticated(
                         &account.config.username,
@@ -546,6 +637,7 @@ impl Runtime {
                     connection,
                     established,
                     expires_at: established + lifetime,
+                    owner: pool.start_expiry(),
                 }
             }
         };
@@ -555,6 +647,24 @@ impl Runtime {
             pool,
             capacity: limits.account_connections,
         })
+    }
+
+    fn endpoint(&self, account: &AccountConfig, limits: &Limits) -> Result<ImapEndpoint, Error> {
+        ImapEndpoint::new_with_shared_roots(
+            account.server.clone(),
+            account.port,
+            match account.tls {
+                TlsMode::Implicit => imap::TlsMode::Implicit,
+                TlsMode::Starttls => imap::TlsMode::StartTls,
+            },
+            self.roots.clone(),
+            imap::Limits {
+                operation_timeout: Duration::from_secs(limits.operation_seconds as u64),
+                connect_timeout: Duration::from_secs(limits.connection_seconds as u64),
+                ..Default::default()
+            },
+        )
+        .map_err(Error::Imap)
     }
 
     async fn work(
@@ -643,5 +753,106 @@ impl Runtime {
         )
         .await
         .map_err(|_| Error::Timeout)?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Gate, Runtime};
+    use crate::config::{AccountConfig, CredentialSource, Limits, TlsMode};
+    use std::{
+        future::Future,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        task::{Context, Wake, Waker},
+    };
+    #[derive(Default)]
+    struct WakeCount(AtomicUsize);
+    impl Wake for WakeCount {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn releasing_worker_capacity_wakes_only_the_next_waiter() {
+        let gate = Arc::new(Gate::default());
+        let active = gate.clone().reserve(1, 32).unwrap();
+        let wakes = Arc::new(WakeCount::default());
+        let waker = Waker::from(wakes.clone());
+        let mut context = Context::from_waker(&waker);
+        let mut queued = (0..32)
+            .map(|_| Box::pin(gate.clone().reserve(1, 32).unwrap().wait(1)))
+            .collect::<Vec<_>>();
+        for request in &mut queued {
+            assert!(request.as_mut().poll(&mut context).is_pending());
+        }
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+        drop(active);
+        assert_eq!(
+            wakes.0.load(Ordering::SeqCst),
+            1,
+            "only one credential worker or connection can claim the released capacity"
+        );
+    }
+
+    #[test]
+    fn cancelling_a_blocked_worker_head_wakes_the_newly_eligible_waiter() {
+        let gate = Arc::new(Gate::default());
+        let _active = gate.clone().reserve(2, 2).unwrap();
+        let wakes = Arc::new(WakeCount::default());
+        let waker = Waker::from(wakes.clone());
+        let mut context = Context::from_waker(&waker);
+        let mut blocked = Box::pin(gate.clone().reserve(1, 2).unwrap().wait(1));
+        let mut eligible = Box::pin(gate.reserve(2, 2).unwrap().wait(2));
+        assert!(blocked.as_mut().poll(&mut context).is_pending());
+        assert!(eligible.as_mut().poll(&mut context).is_pending());
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+        drop(blocked);
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
+        assert!(eligible.as_mut().poll(&mut context).is_ready());
+    }
+
+    #[test]
+    fn repeated_endpoints_do_not_copy_the_runtime_trust_inventory() {
+        let cert =
+            rcgen::generate_simple_self_signed(vec!["synthetic.example.test".into()]).unwrap();
+        let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+        for _ in 0..256 {
+            roots.add(cert.cert.der().clone()).unwrap();
+        }
+        let limits = Limits::default();
+        let runtime = Runtime::new(limits.clone(), roots).unwrap();
+        let account = AccountConfig {
+            key: "synthetic".into(),
+            alias: "synthetic".into(),
+            server: "synthetic.example.test".into(),
+            port: 993,
+            tls: TlsMode::Implicit,
+            username: "synthetic@example.test".into(),
+            mailboxes: vec!["INBOX".into()].into(),
+            from_identities: vec!["synthetic@example.test".into()],
+            drafts_mailbox: None,
+            credential: CredentialSource::Session {},
+            retain_history: false,
+        };
+        drop(runtime.endpoint(&account, &limits).unwrap());
+        let allocations = allocation_counter::measure(|| {
+            for _ in 0..16 {
+                std::hint::black_box(runtime.endpoint(&account, &limits).unwrap());
+            }
+        });
+        println!(
+            "16 endpoints with 256 roots: {} allocations, {} allocated bytes",
+            allocations.count_total, allocations.bytes_total
+        );
+        assert!(
+            allocations.bytes_total <= 512 * 1024,
+            "endpoints copied {} bytes of immutable TLS trust",
+            allocations.bytes_total
+        );
+        assert_eq!(allocations.bytes_current, 0);
     }
 }

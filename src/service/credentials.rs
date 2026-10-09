@@ -109,13 +109,13 @@ impl Service {
                 result.status = "degraded".into();
             }
             let authentication = if check_account {
-                let account = authentication::Account {
+                let account = authentication::BorrowedAccount {
                     id,
                     generation,
-                    config: configured.clone(),
-                    source,
+                    config: configured,
+                    source: &source,
                 };
-                let outcome = match runtime.doctor(&account, &grant.limits).await {
+                let outcome = match runtime.doctor_borrowed(account, &grant.limits).await {
                     Ok(()) => AuthenticationOutcome::Authenticated,
                     Err(error) => {
                         result.status = "degraded".into();
