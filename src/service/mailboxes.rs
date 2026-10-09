@@ -216,11 +216,13 @@ impl Service {
         }
         let limits = &grant.limits;
         let limit = input.limit.unwrap_or(limits.mailbox_page);
-        if limit == 0
-            || limit > limits.mailbox_page
-            || input.account.as_ref().is_some_and(|a| a.len() > 1024)
-        {
-            return Err(Error::new(ErrorCode::InvalidRequest));
+        if limit == 0 || limit > limits.mailbox_page {
+            return Err(Error::input_limit("limit", limits.mailbox_page));
+        }
+        if input.account.as_ref().is_some_and(|a| a.len() > 1024) {
+            return Err(Error::invalid_input(
+                "account must be an account alias of at most 1024 UTF-8 bytes",
+            ));
         }
         let reference: Option<Reference> = input
             .reference
@@ -247,7 +249,9 @@ impl Service {
             .next()
             .ok_or_else(|| Error::new(ErrorCode::AccountNotAllowed))?;
         if accounts.next().is_some() {
-            return Err(Error::new(ErrorCode::InvalidRequest));
+            return Err(Error::invalid_input(
+                "Specify account using an alias returned by account discovery, or resolve one mailbox reference",
+            ));
         }
         let (id, generation) = self.registry.identity(&account.key);
         if let Some(reference) = &reference {

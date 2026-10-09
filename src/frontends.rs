@@ -4,6 +4,7 @@ mod arguments;
 mod configuration;
 mod credentials;
 mod diagnostics;
+mod guidance;
 #[cfg(feature = "mcp")]
 mod mcp;
 #[cfg(feature = "mcp")]
@@ -16,7 +17,6 @@ use crate::{
 };
 use application::Application;
 use arguments::{Action, Invocation};
-use clap::FromArgMatches;
 use diagnostics::{Color, LogFormat, Options, Request};
 use std::{io::Write, process::ExitCode, time::Duration};
 use tracing::Instrument;
@@ -58,21 +58,15 @@ pub fn run_with_environment(
         .ignore_errors(true)
         .try_get_matches_from(&arguments)
         .ok();
-    let options = preliminary
-        .as_ref()
-        .and_then(|matches| Options::from_arg_matches(matches).ok())
-        .unwrap_or_default();
+    let (requested_json, options) = arguments::output_options(&arguments, &command);
     let administration = preliminary.as_ref().is_some_and(|matches| {
         matches!(
             matches.subcommand_name(),
-            Some("setup" | "credential" | "doctor" | "state")
+            Some("setup" | "credential" | "doctor" | "state" | "guide" | "schema")
         )
     });
     let serving = executable.is_mcp() && !administration;
-    let json = !serving
-        && preliminary
-            .as_ref()
-            .is_some_and(|matches| matches.get_flag("json"));
+    let json = !serving && requested_json;
     let initialized = options.initialize(json || serving);
     if initialized.is_err() {
         let _ = Options {
@@ -82,6 +76,7 @@ pub fn run_with_environment(
         .initialize(true);
     }
     let invocation = command
+        .clone()
         .try_get_matches_from(arguments)
         .and_then(|matches| Invocation::from_matches(executable, &matches));
     if let Err(error) = &invocation
@@ -115,11 +110,15 @@ pub fn run_with_environment(
                         diagnostics::stopped();
                         result
                     }
-                    Err(_) => Err(Error::new(ErrorCode::InvalidRequest)),
+                    Err(error) => Err(arguments::argument_error(&error, &command)),
                 },
             };
             match result {
                 Ok(code) => code,
+                Err(error) if serving => {
+                    diagnostics::result(request.id(), Some(&error));
+                    error.exit_code()
+                }
                 Err(error) => report(&request, json, options.color, Err(error), (), 30).await,
             }
         }
@@ -135,6 +134,26 @@ async fn execute(
     host: std::sync::Arc<dyn crate::host::HostEnvironment>,
     request: &Request,
 ) -> Result<u8, Error> {
+    match &invocation.action {
+        Action::Guide { topic } => {
+            let text = guidance::guide(topic)
+                .ok_or_else(|| Error::invalid_input("Unknown guide topic; run guide --help"))?;
+            return report_guidance(
+                request,
+                invocation.options.json,
+                text.into(),
+                serde_json::json!({"topic": topic, "text": text}),
+            )
+            .await;
+        }
+        Action::Schema { operation } => {
+            let schema = guidance::schema(operation).ok_or_else(|| Error::invalid_input("Unknown input schema; use list_accounts, list_mailboxes, search_messages, get_message, list_attachments, get_attachment, save_draft, draft_status, draft_content, or capabilities"))?;
+            let text = serde_json::to_string_pretty(&schema)
+                .map_err(|_| Error::new(ErrorCode::InternalError))?;
+            return report_guidance(request, invocation.options.json, text, schema).await;
+        }
+        _ => {}
+    }
     if invocation.interactive {
         if invocation.options.json {
             return Err(crate::service::credential_error(
@@ -423,7 +442,11 @@ async fn execute_application(
             Action::Email(operation) => application.execute(operation).await,
             #[cfg(feature = "mcp")]
             Action::Mcp { .. } => unreachable!(),
-            Action::Setup(_) | Action::Credential(_) | Action::State(_) => unreachable!(),
+            Action::Setup(_)
+            | Action::Credential(_)
+            | Action::State(_)
+            | Action::Guide { .. }
+            | Action::Schema { .. } => unreachable!(),
         }
     };
     let result = tokio::select! {
@@ -516,12 +539,13 @@ async fn report<O: Send + 'static>(
     });
     diagnostics::result(envelope.request_id(), error);
     let code = error.map_or(0, Error::exit_code);
+    let human_error = !json && envelope.error().is_some();
     let output = if json {
         serde_json::to_string(&envelope)
     } else {
         match envelope.result() {
             Some(result) => presentation::human(result),
-            None => return code,
+            None => presentation::human_error(envelope.error().expect("failure contains an error")),
         }
     };
     let Ok(text) = output else {
@@ -533,6 +557,9 @@ async fn report<O: Send + 'static>(
         if json {
             return writeln!(std::io::stdout().lock(), "{text}");
         }
+        if human_error {
+            return writeln!(std::io::stderr().lock(), "{text}");
+        }
         let heading = anstyle::Style::new().bold();
         writeln!(color.human_stdout(), "{heading}Result{heading:#}\n{text}")
     });
@@ -541,4 +568,26 @@ async fn report<O: Send + 'static>(
         Err(_) => 5,
         _ => 8,
     }
+}
+
+async fn report_guidance(
+    request: &Request,
+    json: bool,
+    text: String,
+    result: serde_json::Value,
+) -> Result<u8, Error> {
+    let text = if json {
+        serde_json::to_string(&request.envelope(Ok(result)))
+            .map_err(|_| Error::new(ErrorCode::InternalError))?
+    } else {
+        text
+    };
+    diagnostics::result(request.id(), None);
+    let write = tokio::task::spawn_blocking(move || writeln!(std::io::stdout().lock(), "{text}"));
+    tokio::time::timeout(Duration::from_secs(30), write)
+        .await
+        .map_err(|_| Error::new(ErrorCode::Timeout))?
+        .map_err(|_| Error::new(ErrorCode::InternalError))?
+        .map_err(|_| Error::new(ErrorCode::InternalError))?;
+    Ok(0)
 }

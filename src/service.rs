@@ -21,7 +21,7 @@ use crate::{
     config::{AccountConfig, Config},
     domain::{
         Account, AccountDiscovery, AccountHealth, Availability, Capabilities, Capacity, Error,
-        ErrorCode, Health, Operation, OperationResult, ProcessCapacity, Setup,
+        ErrorCode, Health, Operation, OperationLimits, OperationResult, ProcessCapacity, Setup,
     },
     policy::{Narrowing, Permission, RequestContext},
 };
@@ -322,7 +322,7 @@ impl Service {
             Operation::ListAccounts(input) => {
                 let limit = input.limit.unwrap_or(grant.limits.accounts);
                 if limit == 0 || limit > grant.limits.accounts {
-                    return Err(Error::new(ErrorCode::InvalidRequest));
+                    return Err(Error::input_limit("limit", grant.limits.accounts));
                 }
                 // Count encoded field bytes before cloning operator-controlled labels.
                 let mut ordered = self.visible_accounts(context).collect::<Vec<_>>();
@@ -369,6 +369,20 @@ impl Service {
                 permissions: context.permissions().to_vec(),
                 health: self.health(context)?,
                 capacity: Self::capacity(&grant.limits),
+                limits: OperationLimits {
+                    accounts: grant.limits.accounts,
+                    mailbox_page: grant.limits.mailbox_page,
+                    search_page: grant.limits.search_page,
+                    text_page_bytes: grant.limits.text_page_bytes,
+                    default_text_page_bytes: grant
+                        .limits
+                        .text_page_bytes
+                        .min(crate::domain::DEFAULT_TEXT_PAGE_BYTES),
+                    attachment_chunk_bytes: grant.limits.attachment_chunk_bytes,
+                    attachment_decoded_bytes: grant.limits.attachment_decoded_bytes,
+                    transfer_seconds: grant.limits.transfer_seconds,
+                    draft_mime_bytes: grant.limits.draft_mime_bytes,
+                },
             }),
             Operation::Health => OperationResult::Health(self.health(context)?),
         };

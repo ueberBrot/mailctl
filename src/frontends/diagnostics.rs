@@ -14,7 +14,7 @@ pub(super) enum LogFormat {
     Json,
     Compact,
 }
-#[derive(Clone, Copy, Default, ValueEnum)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
 pub(super) enum LogLevel {
     Error,
     #[default]
@@ -33,10 +33,13 @@ pub(super) enum Color {
 #[derive(Clone, Copy, Default, Args)]
 #[group(id = "diagnostics")]
 pub(super) struct Options {
+    /// Optional stderr logs; auto is quiet for human results and JSON for machine modes.
     #[arg(long, global = true, value_enum, default_value = "auto")]
     pub log_format: LogFormat,
+    /// Diagnostic verbosity; logs exclude email and credential content.
     #[arg(long, global = true, value_enum, default_value = "warn")]
     pub log_level: LogLevel,
+    /// Terminal color; redirected streams and NO_COLOR remain plain.
     #[arg(long, global = true, value_enum, default_value = "auto")]
     pub color: Color,
 }
@@ -45,6 +48,7 @@ impl Options {
         let format = match (self.log_format, machine) {
             (LogFormat::Compact, true) => return Err(Error::new(ErrorCode::InvalidRequest)),
             (LogFormat::Auto, true) => LogFormat::Json,
+            (LogFormat::Auto, false) if self.log_level == LogLevel::Warn => LogFormat::Off,
             (LogFormat::Auto, false) => LogFormat::Compact,
             (format, _) => format,
         };
@@ -121,6 +125,9 @@ pub(super) struct Request {
     id: String,
 }
 impl Request {
+    pub fn id(&self) -> &str {
+        &self.id
+    }
     pub fn new() -> Self {
         let request = Self {
             id: uuid::Uuid::new_v4().to_string(),
@@ -154,6 +161,8 @@ pub(super) fn result(request_id: &str, error: Option<&Error>) {
             Error::obsolete_runtime_capacity,
             Error::incompatible_schema,
             Error::draft_conflict,
+            #[cfg(feature = "mcp")]
+            Error::mcp_response_limit_setup_required,
         ]
         .into_iter()
         .map(|known| known())

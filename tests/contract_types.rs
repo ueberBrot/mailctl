@@ -74,6 +74,16 @@ const _: fn(OperationResult) = |result| match result {
         let _: Vec<mailctl::policy::Permission> = capabilities.permissions;
         let _: mailctl::domain::Health = capabilities.health;
         let _: mailctl::domain::ProcessCapacity = capabilities.capacity.per_process;
+        let limits: mailctl::domain::OperationLimits = capabilities.limits;
+        let _: usize = limits.accounts;
+        let _: usize = limits.mailbox_page;
+        let _: usize = limits.search_page;
+        let _: usize = limits.text_page_bytes;
+        let _: usize = limits.default_text_page_bytes;
+        let _: usize = limits.attachment_chunk_bytes;
+        let _: usize = limits.attachment_decoded_bytes;
+        let _: usize = limits.transfer_seconds;
+        let _: usize = limits.draft_mime_bytes;
     }
     OperationResult::Health(health) => {
         let _: Option<mailctl::domain::Availability> = health.draft_creation;
@@ -102,6 +112,7 @@ const _: fn(OperationResult) = |result| match result {
 const _: fn(mailctl::domain::GetMessageInput) = |input| {
     let _: String = input.message;
     let _: Option<String> = input.cursor;
+    let _: Option<usize> = input.max_bytes;
 };
 
 #[cfg(any(feature = "cli", feature = "mcp"))]

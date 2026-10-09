@@ -111,6 +111,7 @@ fn setup_service(
 }
 fn get(reference: &str) -> Operation {
     Operation::GetMessage(GetMessageInput {
+        max_bytes: None,
         message: reference.into(),
         cursor: None,
     })
@@ -128,6 +129,101 @@ fn body(text: &str) -> BodyText {
         continuation_available: false,
         next_cursor: None,
     }
+}
+#[tokio::test]
+async fn callers_can_narrow_body_pages_and_resume_with_the_same_budget() {
+    let bodies = Arc::new(MemoryBodies::default());
+    bodies.set("work", "INBOX", 77, 4, body("a🦀éxyz"));
+    let mut configuration = config();
+    configuration.grants[0].limits.text_page_bytes = 8;
+    let (service, reference) = setup(configuration, bodies).await;
+    let context = service.context("reader", &Default::default()).unwrap();
+    let read = |maximum, cursor| {
+        serde_json::from_value::<Operation>(json!({
+            "operation": "get_message",
+            "input": {"message": reference, "max_bytes": maximum, "cursor": cursor}
+        }))
+        .expect("a bounded body page request")
+    };
+    let OperationResult::Message(first) = service
+        .execute(&context, read(4, None::<String>))
+        .await
+        .unwrap()
+    else {
+        panic!("message page expected")
+    };
+    assert_eq!(first.body.text, "a");
+    let cursor = first.body.next_cursor.unwrap();
+    let OperationResult::Message(second) = service
+        .execute(&context, read(4, Some(cursor.clone())))
+        .await
+        .unwrap()
+    else {
+        panic!("message continuation expected")
+    };
+    assert_eq!(second.body.text, "🦀");
+    assert_eq!(
+        service
+            .execute(&context, read(8, Some(cursor)))
+            .await
+            .unwrap_err()
+            .code,
+        mailctl::domain::ErrorCode::StaleCursor
+    );
+    for maximum in [3, 9] {
+        let error = service
+            .execute(&context, read(maximum, None))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, mailctl::domain::ErrorCode::InvalidRequest);
+        assert!(error.message.contains("max_bytes"));
+    }
+}
+#[tokio::test]
+async fn omitted_text_budget_defaults_to_eight_kib_and_can_be_expanded() {
+    let bodies = Arc::new(MemoryBodies::default());
+    let text = "x".repeat(10_000);
+    bodies.set("work", "INBOX", 77, 4, body(&text));
+    let (service, reference) = setup(config(), bodies).await;
+    let context = service.context("reader", &Default::default()).unwrap();
+    let OperationResult::Message(first) = service.execute(&context, get(&reference)).await.unwrap()
+    else {
+        panic!("message page expected")
+    };
+    assert_eq!(first.body.text.len(), 8192);
+    assert!(first.body.continuation_available);
+    let OperationResult::Message(rest) = service
+        .execute(
+            &context,
+            Operation::GetMessage(GetMessageInput {
+                message: reference.clone(),
+                max_bytes: None,
+                cursor: first.body.next_cursor,
+            }),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("message continuation expected")
+    };
+    assert_eq!(first.body.text + &rest.body.text, text);
+    assert!(!rest.body.continuation_available);
+    let OperationResult::Message(expanded) = service
+        .execute(
+            &context,
+            Operation::GetMessage(GetMessageInput {
+                message: reference,
+                max_bytes: Some(10_000),
+                cursor: None,
+            }),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("message page expected")
+    };
+    assert_eq!(expanded.body.text, text);
+    assert!(!expanded.body.continuation_available);
 }
 #[tokio::test]
 async fn body_reads_preserve_identity_bound_text_and_reauthorize_references() {
@@ -384,6 +480,7 @@ async fn authenticated_text_pages_reconstruct_the_available_representation() {
     let mut text = String::new();
     for expected in ["a", "🦀", "éxy", "z"] {
         let input = GetMessageInput {
+            max_bytes: None,
             message: reference.clone(),
             cursor,
         };
@@ -425,6 +522,7 @@ async fn text_cursors_reject_tampering_and_changes_after_fresh_authorization() {
     let cursor = first.body.next_cursor.unwrap();
     let resume = |message: &str, cursor: &str| {
         Operation::GetMessage(GetMessageInput {
+            max_bytes: None,
             message: message.into(),
             cursor: Some(cursor.into()),
         })
@@ -531,6 +629,7 @@ async fn whole_and_partial_body_pages_decode_malformed_html_with_finite_work() {
         let mut text = String::new();
         for _ in 0..5 {
             let input = GetMessageInput {
+                max_bytes: None,
                 message: reference.clone(),
                 cursor,
             };
@@ -580,6 +679,7 @@ async fn restarted_installations_resume_under_new_grants_and_enforce_output_limi
     let context = service.context("second", &Default::default()).unwrap();
     let resume = || {
         Operation::GetMessage(GetMessageInput {
+            max_bytes: None,
             message: reference.clone(),
             cursor: Some(cursor.clone()),
         })

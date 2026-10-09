@@ -11,11 +11,14 @@ pub struct SearchMessagesInput {
     #[serde(deserialize_with = "super::reference")]
     #[schemars(length(min = 1, max = 8192), extend("x-maxUtf8Bytes" = 8192))]
     pub mailbox: String,
+    /// AND predicates; an empty array selects all messages. Text values match case-insensitive substrings.
     #[serde(default)]
     pub criteria: SearchCriteria,
+    /// Page size within capabilities.limits.search_page; omission uses that ceiling.
     #[serde(default, deserialize_with = "super::page_limit::<_, 200>")]
     #[schemars(range(min = 1, max = 200))]
     pub limit: Option<usize>,
+    /// Continue with next_cursor, the same mailbox reference, and the original criteria.
     #[serde(
         default,
         deserialize_with = "super::bounded_optional_string::<_, 8192>"
@@ -120,15 +123,19 @@ impl StandardFlag {
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(tag = "field", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SearchPredicate {
+    /// Include messages received on or after this calendar date (YYYY-MM-DD).
     ReceivedAfter {
         date: SearchDate,
     },
+    /// Include messages received before this calendar date (YYYY-MM-DD).
     ReceivedBefore {
         date: SearchDate,
     },
+    /// Include messages sent on or after this calendar date (YYYY-MM-DD).
     SentAfter {
         date: SearchDate,
     },
+    /// Include messages sent before this calendar date (YYYY-MM-DD).
     SentBefore {
         date: SearchDate,
     },

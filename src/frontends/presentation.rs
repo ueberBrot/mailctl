@@ -1,24 +1,249 @@
 //! Terminal presentation of semantic operation results.
-use crate::domain::OperationResult;
+use crate::domain::{Error, OperationResult};
 use std::fmt::Write;
 
 pub(super) fn human(result: &OperationResult) -> Result<String, serde_json::Error> {
-    let mut metadata = serde_json::to_value(result)?;
-    let body = if let OperationResult::Message(message) = result {
-        metadata["body"]
-            .as_object_mut()
-            .expect("body metadata")
-            .remove("text");
-        Some(message.body.text.as_str())
-    } else {
-        None
-    };
-    let mut output = metadata_text(serde_json::to_string_pretty(&metadata)?);
-    if let Some(body) = body {
-        output.push_str("\n\nBody:\n");
-        append_body(&mut output, body);
+    let mut output = String::new();
+    match result {
+        OperationResult::Accounts(page) => {
+            for account in &page.accounts {
+                let _ = writeln!(
+                    output,
+                    "{}  {}  generation {}  {}",
+                    label(&account.alias),
+                    label(&account.account_id),
+                    account.generation,
+                    serde_json::to_value(account.availability)?
+                        .as_str()
+                        .expect("availability")
+                );
+            }
+            if page.accounts.is_empty() {
+                output.push_str("No authorized email accounts.\n");
+            }
+            if !page.complete {
+                output.push_str(
+                    "Account listing is incomplete; request a larger authorized limit.\n",
+                );
+            }
+        }
+        OperationResult::Mailboxes(page) => {
+            let _ = writeln!(
+                output,
+                "Account: {} (generation {})",
+                label(&page.account_id),
+                page.generation
+            );
+            for mailbox in &page.mailboxes {
+                let selectable = if mailbox.metadata.selectable {
+                    ""
+                } else {
+                    " (not selectable)"
+                };
+                let _ = writeln!(
+                    output,
+                    "{}{}\n  reference: {}",
+                    label(&mailbox.display_label),
+                    selectable,
+                    label(&mailbox.reference)
+                );
+            }
+            if page.mailboxes.is_empty() {
+                output.push_str("No approved mailboxes found.\n");
+            }
+            continuation(&mut output, page.complete, page.next_cursor.as_deref());
+        }
+        OperationResult::Messages(page) => {
+            let _ = writeln!(output, "{} messages", page.messages.len());
+            for message in &page.messages {
+                let subject = match &message.metadata.subject {
+                    crate::domain::Metadata::Present(value) if value.is_empty() => {
+                        "(empty subject)".into()
+                    }
+                    crate::domain::Metadata::Present(value) => label(value),
+                    crate::domain::Metadata::Missing => "(missing subject)".into(),
+                    crate::domain::Metadata::Malformed => "(malformed subject)".into(),
+                };
+                let from = match &message.metadata.from {
+                    crate::domain::Metadata::Present(addresses) => addresses
+                        .iter()
+                        .map(|address| label(&address.address))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    crate::domain::Metadata::Missing => "(missing sender)".into(),
+                    crate::domain::Metadata::Malformed => "(malformed sender)".into(),
+                };
+                let _ = writeln!(
+                    output,
+                    "{}  {}  {}\n  reference: {}",
+                    label(&message.metadata.received_date),
+                    from,
+                    subject,
+                    label(&message.reference)
+                );
+            }
+            continuation(&mut output, page.complete, page.next_cursor.as_deref());
+        }
+        OperationResult::Message(message) => {
+            let _ = write!(output, "Message: {}", label(&message.message_reference));
+            if message.body.converted {
+                let _ = write!(
+                    output,
+                    "\nText converted from {}.",
+                    label(
+                        message
+                            .body
+                            .source_media_type
+                            .as_deref()
+                            .unwrap_or("the selected body")
+                    )
+                );
+            }
+            if message.body.replacements {
+                output.push_str("\nSome text required replacement characters.");
+            }
+            if message.body.empty_reason.is_some() {
+                output.push_str("\nNo supported text body.");
+            }
+            output.push_str("\n\nBody:\n");
+            append_body(&mut output, &message.body.text);
+            if let Some(cursor) = &message.body.next_cursor {
+                let _ = write!(
+                    output,
+                    "\n\nMore text available.\nCursor: {}",
+                    label(cursor)
+                );
+            } else if message.body.truncated {
+                output.push_str("\n\nText is truncated; no continuation is available.");
+            }
+        }
+        OperationResult::Capabilities(capabilities) => {
+            let _ = writeln!(
+                output,
+                "Grant: {}\nStatus: {}",
+                label(&capabilities.health.grant),
+                label(&capabilities.health.status)
+            );
+            let _ = writeln!(
+                output,
+                "Operations: {}",
+                capabilities
+                    .operations
+                    .iter()
+                    .map(|operation| label(operation))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            let _ = writeln!(
+                output,
+                "Permissions: {}",
+                serde_json::to_string(&capabilities.permissions)?
+            );
+            let limits = &capabilities.limits;
+            let _ = writeln!(
+                output,
+                "Page limits: {} accounts, {} mailboxes, {} messages",
+                limits.accounts, limits.mailbox_page, limits.search_page
+            );
+            let _ = writeln!(
+                output,
+                "Text: {} bytes by default; maximum {} bytes per page",
+                limits.default_text_page_bytes, limits.text_page_bytes
+            );
+            let _ = writeln!(
+                output,
+                "Attachments: {} bytes per file, {} bytes per chunk, {}s transfer lifetime",
+                limits.attachment_decoded_bytes,
+                limits.attachment_chunk_bytes,
+                limits.transfer_seconds
+            );
+            let _ = writeln!(output, "Draft MIME: {} bytes", limits.draft_mime_bytes);
+            let capacity = &capabilities.capacity.per_process;
+            let _ = writeln!(
+                output,
+                "Process capacity: {} active requests, {} queued, {} buffered bytes",
+                capacity.active_requests, capacity.queued_requests, capacity.buffered_bytes
+            );
+            if let Some(isolation) = &capabilities.capacity.isolation {
+                let _ = writeln!(
+                    output,
+                    "Isolation capacity: {}",
+                    serde_json::to_string(isolation)?
+                );
+            }
+            for account in &capabilities.health.accounts {
+                let _ = writeln!(
+                    output,
+                    "Account: {} (generation {}), {}",
+                    label(&account.account_id),
+                    account.generation,
+                    serde_json::to_value(account.availability)?
+                        .as_str()
+                        .expect("availability")
+                );
+            }
+            if let Some(availability) = capabilities.health.draft_creation {
+                let _ = writeln!(
+                    output,
+                    "Draft creation: {}",
+                    serde_json::to_value(availability)?
+                        .as_str()
+                        .expect("availability")
+                );
+            }
+            if let Some(availability) = capabilities.health.draft_journal {
+                let _ = writeln!(
+                    output,
+                    "Draft history: {}",
+                    serde_json::to_value(availability)?
+                        .as_str()
+                        .expect("availability")
+                );
+            }
+        }
+        _ => return serde_json::to_string_pretty(result).map(metadata_text),
+    }
+    Ok(output.trim_end_matches('\n').to_owned())
+}
+
+fn continuation(output: &mut String, complete: bool, cursor: Option<&str>) {
+    if let Some(cursor) = cursor {
+        let _ = writeln!(output, "More results available.\nCursor: {}", label(cursor));
+    } else if !complete {
+        output.push_str("Listing is incomplete; no continuation is available.\n");
+    }
+}
+
+pub(super) fn human_error(error: &Error) -> Result<String, serde_json::Error> {
+    let code = serde_json::to_value(error.code)?;
+    let mut output = format!(
+        "Error ({}): {}",
+        code.as_str().expect("error code"),
+        label(&error.message)
+    );
+    if let Some(operation) = &error.draft_operation {
+        let _ = write!(
+            output,
+            "\nDraft operation: {}\nAccount: {} (generation {})\nMailbox: {}",
+            operation.identity.operation_id,
+            operation.identity.account_id,
+            operation.identity.account_generation,
+            label(&operation.mailbox)
+        );
     }
     Ok(output)
+}
+
+fn label(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    for character in text.chars() {
+        if unsafe_character(character) {
+            let _ = write!(output, "\\u{{{:04x}}}", character as u32);
+        } else {
+            output.push(character);
+        }
+    }
+    output
 }
 
 fn unsafe_character(character: char) -> bool {
@@ -130,7 +355,7 @@ mod tests {
     fn labels_and_incomplete_sequences_stay_inert() {
         let mut result = message("");
         if let OperationResult::Message(message) = &mut result {
-            message.account_id = "name\n\t\r\u{1b}\u{009b}\u{202e}é".into();
+            message.message_reference = "name\n\t\r\u{1b}\u{009b}\u{202e}é".into();
         }
         let rendered = human(&result).unwrap();
         assert!(

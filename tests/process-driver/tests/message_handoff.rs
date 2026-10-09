@@ -33,7 +33,7 @@ async fn cli_mcp_and_restarted_sessions_continue_under_fresh_authorization() {
         grant.as_table_mut().unwrap().remove("mailboxes");
     }
     let configuration = toml::to_string(&configuration).unwrap()
-        + "\n[[grants]]\nname = \"text\"\naccounts = [\"work\"]\nmailboxes = [\"Archive*Literal%\"]\n[grants.limits]\ntext_page_bytes = 4\nattachment_chunk_bytes = 3\n\n[[grants]]\nname = \"restricted\"\naccounts = [\"work\"]\nmailboxes = [\"INBOX\"]\n";
+        + "\n[[grants]]\nname = \"text\"\naccounts = [\"work\"]\nmailboxes = [\"Archive*Literal%\"]\n[grants.limits]\ntext_page_bytes = 8\nattachment_chunk_bytes = 3\n\n[[grants]]\nname = \"restricted\"\naccounts = [\"work\"]\nmailboxes = [\"INBOX\"]\n";
     std::fs::write(installation.config(), configuration).unwrap();
     let mut command = installation.cli();
     command.args(["--json", "setup"]);
@@ -233,6 +233,8 @@ async fn text_handoffs(installation: &Installation, server: &server::ImapServer,
                     "get",
                     "--message",
                     message,
+                    "--max-bytes",
+                    "4",
                 ]);
             if let Some(cursor) = &cursor {
                 command.args(["--cursor", cursor]);
@@ -245,7 +247,7 @@ async fn text_handoffs(installation: &Installation, server: &server::ImapServer,
             command
                 .args(["--grant", "text"])
                 .env("MAILCTL_FIXTURE_CA", &server.certificate);
-            mcp_message(command, message, cursor.as_deref()).await["result"].take()
+            mcp_message(command, message, cursor.as_deref(), Some(4)).await["result"].take()
         };
         assert_eq!(result["body"]["text"], expected);
         reconstructed.push_str(expected);
@@ -272,7 +274,7 @@ async fn text_handoffs(installation: &Installation, server: &server::ImapServer,
             let mut command = installation.mcp();
             command.args(["--grant", "restricted"]);
             assert_eq!(
-                mcp_message(command, message, Some(cursor)).await["error"]["code"],
+                mcp_message(command, message, Some(cursor), Some(4)).await["error"]["code"],
                 "mailbox_not_allowed"
             );
             assert_eq!(server.accepted(), before);
@@ -286,11 +288,12 @@ async fn mcp_message(
     command: std::process::Command,
     message: &str,
     cursor: Option<&str>,
+    max_bytes: Option<usize>,
 ) -> serde_json::Value {
     mcp_tool(
         command,
         "email_get_message",
-        serde_json::json!({"message": message, "cursor": cursor}),
+        serde_json::json!({"message": message, "max_bytes": max_bytes, "cursor": cursor}),
     )
     .await
 }
@@ -529,7 +532,7 @@ async fn hostile_presentation(
     server.expect_body_bytes(READ_MAILBOX, &bytes);
     let mut command = installation.mcp();
     command.env("MAILCTL_FIXTURE_CA", &server.certificate);
-    let response = mcp_message(command, message, None).await;
+    let response = mcp_message(command, message, None, None).await;
     assert_eq!(response["result"]["body"]["text"], semantic.as_str());
 }
 

@@ -56,6 +56,19 @@ impl Bounds {
                 Self::reservations(input, envelope, limits.accounts, draft_mime, schema_bytes);
             control + request <= available
         };
+        // Keep room for useful discovery responses before maximizing input.
+        // Maximizing draft input against a 1 KiB envelope otherwise consumes
+        // the budget and rejects ordinary capabilities on a default grant.
+        let mut reserved_envelope = 1024;
+        let mut upper = response_bound.min(limits.envelope_bytes).min(64 * 1024);
+        while reserved_envelope < upper {
+            let candidate = reserved_envelope + (upper - reserved_envelope).div_ceil(2);
+            if fits(1024, candidate) {
+                reserved_envelope = candidate;
+            } else {
+                upper = candidate - 1;
+            }
+        }
         // Draft bodies and search predicates can expand sixfold in JSON.
         // Reserve bounded input and composition storage before sizing responses.
         let mut input = 1024;
@@ -66,7 +79,7 @@ impl Bounds {
         });
         while input < upper {
             let candidate = input + (upper - input).div_ceil(2);
-            if fits(candidate, 1024) {
+            if fits(candidate, reserved_envelope) {
                 input = candidate;
             } else {
                 upper = candidate - 1;

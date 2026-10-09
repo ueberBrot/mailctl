@@ -6,7 +6,135 @@ use crate::domain::{
     SearchMessagesInput,
 };
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
-use std::path::PathBuf;
+use std::{ffi::OsString, path::PathBuf};
+
+/// Recover output controls even when another argument cannot be parsed.
+pub(super) fn output_options(
+    arguments: &[OsString],
+    command: &clap::Command,
+) -> (bool, diagnostics::Options) {
+    use clap::ValueEnum;
+    fn value_options(command: &clap::Command, names: &mut Vec<String>) {
+        for argument in command.get_arguments() {
+            if argument.get_action().takes_values()
+                && let Some(name) = argument.get_long()
+            {
+                names.push(name.into());
+            }
+        }
+        for child in command.get_subcommands() {
+            value_options(child, names);
+        }
+    }
+    let mut values = Vec::new();
+    value_options(command, &mut values);
+    let mut options = diagnostics::Options::default();
+    let mut json = false;
+    let mut arguments = arguments.iter().skip(1).peekable();
+    while let Some(argument) = arguments.next() {
+        let Some(text) = argument.to_str() else {
+            continue;
+        };
+        if text == "--" {
+            break;
+        }
+        let Some(option) = text.strip_prefix("--") else {
+            continue;
+        };
+        let (name, attached) = option
+            .split_once('=')
+            .map_or((option, None), |(name, value)| (name, Some(value)));
+        json |= name == "json" && attached.is_none();
+        if !values.iter().any(|value| value == name) {
+            continue;
+        }
+        let value = attached.or_else(|| {
+            if arguments
+                .peek()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.starts_with('-'))
+            {
+                None
+            } else {
+                arguments.next().and_then(|value| value.to_str())
+            }
+        });
+        let Some(value) = value else { continue };
+        match name {
+            "log-format" => {
+                if let Ok(format) = diagnostics::LogFormat::from_str(value, false) {
+                    options.log_format = format;
+                }
+            }
+            "log-level" => {
+                if let Ok(level) = diagnostics::LogLevel::from_str(value, false) {
+                    options.log_level = level;
+                }
+            }
+            "color" => {
+                if let Ok(color) = diagnostics::Color::from_str(value, false) {
+                    options.color = color;
+                }
+            }
+            _ => {}
+        }
+    }
+    (json, options)
+}
+
+pub(super) fn argument_error(error: &clap::Error, command: &clap::Command) -> crate::domain::Error {
+    use clap::error::{ContextKind, ErrorKind};
+    fn known_flags(command: &clap::Command, flags: &mut Vec<String>) {
+        flags.extend(
+            command
+                .get_arguments()
+                .filter_map(|argument| argument.get_long().map(|name| format!("--{name}"))),
+        );
+        for child in command.get_subcommands() {
+            known_flags(child, flags);
+        }
+    }
+    let mut known = Vec::new();
+    known_flags(command, &mut known);
+    let flags = error
+        .get(ContextKind::InvalidArg)
+        .map_or_else(Vec::new, |value| {
+            value
+                .to_string()
+                .split(|character: char| character.is_whitespace() || character == ',')
+                .filter(|part| known.iter().any(|flag| flag == part))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        });
+    let target = if flags.is_empty() {
+        String::new()
+    } else {
+        format!(" for {}", flags.join(", "))
+    };
+    let detail = match error.kind() {
+        ErrorKind::MissingRequiredArgument => format!(
+            "Missing required argument{}",
+            if flags.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", flags.join(", "))
+            }
+        ),
+        ErrorKind::MissingSubcommand => "Choose a command".into(),
+        ErrorKind::UnknownArgument => "Unknown option or unexpected argument".into(),
+        ErrorKind::InvalidSubcommand => "Unknown command".into(),
+        ErrorKind::ArgumentConflict => format!("Conflicting arguments{target}"),
+        _ => format!("Invalid argument value{target}"),
+    };
+    let mut message = format!("{detail}; run this command with --help");
+    if flags.iter().any(|flag| flag == "--criteria") {
+        message.push_str(" or use schema search_messages for the predicate format");
+    }
+    crate::domain::Error {
+        message,
+        ..crate::domain::Error::new(crate::domain::ErrorCode::InvalidRequest)
+    }
+}
 
 #[derive(Args)]
 pub(super) struct Options {
@@ -14,14 +142,19 @@ pub(super) struct Options {
     #[cfg(target_os = "macos")]
     #[arg(long, global = true, conflicts_with_all = ["config", "grant"])]
     pub isolated: bool,
+    /// Read this shared account configuration; setup initializes it explicitly.
     #[arg(long, global = true, default_value_os_t = super::configuration::default_path())]
     pub config: PathBuf,
+    /// Select an operator-approved access grant; defaults to the configured grant.
     #[arg(long, global = true)]
     pub grant: Option<String>,
+    /// Narrow the selected grant to reads; removes draft creation and history access.
     #[arg(long, global = true)]
     pub read_only: bool,
+    /// Narrow accounts by exact alias; repeat to select more than one.
     #[arg(long = "account", global = true)]
     pub accounts: Vec<String>,
+    /// Write one versioned JSON result to stdout; diagnostics remain on stderr.
     #[arg(long, global = true)]
     pub json: bool,
     #[command(flatten)]
@@ -29,6 +162,16 @@ pub(super) struct Options {
 }
 #[derive(Subcommand)]
 enum Administration {
+    /// Read an offline workflow guide; available before setup.
+    Guide {
+        #[arg(default_value = "overview", value_parser = clap::builder::PossibleValuesParser::new(super::guidance::topics().iter().copied()))]
+        topic: String,
+    },
+    /// Print a JSON input schema, including search predicates and draft_content.
+    Schema {
+        /// Core operation name, such as search_messages, get_message, or draft_content.
+        operation: String,
+    },
     /// Back up, restore, or verify installation history with all runtimes stopped.
     #[command(subcommand, long_about = STATE_RECOVERY_HELP)]
     State(State),
@@ -40,6 +183,7 @@ enum Administration {
     /// After editing configuration, run setup and restart long-running MCP processes.
     Setup(Setup),
     #[command(subcommand)]
+    /// Provision or inspect credentials for one account outside the email tools.
     Credential(Credential),
     /// Inspect local readiness; authenticate only with --check-account.
     Doctor {
@@ -112,17 +256,23 @@ pub(super) enum State {
 }
 #[derive(Args, Default)]
 pub(super) struct Setup {
+    /// Create or update this alias; use --account OLD to rename an existing account.
     #[arg(long)]
     pub alias: Option<String>,
+    /// IMAP hostname; new accounts use implicit TLS on port 993.
     #[arg(long, requires = "alias")]
     pub server: Option<String>,
+    /// IMAP authentication username, usually an email address.
     #[arg(long, requires = "alias")]
     pub username: Option<String>,
 }
 #[derive(Subcommand)]
 pub(super) enum Credential {
+    /// Prompt securely in an operator terminal; select --account when needed. Incompatible with --json.
     Set,
+    /// Remove the credential from a mutable store for the selected account.
     Delete,
+    /// Inspect provisioning and availability without exposing or authenticating the secret.
     Status,
 }
 
@@ -131,7 +281,8 @@ pub(super) enum Credential {
 #[command(
     name = "mailctl",
     version,
-    about = "Controlled access to configured email accounts."
+    about = "Controlled access to configured email accounts.",
+    after_help = "Start with guide for workflows, or schema <operation> for JSON inputs. Both work before setup."
 )]
 struct Mailctl {
     #[command(flatten)]
@@ -145,16 +296,22 @@ struct Mailctl {
 #[cfg(feature = "cli")]
 #[derive(Subcommand)]
 enum Email {
+    /// Create unsent drafts and inspect their durable outcomes.
     #[command(subcommand)]
     Draft(Draft),
+    /// Search message metadata and read selected body text.
     #[command(subcommand)]
     Message(Message),
+    /// List, retrieve, or export attachments.
     #[command(subcommand)]
     Attachment(Attachment),
+    /// Discover approved mailbox names and reusable references.
     #[command(subcommand)]
     Mailbox(Mailbox),
+    /// Discover approved email accounts and their identities.
     #[command(subcommand)]
     Account(Account),
+    /// Inspect effective permissions, limits, and readiness.
     #[command(subcommand)]
     Capability(Capability),
     #[command(flatten)]
@@ -163,12 +320,16 @@ enum Email {
 #[cfg(feature = "cli")]
 #[derive(Args)]
 pub(super) struct DraftIdentity {
+    /// Exact approved Drafts mailbox name; this is not a mailbox reference.
     #[arg(long)]
     mailbox: String,
+    /// Original account UUID returned by account list.
     #[arg(long)]
     account_id: uuid::Uuid,
+    /// Original account generation returned by account list.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..=i64::MAX as u64))]
     account_generation: u64,
+    /// Caller-generated UUID retained with the original composition for safe retries.
     #[arg(long)]
     operation_id: uuid::Uuid,
 }
@@ -202,7 +363,7 @@ enum Draft {
     Save {
         #[command(flatten)]
         identity: DraftIdentity,
-        /// JSON composition file with from, to, cc, bcc, subject, body and reply metadata.
+        /// JSON composition file; use schema draft_content for recipient and body fields.
         #[arg(long)]
         input: PathBuf,
     },
@@ -251,8 +412,10 @@ pub(super) fn draft_content(
 enum Attachment {
     /// Save an attachment under a configured export root on macOS or Windows.
     Export {
+        /// Attachment reference returned by attachment list.
         #[arg(long)]
         attachment: String,
+        /// Existing export root approved in configuration.
         #[arg(long)]
         root: PathBuf,
         /// Safe basename; defaults to attachment.bin.
@@ -261,11 +424,13 @@ enum Attachment {
     },
     /// List attachment metadata without retrieving payloads.
     List {
+        /// Message reference returned by message search.
         #[arg(long)]
         message: String,
     },
     /// Retrieve an attachment in one invocation as a bounded base64 result.
     Get {
+        /// Attachment reference returned by attachment list.
         #[arg(long)]
         attachment: String,
     },
@@ -275,20 +440,31 @@ enum Attachment {
 enum Message {
     /// Read bounded selected text from a reusable message reference.
     Get {
+        /// Message reference returned by message search; copy it unchanged.
         #[arg(long)]
         message: String,
+        /// next_cursor returned by the preceding text page of this same message.
         #[arg(long)]
         cursor: Option<String>,
+        /// Maximum UTF-8 bytes in this text page; defaults to at most 8192.
+        #[arg(long, value_parser = clap::value_parser!(u32).range(4..=2 * 1024 * 1024))]
+        max_bytes: Option<u32>,
     },
     /// Search a mailbox with AND-only criteria and descending-UID continuation.
+    #[command(
+        after_help = "Example:\n  mailctl message search --mailbox \"$mailbox_reference\" --criteria '[{\"field\":\"subject\",\"value\":\"invoice\"}]' --limit 10 --json\n\nUse a reference returned by mailbox list. Read guide reading for discovery and continuation."
+    )]
     Search {
+        /// Mailbox reference returned by mailbox list; an exact folder name is insufficient.
         #[arg(long)]
         mailbox: String,
-        /// JSON array of typed predicates; repeated fields remain AND terms.
+        /// JSON predicates, combined with AND; use schema search_messages for their format.
         #[arg(long, default_value = "[]", value_parser = search_criteria)]
         criteria: SearchCriteria,
+        /// Requested page size, up to the effective search_page ceiling.
         #[arg(long, value_parser = clap::value_parser!(u16).range(1..=200))]
         limit: Option<u16>,
+        /// next_cursor from the same mailbox, criteria, and access grant.
         #[arg(long)]
         cursor: Option<String>,
     },
@@ -305,7 +481,9 @@ fn search_criteria(value: &str) -> Result<SearchCriteria, &'static str> {
 #[cfg(feature = "cli")]
 #[derive(Subcommand)]
 enum Account {
+    /// List authorized aliases, account UUIDs, and generations without authenticating.
     List {
+        /// Maximum account rows, up to the effective accounts ceiling.
         #[arg(long, value_parser = clap::value_parser!(u16).range(1..=256))]
         limit: Option<u16>,
     },
@@ -315,10 +493,13 @@ enum Account {
 enum Mailbox {
     /// List approved mailboxes, or resolve a previously returned reference.
     List {
+        /// Requested page size, up to the effective mailbox_page ceiling.
         #[arg(long, value_parser = clap::value_parser!(u16).range(1..=1000))]
         limit: Option<u16>,
+        /// next_cursor from discovery under the same scope and inventory.
         #[arg(long)]
         cursor: Option<String>,
+        /// Resolve one returned mailbox reference under the current access grant.
         #[arg(long)]
         reference: Option<String>,
     },
@@ -327,6 +508,7 @@ enum Mailbox {
 #[cfg(feature = "cli")]
 #[derive(Subcommand)]
 enum Capability {
+    /// Report effective operations, permissions, limits, and readiness.
     Show,
 }
 
@@ -335,11 +517,13 @@ enum Capability {
 #[command(
     name = "mailctl-mcp",
     version,
-    about = "STDIO email tools with shared account setup."
+    about = "STDIO email tools with shared account setup.",
+    after_help = "Run without a command to serve MCP over STDIO. Use guide for workflows or schema <operation> for JSON inputs; both work before setup."
 )]
 struct Mcp {
     #[command(flatten)]
     options: Options,
+    /// Enable draft permissions from the selected grant; serving is read-only by default.
     #[arg(long, conflicts_with = "read_only")]
     use_configured_grant: bool,
     #[command(subcommand)]
@@ -352,6 +536,12 @@ pub(super) struct Invocation {
     pub interactive: bool,
 }
 pub(super) enum Action {
+    Guide {
+        topic: String,
+    },
+    Schema {
+        operation: String,
+    },
     State(State),
     #[cfg(feature = "cli")]
     DraftSave {
@@ -379,6 +569,8 @@ pub(super) enum Action {
 impl From<Administration> for Action {
     fn from(value: Administration) -> Self {
         match value {
+            Administration::Guide { topic } => Self::Guide { topic },
+            Administration::Schema { operation } => Self::Schema { operation },
             Administration::State(command) => Self::State(command),
             Administration::Setup(args) => Self::Setup(args),
             Administration::Credential(command) => Self::Credential(command),
@@ -434,9 +626,15 @@ impl Invocation {
                             crate::domain::AttachmentStart { attachment },
                         )),
                     ),
-                    Email::Message(Message::Get { message, cursor }) => {
-                        Action::Email(Operation::GetMessage(GetMessageInput { message, cursor }))
-                    }
+                    Email::Message(Message::Get {
+                        message,
+                        cursor,
+                        max_bytes,
+                    }) => Action::Email(Operation::GetMessage(GetMessageInput {
+                        message,
+                        cursor,
+                        max_bytes: max_bytes.map(|value| value as usize),
+                    })),
                     Email::Message(Message::Search {
                         mailbox,
                         criteria,

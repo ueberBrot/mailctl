@@ -195,6 +195,7 @@ mailboxes = ["INBOX"]
                 .execute(
                     &context,
                     Operation::GetMessage(mailctl::domain::GetMessageInput {
+                        max_bytes: None,
                         cursor: None,
                         message: page.messages[0].reference.clone(),
                     }),
@@ -775,6 +776,7 @@ accounts = ["fixture"]
                     .execute(
                         &context,
                         Operation::GetMessage(GetMessageInput {
+                            max_bytes: None,
                             message: message.reference,
                             cursor: None,
                         }),

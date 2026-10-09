@@ -123,12 +123,18 @@ fn diagnostic_controls_apply_to_early_schema_errors() {
                 .unwrap();
             assert_eq!(output.status.code(), Some(2));
             assert!(output.stdout.is_empty());
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert!(stderr.contains("Error (invalid_request)"));
+            assert!(stderr.contains("--help"));
+            assert!(!stderr.contains("fixture-secret"));
             if format == "off" {
-                assert!(output.stderr.is_empty());
+                assert!(!stderr.contains("operation_failed"));
             } else {
-                let event: Value = serde_json::from_slice(&output.stderr).unwrap();
+                let event: Value = serde_json::from_str(
+                    stderr.lines().find(|line| line.starts_with('{')).unwrap(),
+                )
+                .unwrap();
                 assert_eq!(event["code"], "invalid_request");
-                assert!(!String::from_utf8_lossy(&output.stderr).contains("fixture-secret"));
             }
         }
     }
@@ -279,7 +285,9 @@ fn invalid_configuration_payloads_stay_private_and_schema_guidance_survives() {
     let mut command = installation.cli();
     command.args(["--log-format", "json", "account", "list"]);
     let output = support::run_bounded(command);
-    let event: Value = serde_json::from_slice(&output.stderr).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let event: Value =
+        serde_json::from_str(stderr.lines().find(|line| line.starts_with('{')).unwrap()).unwrap();
     assert_eq!(
         event["message"],
         mailctl::domain::Error::incompatible_schema().message

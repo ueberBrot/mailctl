@@ -33,9 +33,11 @@ pub struct DraftOperationDetails {
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DraftAddress {
+    /// Recipient email address; supply each recipient as an object with this field.
     #[serde(deserialize_with = "nonempty::<_, 254>")]
     #[schemars(length(min = 1, max = 254), extend("x-maxUtf8Bytes" = 254))]
     pub address: String,
+    /// Optional recipient display name.
     #[serde(
         default,
         deserialize_with = "super::bounded_optional_string::<_, 1024>"
@@ -60,27 +62,35 @@ impl From<&str> for DraftAddress {
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct DraftContent {
+    /// Approved from_identities address; omission requires one unambiguous identity.
     #[serde(default, deserialize_with = "super::bounded_optional_string::<_, 254>")]
     #[schemars(length(min = 1, max = 254), extend("x-maxUtf8Bytes" = 254))]
     pub from: Option<String>,
+    /// Primary recipients as address/name objects; retain the original list for retries.
     #[serde(default, deserialize_with = "recipients")]
     #[schemars(length(max = 100))]
     pub to: Vec<DraftAddress>,
+    /// Copy recipients as address/name objects.
     #[serde(default, deserialize_with = "recipients")]
     #[schemars(length(max = 100))]
     pub cc: Vec<DraftAddress>,
+    /// Blind-copy recipients as address/name objects.
     #[serde(default, deserialize_with = "recipients")]
     #[schemars(length(max = 100))]
     pub bcc: Vec<DraftAddress>,
+    /// Subject text, unchanged on retry; an empty subject is allowed.
     #[serde(default, deserialize_with = "text::<_, 8192>")]
     #[schemars(length(max = 8192), extend("x-maxUtf8Bytes" = 8192))]
     pub subject: String,
+    /// Plain UTF-8 message text; the encoded draft must fit capabilities.limits.draft_mime_bytes.
     #[serde(default, deserialize_with = "text::<_, 8388608>")]
     #[schemars(length(max = 8388608), extend("x-maxUtf8Bytes" = 8388608))]
     pub body: String,
+    /// Original email Message-ID for a reply, rather than a mailctl message reference.
     #[serde(default, deserialize_with = "super::bounded_optional_string::<_, 998>")]
     #[schemars(length(min = 1, max = 998), extend("x-maxUtf8Bytes" = 998))]
     pub in_reply_to: Option<String>,
+    /// Email Message-IDs in thread order, retained unchanged on retry.
     #[serde(default, deserialize_with = "references")]
     #[schemars(schema_with = "references_schema")]
     pub references: Vec<String>,
@@ -99,12 +109,18 @@ fn references<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SaveDraftInput {
+    /// Literal approved drafts_mailbox name from account discovery, not a mailbox reference.
     #[serde(deserialize_with = "nonempty::<_, 1024>")]
     #[schemars(length(min = 1, max = 1024), extend("x-maxUtf8Bytes" = 1024))]
     pub mailbox: String,
+    /// Stable account_id UUID from account discovery; retain it across retries.
     pub account_id: Uuid,
+    /// Account discovery's generation, retained with the original operation.
+    #[schemars(range(min = 1, max = 9223372036854775807u64))]
     pub account_generation: u64,
+    /// Caller-generated UUID retained before the first call; reuse for identical retries.
     pub operation_id: Uuid,
+    /// Unsent composition retained unchanged for every retry of this operation.
     pub draft: Box<DraftContent>,
 }
 impl SaveDraftInput {
@@ -126,12 +142,18 @@ impl SaveDraftInput {
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DraftStatusInput {
+    /// Original literal Drafts mailbox name used when saving this operation.
     #[serde(deserialize_with = "nonempty::<_, 1024>")]
     #[schemars(length(min = 1, max = 1024), extend("x-maxUtf8Bytes" = 1024))]
     pub mailbox: String,
+    /// Original account UUID retained when saving this operation.
     pub account_id: Uuid,
+    /// Original account generation, including after account configuration changes.
+    #[schemars(range(min = 1, max = 9223372036854775807u64))]
     pub account_generation: u64,
+    /// Original caller-generated operation UUID.
     pub operation_id: Uuid,
+    /// Check uncertain creation against the provider and update its journal outcome; never append again.
     #[serde(default)]
     pub reconcile: bool,
 }

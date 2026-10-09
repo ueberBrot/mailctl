@@ -48,6 +48,190 @@ async fn listed_accounts(installation: &Installation, arguments: &[&str]) -> (Mc
     )
 }
 
+#[tokio::test]
+async fn default_read_and_drafts_grant_can_discover_capabilities() {
+    let installation = Installation::two_accounts();
+    let configuration = std::fs::read_to_string(installation.config()).unwrap();
+    std::fs::write(
+        installation.config(),
+        configuration.replace("profile = \"drafts_only\"", "profile = \"read_and_drafts\""),
+    )
+    .unwrap();
+    setup(&installation);
+    let client = client(
+        &installation,
+        &["--grant", "writer", "--use-configured-grant"],
+    )
+    .await;
+    let response = client
+        .call_tool(CallToolRequestParams::new("email_capabilities"))
+        .await
+        .unwrap();
+    let envelope = response.structured_content.unwrap();
+    assert_eq!(envelope["ok"], true, "{envelope}");
+    assert!(
+        envelope["result"]["permissions"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("append_draft"))
+    );
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn mcp_discovery_provides_guides_and_effective_limits() {
+    let installation = Installation::two_accounts();
+    let mut config: toml::Value =
+        toml::from_str(&std::fs::read_to_string(installation.config()).unwrap()).unwrap();
+    config["grants"][0].as_table_mut().unwrap().insert(
+        "limits".into(),
+        toml::Value::Table(toml::map::Map::from_iter([
+            ("search_page".into(), 7.into()),
+            ("mailbox_page".into(), 11.into()),
+            ("text_page_bytes".into(), 4096.into()),
+        ])),
+    );
+    std::fs::write(installation.config(), toml::to_string(&config).unwrap()).unwrap();
+    setup(&installation);
+    let client = client(&installation, &[]).await;
+    let info = client.peer_info().unwrap();
+    assert!(
+        info.instructions
+            .as_ref()
+            .unwrap()
+            .contains("mailctl://guide/")
+    );
+    assert!(info.capabilities.resources.is_some());
+    let resources = client.list_all_resources().await.unwrap();
+    let uris: Vec<_> = resources
+        .iter()
+        .map(|resource| resource.uri.as_str())
+        .collect();
+    assert_eq!(
+        uris,
+        [
+            "mailctl://guide/overview",
+            "mailctl://guide/reading",
+            "mailctl://guide/attachments",
+            "mailctl://guide/drafts",
+            "mailctl://guide/errors",
+        ]
+    );
+    for resource in resources {
+        let response = client
+            .read_resource(rmcp::model::ReadResourceRequestParams::new(resource.uri))
+            .await
+            .unwrap();
+        let text = serde_json::to_value(response).unwrap();
+        assert!(text["contents"][0]["text"].as_str().unwrap().len() > 100);
+    }
+    assert!(
+        client
+            .read_resource(rmcp::model::ReadResourceRequestParams::new(
+                "mailctl://guide/unknown"
+            ))
+            .await
+            .is_err()
+    );
+    let tools = client.list_all_tools().await.unwrap();
+    let response = client
+        .call_tool(CallToolRequestParams::new("email_capabilities"))
+        .await
+        .unwrap();
+    let envelope = response.structured_content.unwrap();
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["result"]["limits"]["search_page"], 7);
+    assert_eq!(envelope["result"]["limits"]["mailbox_page"], 11);
+    assert_eq!(envelope["result"]["limits"]["text_page_bytes"], 4096);
+    assert_eq!(
+        envelope["result"]["limits"]["default_text_page_bytes"],
+        4096
+    );
+    for operation in envelope["result"]["operations"].as_array().unwrap() {
+        let name = format!("email_{}", operation.as_str().unwrap());
+        assert!(tools.iter().any(|tool| tool.name == name));
+    }
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn mcp_input_errors_provide_safe_repair_guidance() {
+    let installation = Installation::two_accounts();
+    setup(&installation);
+    let client = client(&installation, &[]).await;
+    for (name, arguments, expected) in [
+        (
+            "email_capabilities",
+            json!({"fixture-private-field": "fixture-private-value"}),
+            "no arguments",
+        ),
+        (
+            "email_get_attachment",
+            json!({"attachment": "fixture-private-value", "token": "fixture-private-value"}),
+            "either attachment",
+        ),
+        (
+            "email_search_messages",
+            json!({"mailbox": "fixture-private-value", "limit": 51}),
+            "between 1 and 50",
+        ),
+        (
+            "email_list_mailboxes",
+            json!({"limit": 201}),
+            "between 1 and 200",
+        ),
+    ] {
+        let response = client
+            .call_tool(
+                CallToolRequestParams::new(name)
+                    .with_arguments(arguments.as_object().unwrap().clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.is_error, Some(true));
+        let envelope = response.structured_content.unwrap();
+        assert_eq!(envelope["error"]["code"], "invalid_request");
+        assert!(
+            envelope["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(expected)
+        );
+        assert!(!envelope.to_string().contains("fixture-private"));
+    }
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn mcp_annotations_distinguish_reads_from_draft_journal_mutation() {
+    let installation = Installation::two_accounts();
+    setup(&installation);
+    let reader = client(&installation, &[]).await;
+    for tool in reader.list_all_tools().await.unwrap() {
+        assert_eq!(tool.annotations.unwrap().read_only_hint, Some(true));
+    }
+    reader.cancel().await.unwrap();
+    let writer = client(
+        &installation,
+        &["--grant", "writer", "--use-configured-grant"],
+    )
+    .await;
+    for tool in writer.list_all_tools().await.unwrap() {
+        if matches!(
+            tool.name.as_ref(),
+            "email_save_draft" | "email_draft_status"
+        ) {
+            let annotations = tool.annotations.unwrap();
+            assert_eq!(annotations.read_only_hint, Some(false));
+            assert_eq!(annotations.destructive_hint, Some(false));
+            if tool.name == "email_save_draft" {
+                assert_eq!(annotations.idempotent_hint, Some(true));
+            }
+        }
+    }
+    writer.cancel().await.unwrap();
+}
+
 #[cfg(feature = "cli")]
 #[tokio::test]
 async fn large_discovery_matches_cli_in_both_mcp_result_forms() {

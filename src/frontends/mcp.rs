@@ -24,19 +24,30 @@ fn tool<I: schemars::JsonSchema + 'static, O: schemars::JsonSchema + 'static>(
     name: &'static str,
     description: &'static str,
 ) -> Tool {
+    let journal_mutation = matches!(name, "email_save_draft" | "email_draft_status");
     Tool::new(name, description, serde_json::Map::new())
         .with_input_schema::<I>()
         .with_output_schema::<Envelope<O>>()
+        .with_annotations(
+            ToolAnnotations::new()
+                .read_only(!journal_mutation)
+                .destructive(false)
+                .idempotent(name == "email_save_draft")
+                .open_world(!matches!(
+                    name,
+                    "email_list_accounts" | "email_capabilities"
+                )),
+        )
 }
 
 fn definitions(operations: &[String]) -> Vec<Tool> {
     let empty = json!({"type":"object","properties":{},"additionalProperties":false});
     [
         tool::<crate::domain::SaveDraftInput, crate::domain::DraftReceipt>(
-            "email_save_draft", "Create one unsent draft using caller-retained identity and composition; replay the recorded outcome on retry.",
+            "email_save_draft", "Create one unsent draft; retain identity and unchanged input before calling, then reuse them on retries. See mailctl://guide/drafts.",
         ),
         tool::<crate::domain::DraftStatusInput, crate::domain::DraftReceipt>(
-            "email_draft_status", "Inspect an authorized draft operation. Set reconcile to verify uncertain creation against the original target without another APPEND.",
+            "email_draft_status", "Inspect an original draft operation. reconcile checks uncertain creation and updates its journal; never creates another draft. See mailctl://guide/drafts.",
         ),
         tool::<ListAccountsInput, AccountDiscovery>(
             "email_list_accounts",
@@ -44,10 +55,11 @@ fn definitions(operations: &[String]) -> Vec<Tool> {
         ),
         Tool::new(
             "email_capabilities",
-            "Show effective permissions and implemented operations.",
+            "Show callable MCP operations, effective permissions, health, and operation limits.",
             empty.as_object().unwrap().clone(),
         )
-        .with_output_schema::<Envelope<Capabilities>>(),
+        .with_output_schema::<Envelope<Capabilities>>()
+        .with_annotations(ToolAnnotations::new().read_only(true).open_world(false)),
         tool::<ListMailboxesInput, MailboxDiscovery>(
             "email_list_mailboxes",
             "List approved mailboxes or resolve a reusable mailbox reference.",
@@ -58,7 +70,7 @@ fn definitions(operations: &[String]) -> Vec<Tool> {
         ),
         tool::<GetMessageInput, MessageBody>(
             "email_get_message",
-            "Read or continue bounded selected message text with representation and truncation metadata.",
+            "Read selected message text; max_bytes narrows the page and cursor continues it. Check truncation and continuation metadata. See mailctl://guide/reading.",
         ),
         tool::<crate::domain::ListAttachmentsInput, crate::domain::AttachmentList>(
             "email_list_attachments",
@@ -79,14 +91,51 @@ fn definitions(operations: &[String]) -> Vec<Tool> {
     .collect()
 }
 
+fn invalid_arguments(name: &str) -> Error {
+    Error::invalid_input(match name {
+        "email_list_accounts" => {
+            "Use an optional limit within capabilities.limits.accounts; match tools/list inputSchema"
+        }
+        "email_capabilities" => "email_capabilities accepts no arguments; call it with {}",
+        "email_list_mailboxes" => {
+            "Use an account alias from account discovery and optional reference, limit, cursor; match tools/list inputSchema"
+        }
+        "email_search_messages" => {
+            "Use a mailbox reference, an AND criteria array, optional limit and cursor; retain original criteria when continuing. See mailctl://guide/reading"
+        }
+        "email_get_message" => {
+            "Use a message reference, optional cursor and max_bytes within capabilities.limits.text_page_bytes; match tools/list inputSchema"
+        }
+        "email_list_attachments" => {
+            "Use message with a message reference returned by search; match tools/list inputSchema"
+        }
+        "email_get_attachment" => {
+            "Use either attachment with a returned attachment reference, or token with progress.next_token; never both. See mailctl://guide/attachments"
+        }
+        "email_save_draft" => {
+            "Use account_id and operation_id UUIDs, account_generation, the literal drafts_mailbox name as mailbox, and draft as an object. See mailctl://guide/drafts"
+        }
+        "email_draft_status" => {
+            "Use the original account_id, account_generation, operation_id, mailbox and optional reconcile boolean. See mailctl://guide/drafts"
+        }
+        _ => "Match tools/list inputSchema; see mailctl://guide/errors",
+    })
+}
+
 impl ServerHandler for EmailTools {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_protocol_version(ProtocolVersion::V_2025_11_25)
-            .with_server_info(Implementation::new(
-                "mailctl-mcp",
-                env!("CARGO_PKG_VERSION"),
-            ))
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_resources()
+                .build(),
+        )
+        .with_protocol_version(ProtocolVersion::V_2025_11_25)
+        .with_server_info(Implementation::new(
+            "mailctl-mcp",
+            env!("CARGO_PKG_VERSION"),
+        ))
+        .with_instructions(super::guidance::instructions())
     }
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
         Cow::Borrowed(&[ProtocolVersion::V_2025_11_25])
@@ -107,6 +156,40 @@ impl ServerHandler for EmailTools {
             ..Default::default()
         })
     }
+    async fn list_resources(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, McpError> {
+        if request.is_some_and(|request| request.cursor.is_some()) {
+            return Err(McpError::invalid_params("Invalid cursor", None));
+        }
+        if context.ct.is_cancelled() || self.shutdown.is_cancelled() {
+            return Err(McpError::internal_error("Request cancelled", None));
+        }
+        Ok(ListResourcesResult {
+            resources: guide_resources(),
+            ..Default::default()
+        })
+    }
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, McpError> {
+        if context.ct.is_cancelled() || self.shutdown.is_cancelled() {
+            return Err(McpError::internal_error("Request cancelled", None));
+        }
+        let text = request
+            .uri
+            .strip_prefix("mailctl://guide/")
+            .and_then(super::guidance::guide)
+            .ok_or_else(|| McpError::resource_not_found("Unknown usage guide", None))?;
+        Ok(ReadResourceResult::new(vec![
+            ResourceContents::text(text, request.uri).with_mime_type("text/markdown"),
+        ])
+        .into())
+    }
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
@@ -120,7 +203,7 @@ impl ServerHandler for EmailTools {
                 if name != "capabilities" || !input.is_empty() {
                     wire["input"] = Value::Object(input);
                 }
-                serde_json::from_value(wire).map_err(|_| Error::new(ErrorCode::InvalidRequest))
+                serde_json::from_value(wire).map_err(|_| invalid_arguments(request.name.as_ref()))
             }
             _ => {
                 return Err(McpError::new(
@@ -131,7 +214,7 @@ impl ServerHandler for EmailTools {
             }
         };
         let diagnostic_request = super::diagnostics::Request::new();
-        let result = match operation {
+        let mut result = match operation {
             Err(error) => Err(error),
             Ok(operation) => {
                 let draft_identity = match &operation {
@@ -151,6 +234,13 @@ impl ServerHandler for EmailTools {
                 }))
             }
         };
+        if let Ok(OperationResult::Capabilities(capabilities)) = &mut result {
+            capabilities.operations.retain(|operation| {
+                self.tools
+                    .iter()
+                    .any(|tool| tool.name.strip_prefix("email_") == Some(operation.as_str()))
+            });
+        }
         if result.as_ref().is_err_and(|error| {
             error.code == ErrorCode::OperationConflict
                 && error.conflict_kind == Some(crate::domain::ConflictKind::Configuration)
@@ -177,9 +267,33 @@ impl ServerHandler for EmailTools {
     }
 }
 
+fn guide_resources() -> Vec<Resource> {
+    super::guidance::topics()
+        .iter()
+        .map(|topic| {
+            Resource::new(
+                format!("mailctl://guide/{topic}"),
+                format!("mailctl {topic} guide"),
+            )
+            .with_description(format!("Read when using mailctl {topic}"))
+            .with_mime_type("text/markdown")
+        })
+        .collect()
+}
+
 pub(super) async fn run(application: Application) -> Result<(), Error> {
-    let OperationResult::Capabilities(capabilities) =
-        application.execute(Operation::Capabilities).await?
+    let OperationResult::Capabilities(capabilities) = application
+        .execute(Operation::Capabilities)
+        .await
+        .map_err(|error| {
+            // Startup must discover the tool surface before negotiating MCP.
+            // A ceiling too small for that discovery is an operator setup issue.
+            if error.code == ErrorCode::ResponseTooLarge {
+                Error::mcp_response_limit_setup_required()
+            } else {
+                error
+            }
+        })?
     else {
         return Err(Error::new(ErrorCode::InternalError));
     };
@@ -187,11 +301,28 @@ pub(super) async fn run(application: Application) -> Result<(), Error> {
     let tools = definitions(&capabilities.operations);
     let schema_bytes = crate::encoding::serialized_size(&tools, limits.buffered_bytes)
         .map_err(|_| Error::setup_required())?;
+    // Static discovery and guide replies use the transport's control allocation,
+    // independent of operation-result ceilings. Measure their encoded sizes too.
+    let mut control_bytes = schema_bytes.max(
+        crate::encoding::serialized_size(&guide_resources(), limits.buffered_bytes)
+            .map_err(|_| Error::setup_required())?,
+    );
+    control_bytes = control_bytes.max(
+        crate::encoding::serialized_size(&super::guidance::instructions(), limits.buffered_bytes)
+            .map_err(|_| Error::setup_required())?,
+    );
+    for topic in super::guidance::topics() {
+        let guide = super::guidance::guide(topic).ok_or_else(Error::setup_required)?;
+        control_bytes = control_bytes.max(
+            crate::encoding::serialized_size(&guide, limits.buffered_bytes)
+                .map_err(|_| Error::setup_required())?,
+        );
+    }
     let bounds = Bounds::new(
         limits,
         application.response_bound()?,
         capabilities.operations.iter().any(|op| op == "save_draft"),
-        schema_bytes,
+        control_bytes,
     )?;
     let expires = tokio::time::Instant::now()
         + Duration::from_secs(limits.connection_lifetime_seconds as u64);

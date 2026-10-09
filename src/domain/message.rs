@@ -2,6 +2,9 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+/// Default UTF-8 byte ceiling for each returned text page.
+pub const DEFAULT_TEXT_PAGE_BYTES: usize = 8192;
+
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GetMessageInput {
@@ -9,7 +12,12 @@ pub struct GetMessageInput {
     #[serde(deserialize_with = "super::reference")]
     #[schemars(length(min = 1, max = 8192), extend("x-maxUtf8Bytes" = 8192))]
     pub message: String,
-    /// Authenticated continuation returned by the preceding text page.
+    /// UTF-8 bytes per text page, from 4 through the effective text_page_bytes ceiling.
+    /// Omit to use at most 8192 bytes. Keep this value unchanged for continuation.
+    #[serde(default, deserialize_with = "super::page_limit::<_, 2097152>")]
+    #[schemars(range(min = 4, max = 2097152))]
+    pub max_bytes: Option<usize>,
+    /// Authenticated continuation returned by the preceding text page; repeat max_bytes.
     #[serde(
         default,
         deserialize_with = "super::bounded_optional_string::<_, 8192>"

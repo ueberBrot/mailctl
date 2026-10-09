@@ -55,7 +55,7 @@ impl Service {
         let limits = &grant.limits;
         let limit = input.limit.unwrap_or(limits.search_page);
         if limit == 0 || limit > limits.search_page {
-            return Err(Error::new(ErrorCode::InvalidRequest));
+            return Err(Error::input_limit("limit", limits.search_page));
         }
         let reference: Reference = self.decode(
             "mb1",

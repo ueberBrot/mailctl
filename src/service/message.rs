@@ -2,7 +2,10 @@
 use super::{MailboxTarget, Service, tokens::MessageReference};
 use crate::{
     config::Limits,
-    domain::{BodyText, Error, ErrorCode, GetMessageInput, MessageBody, mailbox_identity},
+    domain::{
+        BodyText, DEFAULT_TEXT_PAGE_BYTES, Error, ErrorCode, GetMessageInput, MessageBody,
+        mailbox_identity,
+    },
     imap::{BodyCursor, BodyRequest},
     policy::{Permission, RequestContext},
 };
@@ -129,7 +132,21 @@ impl Service {
         if !context.permissions().contains(&Permission::ReadMessage) {
             return Err(super::denied());
         }
-        let limits = &grant.limits;
+        let mut page_limits = grant.limits.clone();
+        let maximum = input
+            .max_bytes
+            .unwrap_or(page_limits.text_page_bytes.min(DEFAULT_TEXT_PAGE_BYTES));
+        if !(4..=page_limits.text_page_bytes).contains(&maximum) {
+            return Err(Error {
+                message: format!(
+                    "max_bytes must be between 4 and {} UTF-8 bytes; inspect effective limits with capabilities",
+                    page_limits.text_page_bytes
+                ),
+                ..Error::new(ErrorCode::InvalidRequest)
+            });
+        }
+        page_limits.text_page_bytes = maximum;
+        let limits = &page_limits;
         let stale = if input.cursor.is_some() {
             ErrorCode::StaleCursor
         } else {

@@ -68,6 +68,18 @@ pub struct Error {
     pub draft_operation: Option<Box<DraftOperationDetails>>,
 }
 impl Error {
+    /// Repair guidance from trusted field names and constraints, never caller values.
+    pub(crate) fn invalid_input(message: &'static str) -> Self {
+        Self::with_message(ErrorCode::InvalidRequest, message)
+    }
+    pub(crate) fn input_limit(field: &'static str, maximum: usize) -> Self {
+        Self {
+            message: format!(
+                "{field} must be between 1 and {maximum}; omit it to use the configured default"
+            ),
+            ..Self::new(ErrorCode::InvalidRequest)
+        }
+    }
     pub fn draft_outcome(code: ErrorCode, operation: DraftOperationDetails) -> Self {
         Self {
             draft_operation: Some(Box::new(operation)),
@@ -93,6 +105,13 @@ impl Error {
         Self::with_message(
             ErrorCode::InvalidRequest,
             "Configuration is unavailable or invalid; run this executable's setup subcommand",
+        )
+    }
+    #[cfg(feature = "mcp")]
+    pub(crate) fn mcp_response_limit_setup_required() -> Self {
+        Self::with_message(
+            ErrorCode::InvalidRequest,
+            "MCP capability discovery exceeds the configured response limit; increase envelope_bytes and buffered_bytes, then run this executable's setup subcommand",
         )
     }
     pub fn obsolete_runtime_capacity() -> Self {
@@ -193,6 +212,7 @@ impl std::error::Error for Error {}
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ListAccountsInput {
+    /// Maximum accounts to return; omit to use capabilities.limits.accounts. complete=false means authorized accounts exceed this bound.
     #[serde(default, deserialize_with = "page_limit::<_, 256>")]
     #[schemars(range(min = 1, max = 256))]
     pub limit: Option<usize>,
@@ -283,9 +303,11 @@ pub struct ListMailboxesInput {
     #[serde(default, deserialize_with = "bounded_optional_string::<_, 8192>")]
     #[schemars(length(min = 1, max = 8192), extend("x-maxUtf8Bytes" = 8192))]
     pub reference: Option<String>,
+    /// Page size within capabilities.limits.mailbox_page; omission uses that ceiling.
     #[serde(default, deserialize_with = "page_limit::<_, 1000>")]
     #[schemars(range(min = 1, max = 1000))]
     pub limit: Option<usize>,
+    /// Continue with next_cursor and the same account/reference selection.
     #[serde(default, deserialize_with = "bounded_optional_string::<_, 8192>")]
     #[schemars(length(min = 1, max = 8192), extend("x-maxUtf8Bytes" = 8192))]
     pub cursor: Option<String>,
@@ -543,6 +565,7 @@ pub struct Account {
     pub account_id: String,
     pub generation: u64,
     pub from_identities: Vec<String>,
+    /// Implemented email-core operations; use email_capabilities for callable MCP tools.
     pub capabilities: Vec<String>,
     pub availability: Availability,
 }
@@ -559,6 +582,24 @@ pub struct Capabilities {
     pub permissions: Vec<crate::policy::Permission>,
     pub health: Health,
     pub capacity: Capacity,
+    /// Effective operation ceilings after access-grant narrowing.
+    pub limits: OperationLimits,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OperationLimits {
+    pub accounts: usize,
+    pub mailbox_page: usize,
+    pub search_page: usize,
+    /// Maximum caller-selected decoded text bytes per page.
+    pub text_page_bytes: usize,
+    /// Decoded text bytes per page when max_bytes is omitted.
+    pub default_text_page_bytes: usize,
+    pub attachment_chunk_bytes: usize,
+    pub attachment_decoded_bytes: usize,
+    pub transfer_seconds: usize,
+    pub draft_mime_bytes: usize,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
