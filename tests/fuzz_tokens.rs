@@ -310,6 +310,28 @@ fn retained_token_regressions_reject_every_resource_and_continuation_kind() {
 }
 
 #[test]
+fn noncanonical_signature_trailing_bits_are_rejected_for_every_token_kind() {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let tokens = runtime.block_on(Tokens::new());
+    for case in &tokens.cases {
+        let mut altered = case.value().as_bytes().to_vec();
+        let last = altered.last_mut().unwrap();
+        let index = ALPHABET.iter().position(|byte| byte == last).unwrap();
+        assert_eq!(index & 3, 0, "a 32-byte signature has two unused low bits");
+        for unused_bits in 1..=3 {
+            *altered.last_mut().unwrap() = ALPHABET[index | unused_bits];
+            // These spellings decode to the same signature in a permissive engine.
+            runtime.block_on(tokens.reject(case, &altered));
+        }
+    }
+    runtime.block_on(tokens.verify_transfer());
+}
+
+#[test]
 #[ignore = "explicit bounded fuzz campaign; retained regressions run in ordinary CI"]
 fn fuzz_tokens() {
     let runtime = tokio::runtime::Builder::new_current_thread()

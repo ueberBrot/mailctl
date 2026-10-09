@@ -334,7 +334,7 @@ async fn decoder_and_work_budgets_stop_after_the_selected_literal() {
 #[tokio::test]
 async fn malformed_transfer_tails_keep_the_decoded_prefix_and_mark_replacement() {
     for (transfer_encoding, wire, expected) in [
-        ("BASE64", b"SGVsbG8".as_slice(), "\u{fffd}Hel"),
+        ("BASE64", b"SGVsbG8".as_slice(), "\u{fffd}Hello"),
         ("BASE64", b"TQ=".as_slice(), "\u{fffd}M"),
         ("BASE64", b"SGVs%G8=".as_slice(), "\u{fffd}Hel"),
         ("BASE64", b"SGVsbG8=!".as_slice(), "\u{fffd}Hello"),

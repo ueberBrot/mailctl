@@ -125,8 +125,8 @@ fn invalid_arguments(name: &str) -> Error {
 }
 
 impl ServerHandler for EmailTools {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_resources()

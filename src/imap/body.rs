@@ -74,7 +74,7 @@ pub struct BodyPage {
     pub metrics: Metrics,
 }
 
-const REPRESENTATION: &str = "mailctl-body-1/mail-parser-0.11.8/html2text-0.17.1";
+const REPRESENTATION: &str = "mailctl-body-1/mail-parser-0.11.9/html2text-0.17.1";
 
 impl super::AuthenticatedConnection {
     pub async fn read_body(

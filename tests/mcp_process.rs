@@ -181,6 +181,10 @@ async fn mcp_discovery_provides_guides_and_effective_limits() {
     setup(&installation);
     let client = client(&installation, &[]).await;
     let info = client.peer_info().unwrap();
+    assert_eq!(
+        info.protocol_version,
+        rmcp::model::ProtocolVersion::V_2025_11_25
+    );
     assert!(
         info.instructions
             .as_ref()

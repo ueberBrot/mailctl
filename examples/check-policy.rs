@@ -91,21 +91,21 @@ fn check_dependencies(
             }
         }
         if name == "io-imap"
-            && (!node.features.is_empty() || package.version.to_string() != "0.6.0")
+            && (!node.features.is_empty() || package.version.to_string() != "0.7.1")
         {
             return Err(
-                "Use pinned io-imap 0.6.0 coroutines without client, TLS, or SASL extensions"
+                "Use pinned io-imap 0.7.1 coroutines without client, TLS, or SASL extensions"
                     .into(),
             );
         }
         if name == "tokio-rustls"
-            && (package.version.to_string() != "0.26.5"
+            && (package.version.to_string() != "0.26.6"
                 || node
                     .features
                     .iter()
                     .any(|feature| !["ring", "tls12"].contains(&feature.as_str())))
         {
-            return Err("Use pinned tokio-rustls 0.26.5 with only ring and tls12".into());
+            return Err("Use pinned tokio-rustls 0.26.6 with only ring and tls12".into());
         }
         if name == "mail-builder"
             && (package.version.to_string() != "0.5.0" || !node.features.is_empty())
@@ -125,9 +125,9 @@ fn check_dependencies(
         }
         if name == "mailctl" {
             for (dependency_name, version) in [
-                ("io-imap", "=0.6.0"),
-                ("tokio", "=1.53.1"),
-                ("tokio-rustls", "=0.26.5"),
+                ("io-imap", "=0.7.1"),
+                ("tokio", "=1.53.2"),
+                ("tokio-rustls", "=0.26.6"),
                 ("mail-builder", "=0.5.0"),
                 ("rusqlite", "=0.40.2"),
             ] {
