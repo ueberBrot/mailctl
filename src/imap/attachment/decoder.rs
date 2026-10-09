@@ -13,6 +13,7 @@ pub(super) enum TransferEncoding {
 pub(super) struct Decoder {
     encoding: TransferEncoding,
     pending: Vec<u8>,
+    pending_offset: usize,
     base64: Vec<u8>,
     base64_padded: bool,
     quoted_printable: Vec<u8>,
@@ -35,6 +36,7 @@ impl Decoder {
         Self {
             encoding,
             pending: Vec::new(),
+            pending_offset: 0,
             base64: Vec::new(),
             base64_padded: false,
             quoted_printable: Vec::new(),
@@ -54,6 +56,14 @@ impl Decoder {
             .ok_or(Error::Limit)?;
         if self.decode_steps > limits.max_decode_steps {
             return Err(Error::Limit);
+        }
+        // Output pages advance a prefix without shifting the remaining bytes.
+        // Reclaim that prefix once when another bounded wire slice arrives.
+        if self.pending_offset != 0 {
+            let remaining = self.pending_len();
+            self.pending.copy_within(self.pending_offset.., 0);
+            self.pending.truncate(remaining);
+            self.pending_offset = 0;
         }
         match self.encoding {
             TransferEncoding::Identity => self.append(wire, limits),
@@ -116,10 +126,21 @@ impl Decoder {
     }
 
     pub(super) fn take_chunk(&mut self, max: usize) -> Vec<u8> {
-        let bytes = if self.pending.len() <= max {
+        let bytes = if self.pending_len() <= max {
+            // Compact only the final page and move its existing buffer, keeping
+            // the complete-page allocation behavior of the original decoder.
+            if self.pending_offset != 0 {
+                let remaining = self.pending_len();
+                self.pending.copy_within(self.pending_offset.., 0);
+                self.pending.truncate(remaining);
+                self.pending_offset = 0;
+            }
             std::mem::take(&mut self.pending)
         } else {
-            self.pending.drain(..max).collect()
+            let end = self.pending_offset + max;
+            let bytes = self.pending[self.pending_offset..end].to_vec();
+            self.pending_offset = end;
+            bytes
         };
         self.digest.update(&bytes);
         // append() has already checked this sum against the decoded byte ceiling.
@@ -128,7 +149,7 @@ impl Decoder {
     }
 
     pub(super) fn pending_len(&self) -> usize {
-        self.pending.len()
+        self.pending.len() - self.pending_offset
     }
 
     pub(super) fn decoded_offset(&self) -> usize {
@@ -137,7 +158,7 @@ impl Decoder {
 
     pub(super) fn snapshot(&self) -> DecoderMetrics {
         DecoderMetrics {
-            decoded_bytes: self.decoded_offset + self.pending.len(),
+            decoded_bytes: self.decoded_offset + self.pending_len(),
             decode_steps: self.decode_steps,
             max_state_bytes: self.max_state_bytes,
         }
@@ -224,7 +245,7 @@ impl Decoder {
     fn append(&mut self, bytes: &[u8], limits: &Limits) -> Result<(), Error> {
         let used = self
             .decoded_offset
-            .checked_add(self.pending.len())
+            .checked_add(self.pending_len())
             .ok_or(Error::Limit)?;
         if bytes.len() > limits.max_attachment_decoded_bytes.saturating_sub(used)
             || bytes.len() > Self::state_limit(limits).saturating_sub(self.retained_bytes())
@@ -262,5 +283,104 @@ fn hex(byte: u8) -> Option<u8> {
         b'a'..=b'f' => Some(byte - b'a' + 10),
         b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod narrow_page_tests {
+    use super::*;
+
+    #[test]
+    fn narrow_attachment_pages_preserve_bytes_integrity_and_bounded_state() {
+        const SIZE: usize = 16 * 1_024;
+        let wire = vec![b'x'; SIZE];
+        for page_bytes in [1, 1_024, SIZE] {
+            let limits = Limits {
+                max_attachment_chunk_bytes: page_bytes,
+                ..Limits::default()
+            };
+            let started = std::time::Instant::now();
+            let measured = allocation_counter::measure(|| {
+                for _ in 0..64 {
+                    let mut decoder = Decoder::new(TransferEncoding::Identity);
+                    decoder.push(&wire, &limits).unwrap();
+                    decoder.finish(&limits).unwrap();
+                    while decoder.pending_len() != 0 {
+                        let bytes = decoder.take_chunk(page_bytes);
+                        assert_eq!(bytes.len(), page_bytes);
+                        assert!(bytes.iter().all(|byte| *byte == b'x'));
+                    }
+                    assert_eq!(decoder.snapshot().decoded_bytes, SIZE);
+                    assert!(decoder.snapshot().max_state_bytes <= SIZE + 128);
+                    assert_eq!(
+                        decoder.integrity(),
+                        (SIZE as u64, <[u8; 32]>::from(Sha256::digest(&wire)))
+                    );
+                }
+            });
+            eprintln!(
+                "attachment narrow pages size={SIZE} repetitions=64 page={page_bytes} elapsed_us={} allocations={} total={} peak={}",
+                started.elapsed().as_micros(),
+                measured.count_total,
+                measured.bytes_total,
+                measured.bytes_max
+            );
+        }
+    }
+
+    #[test]
+    fn narrow_pages_and_later_wire_chunks_preserve_decoder_carry_and_limits() {
+        let expected = (0..32 * 1_024 + 9)
+            .map(|index| (index % 256) as u8)
+            .collect::<Vec<_>>();
+        let digest: [u8; 32] = Sha256::digest(&expected).into();
+        for encoding in [
+            TransferEncoding::Identity,
+            TransferEncoding::Base64,
+            TransferEncoding::QuotedPrintable,
+        ] {
+            let wire = match encoding {
+                TransferEncoding::Identity => expected.clone(),
+                TransferEncoding::Base64 => STANDARD.encode(&expected).into_bytes(),
+                TransferEncoding::QuotedPrintable => expected
+                    .chunks(24)
+                    .map(|line| {
+                        line.iter()
+                            .map(|byte| format!("={byte:02X}"))
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("=\r\n")
+                    .into_bytes(),
+            };
+            for page in [1, 7, 1_024] {
+                let limits = Limits {
+                    max_attachment_chunk_bytes: page,
+                    max_attachment_decoded_bytes: expected.len(),
+                    ..Limits::default()
+                };
+                let mut decoder = Decoder::new(encoding);
+                let mut offset = 0;
+                for chunk in wire.chunks(MAX_CHUNK_BYTES) {
+                    decoder.push(chunk, &limits).unwrap();
+                    while decoder.pending_len() >= page {
+                        let bytes = decoder.take_chunk(page);
+                        assert_eq!(bytes, expected[offset..offset + bytes.len()]);
+                        offset += bytes.len();
+                    }
+                }
+                decoder.finish(&limits).unwrap();
+                while decoder.pending_len() != 0 {
+                    let bytes = decoder.take_chunk(page);
+                    assert_eq!(bytes, expected[offset..offset + bytes.len()]);
+                    offset += bytes.len();
+                }
+                assert_eq!(offset, expected.len());
+                assert_eq!(decoder.snapshot().decode_steps, wire.len());
+                assert_eq!(decoder.snapshot().decoded_bytes, expected.len());
+                assert!(decoder.snapshot().max_state_bytes <= MAX_CHUNK_BYTES + page + 128);
+                assert_eq!(decoder.integrity(), (expected.len() as u64, digest));
+            }
+        }
     }
 }

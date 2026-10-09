@@ -281,3 +281,83 @@ fn multi_chunk_reconciliation_has_bounded_memory_wire_and_parser_work() {
         "MIME-sized allocation: {peaks:?}"
     );
 }
+
+#[test]
+fn reconciliation_ignores_unrelated_encoded_words_without_losing_identity_checks() {
+    use sha2::{Digest, Sha256};
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut measurements = Vec::new();
+    for (words, duplicate_id) in [(512, false), (1_024, false), (1_024, true)] {
+        // Fold each physical line below 998 octets while retaining malformed
+        // encoded-word candidates across the complete bounded Subject field.
+        let subject = std::iter::repeat_n("=?AB?q?x".repeat(32), words / 32)
+            .collect::<Vec<_>>()
+            .join("\r\n ");
+        let duplicate = if duplicate_id {
+            "Message-ID: <operation@example.test>\r\n"
+        } else {
+            ""
+        };
+        let bytes = format!(
+            "Message-ID: <operation@example.test>\r\n{duplicate}Subject: {subject}\r\n\r\nFrozen body.\r\n"
+        )
+        .into_bytes();
+        let source_bytes = bytes.len();
+        let expected = DraftVerification {
+            uid_validity: 77,
+            message_id: "operation@example.test".into(),
+            content_sha256: Sha256::digest(&bytes).into(),
+        };
+        let (mut client, server) = dedicated_fixture(
+            TlsMode::Implicit,
+            Limits::default(),
+            move |mut wire| {
+                Box::pin(async move {
+                    authenticate(&mut wire).await;
+                    let tag = expect(&mut wire, "EXAMINE Drafts").await;
+                    write(&mut wire, &format!("* 1 EXISTS\r\n* OK [UIDVALIDITY 77] incarnation\r\n* OK [UIDNEXT 5] next\r\n{tag} OK [READ-ONLY] selected\r\n")).await;
+                    let tag = expect(
+                        &mut wire,
+                        "UID SEARCH UID 1:4 HEADER Message-ID operation@example.test",
+                    )
+                    .await;
+                    write(&mut wire, &format!("* SEARCH 4\r\n{tag} OK found\r\n")).await;
+                    literal_bytes(&mut wire, "", 0, 16 * 1_024, &bytes).await;
+                    dropped(&mut wire).await;
+                })
+            },
+        );
+        let measured = allocation_counter::measure(|| {
+            let result = runtime
+                .block_on(client.reconcile_draft(&expected, &Default::default()))
+                .unwrap();
+            assert_eq!(
+                result,
+                if duplicate_id {
+                    DraftEvidence::ContentMismatch
+                } else {
+                    DraftEvidence::Verified(DraftMessageIdentity {
+                        uid_validity: 77,
+                        uid: 4,
+                    })
+                }
+            );
+        });
+        server.join().unwrap();
+        assert_eq!(client.metrics().append_wire_bytes, 0);
+        eprintln!(
+            "reconciliation unrelated subject source={source_bytes} duplicate={duplicate_id} allocations={} total={} peak={}",
+            measured.count_total, measured.bytes_total, measured.bytes_max
+        );
+        measurements.push((source_bytes, measured));
+    }
+    for (source_bytes, measured) in measurements {
+        assert!(
+            measured.bytes_total < 512 * 1_024 + source_bytes as u64 * 64,
+            "draft identity verification must not normalize unrelated Subject fields: {measured:?}"
+        );
+    }
+}

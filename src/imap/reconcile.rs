@@ -115,7 +115,11 @@ impl AuthenticatedConnection {
                 if !headers_complete {
                     return Ok(DraftEvidence::ContentMismatch);
                 }
-                let parsed = mail_parser::MessageParser::default()
+                // Reconciliation verifies the exact Message-ID and full MIME
+                // hash. Unrelated header normalization contributes no evidence.
+                let parsed = mail_parser::MessageParser::new()
+                    .default_header_ignore()
+                    .header_id(mail_parser::HeaderName::MessageId)
                     .parse_headers(&headers)
                     .ok_or(Error::Protocol)?;
                 let ids = parsed

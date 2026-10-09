@@ -203,7 +203,8 @@ pub(super) fn human(result: &OperationResult) -> Result<String, serde_json::Erro
         }
         _ => return serde_json::to_string_pretty(result).map(metadata_text),
     }
-    Ok(output.trim_end_matches('\n').to_owned())
+    output.truncate(output.trim_end_matches('\n').len());
+    Ok(output)
 }
 
 fn continuation(output: &mut String, complete: bool, cursor: Option<&str>) {
@@ -403,6 +404,34 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("\u{1b}]52;c;clipboard")
+        );
+    }
+
+    #[test]
+    fn human_message_pages_retain_only_one_complete_rendered_copy() {
+        let mut excessive_allocation = Vec::new();
+        for size in [64 * 1024, 256 * 1024, 2 * 1024 * 1024] {
+            let body = format!("{}\n\n", "x".repeat(size));
+            let result = message(&body);
+            let mut rendered = None;
+            let allocation = allocation_counter::measure(|| {
+                rendered = Some(human(&result).unwrap());
+            });
+            let rendered = rendered.unwrap();
+            assert_eq!(
+                rendered,
+                format!("Message: message\n\nBody:\n{}", "x".repeat(size))
+            );
+            eprintln!("human page bytes={size}, {allocation:?}");
+            if allocation.bytes_total > size as u64 + 4096
+                || allocation.bytes_max > size as u64 + 4096
+            {
+                excessive_allocation.push((size, allocation));
+            }
+        }
+        assert!(
+            excessive_allocation.is_empty(),
+            "human presentation must retain only its completed output, beyond small formatting overhead: {excessive_allocation:?}"
         );
     }
 }

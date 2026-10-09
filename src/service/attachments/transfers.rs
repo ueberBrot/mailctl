@@ -17,14 +17,51 @@ use uuid::Uuid;
 pub(in crate::service) struct Transfers(Arc<Store>);
 #[derive(Default)]
 struct Store {
-    slots: Mutex<HashMap<Uuid, Slot>>,
+    slots: Mutex<Slots>,
     expiry_changed: Arc<Notify>,
     expiry_tasks: CleanupTasks,
     has_idle: AtomicBool,
 }
+#[derive(Default)]
+struct Slots {
+    entries: HashMap<Uuid, Slot>,
+    idle: usize,
+    // Checkout can leave an earlier deadline here; expiry refreshes the bound.
+    next_expiry: Option<Instant>,
+    #[cfg(test)]
+    expiry_inspections: usize,
+}
 impl Drop for Store {
     fn drop(&mut self) {
         self.expiry_changed.notify_waiters();
+    }
+}
+impl Slots {
+    fn expire_due(&mut self, now: Instant) {
+        if self.next_expiry.is_none_or(|expiry| expiry > now) {
+            return;
+        }
+        let mut idle = 0;
+        let mut next_expiry = None;
+        // Active reads keep quota until completion/cancellation, even past expiry.
+        self.entries.retain(|_, slot| {
+            #[cfg(test)]
+            {
+                self.expiry_inspections += 1;
+            }
+            if slot.entry.is_none() {
+                return true;
+            }
+            if slot.expires <= now {
+                return false;
+            }
+            idle += 1;
+            next_expiry =
+                Some(next_expiry.map_or(slot.expires, |next: Instant| next.min(slot.expires)));
+            true
+        });
+        self.idle = idle;
+        self.next_expiry = next_expiry;
     }
 }
 impl Store {
@@ -36,16 +73,13 @@ impl Store {
             let Some(store) = store.upgrade() else { return };
             let next_expiry = {
                 let mut slots = store.slots.lock().unwrap();
-                let now = Instant::now();
-                // Active reads own their reservation until completion/cancellation.
-                slots.retain(|_, slot| slot.entry.is_none() || slot.expires > now);
-                let next = slots
-                    .values()
-                    .filter(|slot| slot.entry.is_some())
-                    .map(|slot| slot.expires)
-                    .min();
-                store.has_idle.store(next.is_some(), Ordering::Release);
-                next
+                slots.expire_due(Instant::now());
+                if slots.idle == 0 {
+                    // A later retain must wake cleanup if it went back to waiting.
+                    slots.next_expiry = None;
+                }
+                store.observe_idle(&slots);
+                slots.next_expiry
             };
             // Sleeping cleanup must not keep the process-local transfer store alive.
             drop(store);
@@ -62,11 +96,8 @@ impl Store {
         self.expiry_tasks
             .start(|_| Self::expire_idle(Arc::downgrade(self), self.expiry_changed.clone()));
     }
-    fn observe_idle(&self, slots: &HashMap<Uuid, Slot>) {
-        self.has_idle.store(
-            slots.values().any(|slot| slot.entry.is_some()),
-            Ordering::Release,
-        );
+    fn observe_idle(&self, slots: &Slots) {
+        self.has_idle.store(slots.idle > 0, Ordering::Release);
     }
 }
 struct Slot {
@@ -92,7 +123,7 @@ pub(super) struct Reservation {
 impl Drop for Reservation {
     fn drop(&mut self) {
         if !self.retained {
-            self.store.slots.lock().unwrap().remove(&self.id);
+            self.store.slots.lock().unwrap().entries.remove(&self.id);
         }
     }
 }
@@ -105,24 +136,33 @@ impl Reservation {
     }
     pub fn retain(mut self, entry: Entry) -> Result<(), Error> {
         let mut store = self.store.slots.lock().unwrap();
-        let slot = store.get_mut(&self.id).ok_or_else(expired)?;
+        let slot = store.entries.get_mut(&self.id).ok_or_else(expired)?;
         if slot.expires <= Instant::now() {
             return Err(expired());
         }
         slot.entry = Some(entry);
-        self.store.has_idle.store(true, Ordering::Release);
+        let expires = slot.expires;
+        let changed = store.next_expiry.is_none_or(|previous| expires < previous);
+        store.next_expiry = Some(
+            store
+                .next_expiry
+                .map_or(expires, |previous| previous.min(expires)),
+        );
+        store.idle += 1;
+        self.store.observe_idle(&store);
         self.retained = true;
         drop(store);
         self.store.start_expiry();
-        self.store.expiry_changed.notify_waiters();
+        if changed {
+            self.store.expiry_changed.notify_waiters();
+        }
         Ok(())
     }
 }
 impl Transfers {
-    fn live(&self) -> MutexGuard<'_, HashMap<Uuid, Slot>> {
+    fn live(&self) -> MutexGuard<'_, Slots> {
         let mut store = self.0.slots.lock().unwrap();
-        let now = Instant::now();
-        store.retain(|_, slot| slot.entry.is_none() || slot.expires > now);
+        store.expire_due(Instant::now());
         self.0.observe_idle(&store);
         store
     }
@@ -147,6 +187,7 @@ impl Transfers {
     ) -> Result<Reservation, Error> {
         let mut store = self.live();
         if store
+            .entries
             .values()
             .filter(|slot| slot.account == account)
             .count()
@@ -157,7 +198,7 @@ impl Transfers {
         let id = Uuid::new_v4();
         // Equal operation and transfer limits must share an exact deadline.
         let expires = started + Duration::from_secs(limits.transfer_seconds as u64);
-        store.insert(
+        store.entries.insert(
             id,
             Slot {
                 session,
@@ -182,7 +223,7 @@ impl Transfers {
         authorize: impl FnOnce(&Entry) -> Result<(), Error>,
     ) -> Result<(Reservation, Entry), Error> {
         let mut store = self.live();
-        let slot = store.get_mut(&id).ok_or_else(expired)?;
+        let slot = store.entries.get_mut(&id).ok_or_else(expired)?;
         if slot.session != session {
             return Err(expired());
         }
@@ -193,6 +234,7 @@ impl Transfers {
         authorize(entry)?;
         let entry = slot.entry.take().ok_or_else(expired)?;
         let expires = slot.expires;
+        store.idle -= 1;
         self.0.observe_idle(&store);
         Ok((
             Reservation {
@@ -220,10 +262,143 @@ impl Drop for TransferSession {
     fn drop(&mut self) {
         if let Some(store) = self.store.upgrade() {
             let mut slots = store.slots.lock().unwrap();
-            slots.retain(|_, slot| slot.session != self.id);
+            let mut idle = 0;
+            let mut next_expiry = None;
+            slots.entries.retain(|_, slot| {
+                if slot.session == self.id {
+                    return false;
+                }
+                if slot.entry.is_some() {
+                    idle += 1;
+                    next_expiry = Some(
+                        next_expiry.map_or(slot.expires, |next: Instant| next.min(slot.expires)),
+                    );
+                }
+                true
+            });
+            slots.idle = idle;
+            slots.next_expiry = next_expiry;
             store.observe_idle(&slots);
             drop(slots);
             store.expiry_changed.notify_waiters();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AttachmentReader, Entry, Error, Limits, MessageReference, Transfers};
+    use std::{future::Future, pin::Pin};
+    use tokio::time::Instant;
+    use uuid::Uuid;
+
+    struct Unread;
+    impl AttachmentReader for Unread {
+        fn next<'a>(
+            &'a mut self,
+            _: &'a Limits,
+        ) -> Pin<Box<dyn Future<Output = Result<crate::imap::AttachmentData, Error>> + Send + 'a>>
+        {
+            panic!("bookkeeping probe must not read a payload")
+        }
+    }
+
+    fn entry(account: &str) -> Entry {
+        Entry {
+            resource: MessageReference {
+                account: account.into(),
+                generation: 1,
+                mailbox: "INBOX".into(),
+                uid_validity: 1,
+                uid: 1,
+            },
+            reference: "synthetic-attachment".into(),
+            scope: "synthetic-scope".into(),
+            offset: 0,
+            reader: Box::new(Unread),
+        }
+    }
+
+    #[test]
+    fn continued_transfers_do_not_revisit_unexpired_other_accounts() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _context = runtime.enter();
+        let transfers = Transfers::default();
+        let limits = Limits {
+            accounts: 256,
+            transfers_per_account: 4,
+            transfer_seconds: 600,
+            ..Limits::default()
+        };
+        let session = Uuid::new_v4();
+        let started = Instant::now();
+        let mut first = None;
+        for index in 0..1024 {
+            let account = format!("synthetic-account-{}", index / 4);
+            let reservation = transfers
+                .reserve(session, &account, &limits, started)
+                .unwrap();
+            first.get_or_insert(reservation.id());
+            reservation.retain(entry(&account)).unwrap();
+        }
+        transfers.0.slots.lock().unwrap().expiry_inspections = 0;
+        for _ in 0..100 {
+            let (reservation, entry) = transfers
+                .checkout(session, first.unwrap(), "synthetic-scope", 0, |_| Ok(()))
+                .unwrap();
+            reservation.retain(entry).unwrap();
+        }
+        let inspections = transfers.0.slots.lock().unwrap().expiry_inspections;
+        println!("100 continuations with 1,024 live slots: {inspections} expiry inspections");
+        assert_eq!(
+            inspections, 0,
+            "future transfer deadlines must not cause an inventory scan for each chunk"
+        );
+    }
+
+    #[test]
+    #[ignore = "native performance probe; run explicitly on a quiet host"]
+    fn continuation_bookkeeping_with_many_accounts() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _context = runtime.enter();
+        let limits = Limits {
+            accounts: 256,
+            transfers_per_account: 4,
+            transfer_seconds: 600,
+            ..Limits::default()
+        };
+        limits.validate().unwrap();
+        for count in [1, 1024, 1, 1024] {
+            let transfers = Transfers::default();
+            let session = Uuid::new_v4();
+            let started = Instant::now();
+            let mut first = None;
+            for index in 0..count {
+                let account = format!("synthetic-account-{}", index / 4);
+                let reservation = transfers
+                    .reserve(session, &account, &limits, started)
+                    .unwrap();
+                first.get_or_insert(reservation.id());
+                reservation.retain(entry(&account)).unwrap();
+            }
+            let id = first.unwrap();
+            let start = std::time::Instant::now();
+            for _ in 0..20_000 {
+                let (reservation, entry) = transfers
+                    .checkout(session, id, "synthetic-scope", 0, |_| Ok(()))
+                    .unwrap();
+                reservation.retain(entry).unwrap();
+            }
+            println!(
+                "{{\"slots\":{count},\"continuations\":20000,\"elapsed_ns\":{}}}",
+                start.elapsed().as_nanos()
+            );
         }
     }
 }

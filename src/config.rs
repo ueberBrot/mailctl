@@ -37,6 +37,26 @@ impl MailboxScope {
     /// Intersect authority, normalizing only the case-insensitive INBOX identity.
     /// An empty intersection is valid even though an empty configured list is not.
     pub fn intersection(&self, other: &Self) -> Self {
+        if let (Self::Only(left), Self::Only(right)) = (self, other)
+            && left.len().min(right.len()) > 32
+        {
+            let (indexed, scanned) = if left.len() <= right.len() {
+                (left, right)
+            } else {
+                (right, left)
+            };
+            let mut remaining = indexed
+                .iter()
+                .map(|name| crate::domain::mailbox_identity(name))
+                .collect::<HashSet<_>>();
+            let mut names = scanned
+                .iter()
+                .filter_map(|name| remaining.take(crate::domain::mailbox_identity(name)))
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            names.sort_unstable();
+            return Self::Only(names);
+        }
         let (names, scope) = match (self, other) {
             (Self::All, Self::All) => return Self::All,
             (Self::Only(names), scope) | (scope, Self::Only(names)) => (names, scope),

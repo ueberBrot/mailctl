@@ -1,4 +1,7 @@
-use mailctl::{config::Config, domain::Error};
+use mailctl::{
+    config::{Config, MailboxScope},
+    domain::Error,
+};
 use std::fmt::Write;
 
 fn configuration() -> String {
@@ -69,4 +72,78 @@ fn config_parse_fast_path_preserves_version_and_migration_error_precedence() {
     let error = Config::parse(&legacy).unwrap_err();
     assert_eq!(error.code, Error::obsolete_runtime_capacity().code);
     assert_eq!(error.message, Error::obsolete_runtime_capacity().message);
+}
+
+#[test]
+fn scope_intersections_preserve_literal_names_and_normalize_only_inbox() {
+    let scope =
+        |names: &[&str]| MailboxScope::Only(names.iter().map(|name| (*name).to_owned()).collect());
+    let pad = |scope: MailboxScope, prefix: &str| {
+        let MailboxScope::Only(mut names) = scope else {
+            panic!("explicit fixture scope");
+        };
+        names.extend((0..40).map(|index| format!("{prefix}-{index}")));
+        MailboxScope::Only(names)
+    };
+    let left = pad(
+        scope(&[
+            "INBOX",
+            "inbox",
+            "iNbOx",
+            "Archive",
+            "archive",
+            "Ärger",
+            "Étage",
+            "work/Sub",
+            "sub",
+            "InboxArchive",
+            "ińbox",
+            "箱",
+        ]),
+        "left-only",
+    );
+    let right = pad(
+        scope(&[
+            "iNBOX",
+            "INBOX",
+            "inbox",
+            "Archive",
+            "Ärger",
+            "Étage",
+            "work/Sub",
+            "SUB",
+            "InboxArchive",
+            "INBÖX",
+            "箱",
+            "Other",
+        ]),
+        "right-only",
+    );
+    let expected = scope(&[
+        "Archive",
+        "INBOX",
+        "InboxArchive",
+        "work/Sub",
+        "Ärger",
+        "Étage",
+        "箱",
+    ]);
+    assert_eq!(left.intersection(&right), expected);
+    assert_eq!(right.intersection(&left), expected);
+    assert_eq!(scope(&["inbox"]).intersection(&right), scope(&["INBOX"]));
+    assert_eq!(right.intersection(&scope(&["inbox"])), scope(&["INBOX"]));
+    let disjoint = MailboxScope::Only((0..12).map(|i| format!("other-{i}")).collect());
+    assert_eq!(left.intersection(&disjoint), MailboxScope::Only(vec![]));
+    assert_eq!(
+        left.intersection(&MailboxScope::Only(vec![])),
+        MailboxScope::Only(vec![])
+    );
+    assert_eq!(
+        MailboxScope::All.intersection(&MailboxScope::All),
+        MailboxScope::All
+    );
+    assert_eq!(
+        MailboxScope::All.intersection(&left),
+        left.intersection(&MailboxScope::All)
+    );
 }

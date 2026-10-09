@@ -519,6 +519,37 @@ fn termination_signal() -> Result<impl Future<Output = ()>, Error> {
     }
 }
 
+struct ReportBuffer(Vec<u8>);
+enum ReportOutput {
+    Json(Vec<u8>),
+    Human(String),
+}
+impl std::io::Write for ReportBuffer {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let needed = self
+            .0
+            .len()
+            .checked_add(bytes.len())
+            .ok_or_else(|| std::io::Error::other("Output unavailable"))?;
+        if needed > self.0.capacity() {
+            // A large string arrives in one write. Leave room for the envelope's
+            // trailing fields so they do not double that whole allocation.
+            // Small escaped writes still grow geometrically.
+            let capacity = needed
+                .saturating_add(1024)
+                .max(self.0.capacity().saturating_mul(2));
+            self.0
+                .try_reserve_exact(capacity - self.0.len())
+                .map_err(std::io::Error::other)?;
+        }
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 async fn report<O: Send + 'static>(
     request: &Request,
     json: bool,
@@ -541,22 +572,33 @@ async fn report<O: Send + 'static>(
     let code = error.map_or(0, Error::exit_code);
     let human_error = !json && envelope.error().is_some();
     let output = if json {
-        serde_json::to_string(&envelope)
+        // Keep one complete buffer so serializer failures leave stdout untouched.
+        let mut output = ReportBuffer(Vec::with_capacity(1024));
+        serde_json::to_writer(&mut output, &envelope)
+            .ok()
+            .map(|()| ReportOutput::Json(output.0))
     } else {
         match envelope.result() {
             Some(result) => presentation::human(result),
             None => presentation::human_error(envelope.error().expect("failure contains an error")),
         }
+        .ok()
+        .map(ReportOutput::Human)
     };
-    let Ok(text) = output else {
+    let Some(output) = output else {
         return 8;
     };
     let write = tokio::task::spawn_blocking(move || {
         let _owner = owner;
         // Terminal filtering strips valid JSON string data such as DELETE.
-        if json {
-            return writeln!(std::io::stdout().lock(), "{text}");
-        }
+        let text = match output {
+            ReportOutput::Json(bytes) => {
+                let mut stdout = std::io::stdout().lock();
+                stdout.write_all(&bytes)?;
+                return stdout.write_all(b"\n");
+            }
+            ReportOutput::Human(text) => text,
+        };
         if human_error {
             return writeln!(std::io::stderr().lock(), "{text}");
         }
@@ -590,4 +632,137 @@ async fn report_guidance(
         .map_err(|_| Error::new(ErrorCode::InternalError))?
         .map_err(|_| Error::new(ErrorCode::InternalError))?;
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{BodyText, MessageBody};
+
+    #[test]
+    fn cli_json_buffers_keep_escaped_pages_with_geometric_growth() {
+        let value = serde_json::json!({"text": "\u{1}\"\\é🦀\n".repeat(64 * 1024)});
+        let expected = serde_json::to_vec(&value).unwrap();
+        let mut output = ReportBuffer(Vec::with_capacity(1024));
+        let allocation = allocation_counter::measure(|| {
+            serde_json::to_writer(&mut output, &value).unwrap();
+        });
+        assert_eq!(output.0, expected);
+        assert!(
+            allocation.bytes_total < expected.len() as u64 * 4,
+            "incremental escaped output must not repeatedly reserve its exact next length: {allocation:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_json_serializer_failures_leave_stdout_empty() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "frontends::tests::non_utf8_export_report_fixture",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "serializer failure fixture failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            output.contains("1 passed; 0 failed"),
+            "fixture did not run: {output}"
+        );
+        assert!(
+            !output.contains("\"schema_version\""),
+            "failed serialization must not emit a partial JSON envelope: {output}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "child fixture for the serializer failure stdout regression"]
+    fn non_utf8_export_report_fixture() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = OperationResult::Export(crate::domain::ExportReceipt {
+            path: OsString::from_vec(b"/fixture/invalid-\xff".to_vec()).into(),
+            filesystem: "fixture".into(),
+            total_decoded_bytes: 0,
+            sha256: "0".repeat(64),
+        });
+        assert_eq!(
+            runtime.block_on(report(
+                &Request::new(),
+                true,
+                Color::Never,
+                Ok(result),
+                (),
+                30
+            )),
+            8
+        );
+    }
+
+    #[test]
+    #[ignore = "explicit stdout allocation probe; redirect stdout while running"]
+    fn cli_json_reports_allocate_only_the_complete_output_buffer() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut excessive_allocation = Vec::new();
+        for size in [64 * 1024, 256 * 1024, 2 * 1024 * 1024] {
+            let result = OperationResult::Message(MessageBody {
+                account_id: "account".into(),
+                generation: 1,
+                message_reference: "message".into(),
+                body: BodyText {
+                    text: "x".repeat(size),
+                    selected_part: Some("1".into()),
+                    source_media_type: Some("text/plain".into()),
+                    representation_version: "1".into(),
+                    converted: false,
+                    replacements: false,
+                    truncated: false,
+                    empty_reason: None,
+                    continuation_available: false,
+                    next_cursor: None,
+                },
+            });
+            let request = Request::new();
+            let mut code = None;
+            let started = std::time::Instant::now();
+            let allocation = allocation_counter::measure(|| {
+                code = Some(runtime.block_on(report(
+                    &request,
+                    true,
+                    Color::Never,
+                    Ok(result),
+                    (),
+                    30,
+                )));
+            });
+            assert_eq!(code, Some(0));
+            eprintln!(
+                "CLI JSON bytes={size}, elapsed={:?}, {allocation:?}",
+                started.elapsed()
+            );
+            if allocation.bytes_total > size as u64 + 64 * 1024
+                || allocation.bytes_max > size as u64 + 64 * 1024
+            {
+                excessive_allocation.push((size, allocation));
+            }
+        }
+        assert!(
+            excessive_allocation.is_empty(),
+            "CLI JSON presentation must not repeatedly grow its complete output buffer: {excessive_allocation:?}"
+        );
+    }
 }

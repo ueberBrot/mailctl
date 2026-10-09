@@ -397,6 +397,11 @@ pub(super) fn draft_content(
         return Err(oversized());
     }
     let mut bytes = Vec::new();
+    let capacity = usize::try_from(metadata.len())
+        .ok()
+        .and_then(|length| length.checked_add(1))
+        .ok_or_else(oversized)?;
+    bytes.try_reserve_exact(capacity).map_err(|_| oversized())?;
     file.take(maximum as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| invalid())?;
@@ -405,6 +410,48 @@ pub(super) fn draft_content(
     }
     crate::encoding::validate_json_bounds(&bytes, nesting, 4096).map_err(|_| invalid())?;
     serde_json::from_slice(&bytes).map_err(|_| invalid())
+}
+
+#[cfg(all(test, feature = "cli"))]
+mod tests {
+    use super::draft_content;
+    use crate::domain::DraftContent;
+
+    #[test]
+    fn stable_draft_input_files_allocate_once_for_their_inspected_length() {
+        let mut excessive_allocation = Vec::new();
+        for size in [64 * 1024, 2 * 1024 * 1024] {
+            let expected = DraftContent {
+                body: "x".repeat(size),
+                ..Default::default()
+            };
+            let input = serde_json::to_vec(&expected).unwrap();
+            let path = std::env::temp_dir().join(format!(
+                "mailctl-draft-file-performance-{}.json",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::write(&path, &input).unwrap();
+            assert_eq!(
+                draft_content(&path, input.len() - 1, 32).unwrap_err().code,
+                crate::domain::ErrorCode::ResponseTooLarge
+            );
+            let mut parsed = None;
+            let allocation = allocation_counter::measure(|| {
+                parsed = Some(draft_content(&path, input.len(), 32).unwrap());
+            });
+            std::fs::remove_file(&path).unwrap();
+            assert_eq!(parsed.unwrap(), expected);
+            eprintln!("CLI draft input bytes={}, {allocation:?}", input.len());
+            let bound = input.len() as u64 + size as u64 + 4096;
+            if allocation.bytes_total > bound || allocation.bytes_max > bound {
+                excessive_allocation.push((size, allocation));
+            }
+        }
+        assert!(
+            excessive_allocation.is_empty(),
+            "CLI draft input must reserve its inspected length instead of growing repeatedly: {excessive_allocation:?}"
+        );
+    }
 }
 
 #[cfg(feature = "cli")]

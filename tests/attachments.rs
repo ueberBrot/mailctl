@@ -229,6 +229,50 @@ async fn expired_idle_transfers_release_readers_without_another_request() {
     drop((context, service));
 }
 
+#[tokio::test]
+async fn a_new_shorter_transfer_wakes_cleanup_without_expiring_an_older_reader() {
+    use std::time::Duration;
+    use tokio::sync::Notify;
+    let dropped = Arc::new(Notify::new());
+    let mut configuration = config();
+    configuration.limits.transfer_seconds = 3;
+    configuration.grants[0].limits.transfer_seconds = 3;
+    let mut shorter = configuration.grants[0].clone();
+    shorter.name = "short-reader".into();
+    shorter.limits.transfer_seconds = 1;
+    configuration.grants.push(shorter);
+    let (service, message) = setup(
+        configuration,
+        Arc::new(drop_reader::Backend(dropped.clone())),
+    )
+    .await;
+    let older = service.context("reader", &Default::default()).unwrap();
+    let shorter = service
+        .context("short-reader", &Default::default())
+        .unwrap();
+    let reference = attachment_reference(&service, &older, &message).await;
+    let token = start(&service, &older, &reference).await;
+    // Let cleanup register its initial, longer sleep before admitting the new deadline.
+    tokio::task::yield_now().await;
+    let _short_token = start(&service, &shorter, &reference).await;
+    tokio::time::timeout(Duration::from_millis(1500), dropped.notified())
+        .await
+        .expect("a newly earlier transfer deadline must wake the sleeping cleanup task");
+    let OperationResult::Attachment(page) = service
+        .execute(&older, operation("get_attachment", json!({"token":token})))
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(page.decoded_offset, 1);
+    assert!(matches!(
+        page.progress,
+        mailctl::domain::AttachmentProgress::Continue { .. }
+    ));
+    drop((older, shorter, service));
+}
+
 fn transfer_cleanup_across_runtime_shutdown(overlap: bool) {
     use std::time::Duration;
     use tokio::sync::Notify;

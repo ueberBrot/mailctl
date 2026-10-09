@@ -42,7 +42,32 @@ pub(super) fn select(
     content_ids: &HashMap<Part, String>,
 ) -> Result<Option<Selected>, Error> {
     validate_structure(structure, limits)?;
-    select_part(structure, None, content_ids)
+    // The selected body owns metadata; excluded candidates need only borrowed
+    // fields while validation and selection traverse the complete structure.
+    let content_ids = content_ids
+        .iter()
+        .map(|(part, id)| (part.0.as_ref(), id.as_str()))
+        .collect();
+    select_part(structure, &mut Vec::new(), &content_ids).map(|candidate| {
+        candidate.map(|mut candidate| {
+            candidate.path.reverse();
+            if candidate.path.is_empty() {
+                candidate.path.push(NonZeroU32::MIN);
+            }
+            Selected {
+                part: Part(
+                    candidate
+                        .path
+                        .try_into()
+                        .expect("selected path is nonempty"),
+                ),
+                media_type: candidate.media_type.to_owned(),
+                charset: candidate.charset.to_owned(),
+                transfer_encoding: candidate.transfer_encoding.to_ascii_lowercase(),
+                wire_size: candidate.wire_size,
+            }
+        })
+    })
 }
 
 /// Return only the direct children whose MIME headers can establish a related root.
@@ -80,14 +105,21 @@ pub(super) fn validate_headers(
     // Body selection does not need Subject, addresses, or descriptive fields.
     // Their encoded-word normalization can retry malformed suffixes; skip them
     // rather than spending the body-read budget on unrelated metadata.
-    let message = MessageParser::new()
+    let parser = MessageParser::new()
         .default_header_ignore()
-        .header_content_type(mail_parser::HeaderName::ContentType)
-        .header_content_type(mail_parser::HeaderName::ContentDisposition)
-        .header_id(mail_parser::HeaderName::ContentId)
-        .header_raw(mail_parser::HeaderName::ContentTransferEncoding)
-        .parse_headers(raw)
-        .ok_or(Error::Protocol)?;
+        .header_id(mail_parser::HeaderName::ContentId);
+    // MIME identity needs only the media type, charset and disposition type.
+    // Keep offsets for these fields so irrelevant canonical parameters can be
+    // omitted before the pinned parser joins continuation fragments.
+    let parser = if selected.is_some() {
+        parser
+            .ignore_header(mail_parser::HeaderName::ContentType)
+            .ignore_header(mail_parser::HeaderName::ContentDisposition)
+            .header_raw(mail_parser::HeaderName::ContentTransferEncoding)
+    } else {
+        parser
+    };
+    let message = parser.parse_headers(raw).ok_or(Error::Protocol)?;
     let headers = message.parts.first().ok_or(Error::Protocol)?;
     let content_id = headers
         .headers
@@ -98,7 +130,23 @@ pub(super) fn validate_headers(
         .map(ToOwned::to_owned);
 
     if let Some(selected) = selected {
-        let (media_type, charset) = headers.content_type().map_or_else(
+        let content_type = identity_header_value(
+            raw,
+            headers.headers.header(mail_parser::HeaderName::ContentType),
+            Some("charset"),
+        )?;
+        let content_type =
+            mail_parser::parsers::MessageStream::new(content_type.as_ref()).parse_content_type();
+        let disposition = identity_header_value(
+            raw,
+            headers
+                .headers
+                .header(mail_parser::HeaderName::ContentDisposition),
+            None,
+        )?;
+        let disposition =
+            mail_parser::parsers::MessageStream::new(disposition.as_ref()).parse_content_type();
+        let (media_type, charset) = content_type.as_content_type().map_or_else(
             || ("text/plain".to_owned(), "us-ascii"),
             |content_type| {
                 let subtype = content_type.c_subtype.as_deref().unwrap_or("plain");
@@ -117,14 +165,117 @@ pub(super) fn validate_headers(
                 .unwrap_or("7bit")
                 .trim()
                 .eq_ignore_ascii_case(&selected.transfer_encoding)
-            || headers
-                .content_disposition()
+            || disposition
+                .as_content_type()
                 .is_some_and(|value| value.c_type.eq_ignore_ascii_case("attachment"))
         {
             return Err(Error::Protocol);
         }
     }
     Ok(content_id)
+}
+
+fn identity_header_value<'a>(
+    raw: &'a [u8],
+    header: Option<&mail_parser::Header<'_>>,
+    wanted: Option<&str>,
+) -> Result<Cow<'a, [u8]>, Error> {
+    let Some(header) = header else {
+        return Ok(Cow::Borrowed(&[]));
+    };
+    let value = raw
+        .get(header.offset_start as usize..header.offset_end as usize)
+        .ok_or(Error::Protocol)?;
+    Ok(projected_mime_value(value, wanted))
+}
+
+// Projection is limited to canonical ASCII tokens and unencoded continuations.
+// Any uncertain segment keeps the entire original field: removing later text
+// can otherwise change the dependency's permissive recovery from earlier text.
+fn projected_mime_value<'a>(raw: &'a [u8], wanted: Option<&str>) -> Cow<'a, [u8]> {
+    fn token(value: &str) -> bool {
+        !value.is_empty()
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii() && byte > b' ' && !b"()<>@,;:\\\"/[]?=".contains(&byte))
+    }
+    fn parameter_base(segment: &str) -> Option<&str> {
+        let (name, value) = segment.trim_ascii().split_once('=')?;
+        let name = name.trim_matches([' ', '\t']);
+        let value = value.trim_matches([' ', '\t']);
+        if !token(name) {
+            return None;
+        }
+        // Quoted tokens follow the same simple parser path as unquoted ones.
+        // Empty values, escapes, folds and more complex quotes retain the full
+        // original field, including the pinned parser's recovery behavior.
+        let value = if let Some(value) = value.strip_prefix('"') {
+            value.strip_suffix('"')?
+        } else {
+            value
+        };
+        if !token(value) {
+            return None;
+        }
+        let Some((base, suffix)) = name.split_once('*') else {
+            return Some(name);
+        };
+        if base.is_empty() {
+            return None;
+        }
+        if suffix.is_empty()
+            || !suffix.bytes().all(|byte| byte.is_ascii_digit())
+            || suffix.parse::<u32>().is_err()
+        {
+            return None;
+        }
+        Some(base)
+    }
+    fn keep_segment(segment: &str, first: bool, wanted: Option<&str>) -> Option<bool> {
+        if first {
+            let mut pieces = segment.trim_ascii().split('/');
+            let first = pieces.next()?;
+            if !token(first)
+                || pieces.next().is_some_and(|piece| !token(piece))
+                || pieces.next().is_some()
+            {
+                return None;
+            }
+            return Some(true);
+        }
+        let name = parameter_base(segment)?;
+        Some(wanted.is_some_and(|wanted| {
+            name.eq_ignore_ascii_case(wanted)
+                || name.len() == wanted.len() + "-language".len()
+                    && name[..wanted.len()].eq_ignore_ascii_case(wanted)
+                    && name[wanted.len()..].eq_ignore_ascii_case("-language")
+        }))
+    }
+    let Ok(value) = std::str::from_utf8(raw) else {
+        return Cow::Borrowed(raw);
+    };
+    if value.contains("=?")
+        || value.bytes().any(|byte| {
+            !byte.is_ascii() || byte.is_ascii_control() && !matches!(byte, b'\t' | b'\r' | b'\n')
+        })
+    {
+        return Cow::Borrowed(raw);
+    }
+    let value = value.trim_ascii();
+    let mut result = String::with_capacity(value.len().min(128) + 2);
+    for (index, segment) in value.split(';').enumerate() {
+        let Some(keep) = keep_segment(segment, index == 0, wanted) else {
+            return Cow::Borrowed(raw);
+        };
+        if keep {
+            if index != 0 {
+                result.push(';');
+            }
+            result.push_str(segment);
+        }
+    }
+    result.push_str("\r\n");
+    Cow::Owned(result.into_bytes())
 }
 
 pub(super) fn render(selected: &Selected, wire: &[u8], limits: &Limits) -> Result<Rendered, Error> {
@@ -179,11 +330,21 @@ pub(super) fn render(selected: &Selected, wire: &[u8], limits: &Limits) -> Resul
     })
 }
 
-fn select_part(
-    structure: &BodyStructure<'_>,
-    path: Option<&Part>,
-    content_ids: &HashMap<Part, String>,
-) -> Result<Option<Selected>, Error> {
+struct Candidate<'a> {
+    // A child contributes its number only if its candidate remains selected.
+    // Ancestors append their numbers, and select() reverses the final path.
+    path: Vec<NonZeroU32>,
+    media_type: &'static str,
+    charset: &'a str,
+    transfer_encoding: &'a str,
+    wire_size: usize,
+}
+
+fn select_part<'a>(
+    structure: &'a BodyStructure<'_>,
+    path: &mut Vec<NonZeroU32>,
+    content_ids: &HashMap<&[NonZeroU32], &str>,
+) -> Result<Option<Candidate<'a>>, Error> {
     match structure {
         BodyStructure::Single {
             body,
@@ -192,11 +353,7 @@ fn select_part(
             if attachment(extension_data.as_ref().and_then(|data| data.tail.as_ref())) {
                 return Ok(None);
             }
-            leaf(
-                body,
-                path.cloned()
-                    .unwrap_or_else(|| Part(NonZeroU32::MIN.into())),
-            )
+            leaf(body)
         }
         BodyStructure::Multi {
             bodies,
@@ -206,45 +363,61 @@ fn select_part(
             if attachment(extension_data.as_ref().and_then(|data| data.tail.as_ref())) {
                 return Ok(None);
             }
-            let subtype = imap_text(subtype)?.to_ascii_lowercase();
+            let subtype = imap_text(subtype)?;
             let children = bodies.as_ref();
-            let mut selected = Vec::with_capacity(children.len());
-            for (index, child) in children.iter().enumerate() {
-                let child_path = child_path(path, index + 1)?;
-                let candidate = select_part(child, Some(&child_path), content_ids)?;
-                selected.push((child_path, candidate));
-            }
-            Ok(match subtype.as_str() {
-                "alternative" => first_type(&mut selected, "text/plain")
-                    .or_else(|| first_type(&mut selected, "text/html")),
-                "related" => {
-                    let parameters = extension_data
+            let alternative = subtype.eq_ignore_ascii_case("alternative");
+            let root = if subtype.eq_ignore_ascii_case("related") {
+                parameter(
+                    extension_data
                         .as_ref()
-                        .map_or(&[][..], |data| data.parameter_list.as_slice());
-                    let root = parameter(parameters, "start")?
-                        .map(normalize_content_id)
-                        .transpose()?;
-                    let related_root = if let Some(root) = root {
-                        let mut related_root = None;
-                        for (child, (path, candidate)) in children.iter().zip(&mut selected) {
-                            let content_id = content_ids
-                                .get(path)
-                                .map(|value| normalize_content_id(value))
-                                .transpose()?
-                                .or(structure_content_id(child)?);
-                            if content_id == Some(root) {
-                                related_root = candidate.take();
-                                break;
-                            }
+                        .map_or(&[][..], |data| data.parameter_list.as_slice()),
+                    "start",
+                )?
+                .map(normalize_content_id)
+                .transpose()?
+            } else {
+                None
+            };
+            let mut selected: Option<Candidate<'a>> = None;
+            let mut related_root = None;
+            let mut root_matched = false;
+            for (index, child) in children.iter().enumerate() {
+                let number = NonZeroU32::new(u32::try_from(index + 1).map_err(|_| Error::Limit)?)
+                    .ok_or(Error::Limit)?;
+                path.push(number);
+                // Continue through every child even after a definite choice so
+                // malformed candidate fields keep their existing error outcome.
+                let mut candidate = select_part(child, path, content_ids)?;
+                if let Some(root) = root
+                    && !root_matched
+                {
+                    let content_id = content_ids
+                        .get(path.as_slice())
+                        .map(|value| normalize_content_id(value))
+                        .transpose()?
+                        .or(structure_content_id(child)?);
+                    if content_id == Some(root) {
+                        root_matched = true;
+                        if let Some(mut candidate) = candidate.take() {
+                            candidate.path.push(number);
+                            related_root = Some(candidate);
                         }
-                        related_root
-                    } else {
-                        None
-                    };
-                    related_root.or_else(|| first(&mut selected))
+                    }
                 }
-                _ => first(&mut selected),
-            })
+                path.pop();
+                if let Some(mut candidate) = candidate
+                    && (selected.is_none()
+                        || alternative
+                            && candidate.media_type == "text/plain"
+                            && selected
+                                .as_ref()
+                                .is_some_and(|selected| selected.media_type != "text/plain"))
+                {
+                    candidate.path.push(number);
+                    selected = Some(candidate);
+                }
+            }
+            Ok(related_root.or(selected))
         }
     }
 }
@@ -335,7 +508,7 @@ fn related_headers(
     }
 }
 
-fn leaf(body: &Body<'_>, part: Part) -> Result<Option<Selected>, Error> {
+fn leaf<'a>(body: &'a Body<'_>) -> Result<Option<Candidate<'a>>, Error> {
     let SpecificFields::Text { subtype, .. } = &body.specific else {
         return Ok(None);
     };
@@ -347,13 +520,11 @@ fn leaf(body: &Body<'_>, part: Part) -> Result<Option<Selected>, Error> {
     } else {
         return Ok(None);
     };
-    Ok(Some(Selected {
-        part,
-        media_type: media_type.to_owned(),
-        charset: parameter(&body.basic.parameter_list, "charset")?
-            .unwrap_or("us-ascii")
-            .to_owned(),
-        transfer_encoding: imap_text(&body.basic.content_transfer_encoding)?.to_ascii_lowercase(),
+    Ok(Some(Candidate {
+        path: Vec::new(),
+        media_type,
+        charset: parameter(&body.basic.parameter_list, "charset")?.unwrap_or("us-ascii"),
+        transfer_encoding: imap_text(&body.basic.content_transfer_encoding)?,
         wire_size: body.basic.size as usize,
     }))
 }
@@ -382,18 +553,6 @@ fn parameter<'a>(
         }
     }
     Ok(None)
-}
-
-fn first(candidates: &mut [(Part, Option<Selected>)]) -> Option<Selected> {
-    candidates
-        .iter_mut()
-        .find_map(|(_, candidate)| candidate.take())
-}
-
-fn first_type(candidates: &mut [(Part, Option<Selected>)], media_type: &str) -> Option<Selected> {
-    candidates.iter_mut().find_map(|(_, candidate)| {
-        candidate.take_if(|candidate| candidate.media_type == media_type)
-    })
 }
 
 fn complete_headers(raw: &[u8]) -> bool {
@@ -686,6 +845,342 @@ mod planner_performance_tests {
                 measured.count_total < parts as u64 * 4,
                 "header planning must not repeatedly select every descendant: {measured:?}"
             );
+        }
+    }
+
+    #[test]
+    fn body_selection_does_not_materialize_every_excluded_leaf() {
+        let mut measurements = Vec::new();
+        for (depth, parts) in [(2, 1_000), (40, 1_000)] {
+            let structure = deep_structure(depth, parts);
+            let limits = Limits {
+                max_nesting: depth,
+                max_mime_parts: parts,
+                ..Limits::default()
+            };
+            let measured = allocation_counter::measure(|| {
+                let selected = select(&structure, &limits, &HashMap::new())
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(selected.media_type, "text/plain");
+                assert_eq!(selected.charset, "us-ascii");
+                assert_eq!(selected.transfer_encoding, "7bit");
+                assert_eq!(selected.part.0.as_ref().len(), depth - 1);
+                assert!(selected.part.0.as_ref().iter().all(|part| part.get() == 1));
+            });
+            eprintln!(
+                "body selection depth={depth} parts={parts} allocations={} total={} peak={}",
+                measured.count_total, measured.bytes_total, measured.bytes_max
+            );
+            measurements.push(measured);
+        }
+        for measured in measurements {
+            assert!(
+                measured.count_total < 128 && measured.bytes_total < 16 * 1024,
+                "selection must allocate for the chosen part rather than every readable sibling: {measured:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn body_selection_still_validates_readable_siblings_after_its_first_choice() {
+        let mut structure = deep_structure(2, 3);
+        let BodyStructure::Multi { bodies, .. } = &structure else {
+            unreachable!();
+        };
+        let mut children = bodies.clone().into_inner();
+        let BodyStructure::Single { body, .. } = &mut children[1] else {
+            unreachable!();
+        };
+        body.basic.parameter_list.push((
+            "CHARSET".try_into().unwrap(),
+            vec![0xff].try_into().unwrap(),
+        ));
+        let BodyStructure::Multi { bodies, .. } = &mut structure else {
+            unreachable!();
+        };
+        *bodies = children.try_into().unwrap();
+        assert_eq!(
+            select(&structure, &Limits::default(), &HashMap::new()),
+            Err(Error::Protocol)
+        );
+    }
+
+    #[test]
+    fn mime_header_parameter_continuations_have_linear_allocation() {
+        let mut measurements = Vec::new();
+        for fragments in [128, 512] {
+            let mut headers = "Content-Type: text/plain; charset=us-ascii".to_owned();
+            for index in 0..fragments {
+                headers.push_str(&format!(";\r\n x*{index}={}", "a".repeat(32)));
+            }
+            headers.push_str("\r\n\r\n");
+            let measured = allocation_counter::measure(|| {
+                assert_eq!(
+                    validate_headers(headers.as_bytes(), None, &Limits::default()),
+                    Ok(None)
+                );
+            });
+            eprintln!(
+                "MIME continuations fragments={fragments} source={} allocations={} total={} peak={}",
+                headers.len(),
+                measured.count_total,
+                measured.bytes_total,
+                measured.bytes_max
+            );
+            measurements.push((headers.len(), measured));
+        }
+        for (bytes, measured) in measurements {
+            assert!(
+                measured.bytes_total < 64 * 1_024 + bytes as u64 * 32,
+                "ignored MIME parameter fragments must not repeatedly copy their combined value: {measured:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn selected_mime_headers_still_validate_charset_encoding_and_disposition() {
+        let selected = Selected {
+            part: Part(NonZeroU32::MIN.into()),
+            media_type: "text/plain".into(),
+            charset: "UTF-8".into(),
+            transfer_encoding: "7bit".into(),
+            wire_size: 5,
+        };
+        let valid = b"Content-Type: text/plain; charset*0=utf; charset*1=-8\r\nContent-Disposition: inline; filename*0=first; filename*1=last\r\n\r\n";
+        assert_eq!(
+            validate_headers(valid, Some(&selected), &Limits::default()),
+            Ok(None)
+        );
+        for invalid in [
+            "Content-Type: text/html; charset=utf-8\r\n\r\n",
+            "Content-Type: text/plain; charset=iso-8859-1\r\n\r\n",
+            "Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: base64\r\n\r\n",
+            "Content-Type: text/plain; charset=utf-8\r\nContent-Disposition: attachment\r\n\r\n",
+        ] {
+            assert_eq!(
+                validate_headers(invalid.as_bytes(), Some(&selected), &Limits::default()),
+                Err(Error::Protocol)
+            );
+        }
+    }
+
+    #[test]
+    fn selected_mime_headers_skip_unused_parameter_continuation_decoding() {
+        let selected = Selected {
+            part: Part(NonZeroU32::MIN.into()),
+            media_type: "text/plain".into(),
+            charset: "us-ascii".into(),
+            transfer_encoding: "7bit".into(),
+            wire_size: 5,
+        };
+        let mut measurements = Vec::new();
+        for (fragments, quoted) in [(128, false), (512, false), (512, true)] {
+            let charset = if quoted { "\"us-ascii\"" } else { "us-ascii" };
+            let mut headers = format!("Content-Type: text/plain; charset={charset}");
+            for index in 0..fragments {
+                headers.push_str(&format!(";\r\n x*{index}={}", "a".repeat(32)));
+            }
+            headers.push_str("\r\n\r\n");
+            let measured = allocation_counter::measure(|| {
+                assert_eq!(
+                    validate_headers(headers.as_bytes(), Some(&selected), &Limits::default()),
+                    Ok(None)
+                );
+            });
+            eprintln!(
+                "selected MIME continuations fragments={fragments} quoted={quoted} source={} allocations={} total={} peak={}",
+                headers.len(),
+                measured.count_total,
+                measured.bytes_total,
+                measured.bytes_max
+            );
+            measurements.push((headers.len(), measured));
+        }
+        for (bytes, measured) in measurements {
+            assert!(
+                measured.bytes_total < 64 * 1_024 + bytes as u64 * 32,
+                "selected MIME identity must not repeatedly copy unrelated continued parameter values: {measured:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mime_identity_projection_matches_the_full_pinned_parser() {
+        let values = [
+            "text/plain; charset=UTF-8",
+            "text/plain; x*0=first; charset=\"us-ascii\"; x*1=last",
+            "text/plain; x*0=\"first\"; charset=\"utf-8\"; x*1=\"last\"",
+            "TEXT/PLAIN (comment); unused=ignored; charset=\"utf-8\"",
+            "text/plain; unused=\"semi; charset=wrong\"; charset=utf-8",
+            "text/plain; unused=\"escaped\\\"; charset=wrong\"; charset=utf-8",
+            "text/plain; charset*0=utf; charset*1=-8; x*0=first; x*1=last",
+            "text/plain; charset*0*=utf-8''utf; charset*1*=%2D8",
+            "text/plain; charset=us-ascii; charset*0=utf; charset*1=-8",
+            "text/plain; x=first\r\n charset=utf-8",
+            "text/plain; charset (comment)=utf-8; x*0=first; x*1=last",
+            "text/plain; unused (nested(comment))=ignored; charset=utf-8",
+            "text/plain; unused=a\\; charset=wrong; charset=utf-8",
+            "text/plain; unused=\"open; charset=utf-8",
+            "text/plain; unused=(open; charset=utf-8",
+            "text/plain; unused=first); charset=utf-8",
+            "text/plain; charset=utf-8; unused=backslash\\",
+            "text/plain\r\n charset=utf-8",
+            "inline; filename*0*=utf-8'en'%E2; filename*1*=%82%AC",
+            "attachment; filename=\"name; charset=wrong\"",
+            "text/plain; x=\"hello\" charset=utf-8",
+            "text/plain; unused=\"x\"charset=utf-8",
+            "inline; filename=\"hello\" attachment",
+            "text/plain; charset=iso-8859-1; x*2=; charset=utf-8",
+            "text/plain; charset=iso-8859-1; x*2=\"\"; charset=utf-8",
+            "text/plain; x*=utf-8''; charset=utf-8",
+            "text/plain; x*0*=utf-8''; charset=utf-8",
+            "text/plain; charset-language=en; charset*=utf-8'en'utf-8",
+            "text/plain; CHARSET-LANGUAGE=en; charset*=utf-8'en'utf-8",
+            "text/plain; x=\"=?utf-8?Q?a?=\"; charset=utf-8",
+            "text/plain; unused=\"(parentheses)\"; charset=utf-8",
+            "text/plain; unused=a,b; charset=utf-8",
+            "text/plain; unused=a=b; charset=utf-8",
+            "text/plain; unused=a:b; charset=utf-8",
+            "text/plain; unused=a\\;charset=utf-8",
+        ];
+        for value in values {
+            for (header, wanted) in [
+                (mail_parser::HeaderName::ContentType, Some("charset")),
+                (mail_parser::HeaderName::ContentDisposition, None),
+            ] {
+                let raw = format!("{header}: {value}\r\n\r\n");
+                let reference = MessageParser::new()
+                    .default_header_ignore()
+                    .header_content_type(header.clone())
+                    .parse_headers(raw.as_bytes())
+                    .unwrap();
+                let reference = reference.parts[0].headers.header_value(&header).unwrap();
+                let parsed = MessageParser::new()
+                    .default_header_ignore()
+                    .ignore_header(header.clone())
+                    .parse_headers(raw.as_bytes())
+                    .unwrap();
+                let value = parsed.parts[0].headers.header(header.clone()).unwrap();
+                let value = &raw.as_bytes()[value.offset_start as usize..value.offset_end as usize];
+                let projected = projected_mime_value(value, wanted);
+                let projected = mail_parser::parsers::MessageStream::new(projected.as_ref())
+                    .parse_content_type();
+                let identity = |value: &mail_parser::HeaderValue<'_>| {
+                    value.as_content_type().map(|value| {
+                        (
+                            value.c_type.to_string(),
+                            value.c_subtype.as_deref().map(str::to_owned),
+                            wanted
+                                .and_then(|wanted| value.attribute(wanted))
+                                .map(str::to_owned),
+                        )
+                    })
+                };
+                assert_eq!(identity(reference), identity(&projected), "{raw:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn mime_identity_projection_matches_deterministic_syntax_mutations() {
+        fn compare(value: &[u8]) {
+            for (header, wanted) in [
+                (mail_parser::HeaderName::ContentType, Some("charset")),
+                (mail_parser::HeaderName::ContentDisposition, None),
+            ] {
+                let mut raw = format!("{header}: ").into_bytes();
+                raw.extend_from_slice(value);
+                raw.extend_from_slice(b"\r\n\r\n");
+                let reference = MessageParser::new()
+                    .default_header_ignore()
+                    .header_content_type(header.clone())
+                    .parse_headers(&raw)
+                    .unwrap();
+                let empty = mail_parser::HeaderValue::Empty;
+                let reference = reference.parts[0]
+                    .headers
+                    .header_value(&header)
+                    .unwrap_or(&empty);
+                let parsed = MessageParser::new()
+                    .default_header_ignore()
+                    .ignore_header(header.clone())
+                    .parse_headers(&raw)
+                    .unwrap();
+                let projected = parsed.parts[0]
+                    .headers
+                    .header(header.clone())
+                    .map(|value| &raw[value.offset_start as usize..value.offset_end as usize])
+                    .map(|value| projected_mime_value(value, wanted));
+                let projected = projected.as_ref().map_or_else(
+                    || mail_parser::HeaderValue::Empty,
+                    |projected| {
+                        mail_parser::parsers::MessageStream::new(projected.as_ref())
+                            .parse_content_type()
+                    },
+                );
+                let identity = |value: &mail_parser::HeaderValue<'_>| {
+                    value.as_content_type().map(|value| {
+                        (
+                            value.c_type.to_string(),
+                            value.c_subtype.as_deref().map(str::to_owned),
+                            wanted
+                                .and_then(|wanted| value.attribute(wanted))
+                                .map(str::to_owned),
+                        )
+                    })
+                };
+                assert_eq!(identity(reference), identity(&projected), "{raw:?}");
+            }
+        }
+        let bases: &[&[u8]] = &[
+            b"text/plain; x*0=first; x*1=last; charset=utf-8",
+            b"text/plain; x*0=first; x*1=last; charset=\"us-ascii\"",
+            b"text/plain; x*0=\"first\"; x*1=\"last\"; charset=\"utf-8\"",
+            b"text/plain; charset*0=utf; charset*1=-8; charset=iso-8859-1",
+            b"text/plain; unused=\"semi; escaped\\\"quote\"; charset=\"utf-8\"",
+            b"attachment; filename*0=first; filename*1=last; charset*0=utf; charset*1=-8",
+        ];
+        let additions: &[&[u8]] = &[
+            b"\r\n ",
+            b"\r\n\t",
+            b"\xff\xfe",
+            b"\xc3\x28",
+            b"; charset=latin1",
+            b"; charset*0=utf; charset*1=-8",
+            b"; charset*0*=utf-8'en'utf; charset*1*=%2D8",
+            b"; charset*1=-8; charset*0=utf",
+            b"; charset-language=en; charset*=utf-8'en'utf-8",
+            b"; CHARSET-LANGUAGE=en; charset*=utf-8'en'utf-8",
+            b"; unused=\"x\"charset=utf-8",
+            b"; x*2=; charset=utf-8",
+            b"; x*2=\"\"; charset=utf-8",
+            b"; x*=utf-8''; charset=utf-8",
+            b"; unused=\"=?utf-8?Q?a?=\"; charset=utf-8",
+        ];
+        for base in bases {
+            let mut positions = vec![0, base.len()];
+            // Include token interiors as well as separators; malformed unused
+            // values can influence the pinned parser's later recovery.
+            positions.extend(0..base.len());
+            for index in positions {
+                for byte in 0..=127u8 {
+                    let mut value = base.to_vec();
+                    value.insert(index, byte);
+                    compare(&value);
+                    if index != base.len() {
+                        let mut value = base.to_vec();
+                        value[index] = byte;
+                        compare(&value);
+                    }
+                }
+                for addition in additions {
+                    let mut value = base[..index].to_vec();
+                    value.extend_from_slice(addition);
+                    value.extend_from_slice(&base[index..]);
+                    compare(&value);
+                }
+            }
         }
     }
 }
