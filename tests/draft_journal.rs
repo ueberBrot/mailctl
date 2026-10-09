@@ -563,6 +563,246 @@ fn retained_history_verification_avoids_heap_copies_of_fixed_identity_fields() {
 }
 
 #[test]
+fn dispatch_verification_borrows_retained_text_without_per_record_heap_growth() {
+    let mut measured = Vec::new();
+    for records in [512, 4096] {
+        let temporary = TemporaryJournal::new();
+        let mut journal = DraftJournal::open(&temporary.path).unwrap();
+        let reconstruction = mailctl::draft_journal::DraftReconstruction {
+            uid_validity: 17,
+            input_sha256: [42; 32],
+            from_configuration_sha256: [43; 32],
+            selected_from_sha256: Some([44; 32]),
+            date_unix: 1_700_000_000,
+            encoder_version: 2,
+        };
+        let mut first = child_operation();
+        first.mailbox_identity = format!("Drafts {}", "synthetic ".repeat(100));
+        first.reconstruction = Some(reconstruction.clone());
+        let original = journal.prepare(first.clone()).unwrap();
+        let database = Connection::open(&temporary.path).unwrap();
+        database.execute(
+            &format!(
+                "WITH RECURSIVE records(number) AS (VALUES(1) UNION ALL SELECT number + 1 FROM records WHERE number < {})
+                 INSERT INTO draft_operations(operation_id, account_id, account_generation, mailbox_identity, content_sha256, reconstruction, state)
+                 SELECT randomblob(16), zeroblob(16), 1, ?1, zeroblob(32), ?2, 'prepared' FROM records;",
+                records - 1
+            ),
+            params![first.mailbox_identity, serde_json::to_string(&reconstruction).unwrap()],
+        ).unwrap();
+        let started = Instant::now();
+        let allocations = allocation_counter::measure(|| {
+            journal
+                .verify_for_dispatch(Instant::now() + Duration::from_secs(5), records)
+                .unwrap();
+        });
+        eprintln!(
+            "borrowed retained text: records={records}, elapsed={:?}, {allocations:?}",
+            started.elapsed()
+        );
+        assert_eq!(journal.inspect(&first.identity).unwrap(), Some(original));
+        measured.push(allocations);
+    }
+    // Verification retains no row data. Its heap budget should not scale with
+    // the number or length of supported mailbox and reconstruction text fields.
+    for allocations in measured {
+        assert!(allocations.bytes_total < 64 * 1024, "{allocations:?}");
+    }
+}
+
+#[test]
+fn borrowed_verification_preserves_text_corruption_and_legacy_state_checks() {
+    use mailctl::draft_journal::DraftReconstruction;
+    for (assignment, expected) in [
+        (
+            "mailbox_identity = CAST(X'ff' AS TEXT)",
+            DraftJournalError::InvalidDatabase,
+        ),
+        (
+            "reconstruction = CAST(X'ff' AS TEXT)",
+            DraftJournalError::InvalidDatabase,
+        ),
+        (
+            "state = CAST(X'ff' AS TEXT)",
+            DraftJournalError::InvalidDatabase,
+        ),
+        (
+            "mailbox_identity = X'6162'",
+            DraftJournalError::InvalidDatabase,
+        ),
+        (
+            "reconstruction = X'6162'",
+            DraftJournalError::InvalidDatabase,
+        ),
+        ("state = X'6162'", DraftJournalError::InvalidDatabase),
+        ("mailbox_identity = ''", DraftJournalError::InvalidDatabase),
+        ("reconstruction = '{'", DraftJournalError::InvalidDatabase),
+        ("state = 'unknown'", DraftJournalError::InvalidDatabase),
+        (
+            "account_generation = -1",
+            DraftJournalError::InvalidDatabase,
+        ),
+        (
+            "account_generation = 'synthetic'",
+            DraftJournalError::InvalidDatabase,
+        ),
+        ("appended_uid = 1", DraftJournalError::InvalidDatabase),
+        (
+            "state = 'created', appended_uid_validity = 4294967296, appended_uid = 1",
+            DraftJournalError::InvalidDatabase,
+        ),
+        (
+            "state = 'rejected', appended_uid_validity = 1, appended_uid = 1",
+            DraftJournalError::InvalidDatabase,
+        ),
+        ("state = 'duplicate'", DraftJournalError::InvalidDatabase),
+        ("reconstruction = NULL", DraftJournalError::InvalidOperation),
+    ] {
+        let temporary = TemporaryJournal::new();
+        let mut journal = DraftJournal::open(&temporary.path).unwrap();
+        let mut operation = child_operation();
+        operation.reconstruction = Some(DraftReconstruction {
+            uid_validity: 17,
+            input_sha256: [42; 32],
+            from_configuration_sha256: [43; 32],
+            selected_from_sha256: Some([44; 32]),
+            date_unix: 1_700_000_000,
+            encoder_version: 2,
+        });
+        journal.prepare(operation.clone()).unwrap();
+        let database = Connection::open(&temporary.path).unwrap();
+        database
+            .execute_batch(&format!(
+                "PRAGMA ignore_check_constraints = ON; UPDATE draft_operations SET {assignment}"
+            ))
+            .unwrap();
+        assert_eq!(
+            journal.verify_for_dispatch(Instant::now() + Duration::from_secs(5), 1),
+            Err(expected),
+            "{assignment}"
+        );
+        if assignment.starts_with("account_generation =") {
+            assert_eq!(journal.inspect(&operation.identity).unwrap(), None);
+        } else if expected == DraftJournalError::InvalidDatabase {
+            assert_eq!(
+                journal.inspect(&operation.identity),
+                Err(expected),
+                "{assignment}"
+            );
+        }
+    }
+
+    for state in [
+        "created",
+        "in_flight",
+        "rejected",
+        "outcome_unknown",
+        "duplicate",
+    ] {
+        let temporary = TemporaryJournal::new();
+        let mut journal = DraftJournal::open(&temporary.path).unwrap();
+        let operation = child_operation();
+        journal.prepare(operation.clone()).unwrap();
+        let database = Connection::open(&temporary.path).unwrap();
+        let uid = if state == "duplicate" { "1" } else { "NULL" };
+        database.execute_batch(&format!(
+            "UPDATE draft_operations SET state = '{state}', appended_uid_validity = {uid}, appended_uid = {uid}"
+        )).unwrap();
+        journal
+            .verify_for_dispatch(Instant::now() + Duration::from_secs(5), 1)
+            .unwrap();
+        assert_eq!(
+            journal
+                .inspect(&operation.identity)
+                .unwrap()
+                .unwrap()
+                .operation,
+            operation,
+            "legacy {state} reconstruction must stay optional"
+        );
+    }
+}
+
+#[test]
+fn borrowed_verification_retains_mailbox_character_and_prepared_evidence_bounds() {
+    use mailctl::draft_journal::DraftReconstruction;
+    let temporary = TemporaryJournal::new();
+    let mut journal = DraftJournal::open(&temporary.path).unwrap();
+    let mut operation = child_operation();
+    operation.mailbox_identity = "é".repeat(4096);
+    let mut reconstruction = DraftReconstruction {
+        uid_validity: 17,
+        input_sha256: [42; 32],
+        from_configuration_sha256: [43; 32],
+        selected_from_sha256: Some([44; 32]),
+        date_unix: 1_700_000_000,
+        encoder_version: 2,
+    };
+    operation.reconstruction = Some(reconstruction.clone());
+    let original = journal.prepare(operation.clone()).unwrap();
+    journal
+        .verify_for_dispatch(Instant::now() + Duration::from_secs(5), 1)
+        .unwrap();
+    assert_eq!(
+        journal.inspect(&operation.identity).unwrap(),
+        Some(original.clone())
+    );
+    let database = Connection::open(&temporary.path).unwrap();
+    database
+        .execute_batch("PRAGMA ignore_check_constraints = ON")
+        .unwrap();
+    database
+        .execute(
+            "UPDATE draft_operations SET mailbox_identity = ?1",
+            ["é".repeat(4097)],
+        )
+        .unwrap();
+    assert_eq!(
+        journal.verify_for_dispatch(Instant::now() + Duration::from_secs(5), 1),
+        Err(DraftJournalError::InvalidDatabase)
+    );
+    database
+        .execute(
+            "UPDATE draft_operations SET mailbox_identity = ?1",
+            [&operation.mailbox_identity],
+        )
+        .unwrap();
+    for field in ["encoder", "validity", "selected-from"] {
+        match field {
+            "encoder" => reconstruction.encoder_version = 3,
+            "validity" => reconstruction.uid_validity = 0,
+            "selected-from" => reconstruction.selected_from_sha256 = None,
+            _ => unreachable!(),
+        }
+        database
+            .execute(
+                "UPDATE draft_operations SET reconstruction = ?1",
+                [serde_json::to_string(&reconstruction).unwrap()],
+            )
+            .unwrap();
+        assert_eq!(
+            journal.verify_for_dispatch(Instant::now() + Duration::from_secs(5), 1),
+            Err(DraftJournalError::InvalidOperation),
+            "{field}"
+        );
+        reconstruction = operation.reconstruction.clone().unwrap();
+    }
+    database
+        .execute(
+            "UPDATE draft_operations SET reconstruction = ?1",
+            [serde_json::to_string(&reconstruction).unwrap()],
+        )
+        .unwrap();
+    journal
+        .verify_for_dispatch(Instant::now() + Duration::from_secs(5), 1)
+        .unwrap();
+    assert_eq!(
+        journal.inspect(&operation.identity).unwrap(),
+        Some(original)
+    );
+}
+
+#[test]
 fn retained_history_verification_rejects_incorrect_fixed_blob_lengths() {
     for column in ["operation_id", "account_id", "content_sha256"] {
         let temporary = TemporaryJournal::new();

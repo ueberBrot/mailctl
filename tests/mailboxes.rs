@@ -333,6 +333,128 @@ fn metadata(name: &str) -> MailboxMetadata {
         special_use: vec![],
     }
 }
+
+struct ReportedInventory(Vec<MailboxMetadata>);
+impl mailctl::service::MailboxBackend for ReportedInventory {
+    fn discover_all<'a>(
+        &'a self,
+        _: mailctl::service::MailboxTarget<'a>,
+        _: &'a mailctl::config::Limits,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = Result<Vec<MailboxMetadata>, mailctl::domain::Error>> + Send + 'a>,
+    > {
+        Box::pin(async move { Ok(self.0.clone()) })
+    }
+
+    fn discover<'a>(
+        &'a self,
+        _: mailctl::service::MailboxTarget<'a>,
+        _: &'a [String],
+        _: &'a mailctl::config::Limits,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = Result<Vec<MailboxMetadata>, mailctl::domain::Error>> + Send + 'a>,
+    > {
+        Box::pin(async move { Ok(self.0.clone()) })
+    }
+}
+
+#[tokio::test]
+async fn large_explicit_inventories_keep_literal_names_and_validate_every_returned_row() {
+    use mailctl::domain::ErrorCode;
+    let mut names = (0..60)
+        .map(|index| format!("Folder{index:02}"))
+        .collect::<Vec<_>>();
+    names.extend(
+        [
+            "INBOX",
+            "Case",
+            "case",
+            "Réunions",
+            "项目*2026",
+            "Projects%2026",
+        ]
+        .map(str::to_owned),
+    );
+    let mut expected = names.clone();
+    expected.sort();
+    let mut configuration = config();
+    configuration.accounts[0].mailboxes = names.clone().into();
+    names[60] = "inbox".into();
+    configuration.grants[0].mailboxes = names.into();
+    let mut rows = expected
+        .iter()
+        .rev()
+        .map(|name| metadata(name))
+        .collect::<Vec<_>>();
+    let mut inbox = metadata("iNbOx");
+    inbox.special_use = vec!["\\Trash".into(), "\\Archive".into(), "\\Archive".into()];
+    let original_inbox = rows.iter_mut().find(|row| row.name == "INBOX").unwrap();
+    original_inbox.special_use = vec!["\\Archive".into(), "\\Trash".into()];
+    rows.push(inbox);
+    let service = Service::in_memory(configuration.clone())
+        .unwrap()
+        .with_mailbox_backend(Arc::new(ReportedInventory(rows.clone())));
+    let page = list(&service, "reader", ListMailboxesInput::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        page.mailboxes
+            .iter()
+            .map(|entry| entry.metadata.name.as_str())
+            .collect::<Vec<_>>(),
+        expected.iter().map(String::as_str).collect::<Vec<_>>()
+    );
+    let inbox = page
+        .mailboxes
+        .iter()
+        .find(|entry| entry.metadata.name == "INBOX")
+        .unwrap();
+    assert_eq!(inbox.metadata.special_use, ["\\Archive", "\\Trash"]);
+    assert!(page.complete);
+
+    for invalid in [
+        metadata("réunions"),
+        metadata("ProjectsA2026"),
+        metadata("项目OTHER2026"),
+        metadata("bad\nname"),
+        MailboxMetadata {
+            selectable: false,
+            ..metadata("inbox")
+        },
+    ] {
+        let mut reported = rows.clone();
+        reported.push(invalid);
+        let service = Service::in_memory(configuration.clone())
+            .unwrap()
+            .with_mailbox_backend(Arc::new(ReportedInventory(reported)));
+        assert_eq!(
+            list(&service, "reader", ListMailboxesInput::default())
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::ProviderUnavailable
+        );
+    }
+
+    let memory = Arc::new(MemoryMailboxes::default());
+    rows.push(metadata("Unapproved"));
+    memory.set("work", rows);
+    let service = Service::in_memory(configuration)
+        .unwrap()
+        .with_mailbox_backend(memory);
+    let filtered = list(&service, "reader", ListMailboxesInput::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        filtered
+            .mailboxes
+            .iter()
+            .map(|entry| entry.metadata.name.as_str())
+            .collect::<Vec<_>>(),
+        expected.iter().map(String::as_str).collect::<Vec<_>>()
+    );
+}
+
 async fn list(
     service: &Service,
     grant: &str,

@@ -100,17 +100,19 @@ impl PreparedDraft {
         {
             return Err(Error::InvalidInput);
         }
-        let input_bytes = input.to.iter().chain(&input.cc).chain(&input.bcc).fold(
-            input.body.len() + input.subject.len() + input.from.len() + input.message_id.len(),
+        let body = normalize_body(input.body);
+        let header_input_bytes = input.to.iter().chain(&input.cc).chain(&input.bcc).fold(
+            input.subject.len() + input.from.len() + input.message_id.len(),
             |bytes, address| {
                 bytes + address.address.len() + address.name.as_ref().map_or(0, String::len)
             },
         ) + input.in_reply_to.as_ref().map_or(0, String::len)
             + input.references.iter().map(String::len).sum::<usize>();
-        // MIME encoding can expand text. Reserve from this draft's input, while
-        // the writer enforces the ceiling before every allocation and write.
-        let capacity = input_bytes
+        // Reserve for this body and bounded header expansion. This is only a
+        // storage hint: the pinned encoder and writer retain byte admission.
+        let capacity = header_input_bytes
             .saturating_mul(3)
+            .saturating_add(body_capacity_hint(&body))
             .saturating_add(4096)
             .min(max_mime_bytes);
         let mut builder = MessageBuilder::new()
@@ -118,7 +120,7 @@ impl PreparedDraft {
             .subject(input.subject)
             .message_id(input.message_id)
             .date(input.date_unix)
-            .text_body(normalize_body(input.body));
+            .text_body(body);
         if !input.to.is_empty() {
             builder = builder.to(recipients(input.to));
         }
@@ -164,6 +166,50 @@ impl PreparedDraft {
     pub fn sha256(&self) -> [u8; 32] {
         self.sha256
     }
+}
+
+fn body_capacity_hint(body: &str) -> usize {
+    let encoded = body.len().div_ceil(3).saturating_mul(4);
+    // The encoder compares pre-fold quoted-printable size with base64. Allow
+    // three-byte soft breaks after 74 columns even when quoted-printable wins
+    // narrowly; this also covers base64's two-byte folds after 76 columns.
+    let encoding_bound = encoded.saturating_add(encoded.div_ceil(74).saturating_mul(3));
+    if !body.is_ascii() {
+        return encoding_bound;
+    }
+    // Reduce bounded chunks as bytes, then widen, so large bodies can use cheap
+    // narrow reductions. Each chunk count is at most 64 and cannot overflow.
+    let (chunks, tail) = body.as_bytes().as_chunks::<64>();
+    let breaks = chunks
+        .iter()
+        .map(|chunk| {
+            usize::from(
+                chunk
+                    .iter()
+                    .map(|byte| u8::from(*byte == b'\n'))
+                    .sum::<u8>(),
+            )
+        })
+        .sum::<usize>()
+        + tail
+            .iter()
+            .map(|byte| usize::from(*byte == b'\n'))
+            .sum::<usize>();
+    let plain = body.len().saturating_add(breaks);
+    // Rust's ASCII classification includes DEL, which this encoder escapes.
+    // Equals alone may leave the body in 7bit, so retain its plain LF floor.
+    if body.contains('=')
+        || body.contains('\u{7f}')
+        || body.ends_with([' ', '\t'])
+        || body.contains(" \n")
+        || body.contains("\t\n")
+    {
+        return encoding_bound.max(plain);
+    }
+    plain
+        .saturating_add(plain.div_ceil(74).saturating_mul(3))
+        .min(encoding_bound)
+        .max(plain)
 }
 
 struct MimeOutput {

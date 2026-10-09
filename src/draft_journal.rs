@@ -238,17 +238,13 @@ impl DraftJournal {
             if count > maximum {
                 return Err(DraftJournalError::Unavailable);
             }
-            let operation = decode_row(database_row(row).map_err(unavailable)?)?;
+            let operation = decode_row(database_row(row)?)?;
             if operation.state == DraftOperationState::Prepared
-                && operation
-                    .operation
-                    .reconstruction
-                    .as_ref()
-                    .is_none_or(|frozen| {
-                        frozen.encoder_version != crate::draft::ENCODER_VERSION
-                            || frozen.uid_validity == 0
-                            || frozen.selected_from_sha256.is_none()
-                    })
+                && operation.reconstruction.as_ref().is_none_or(|frozen| {
+                    frozen.encoder_version != crate::draft::ENCODER_VERSION
+                        || frozen.uid_validity == 0
+                        || frozen.selected_from_sha256.is_none()
+                })
             {
                 return Err(DraftJournalError::InvalidOperation);
             }
@@ -531,14 +527,14 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), DraftJournalErro
     transaction.commit().map_err(unavailable)
 }
 
-struct DatabaseRow {
+struct DatabaseRow<'row> {
     operation_id: [u8; 16],
     account_id: [u8; 16],
     account_generation: i64,
-    mailbox_identity: String,
+    mailbox_identity: &'row str,
     content_sha256: [u8; 32],
-    reconstruction: Option<String>,
-    state: String,
+    reconstruction: Option<&'row str>,
+    state: &'row str,
     appended_uid_validity: Option<i64>,
     appended_uid: Option<i64>,
 }
@@ -595,28 +591,67 @@ fn read_by_identity(
                 account_generation,
                 identity.operation_id.as_bytes().as_slice(),
             ],
-            database_row,
+            |row| {
+                Ok(database_row(row)
+                    .and_then(decode_row)
+                    .map(DecodedRow::into_persisted))
+            },
         )
         .optional()
         .map_err(unavailable)?;
-    row.map(decode_row).transpose()
+    row.transpose()
 }
 
-fn database_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DatabaseRow> {
+fn database_row<'row>(
+    row: &'row rusqlite::Row<'_>,
+) -> Result<DatabaseRow<'row>, DraftJournalError> {
     Ok(DatabaseRow {
-        operation_id: row.get(0)?,
-        account_id: row.get(1)?,
-        account_generation: row.get(2)?,
-        mailbox_identity: row.get(3)?,
-        content_sha256: row.get(4)?,
-        reconstruction: row.get(5)?,
-        state: row.get(6)?,
-        appended_uid_validity: row.get(7)?,
-        appended_uid: row.get(8)?,
+        operation_id: row.get(0).map_err(unavailable)?,
+        account_id: row.get(1).map_err(unavailable)?,
+        account_generation: row.get(2).map_err(unavailable)?,
+        mailbox_identity: row
+            .get_ref(3)
+            .map_err(unavailable)?
+            .as_str()
+            .map_err(|_| DraftJournalError::InvalidDatabase)?,
+        content_sha256: row.get(4).map_err(unavailable)?,
+        reconstruction: row
+            .get_ref(5)
+            .map_err(unavailable)?
+            .as_str_or_null()
+            .map_err(|_| DraftJournalError::InvalidDatabase)?,
+        state: row
+            .get_ref(6)
+            .map_err(unavailable)?
+            .as_str()
+            .map_err(|_| DraftJournalError::InvalidDatabase)?,
+        appended_uid_validity: row.get(7).map_err(unavailable)?,
+        appended_uid: row.get(8).map_err(unavailable)?,
     })
 }
 
-fn decode_row(row: DatabaseRow) -> Result<PersistedDraftOperation, DraftJournalError> {
+struct DecodedRow<'row> {
+    identity: DraftOperationIdentity,
+    mailbox_identity: &'row str,
+    content_sha256: [u8; 32],
+    reconstruction: Option<DraftReconstruction>,
+    state: DraftOperationState,
+}
+impl DecodedRow<'_> {
+    fn into_persisted(self) -> PersistedDraftOperation {
+        PersistedDraftOperation {
+            operation: PreparedDraftOperation {
+                identity: self.identity,
+                mailbox_identity: self.mailbox_identity.into(),
+                content_sha256: self.content_sha256,
+                reconstruction: self.reconstruction,
+            },
+            state: self.state,
+        }
+    }
+}
+
+fn decode_row(row: DatabaseRow<'_>) -> Result<DecodedRow<'_>, DraftJournalError> {
     let operation_id = Uuid::from_bytes(row.operation_id);
     let account_id = Uuid::from_bytes(row.account_id);
     let account_generation =
@@ -638,7 +673,7 @@ fn decode_row(row: DatabaseRow) -> Result<PersistedDraftOperation, DraftJournalE
     if row.mailbox_identity.is_empty() || row.mailbox_identity.chars().count() > 4096 {
         return Err(DraftJournalError::InvalidDatabase);
     }
-    let state = match row.state.as_str() {
+    let state = match row.state {
         "prepared" if appended_message.is_none() => DraftOperationState::Prepared,
         "in_flight" if appended_message.is_none() => DraftOperationState::InFlight,
         "created" => DraftOperationState::Created { appended_message },
@@ -649,20 +684,18 @@ fn decode_row(row: DatabaseRow) -> Result<PersistedDraftOperation, DraftJournalE
         "outcome_unknown" if appended_message.is_none() => DraftOperationState::OutcomeUnknown,
         _ => return Err(DraftJournalError::InvalidDatabase),
     };
-    Ok(PersistedDraftOperation {
-        operation: PreparedDraftOperation {
-            identity: DraftOperationIdentity {
-                account_id,
-                account_generation,
-                operation_id,
-            },
-            mailbox_identity: row.mailbox_identity,
-            content_sha256,
-            reconstruction: row
-                .reconstruction
-                .map(|s| serde_json::from_str(&s).map_err(|_| DraftJournalError::InvalidDatabase))
-                .transpose()?,
+    Ok(DecodedRow {
+        identity: DraftOperationIdentity {
+            account_id,
+            account_generation,
+            operation_id,
         },
+        mailbox_identity: row.mailbox_identity,
+        content_sha256,
+        reconstruction: row
+            .reconstruction
+            .map(|s| serde_json::from_str(s).map_err(|_| DraftJournalError::InvalidDatabase))
+            .transpose()?,
         state,
     })
 }

@@ -2,7 +2,7 @@
 use super::{Service, tokens::fingerprint};
 use crate::domain::mailbox_identity;
 use crate::{
-    config::{AccountConfig, Limits, MailboxScope},
+    config::{AccountConfig, Limits, MailboxMatcher, MailboxScope},
     domain::{Error, ErrorCode, ListMailboxesInput, Mailbox, MailboxDiscovery, MailboxMetadata},
     policy::{Permission, RequestContext},
 };
@@ -100,17 +100,13 @@ impl MemoryMailboxes {
                 }
             }
         }
+        let matcher = MailboxMatcher::new(names);
         let selected = rows
             .iter()
-            .filter(|mailbox| {
-                names.is_none_or(|names| {
-                    names
-                        .iter()
-                        .any(|name| mailbox_identity(name) == mailbox_identity(&mailbox.name))
-                })
-            })
+            .filter(|mailbox| matcher.allows(&mailbox.name))
             .take(limits.mailbox_inventory.saturating_add(1))
             .collect::<Vec<_>>();
+        drop(matcher);
         if selected.len() > limits.mailbox_inventory {
             return Err(Error::new(ErrorCode::ResponseTooLarge));
         }
@@ -309,6 +305,10 @@ impl Service {
         if rows.len() > limits.mailbox_inventory {
             return Err(Error::new(ErrorCode::ResponseTooLarge));
         }
+        let matcher = MailboxMatcher::new(match &effective {
+            MailboxScope::All => None,
+            MailboxScope::Only(names) => Some(names),
+        });
         let mut inventory = BTreeMap::new();
         for mut row in rows {
             validate_metadata(&row)?;
@@ -316,7 +316,7 @@ impl Service {
                 continue;
             }
             let identity = mailbox_identity(&row.name);
-            if row.name.is_empty() || !effective.allows(&row.name) {
+            if row.name.is_empty() || !matcher.allows(&row.name) {
                 return Err(Error::new(ErrorCode::ProviderUnavailable));
             }
             if identity != row.name {
@@ -334,6 +334,7 @@ impl Service {
                 Entry::Occupied(_) => {}
             }
         }
+        drop(matcher);
         if reference.is_some() && inventory.is_empty() {
             return Err(Error::new(ErrorCode::StaleReference));
         }

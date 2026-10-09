@@ -84,6 +84,39 @@ impl From<Vec<String>> for MailboxScope {
     }
 }
 
+/// Borrowed membership checks for a complete inventory, without copying its scope.
+pub(crate) enum MailboxMatcher<'a> {
+    All,
+    Linear(&'a [String]),
+    Indexed(HashSet<&'a str>),
+}
+
+impl<'a> MailboxMatcher<'a> {
+    pub(crate) fn new(names: Option<&'a [String]>) -> Self {
+        match names {
+            None => Self::All,
+            Some(names) if names.len() <= 32 => Self::Linear(names),
+            Some(names) => Self::Indexed(
+                names
+                    .iter()
+                    .map(|name| crate::domain::mailbox_identity(name))
+                    .collect(),
+            ),
+        }
+    }
+
+    pub(crate) fn allows(&self, mailbox: &str) -> bool {
+        let identity = crate::domain::mailbox_identity(mailbox);
+        match self {
+            Self::All => true,
+            Self::Linear(names) => names
+                .iter()
+                .any(|name| crate::domain::mailbox_identity(name) == identity),
+            Self::Indexed(names) => names.contains(identity),
+        }
+    }
+}
+
 fn obsolete_runtime_capacity(input: &str) -> bool {
     fn contains(value: &toml::Value) -> bool {
         match value {

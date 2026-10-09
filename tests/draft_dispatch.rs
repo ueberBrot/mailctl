@@ -57,6 +57,113 @@ fn small_draft_composition_allocates_for_content_instead_of_the_mime_ceiling() {
 }
 
 #[test]
+fn large_draft_composition_sizes_storage_for_supported_encoded_content() {
+    let maximum = 8 * 1024 * 1024;
+    let mut measured = Vec::new();
+    for bytes in [64 * 1024, 2 * 1024 * 1024] {
+        for (kind, line) in [
+            (
+                "ascii",
+                "A short synthetic line of ASCII text.\n".to_owned(),
+            ),
+            (
+                "crlf",
+                "A short synthetic line of ASCII text.\r\n".to_owned(),
+            ),
+            ("dense-newlines", "\n".to_owned()),
+            ("long-ascii", "A".repeat(128)),
+            ("equals", format!("{}\n", "=".repeat(76))),
+            ("trailing-space", "A synthetic line \n".to_owned()),
+            ("trailing-tab", "A synthetic line\t\n".to_owned()),
+            (
+                "control-del",
+                "A short synthetic DEL \u{7f} line.\n".to_owned(),
+            ),
+            (
+                "near-selector-del",
+                format!("{}{}", "A".repeat(21), "\u{7f}".repeat(4)),
+            ),
+            ("near-selector-unicode", format!("{}éé", "A".repeat(21))),
+            ("equals-dense-newlines", format!("={}", "\n".repeat(15))),
+            (
+                "nonuniform-clean",
+                format!("{}{}", "A".repeat(128), "\n".repeat(128)),
+            ),
+            ("unicode", "München 東京 Αθήνα synthetic\n".to_owned()),
+            (
+                "quoted-printable",
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA é\n".to_owned(),
+            ),
+        ] {
+            let body = line.repeat(bytes / line.len());
+            let body_bytes = body.len();
+            let expected = body.replace("\r\n", "\n").replace('\r', "\n");
+            let input = mailctl::draft::DraftInput {
+                from: "work@example.test".into(),
+                message_id: "large@mailctl.invalid".into(),
+                date_unix: 1_700_000_000,
+                body,
+                ..Default::default()
+            };
+            let repeat_input = input.clone();
+            let mut draft = None;
+            let started = std::time::Instant::now();
+            let allocations = allocation_counter::measure(|| {
+                draft = Some(PreparedDraft::compose(input, maximum).unwrap());
+            });
+            let elapsed = started.elapsed();
+            let draft = draft.unwrap();
+            let mime_bytes = draft.bytes().len();
+            eprintln!(
+                "large composition: kind={kind}, input={body_bytes}, mime={mime_bytes}, elapsed={elapsed:?}, {allocations:?}"
+            );
+            let parsed = mail_parser::MessageParser::default()
+                .parse(draft.bytes())
+                .unwrap();
+            assert_eq!(
+                parsed.body_text(0).unwrap().replace("\r\n", "\n"),
+                expected,
+                "{kind} decoded composition changed"
+            );
+            let exact = PreparedDraft::compose(repeat_input.clone(), mime_bytes).unwrap();
+            assert_eq!(exact.bytes(), draft.bytes());
+            assert_eq!(exact.sha256(), draft.sha256());
+            assert!(matches!(
+                PreparedDraft::compose(repeat_input, mime_bytes - 1),
+                Err(mailctl::draft::Error::Limit)
+            ));
+            measured.push((kind, allocations, mime_bytes, body_bytes));
+        }
+    }
+    for (kind, allocations, mime_bytes, body_bytes) in measured {
+        if matches!(kind, "near-selector-del" | "near-selector-unicode") {
+            // The pinned encoder allocates transient formatting scratch for
+            // every escape in these stress bodies. Peak memory isolates the
+            // frozen representation and its storage overhead from that churn.
+            let budget = mime_bytes as u64 + 128 * 1024;
+            assert!(
+                allocations.bytes_max <= budget,
+                "{kind}, mime={mime_bytes}, peak budget={budget}, {allocations:?}"
+            );
+            continue;
+        }
+        // Plain content needs its frozen representation and header overhead;
+        // CRLF normalization can additionally own one body. Encoded variants
+        // allow transient storage from the pinned quoted-printable encoder.
+        let budget = match kind {
+            "ascii" | "long-ascii" | "dense-newlines" => mime_bytes,
+            "crlf" => mime_bytes + body_bytes,
+            _ => 2 * mime_bytes,
+        } as u64
+            + 128 * 1024;
+        assert!(
+            allocations.bytes_total <= budget,
+            "{kind}, mime={mime_bytes}, budget={budget}, {allocations:?}"
+        );
+    }
+}
+
+#[test]
 fn mixed_line_endings_are_normalized_with_one_bounded_body_allocation() {
     let repetitions = 65_536;
     let body = "one\r\ntwo\rthree\n".repeat(repetitions);

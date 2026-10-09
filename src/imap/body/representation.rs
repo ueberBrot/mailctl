@@ -189,7 +189,7 @@ fn identity_header_value<'a>(
     Ok(projected_mime_value(value, wanted))
 }
 
-// Projection is limited to canonical ASCII tokens and unencoded continuations.
+// Projection is limited to canonical ASCII tokens and nonempty continuations.
 // Any uncertain segment keeps the entire original field: removing later text
 // can otherwise change the dependency's permissive recovery from earlier text.
 fn projected_mime_value<'a>(raw: &'a [u8], wanted: Option<&str>) -> Cow<'a, [u8]> {
@@ -198,6 +198,42 @@ fn projected_mime_value<'a>(raw: &'a [u8], wanted: Option<&str>) -> Cow<'a, [u8]
             && value
                 .bytes()
                 .all(|byte| byte.is_ascii() && byte > b' ' && !b"()<>@,;:\\\"/[]?=".contains(&byte))
+    }
+    fn encoded_parameter(value: &str, position: u32) -> bool {
+        let payload = if position == 0 {
+            let Some((charset, rest)) = value.split_once('\'') else {
+                return false;
+            };
+            let Some((language, payload)) = rest.split_once('\'') else {
+                return false;
+            };
+            if !token(charset)
+                || !language
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            {
+                return false;
+            }
+            payload
+        } else {
+            value
+        };
+        if payload.is_empty() {
+            return false;
+        }
+        let mut bytes = payload.bytes();
+        while let Some(byte) = bytes.next() {
+            if byte == b'%' {
+                if !bytes.next().is_some_and(|byte| byte.is_ascii_hexdigit())
+                    || !bytes.next().is_some_and(|byte| byte.is_ascii_hexdigit())
+                {
+                    return false;
+                }
+            } else if matches!(byte, b'\'' | b'*') {
+                return false;
+            }
+        }
+        true
     }
     fn parameter_base(segment: &str) -> Option<&str> {
         let (name, value) = segment.trim_ascii().split_once('=')?;
@@ -223,10 +259,17 @@ fn projected_mime_value<'a>(raw: &'a [u8], wanted: Option<&str>) -> Cow<'a, [u8]
         if base.is_empty() {
             return None;
         }
-        if suffix.is_empty()
-            || !suffix.bytes().all(|byte| byte.is_ascii_digit())
-            || suffix.parse::<u32>().is_err()
-        {
+        if suffix.is_empty() {
+            return encoded_parameter(value, 0).then_some(base);
+        }
+        let (suffix, encoded) = suffix
+            .strip_suffix('*')
+            .map_or((suffix, false), |suffix| (suffix, true));
+        if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        let position = suffix.parse::<u32>().ok()?;
+        if encoded && !encoded_parameter(value, position) {
             return None;
         }
         Some(base)
@@ -308,11 +351,27 @@ pub(super) fn render(selected: &Selected, wire: &[u8], limits: &Limits) -> Resul
         work.checked_add(decoded.len() * 3).ok_or(Error::Limit)?,
         limits,
     )?;
-    let (mut text, charset_replacements) = decode_charset(&decoded, &selected.charset);
+    let (text, charset_replacements) = decode_charset(&decoded, &selected.charset);
     replacements |= charset_replacements;
-    if replacements {
-        text.insert(0, '\u{fffd}');
-    }
+    let mut text = if replacements {
+        match text {
+            Cow::Borrowed(text) => {
+                let mut marked = String::with_capacity(text.len() + '\u{fffd}'.len_utf8());
+                marked.push('\u{fffd}');
+                marked.push_str(text);
+                marked
+            }
+            Cow::Owned(mut text) => {
+                // Charset conversions may already have spare output capacity.
+                // Preserve it; otherwise reserve only the marker before shifting.
+                text.reserve_exact('\u{fffd}'.len_utf8());
+                text.insert(0, '\u{fffd}');
+                text
+            }
+        }
+    } else {
+        text.into_owned()
+    };
     work = add_work(work, text.len(), limits)?;
 
     let converted = selected.media_type == "text/html";
@@ -669,13 +728,10 @@ fn quoted_printable_prefix_len(wire: &[u8]) -> usize {
     index
 }
 
-fn decode_charset(bytes: &[u8], charset: &str) -> (String, bool) {
+fn decode_charset<'a>(bytes: &'a [u8], charset: &str) -> (Cow<'a, str>, bool) {
     encoding_rs::Encoding::for_label(charset.trim().as_bytes()).map_or_else(
-        || (String::from_utf8_lossy(bytes).into_owned(), true),
-        |encoding| {
-            let (text, replacements) = encoding.decode_without_bom_handling(bytes);
-            (text.into_owned(), replacements)
-        },
+        || (String::from_utf8_lossy(bytes), true),
+        |encoding| encoding.decode_without_bom_handling(bytes),
     )
 }
 
@@ -784,6 +840,83 @@ fn add_work(work: usize, additional: usize, limits: &Limits) -> Result<usize, Er
 mod planner_performance_tests {
     use super::*;
     use io_imap::types::{body::BasicFields, core::NString};
+
+    #[test]
+    fn replacement_markers_do_not_grow_an_already_owned_body_copy() {
+        let mut measurements = Vec::new();
+        for size in [64 * 1_024, 256 * 1_024, 2 * 1_024 * 1_024] {
+            let wire = vec![b'x'; size];
+            for charset in ["UTF-8", "x-unknown-fixture"] {
+                let selected = Selected {
+                    part: Part(NonZeroU32::MIN.into()),
+                    media_type: "text/plain".into(),
+                    charset: charset.into(),
+                    transfer_encoding: "7bit".into(),
+                    wire_size: size,
+                };
+                let replacement = charset == "x-unknown-fixture";
+                let measured = allocation_counter::measure(|| {
+                    let rendered = render(&selected, &wire, &Limits::default()).unwrap();
+                    assert_eq!(rendered.replacements, replacement);
+                    assert!(!rendered.converted);
+                    assert_eq!(rendered.text.len(), size + usize::from(replacement) * 3);
+                    assert_eq!(rendered.work, size * 7 + usize::from(replacement) * 3);
+                    let payload = if replacement {
+                        rendered.text.strip_prefix('\u{fffd}').unwrap()
+                    } else {
+                        &rendered.text
+                    };
+                    assert_eq!(payload.as_bytes(), wire);
+                });
+                eprintln!(
+                    "body replacement size={size} charset={charset} allocations={} total={} peak={}",
+                    measured.count_total, measured.bytes_total, measured.bytes_max
+                );
+                measurements.push((size, measured));
+            }
+        }
+        for (size, measured) in measurements {
+            assert!(
+                measured.bytes_total < size as u64 * 2 + 32 * 1_024,
+                "a replacement marker must not geometrically grow a complete body copy: {measured:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn owned_charset_results_keep_their_existing_output_allocation() {
+        const SIZE: usize = 64 * 1_024;
+        let wire = vec![0xe9; SIZE];
+        for transfer_encoding in ["7bit", "x-unknown-fixture"] {
+            let selected = Selected {
+                part: Part(NonZeroU32::MIN.into()),
+                media_type: "text/plain".into(),
+                charset: "iso-8859-1".into(),
+                transfer_encoding: transfer_encoding.into(),
+                wire_size: SIZE,
+            };
+            let replacement = transfer_encoding == "x-unknown-fixture";
+            let measured = allocation_counter::measure(|| {
+                let rendered = render(&selected, &wire, &Limits::default()).unwrap();
+                assert_eq!(rendered.replacements, replacement);
+                let payload = if replacement {
+                    rendered.text.strip_prefix('\u{fffd}').unwrap()
+                } else {
+                    &rendered.text
+                };
+                assert_eq!(payload.len(), SIZE * 2);
+                assert!(payload.chars().all(|character| character == 'é'));
+            });
+            eprintln!(
+                "owned charset size={SIZE} transfer={transfer_encoding} allocations={} total={} peak={}",
+                measured.count_total, measured.bytes_total, measured.bytes_max
+            );
+            assert_eq!(
+                measured.count_total, 1,
+                "an owned charset conversion with spare capacity must not copy into another output buffer: {measured:?}"
+            );
+        }
+    }
 
     fn deep_structure(depth: usize, parts: usize) -> BodyStructure<'static> {
         let leaf = BodyStructure::Single {
@@ -1006,6 +1139,78 @@ mod planner_performance_tests {
     }
 
     #[test]
+    fn selected_mime_headers_skip_canonical_encoded_unused_continuations() {
+        let selected = Selected {
+            part: Part(NonZeroU32::MIN.into()),
+            media_type: "text/plain".into(),
+            charset: "us-ascii".into(),
+            transfer_encoding: "7bit".into(),
+            wire_size: 5,
+        };
+        let mut measurements = Vec::new();
+        for fragments in [128, 512] {
+            for initial in [
+                "Content-Type: text/plain; charset=us-ascii",
+                "Content-Disposition: inline",
+            ] {
+                let mut headers = initial.to_owned();
+                for index in 0..fragments {
+                    let prefix = if index == 0 { "utf-8'en'" } else { "" };
+                    headers.push_str(&format!(
+                        ";\r\n unused*{index}*={prefix}{}",
+                        "%61".repeat(32)
+                    ));
+                }
+                headers.push_str("\r\n\r\n");
+                assert!(headers.len() < Limits::default().max_header_bytes);
+                let measured = allocation_counter::measure(|| {
+                    assert_eq!(
+                        validate_headers(headers.as_bytes(), Some(&selected), &Limits::default()),
+                        Ok(None)
+                    );
+                });
+                eprintln!(
+                    "selected encoded MIME continuations fragments={fragments} field={initial:?} source={} allocations={} total={} peak={}",
+                    headers.len(),
+                    measured.count_total,
+                    measured.bytes_total,
+                    measured.bytes_max
+                );
+                measurements.push((headers.len(), measured));
+            }
+        }
+        for (bytes, measured) in measurements {
+            assert!(
+                measured.bytes_total < 64 * 1_024 + bytes as u64 * 32,
+                "canonical encoded unused values must not repeatedly copy their combined value: {measured:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn uncertain_encoded_mime_parameters_keep_the_entire_pinned_parser_input() {
+        for value in [
+            "text/plain; x*0*=utf-8'en'%61; x*1*=%; charset=utf-8\r\n",
+            "text/plain; x*0*=utf-8'en'%61; x*1*=%QZ; charset=utf-8\r\n",
+            "text/plain; x*0*=utf-8'en'%61; x*1*=extra'apostrophe; charset=utf-8\r\n",
+            "text/plain; x*0*=utf-8'en'; charset=utf-8\r\n",
+            "text/plain; x*0*=''value; charset=utf-8\r\n",
+            "text/plain; x*0*=utf-8'bad language'value; charset=utf-8\r\n",
+            "text/plain; x*0*=utf-8'en'%61; x*4294967296*=%62; charset=utf-8\r\n",
+            "text/plain; x*0*=utf-8'en'%61; x*1*=%62(comment); charset=utf-8\r\n",
+            "text/plain; x*0*=utf-8'en'%61; x*1*=\"%62\\\"quote\"; charset=utf-8\r\n",
+        ] {
+            assert!(
+                matches!(
+                    projected_mime_value(value.as_bytes(), Some("charset")),
+                    Cow::Borrowed(bytes) if bytes == value.as_bytes()
+                ),
+                "uncertain MIME syntax must preserve full-field parser recovery: {value:?}"
+            );
+        }
+    }
+
+    #[test]
     fn mime_identity_projection_matches_the_full_pinned_parser() {
         let values = [
             "text/plain; charset=UTF-8",
@@ -1043,6 +1248,35 @@ mod planner_performance_tests {
             "text/plain; unused=a=b; charset=utf-8",
             "text/plain; unused=a:b; charset=utf-8",
             "text/plain; unused=a\\;charset=utf-8",
+            "text/plain; x*0*=utf-8'en'%61; x*1*=%62; charset=utf-8",
+            "text/plain; x*0*=UTF-8''%E2; x*1*=%82; x*2*=%AC; charset=utf-8",
+            "text/plain; x*2*=%AC; x*0*=utf-8'en'%E2; charset=utf-8; x*1*=%82",
+            "text/plain; x*0*=utf-8'en'%61; charset=utf-8; x*1*=%62; x*1*=%63",
+            "text/plain; x*0*=utf-8'en'%61; x*0*=utf-8'en'%62; charset=utf-8",
+            "text/plain; x*=utf-8'en'%61; charset=utf-8",
+            "text/plain; x*=unknown-charset''%E2%82%AC; charset=utf-8",
+            "text/plain; x*0*=utf-8'en'%61; x*1=last; charset=utf-8",
+            "text/plain; x*0=first; x*1*=%62; charset=utf-8",
+            "text/plain; charset*0*=utf-8'en'utf; x*=utf-8'en'%61; charset*1*=%2D8",
+            "text/plain; charset-language=en; x*=utf-8'en'%61; charset*=utf-8'en'utf-8",
+            "text/plain; charset-language*=utf-8'en'%64%65; x*=utf-8''%61; charset*=utf-8'en'utf-8",
+            "inline; filename*2*=%AC; filename*0*=utf-8'en'%E2; filename*1*=%82",
+            "inline; filename*0*=\"utf-8'en'%61\"; filename*1*=\"%62\"",
+            "text/plain; x*0*=utf-8''%00; x*1*=%FF; charset=utf-8",
+            "text/plain; x*0*=utf-8'en'%61; x*01*=%62; charset=utf-8",
+            "text/plain; x*0*=utf-8'en'%61; x*4294967295*=%62; charset=utf-8",
+            "text/plain; x*0*=utf-8'en'%61; x*4294967296*=%62; charset=utf-8",
+            "text/plain; x*0*=utf-8'en'%61; x*2*=%62; charset=utf-8",
+            "text/plain; x*0*=utf-8'en'%61; x*1*=extra'apostrophe; charset=utf-8",
+            "text/plain; x*0*=utf-8'en'%61; x*1*=%QZ; charset=utf-8",
+            "text/plain; x*0*=utf-8'en'%61; x*1*=%6; charset=utf-8",
+            "text/plain; x*0*=utf-8'en'%61; x*1*=%; charset=utf-8",
+            "text/plain; x*0*=utf-8'en'%61; x*1*=%62(comment); charset=utf-8",
+            "text/plain; x*0*=utf-8'en'%61; x*1*=%62; x*2*=; charset=utf-8",
+            "text/plain; x*0*=utf-8'en'; charset=utf-8",
+            "text/plain; x*0*=''value; charset=utf-8",
+            "text/plain; x*0*=utf-8'bad language'value; charset=utf-8",
+            "text/plain; x*0*=utf-8'en'first; x*1*=last; charset=utf-8",
         ];
         for value in values {
             for (header, wanted) in [
@@ -1140,6 +1374,9 @@ mod planner_performance_tests {
             b"text/plain; charset*0=utf; charset*1=-8; charset=iso-8859-1",
             b"text/plain; unused=\"semi; escaped\\\"quote\"; charset=\"utf-8\"",
             b"attachment; filename*0=first; filename*1=last; charset*0=utf; charset*1=-8",
+            b"text/plain; x*0*=utf-8'en'%61; x*1*=%62; charset=utf-8",
+            b"text/plain; charset*0*=utf-8'en'utf; x*=utf-8'en'%61; charset*1*=%2D8",
+            b"inline; filename*2*=%AC; filename*0*=utf-8'en'%E2; filename*1*=%82; charset=utf-8",
         ];
         let additions: &[&[u8]] = &[
             b"\r\n ",
@@ -1157,6 +1394,20 @@ mod planner_performance_tests {
             b"; x*2=\"\"; charset=utf-8",
             b"; x*=utf-8''; charset=utf-8",
             b"; unused=\"=?utf-8?Q?a?=\"; charset=utf-8",
+            b"; x*=utf-8'en'%61",
+            b"; x*0*=utf-8''%E2; x*1*=%82; x*2*=%AC",
+            b"; x*1*=%61; x*0*=utf-8'en'%62",
+            b"; x*1*=%61; x*1*=%62",
+            b"; x*0*=utf-8''%61; x*2*=%62",
+            b"; x*0*=utf-8'en'",
+            b"; x*0*=''value",
+            b"; x*0*=utf-8'bad language'value",
+            b"; x*1*=extra'apostrophe",
+            b"; x*1*=%QZ",
+            b"; x*1*=%6",
+            b"; x*1*=%",
+            b"; x*4294967296*=%61",
+            b"; charset-language*=utf-8'en'%64%65; charset*=utf-8'en'utf-8",
         ];
         for base in bases {
             let mut positions = vec![0, base.len()];
