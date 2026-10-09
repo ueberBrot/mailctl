@@ -65,6 +65,26 @@ fn child_operation() -> PreparedDraftOperation {
     operation(Uuid::from_u128(1), 1, Uuid::from_u128(2), 12)
 }
 
+fn reconstruction(
+    operation: &PreparedDraftOperation,
+) -> mailctl::draft_journal::DraftReconstruction {
+    let mut frozen = mailctl::draft_journal::DraftReconstruction {
+        uid_validity: 17,
+        input_sha256: [42; 32],
+        from_configuration_sha256: [43; 32],
+        selected_from_sha256: Some([44; 32]),
+        date_unix: 1_700_000_000,
+        encoder_version: 3,
+        facts_sha256: None,
+    };
+    frozen.facts_sha256 = Some(
+        frozen
+            .fingerprint(&operation.identity, &operation.mailbox_identity)
+            .unwrap(),
+    );
+    frozen
+}
+
 fn run_abort_child(temporary: &TemporaryJournal, outcome: &str) {
     let executable = env::current_exe().unwrap();
     let mut child = Command::new(executable)
@@ -568,28 +588,29 @@ fn dispatch_verification_borrows_retained_text_without_per_record_heap_growth() 
     for records in [512, 4096] {
         let temporary = TemporaryJournal::new();
         let mut journal = DraftJournal::open(&temporary.path).unwrap();
-        let reconstruction = mailctl::draft_journal::DraftReconstruction {
-            uid_validity: 17,
-            input_sha256: [42; 32],
-            from_configuration_sha256: [43; 32],
-            selected_from_sha256: Some([44; 32]),
-            date_unix: 1_700_000_000,
-            encoder_version: 2,
-        };
         let mut first = child_operation();
         first.mailbox_identity = format!("Drafts {}", "synthetic ".repeat(100));
-        first.reconstruction = Some(reconstruction.clone());
+        first.reconstruction = Some(reconstruction(&first));
         let original = journal.prepare(first.clone()).unwrap();
-        let database = Connection::open(&temporary.path).unwrap();
-        database.execute(
-            &format!(
-                "WITH RECURSIVE records(number) AS (VALUES(1) UNION ALL SELECT number + 1 FROM records WHERE number < {})
-                 INSERT INTO draft_operations(operation_id, account_id, account_generation, mailbox_identity, content_sha256, reconstruction, state)
-                 SELECT randomblob(16), zeroblob(16), 1, ?1, zeroblob(32), ?2, 'prepared' FROM records;",
-                records - 1
-            ),
-            params![first.mailbox_identity, serde_json::to_string(&reconstruction).unwrap()],
-        ).unwrap();
+        let mut database = Connection::open(&temporary.path).unwrap();
+        let transaction = database.transaction().unwrap();
+        for index in 1..records {
+            let mut operation = first.clone();
+            operation.identity.operation_id = Uuid::from_u128(index as u128 + 2);
+            operation.reconstruction = Some(reconstruction(&operation));
+            transaction.execute(
+                "INSERT INTO draft_operations(operation_id, account_id, account_generation, mailbox_identity, content_sha256, reconstruction, state)
+                 VALUES (?1, ?2, 1, ?3, ?4, ?5, 'prepared')",
+                params![
+                    operation.identity.operation_id.as_bytes(),
+                    operation.identity.account_id.as_bytes(),
+                    operation.mailbox_identity,
+                    operation.content_sha256,
+                    serde_json::to_string(&operation.reconstruction.unwrap()).unwrap(),
+                ],
+            ).unwrap();
+        }
+        transaction.commit().unwrap();
         let started = Instant::now();
         let allocations = allocation_counter::measure(|| {
             journal
@@ -612,7 +633,6 @@ fn dispatch_verification_borrows_retained_text_without_per_record_heap_growth() 
 
 #[test]
 fn borrowed_verification_preserves_text_corruption_and_legacy_state_checks() {
-    use mailctl::draft_journal::DraftReconstruction;
     for (assignment, expected) in [
         (
             "mailbox_identity = CAST(X'ff' AS TEXT)",
@@ -661,14 +681,7 @@ fn borrowed_verification_preserves_text_corruption_and_legacy_state_checks() {
         let temporary = TemporaryJournal::new();
         let mut journal = DraftJournal::open(&temporary.path).unwrap();
         let mut operation = child_operation();
-        operation.reconstruction = Some(DraftReconstruction {
-            uid_validity: 17,
-            input_sha256: [42; 32],
-            from_configuration_sha256: [43; 32],
-            selected_from_sha256: Some([44; 32]),
-            date_unix: 1_700_000_000,
-            encoder_version: 2,
-        });
+        operation.reconstruction = Some(reconstruction(&operation));
         journal.prepare(operation.clone()).unwrap();
         let database = Connection::open(&temporary.path).unwrap();
         database
@@ -725,19 +738,11 @@ fn borrowed_verification_preserves_text_corruption_and_legacy_state_checks() {
 
 #[test]
 fn borrowed_verification_retains_mailbox_character_and_prepared_evidence_bounds() {
-    use mailctl::draft_journal::DraftReconstruction;
     let temporary = TemporaryJournal::new();
     let mut journal = DraftJournal::open(&temporary.path).unwrap();
     let mut operation = child_operation();
     operation.mailbox_identity = "é".repeat(4096);
-    let mut reconstruction = DraftReconstruction {
-        uid_validity: 17,
-        input_sha256: [42; 32],
-        from_configuration_sha256: [43; 32],
-        selected_from_sha256: Some([44; 32]),
-        date_unix: 1_700_000_000,
-        encoder_version: 2,
-    };
+    let mut reconstruction = reconstruction(&operation);
     operation.reconstruction = Some(reconstruction.clone());
     let original = journal.prepare(operation.clone()).unwrap();
     journal
@@ -769,7 +774,7 @@ fn borrowed_verification_retains_mailbox_character_and_prepared_evidence_bounds(
         .unwrap();
     for field in ["encoder", "validity", "selected-from"] {
         match field {
-            "encoder" => reconstruction.encoder_version = 3,
+            "encoder" => reconstruction.encoder_version = 999,
             "validity" => reconstruction.uid_validity = 0,
             "selected-from" => reconstruction.selected_from_sha256 = None,
             _ => unreachable!(),

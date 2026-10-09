@@ -16,6 +16,7 @@ use std::{
 struct Backend {
     routes: Mutex<Vec<(u64, String, CredentialSource, String)>>,
     bytes: Mutex<Vec<Vec<u8>>>,
+    verifications: Mutex<Vec<(u32, String, [u8; 32])>>,
     outcome: AppendOutcome,
     evidence: Mutex<Result<mailctl::draft::DraftEvidence, ErrorCode>>,
     validity: Mutex<Result<u32, ErrorCode>>,
@@ -30,6 +31,11 @@ impl DraftBackend for Backend {
     ) -> Pin<Box<dyn Future<Output = Result<mailctl::draft::DraftEvidence, Error>> + Send + 'a>>
     {
         Box::pin(async move {
+            self.verifications.lock().unwrap().push((
+                expected.uid_validity,
+                expected.message_id.clone(),
+                expected.content_sha256,
+            ));
             let selection = self.prepare(target, mailbox, limits).await?;
             if selection.uid_validity() != expected.uid_validity {
                 return Err(Error::new(ErrorCode::StaleReference));
@@ -91,6 +97,7 @@ impl Fixture {
         let backend = Arc::new(Backend {
             routes: Mutex::new(Vec::new()),
             bytes: Mutex::new(Vec::new()),
+            verifications: Mutex::new(Vec::new()),
             validity: Mutex::new(Ok(77)),
             evidence: Mutex::new(Ok(mailctl::draft::DraftEvidence::Verified(
                 DraftMessageIdentity {
@@ -204,6 +211,12 @@ impl Fixture {
             reconcile: false,
         })
     }
+    fn message_id(&self) -> String {
+        format!(
+            "{}.{}.{}@mailctl.invalid",
+            self.input.account_id, self.input.account_generation, self.input.operation_id
+        )
+    }
     fn mutate_reconstruction(&self, field: &str, value: serde_json::Value) {
         let database =
             rusqlite::Connection::open(self.config.state_dir.join("drafts.sqlite")).unwrap();
@@ -214,6 +227,19 @@ impl Fixture {
             .execute(
                 "UPDATE draft_operations SET reconstruction = ?1",
                 [frozen.to_string()],
+            )
+            .unwrap();
+    }
+    fn use_previous_encoder(&self) {
+        self.mutate_reconstruction("encoder_version", 2.into());
+        let database =
+            rusqlite::Connection::open(self.config.state_dir.join("drafts.sqlite")).unwrap();
+        // Represent MIME emitted by the previous dependency without retaining
+        // that dependency merely to reproduce its obsolete folding rules.
+        database
+            .execute(
+                "UPDATE draft_operations SET content_sha256 = ?1",
+                [[0x5a_u8; 32].as_slice()],
             )
             .unwrap();
     }
@@ -281,6 +307,283 @@ async fn all_outcomes_keep_original_identity_and_prepared_retry_uses_retained_ro
             assert_eq!(f.backend.routes.lock().unwrap().len(), 1);
         }
     }
+}
+
+#[tokio::test]
+async fn previous_encoder_prepared_retry_reencodes_once_and_preserves_frozen_parameters() {
+    let mut f = Fixture::new(DraftOperationState::Prepared).await;
+    let current_version = f.record().operation.reconstruction.unwrap().encoder_version;
+    f.use_previous_encoder();
+    let previous = f.record();
+    Service::verify_state(&f.config).unwrap();
+    assert_eq!(f.record(), previous);
+    f.repoint();
+    let service = f.open();
+    run(&service, Operation::SaveDraft(f.input.clone()))
+        .await
+        .unwrap();
+    let migrated = f.record();
+    let mut expected_frozen = previous.operation.reconstruction.unwrap();
+    expected_frozen.encoder_version = current_version;
+    assert_eq!(
+        migrated.operation.reconstruction,
+        Some(expected_frozen.clone())
+    );
+    assert_eq!(migrated.operation.identity, previous.operation.identity);
+    assert_eq!(migrated.operation.mailbox_identity, "Drafts");
+    assert_ne!(migrated.operation.content_sha256, [0x5a; 32]);
+    let expected_mime = PreparedDraft::compose(
+        mailctl::draft::DraftInput {
+            from: "original@example.test".into(),
+            to: f.input.draft.to.clone(),
+            cc: f.input.draft.cc.clone(),
+            bcc: f.input.draft.bcc.clone(),
+            subject: f.input.draft.subject.clone(),
+            body: f.input.draft.body.clone(),
+            message_id: f.message_id(),
+            date_unix: expected_frozen.date_unix,
+            in_reply_to: f.input.draft.in_reply_to.clone(),
+            references: f.input.draft.references.clone(),
+        },
+        f.config.limits.draft_mime_bytes,
+    )
+    .unwrap();
+    assert_eq!(migrated.operation.content_sha256, expected_mime.sha256());
+    {
+        let attempts = f.backend.bytes.lock().unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0], expected_mime.bytes());
+    }
+    assert_eq!(
+        f.backend.routes.lock().unwrap()[1],
+        (
+            1,
+            "imap.example.test".into(),
+            CredentialSource::Native {},
+            "Drafts".into()
+        )
+    );
+    run(&service, Operation::SaveDraft(f.input.clone()))
+        .await
+        .unwrap();
+    assert_eq!(f.record(), migrated);
+    assert_eq!(f.backend.bytes.lock().unwrap().len(), 1);
+    assert_eq!(f.backend.routes.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn previous_encoder_terminal_retries_preserve_receipts_without_another_append() {
+    for state in [
+        DraftOperationState::Created {
+            appended_message: None,
+        },
+        DraftOperationState::Rejected,
+        DraftOperationState::Duplicate {
+            appended_message: DraftMessageIdentity {
+                uid_validity: 77,
+                uid: 4,
+            },
+        },
+    ] {
+        let initial = if matches!(state, DraftOperationState::Duplicate { .. }) {
+            DraftOperationState::OutcomeUnknown
+        } else {
+            state
+        };
+        let f = Fixture::new(initial).await;
+        if matches!(state, DraftOperationState::Duplicate { .. }) {
+            let service = f.open();
+            let Operation::DraftStatus(mut input) = f.status() else {
+                panic!()
+            };
+            input.reconcile = true;
+            run(&service, Operation::DraftStatus(input)).await.unwrap();
+        }
+        f.use_previous_encoder();
+        let previous = f.record();
+        Service::verify_state(&f.config).unwrap();
+        let routes = f.backend.routes.lock().unwrap().len();
+        let service = f.open();
+        let OperationResult::Draft(status) = run(&service, f.status()).await.unwrap() else {
+            panic!()
+        };
+        let OperationResult::Draft(replayed) = run(&service, Operation::SaveDraft(f.input.clone()))
+            .await
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(status.content_sha256, "5a".repeat(32));
+        assert_eq!(
+            serde_json::to_value(status).unwrap(),
+            serde_json::to_value(replayed).unwrap()
+        );
+        assert_eq!(f.record(), previous);
+        assert_eq!(f.backend.bytes.lock().unwrap().len(), 1);
+        assert_eq!(f.backend.routes.lock().unwrap().len(), routes);
+    }
+}
+
+#[tokio::test]
+async fn previous_encoder_uncertain_retries_reconcile_with_the_original_mime_identity() {
+    for in_flight in [false, true] {
+        let f = Fixture::new(DraftOperationState::OutcomeUnknown).await;
+        f.use_previous_encoder();
+        if in_flight {
+            let database =
+                rusqlite::Connection::open(f.config.state_dir.join("drafts.sqlite")).unwrap();
+            database
+                .execute("UPDATE draft_operations SET state = 'in_flight'", [])
+                .unwrap();
+        }
+        let previous = f.record().operation;
+        let service = f.open();
+        assert_eq!(
+            run(&service, f.status()).await.unwrap_err().code,
+            if in_flight {
+                ErrorCode::OperationInProgress
+            } else {
+                ErrorCode::OutcomeUnknown
+            }
+        );
+        let error = run(&service, Operation::SaveDraft(f.input.clone()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::OutcomeUnknown);
+        assert_eq!(error.draft_operation.unwrap().identity, f.input.identity());
+        assert_eq!(f.record().operation, previous);
+        assert_eq!(f.backend.routes.lock().unwrap().len(), 1);
+        assert!(f.backend.verifications.lock().unwrap().is_empty());
+        let Operation::DraftStatus(mut input) = f.status() else {
+            panic!()
+        };
+        input.reconcile = true;
+        let OperationResult::Draft(receipt) =
+            run(&service, Operation::DraftStatus(input)).await.unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(receipt.state, mailctl::domain::DraftState::Duplicate);
+        assert_eq!(receipt.content_sha256, "5a".repeat(32));
+        assert_eq!(
+            f.backend.verifications.lock().unwrap().as_slice(),
+            [(77, f.message_id(), [0x5a; 32])]
+        );
+        run(&service, Operation::SaveDraft(f.input.clone()))
+            .await
+            .unwrap();
+        assert_eq!(f.record().operation, previous);
+        assert_eq!(f.backend.bytes.lock().unwrap().len(), 1);
+        assert_eq!(f.backend.routes.lock().unwrap().len(), 2);
+    }
+}
+
+#[tokio::test]
+async fn previous_encoder_retries_still_reject_changed_input_before_backend_work() {
+    for state in [
+        DraftOperationState::Prepared,
+        DraftOperationState::Created {
+            appended_message: None,
+        },
+        DraftOperationState::OutcomeUnknown,
+    ] {
+        let f = Fixture::new(state).await;
+        f.use_previous_encoder();
+        let previous = f.record();
+        let appends = f.backend.bytes.lock().unwrap().len();
+        let service = f.open();
+        let mut conflicting = f.input.clone();
+        conflicting.draft.body = "Changed operation input".into();
+        assert_eq!(
+            run(&service, Operation::SaveDraft(conflicting))
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::OperationConflict
+        );
+        assert_eq!(f.record(), previous);
+        assert_eq!(f.backend.bytes.lock().unwrap().len(), appends);
+        assert_eq!(f.backend.routes.lock().unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn previous_encoder_prepared_retry_requires_the_original_mailbox_and_durable_update() {
+    for failure in ["incarnation", "journal"] {
+        let f = Fixture::new(DraftOperationState::Prepared).await;
+        f.use_previous_encoder();
+        let previous = f.record();
+        let expected = if failure == "incarnation" {
+            *f.backend.validity.lock().unwrap() = Ok(88);
+            ErrorCode::DraftMailboxUnavailable
+        } else {
+            let database =
+                rusqlite::Connection::open(f.config.state_dir.join("drafts.sqlite")).unwrap();
+            database.execute_batch("CREATE TRIGGER stop_upgrade BEFORE UPDATE ON draft_operations BEGIN SELECT RAISE(ABORT, 'synthetic'); END;").unwrap();
+            ErrorCode::JournalUnavailable
+        };
+        let service = f.open();
+        assert_eq!(
+            run(&service, Operation::SaveDraft(f.input.clone()))
+                .await
+                .unwrap_err()
+                .code,
+            expected,
+            "{failure}"
+        );
+        assert_eq!(f.record(), previous, "{failure}");
+        assert!(f.backend.bytes.lock().unwrap().is_empty(), "{failure}");
+    }
+}
+
+#[tokio::test]
+async fn previous_encoder_prepared_retry_rejects_changed_frozen_facts_without_overwriting_identity()
+{
+    let f = Fixture::new(DraftOperationState::Prepared).await;
+    f.use_previous_encoder();
+    f.mutate_reconstruction("date_unix", 0.into());
+    let changed = f.record();
+    let service = f.open();
+    run(&service, f.status()).await.unwrap();
+    assert_eq!(
+        run(&service, Operation::SaveDraft(f.input.clone()))
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::OperationConflict
+    );
+    assert_eq!(f.record(), changed);
+    assert!(f.backend.bytes.lock().unwrap().is_empty());
+    assert_eq!(f.backend.routes.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn legacy_prepared_rows_without_frozen_facts_remain_inspectable_and_allow_new_drafts() {
+    let f = Fixture::new(DraftOperationState::Prepared).await;
+    f.use_previous_encoder();
+    f.mutate_reconstruction("facts_sha256", serde_json::Value::Null);
+    let legacy = f.record();
+    Service::verify_state(&f.config).unwrap();
+    let service = f.open();
+    let OperationResult::Draft(status) = run(&service, f.status()).await.unwrap() else {
+        panic!()
+    };
+    assert_eq!(status.state, mailctl::domain::DraftState::Prepared);
+    assert_eq!(status.content_sha256, "5a".repeat(32));
+    assert_eq!(
+        run(&service, Operation::SaveDraft(f.input.clone()))
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::UnsupportedCapability
+    );
+    assert_eq!(f.record(), legacy);
+    assert!(f.backend.bytes.lock().unwrap().is_empty());
+    let mut new = f.input.clone();
+    new.operation_id = uuid::Uuid::new_v4();
+    run(&service, Operation::SaveDraft(new)).await.unwrap();
+    assert_eq!(f.record(), legacy);
+    assert_eq!(f.backend.bytes.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -734,15 +1037,27 @@ async fn snapshots_preserve_all_outcomes_original_targets_and_reconstruction() {
 
 #[tokio::test]
 async fn upgrade_verification_refuses_incompatible_prepared_reconstruction_without_changes() {
-    let f = Fixture::new(DraftOperationState::Prepared).await;
-    f.mutate_reconstruction("encoder_version", 999.into());
-    let before = f.record();
-    assert_eq!(
-        Service::verify_state(&f.config).unwrap_err().code,
-        ErrorCode::UnsupportedCapability
-    );
-    assert_eq!(f.record(), before);
-    assert!(f.backend.bytes.lock().unwrap().is_empty());
+    for version in [0, 999] {
+        let f = Fixture::new(DraftOperationState::Prepared).await;
+        f.mutate_reconstruction("encoder_version", version.into());
+        let before = f.record();
+        assert_eq!(
+            Service::verify_state(&f.config).unwrap_err().code,
+            ErrorCode::UnsupportedCapability
+        );
+        let service = f.open();
+        run(&service, f.status()).await.unwrap();
+        assert_eq!(
+            run(&service, Operation::SaveDraft(f.input.clone()))
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::UnsupportedCapability
+        );
+        assert_eq!(f.record(), before);
+        assert!(f.backend.bytes.lock().unwrap().is_empty());
+        assert_eq!(f.backend.routes.lock().unwrap().len(), 1);
+    }
 }
 
 #[tokio::test]

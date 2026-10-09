@@ -18,14 +18,16 @@ use uuid::Uuid;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const SCHEMA_VERSION: i64 = 3;
+const FACTS_VERSION: u32 = 3;
 
 pub use crate::domain::DraftIdentity as DraftOperationIdentity;
 
-/// The immutable facts that allow a prepared operation to be dispatched.
+/// The frozen facts that allow a prepared operation to be dispatched.
 ///
 /// `mailbox_identity` is an opaque mailbox identity, never a mutable Drafts
 /// alias. `content_sha256` is the hash of frozen MIME bytes; callers retain the
-/// bytes and composition input needed to reconstruct them.
+/// bytes and composition input needed to reconstruct them. An encoder upgrade
+/// may replace only the representation of work that has never been dispatched.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreparedDraftOperation {
     pub identity: DraftOperationIdentity,
@@ -45,6 +47,36 @@ pub struct DraftReconstruction {
     pub selected_from_sha256: Option<[u8; 32]>,
     pub date_unix: i64,
     pub encoder_version: u32,
+    /// Encoder-independent integrity check of the operation's frozen facts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub facts_sha256: Option<[u8; 32]>,
+}
+
+impl DraftReconstruction {
+    /// Stable integrity fingerprint of the frozen facts, excluding MIME encoding.
+    pub fn fingerprint(
+        &self,
+        identity: &DraftOperationIdentity,
+        mailbox: &str,
+    ) -> Result<[u8; 32], DraftJournalError> {
+        // Keep this format fixed across encoder and reconstruction changes.
+        crate::encoding::json_sha256(
+            &(
+                "mailctl-draft-facts-1",
+                identity.account_id,
+                identity.account_generation,
+                identity.operation_id,
+                mailbox,
+                self.uid_validity,
+                self.input_sha256,
+                self.from_configuration_sha256,
+                self.selected_from_sha256,
+                self.date_unix,
+            ),
+            usize::MAX,
+        )
+        .map_err(|_| DraftJournalError::InvalidOperation)
+    }
 }
 
 /// The durable acknowledgement state of a draft operation.
@@ -239,14 +271,30 @@ impl DraftJournal {
                 return Err(DraftJournalError::Unavailable);
             }
             let operation = decode_row(database_row(row)?)?;
-            if operation.state == DraftOperationState::Prepared
-                && operation.reconstruction.as_ref().is_none_or(|frozen| {
-                    frozen.encoder_version != crate::draft::ENCODER_VERSION
-                        || frozen.uid_validity == 0
-                        || frozen.selected_from_sha256.is_none()
-                })
-            {
-                return Err(DraftJournalError::InvalidOperation);
+            if operation.state == DraftOperationState::Prepared {
+                let frozen = operation
+                    .reconstruction
+                    .as_ref()
+                    .ok_or(DraftJournalError::InvalidOperation)?;
+                if !(1..=crate::draft::ENCODER_VERSION).contains(&frozen.encoder_version)
+                    || frozen.uid_validity == 0
+                    || frozen.selected_from_sha256.is_none()
+                {
+                    return Err(DraftJournalError::InvalidOperation);
+                }
+                match frozen.facts_sha256 {
+                    Some(expected)
+                        if frozen
+                            .fingerprint(&operation.identity, operation.mailbox_identity)?
+                            != expected =>
+                    {
+                        return Err(DraftJournalError::InvalidOperation);
+                    }
+                    None if frozen.encoder_version >= FACTS_VERSION => {
+                        return Err(DraftJournalError::InvalidOperation);
+                    }
+                    _ => {}
+                }
             }
         }
         Ok(())
@@ -316,6 +364,67 @@ impl DraftJournal {
                 ],
             )
             .map_err(unavailable)?;
+        transaction.commit().map_err(unavailable)?;
+        Ok(PersistedDraftOperation {
+            operation,
+            state: DraftOperationState::Prepared,
+        })
+    }
+
+    /// Replace an older encoding only before any APPEND bytes were dispatched.
+    /// The caller retains the account writer lock and verifies the original
+    /// mailbox incarnation. Frozen logical facts and their fingerprint remain.
+    pub(crate) fn reencode_prepared(
+        &mut self,
+        expected: &PreparedDraftOperation,
+        content_sha256: [u8; 32],
+    ) -> Result<PersistedDraftOperation, DraftJournalError> {
+        let frozen = expected
+            .reconstruction
+            .as_ref()
+            .ok_or(DraftJournalError::InvalidOperation)?;
+        if !(1..crate::draft::ENCODER_VERSION).contains(&frozen.encoder_version)
+            || frozen.uid_validity == 0
+            || frozen.selected_from_sha256.is_none()
+            || frozen.facts_sha256
+                != Some(frozen.fingerprint(&expected.identity, &expected.mailbox_identity)?)
+        {
+            return Err(DraftJournalError::InvalidOperation);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(unavailable)?;
+        let prior = read_by_identity(&transaction, &expected.identity)?
+            .ok_or(DraftJournalError::OperationNotPrepared)?;
+        if prior.operation != *expected {
+            return Err(DraftJournalError::OperationConflict);
+        }
+        if prior.state != DraftOperationState::Prepared {
+            return Err(DraftJournalError::NotDispatchable(prior.state));
+        }
+        let mut operation = prior.operation;
+        operation.content_sha256 = content_sha256;
+        let frozen = operation.reconstruction.as_mut().unwrap();
+        frozen.encoder_version = crate::draft::ENCODER_VERSION;
+        let changed = transaction
+            .execute(
+                "UPDATE draft_operations SET content_sha256 = ?4, reconstruction = ?5
+                 WHERE account_id = ?1 AND account_generation = ?2 AND operation_id = ?3
+                   AND state = 'prepared'",
+                params![
+                    operation.identity.account_id.as_bytes().as_slice(),
+                    sqlite_generation(operation.identity.account_generation)?,
+                    operation.identity.operation_id.as_bytes().as_slice(),
+                    content_sha256.as_slice(),
+                    serde_json::to_string(frozen)
+                        .map_err(|_| DraftJournalError::InvalidOperation)?,
+                ],
+            )
+            .map_err(unavailable)?;
+        if changed != 1 {
+            return Err(DraftJournalError::OperationConflict);
+        }
         transaction.commit().map_err(unavailable)?;
         Ok(PersistedDraftOperation {
             operation,

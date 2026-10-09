@@ -136,22 +136,15 @@ fn large_draft_composition_sizes_storage_for_supported_encoded_content() {
         }
     }
     for (kind, allocations, mime_bytes, body_bytes) in measured {
-        if matches!(kind, "near-selector-del" | "near-selector-unicode") {
-            // The pinned encoder allocates transient formatting scratch for
-            // every escape in these stress bodies. Peak memory isolates the
-            // frozen representation and its storage overhead from that churn.
-            let budget = mime_bytes as u64 + 128 * 1024;
-            assert!(
-                allocations.bytes_max <= budget,
-                "{kind}, mime={mime_bytes}, peak budget={budget}, {allocations:?}"
-            );
-            continue;
-        }
         // Plain content needs its frozen representation and header overhead;
         // CRLF normalization can additionally own one body. Encoded variants
-        // allow transient storage from the pinned quoted-printable encoder.
+        // also allow conservative output capacity.
         let budget = match kind {
-            "ascii" | "long-ascii" | "dense-newlines" => mime_bytes,
+            "ascii"
+            | "long-ascii"
+            | "dense-newlines"
+            | "near-selector-del"
+            | "near-selector-unicode" => mime_bytes,
             "crlf" => mime_bytes + body_bytes,
             _ => 2 * mime_bytes,
         } as u64

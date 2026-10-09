@@ -108,9 +108,9 @@ fn check_dependencies(
             return Err("Use pinned tokio-rustls 0.26.6 with only ring and tls12".into());
         }
         if name == "mail-builder"
-            && (package.version.to_string() != "0.5.0" || !node.features.is_empty())
+            && (package.version.to_string() != "1.0.0" || !node.features.is_empty())
         {
-            return Err("Use pinned mail-builder 0.5.0 without hostname discovery".into());
+            return Err("Use pinned mail-builder 1.0.0 without hostname discovery".into());
         }
         if name == "rusqlite"
             && (package.version.to_string() != "0.40.2"
@@ -128,7 +128,7 @@ fn check_dependencies(
                 ("io-imap", "=0.7.1"),
                 ("tokio", "=1.53.2"),
                 ("tokio-rustls", "=0.26.6"),
-                ("mail-builder", "=0.5.0"),
+                ("mail-builder", "=1.0.0"),
                 ("rusqlite", "=0.40.2"),
             ] {
                 if !dependencies.iter().any(|dependency| {

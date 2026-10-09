@@ -365,8 +365,10 @@ async fn cancellation_before_and_after_literal_closes_transport_and_retains_unkn
 }
 
 #[test]
-fn frozen_composition_preserves_bcc_body_and_reply_metadata_with_exact_size_limit() {
+fn frozen_composition_preserves_folded_headers_and_body_with_exact_size_limit() {
     let mut input = input();
+    let subject = format!("{} {}", "a".repeat(60), "b".repeat(11));
+    input.subject = subject.clone();
     input.in_reply_to = Some("parent@example.test".into());
     input.references = vec!["ancestor@example.test".into(), "parent@example.test".into()];
     let draft = PreparedDraft::compose(input.clone(), 1024 * 1024).unwrap();
@@ -380,7 +382,7 @@ fn frozen_composition_preserves_bcc_body_and_reply_metadata_with_exact_size_limi
     let message = mail_parser::MessageParser::default()
         .parse(draft.bytes())
         .unwrap();
-    assert_eq!(message.subject(), Some("Unsent fixture"));
+    assert_eq!(message.subject(), Some(subject.as_str()));
     assert_eq!(message.message_id(), Some("operation@example.test"));
     assert_eq!(
         message.bcc().unwrap().first().unwrap().address(),

@@ -4,7 +4,7 @@ use mail_builder::MessageBuilder;
 use sha2::{Digest, Sha256};
 use std::io::{self, Write};
 
-pub(crate) const ENCODER_VERSION: u32 = 2;
+pub(crate) const ENCODER_VERSION: u32 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -140,7 +140,10 @@ impl PreparedDraft {
             bytes: Vec::with_capacity(capacity),
             maximum: max_mime_bytes,
         };
-        builder.write_to(&mut output).map_err(|_| Error::Limit)?;
+        // The sink is already in memory; keep the encoder's I/O adapter small.
+        let mut writer = mail_builder::IoWriter::with_capacity(4096, &mut output);
+        builder.serialize(&mut writer);
+        writer.into_result().map_err(|_| Error::Limit)?;
         let bytes = output.bytes;
         let header_bytes = bytes
             .windows(4)

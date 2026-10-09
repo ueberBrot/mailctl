@@ -345,28 +345,35 @@ impl Service {
         validate_size(&content, limits)?;
         content.body = crate::draft::normalize_body(content.body);
         let input_sha256 = hash(&content)?;
-        let (frozen, expected_content_sha256) = match prior {
+        let prior = match prior {
             Some(prior) => {
                 let frozen = prior
                     .operation
                     .reconstruction
                     .as_ref()
                     .ok_or_else(|| Error::new(ErrorCode::JournalUnavailable))?;
-                if frozen.encoder_version != crate::draft::ENCODER_VERSION {
-                    return Err(Error::new(ErrorCode::UnsupportedCapability));
-                }
                 if frozen.input_sha256 != input_sha256 {
                     return Err(Error::draft_conflict());
                 }
                 if prior.state != DraftOperationState::Prepared {
                     return self.draft_receipt(prior, limits);
                 }
-                (
-                    prior.operation.reconstruction,
-                    Some(prior.operation.content_sha256),
-                )
+                if !(1..=crate::draft::ENCODER_VERSION).contains(&frozen.encoder_version) {
+                    return Err(Error::new(ErrorCode::UnsupportedCapability));
+                }
+                let expected = frozen
+                    .facts_sha256
+                    .ok_or_else(|| Error::new(ErrorCode::UnsupportedCapability))?;
+                if frozen
+                    .fingerprint(&prior.operation.identity, &prior.operation.mailbox_identity)
+                    .map_err(journal_error)?
+                    != expected
+                {
+                    return Err(Error::draft_conflict());
+                }
+                Some(prior.operation)
             }
-            None => (None, None),
+            None => None,
         };
         self.registry.draft_creation_allowed()?;
         // Revisit retained rows before dispatch even if a previous storage failure
@@ -382,7 +389,10 @@ impl Service {
         journal = verified;
         result.map_err(journal_error)?;
         self.registry.draft_creation_allowed()?;
-        let from = match (frozen.as_ref(), content.from) {
+        let frozen = prior
+            .as_ref()
+            .and_then(|operation| operation.reconstruction.as_ref());
+        let from = match (frozen, content.from) {
             (Some(frozen), _) => target
                 .config
                 .from_identities
@@ -397,7 +407,7 @@ impl Service {
             _ => return Err(Error::new(ErrorCode::InvalidRequest)),
         };
         let frozen = match frozen {
-            Some(frozen) => frozen,
+            Some(frozen) => frozen.clone(),
             None => DraftReconstruction {
                 uid_validity: 0,
                 input_sha256,
@@ -408,8 +418,10 @@ impl Service {
                     .map_err(|_| Error::new(ErrorCode::InternalError))?
                     .as_secs() as i64,
                 encoder_version: crate::draft::ENCODER_VERSION,
+                facts_sha256: None,
             },
         };
+        let reencoding = frozen.encoder_version != crate::draft::ENCODER_VERSION;
         let mime = crate::draft::PreparedDraft::compose(
             crate::draft::DraftInput {
                 from,
@@ -428,7 +440,11 @@ impl Service {
         if mime.header_bytes() > limits.header_bytes {
             return Err(Error::new(ErrorCode::ResponseTooLarge));
         }
-        if expected_content_sha256.is_some_and(|expected| expected != mime.sha256()) {
+        if !reencoding
+            && prior
+                .as_ref()
+                .is_some_and(|operation| operation.content_sha256 != mime.sha256())
+        {
             return Err(Error::draft_conflict());
         }
         let route = self
@@ -454,22 +470,33 @@ impl Service {
             append
         }?;
         let validity = append.uid_validity();
-        if validity == 0 || (expected_content_sha256.is_some() && validity != frozen.uid_validity) {
+        if validity == 0 || (prior.is_some() && validity != frozen.uid_validity) {
             return Err(Error::new(ErrorCode::DraftMailboxUnavailable));
         }
-        let operation = PreparedDraftOperation {
-            identity,
-            mailbox_identity: mailbox.into(),
-            content_sha256: mime.sha256(),
-            reconstruction: Some(DraftReconstruction {
-                uid_validity: validity,
-                ..frozen
-            }),
-        };
         self.registry.draft_creation_allowed()?;
         let prepared = journal
             .access(|journal| {
-                journal.prepare_with_limit(operation, self.config.limits.journal_records)
+                if let Some(prior) = prior.as_ref()
+                    && reencoding
+                {
+                    return journal.reencode_prepared(prior, mime.sha256());
+                }
+                let mut frozen = DraftReconstruction {
+                    uid_validity: validity,
+                    ..frozen
+                };
+                if prior.is_none() {
+                    frozen.facts_sha256 = Some(frozen.fingerprint(&identity, mailbox)?);
+                }
+                journal.prepare_with_limit(
+                    PreparedDraftOperation {
+                        identity,
+                        mailbox_identity: mailbox.into(),
+                        content_sha256: mime.sha256(),
+                        reconstruction: Some(frozen),
+                    },
+                    self.config.limits.journal_records,
+                )
             })
             .map_err(journal_error)?;
         let dispatch = Dispatch::start(&mut journal, &prepared.operation)?;
