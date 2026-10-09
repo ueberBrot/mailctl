@@ -131,8 +131,6 @@ pub(super) fn validate_headers(
             headers.headers.header(mail_parser::HeaderName::ContentType),
             Some("charset"),
         )?;
-        let content_type =
-            mail_parser::parsers::MessageStream::new(content_type.as_ref()).parse_content_type();
         let disposition = identity_header_value(
             raw,
             headers
@@ -140,6 +138,14 @@ pub(super) fn validate_headers(
                 .header(mail_parser::HeaderName::ContentDisposition),
             None,
         )?;
+        let work = add_work(0, mime_identity_parser_work(content_type.as_ref())?, limits)?;
+        add_work(
+            work,
+            mime_identity_parser_work(disposition.as_ref())?,
+            limits,
+        )?;
+        let content_type =
+            mail_parser::parsers::MessageStream::new(content_type.as_ref()).parse_content_type();
         let disposition =
             mail_parser::parsers::MessageStream::new(disposition.as_ref()).parse_content_type();
         let (media_type, charset) = content_type.as_content_type().map_or_else(
@@ -185,7 +191,30 @@ fn identity_header_value<'a>(
     Ok(projected_mime_value(value, wanted))
 }
 
-// Projection is limited to canonical ASCII tokens, quoted empty scalars and nonempty continuations.
+fn mime_identity_parser_work(value: &[u8]) -> Result<usize, Error> {
+    // Admit the pinned parser's repeated continuation joins, language-name
+    // searches and encoded-word suffix retries. Count triggers in every state;
+    // RFC2047 then RFC2231 decoding can each expand fourfold. This conservative
+    // estimate reserves their composed factor of 16 before dependency parsing.
+    let attempts = value
+        .iter()
+        .enumerate()
+        .try_fold(1usize, |attempts, (index, byte)| {
+            if matches!(*byte, b'*' | b'\'') || *byte == b'=' && value.get(index + 1) == Some(&b'?')
+            {
+                attempts.checked_add(1).ok_or(Error::Limit)
+            } else {
+                Ok(attempts)
+            }
+        })?;
+    value
+        .len()
+        .checked_mul(attempts)
+        .and_then(|work| work.checked_mul(16))
+        .ok_or(Error::Limit)
+}
+
+// Projection accepts canonical ASCII tokens, simple quoted scalars and nonempty continuations.
 // Any uncertain segment keeps the entire original field: removing later text
 // can otherwise change the dependency's permissive recovery from earlier text.
 fn projected_mime_value<'a>(raw: &'a [u8], wanted: Option<&str>) -> Cow<'a, [u8]> {
@@ -238,13 +267,25 @@ fn projected_mime_value<'a>(raw: &'a [u8], wanted: Option<&str>) -> Cow<'a, [u8]
         if !token(name) {
             return None;
         }
-        // Empty quoted scalars do not leave continuation state in the pinned
-        // parser. Starred empties can affect recovery of the next parameter.
-        if value == "\"\"" && !name.contains('*') {
-            return Some(name);
+        // Ordinary empty values and complete unescaped quoted scalars leave no
+        // continuation state. Starred empties can affect the next parameter's
+        // recovery; quoted continuations still require the token checks below.
+        if !name.contains('*') {
+            if value.is_empty() {
+                return Some(name);
+            }
+            if let Some(inner) = value
+                .strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+                && inner
+                    .bytes()
+                    .all(|byte| matches!(byte, b' '..=b'~') && !b"\"\\;".contains(&byte))
+            {
+                return Some(name);
+            }
         }
         // Quoted tokens follow the same simple parser path as unquoted ones.
-        // Other empty values, escapes, folds and more complex quotes retain the full
+        // Starred empty values, escapes, folds and more complex quotes retain the full
         // original field, including the pinned parser's recovery behavior.
         let value = if let Some(value) = value.strip_prefix('"') {
             value.strip_suffix('"')?
@@ -286,6 +327,11 @@ fn projected_mime_value<'a>(raw: &'a [u8], wanted: Option<&str>) -> Cow<'a, [u8]
                 return None;
             }
             return Some(true);
+        }
+        // Semicolons with no intervening parameter leave the parser in the
+        // same attribute-name state after the preceding canonical segment.
+        if segment.trim_ascii().is_empty() {
+            return Some(false);
         }
         let name = parameter_base(segment)?;
         Some(wanted.is_some_and(|wanted| {
@@ -668,7 +714,9 @@ fn scan_base64(wire: &[u8]) -> (usize, bool) {
     let mut len = 0;
     let mut padded = false;
     for (index, byte) in wire.iter().copied().enumerate() {
-        if byte.is_ascii_whitespace() {
+        // Match the pinned decoder's transport whitespace so recovery stops
+        // before other controls rather than retrying a prefix it cannot decode.
+        if matches!(byte, b' ' | b'\t' | b'\r' | b'\n') {
             continue;
         }
         if padded || !(base64_alphabet(byte) || byte == b'=') {
@@ -866,19 +914,30 @@ mod planner_performance_tests {
             (b"Zg==Zm9v".as_slice(), (4, false)),
             (b"Zm9v$ignored".as_slice(), (4, false)),
             (b"Zm9vZg".as_slice(), (4, false)),
+            (b"Zm9v\x0bYmFy".as_slice(), (4, false)),
+            (b"Zm9v\x0cYmFy".as_slice(), (4, false)),
+            (b"Zm9vYm\x0cFy".as_slice(), (4, false)),
+            (b"Zm9v\x0c".as_slice(), (4, false)),
         ] {
             assert_eq!(scan_base64(wire), expected, "{wire:?}");
         }
     }
 
     #[test]
-    fn empty_scalar_mime_parameters_preserve_bounded_continuation_allocation() {
+    fn ordinary_mime_parameters_preserve_bounded_continuation_allocation() {
         for fragments in [128, 512, 2048] {
             let mut field = format!("text/plain; x*0={}", "a".repeat(32 * 1024));
             for index in 1..fragments {
                 field.push_str(&format!("; x*{index}=b"));
             }
-            for tail in ["; charset=utf-8", "; unused=\"\"; charset=utf-8"] {
+            for tail in [
+                "; charset=utf-8",
+                "; unused=\"\"; charset=utf-8",
+                "; unused=; charset=utf-8",
+                "; unused=\"two words\"; charset=utf-8",
+                "; unused=\"(parentheses)\"; charset=utf-8",
+                "; charset=utf-8;;",
+            ] {
                 let selected = Selected {
                     part: Part(NonZeroU32::MIN.into()),
                     media_type: "text/plain".into(),
@@ -901,9 +960,113 @@ mod planner_performance_tests {
                 );
                 assert!(
                     measured.bytes_total < 64 * 1024 + raw.len() as u64 * 4,
-                    "an empty scalar must not force unused continuation materialization: {measured:?}"
+                    "ordinary scalars and empty separators must not force unused continuation materialization: {measured:?}"
                 );
             }
+        }
+    }
+
+    fn mime_identity_selection(charset: &str) -> Selected {
+        Selected {
+            part: Part(NonZeroU32::MIN.into()),
+            media_type: "text/plain".into(),
+            charset: charset.into(),
+            transfer_encoding: "7bit".into(),
+            wire_size: 5,
+        }
+    }
+
+    #[test]
+    fn mime_identity_parser_work_is_shared_by_type_and_disposition() {
+        let raw = b"Content-Type: text/plain; charset=utf-8\r\nContent-Disposition: inline\r\n\r\n";
+        let selected = mime_identity_selection("utf-8");
+        // The projected type has 27 bytes and the disposition has eight.
+        // Each fits either budget separately; together their admission is 560.
+        for (maximum, expected) in [(560, Ok(None)), (559, Err(Error::Limit))] {
+            let limits = Limits {
+                max_decode_steps: maximum,
+                ..Limits::default()
+            };
+            assert_eq!(validate_headers(raw, Some(&selected), &limits), expected);
+        }
+    }
+
+    #[test]
+    fn mime_identity_parser_work_preserves_permissive_values() {
+        let selected = mime_identity_selection("utf-8");
+        let limits = Limits {
+            max_decode_steps: 32 * 1024,
+            ..Limits::default()
+        };
+        for raw in [
+            "Content-Type: text/plain (comment); charset=utf-8\r\nContent-Disposition: inline (comment)\r\n\r\n",
+            "Content-Type: text/plain; charset*0=utf-; charset*1=8\r\n\r\n",
+            "Content-Type: text/plain; unused*=utf-8'a'b'c'd; charset=utf-8\r\n\r\n",
+            "Content-Type: text/plain; charset=\"=?us-ascii?q?utf-8?=\"\r\n\r\n",
+            "Content-Type: text/plain; unused=\"=?AB?Q? =?AB?Q? a\"; charset=utf-8\r\n\r\n",
+        ] {
+            assert_eq!(
+                validate_headers(raw.as_bytes(), Some(&selected), &limits),
+                Ok(None),
+                "{raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mime_identity_parser_work_stops_costly_parameters_before_parsing() {
+        const FRAGMENTS: usize = 512;
+        let first_value = "a".repeat(32 * 1024);
+        let continuations = |name: &str| {
+            let mut field = format!("text/plain; {name}*0={first_value}");
+            for index in 1..FRAGMENTS {
+                field.push_str(&format!("; {name}*{index}=b"));
+            }
+            field
+        };
+        let retained_charset = first_value.clone() + &"b".repeat(FRAGMENTS - 1);
+        let limits = Limits::default();
+        for (raw, charset) in [
+            (
+                format!(
+                    "Content-Type: {}; unused=abc(comment); charset=utf-8\r\n\r\n",
+                    continuations("unused")
+                ),
+                "utf-8".to_owned(),
+            ),
+            (
+                format!("Content-Type: {}\r\n\r\n", continuations("charset")),
+                retained_charset,
+            ),
+            (
+                format!(
+                    "Content-Type: text/plain; {}*=utf-8'{}; charset=utf-8\r\n\r\n",
+                    "x".repeat(8 * 1024),
+                    "a'".repeat(1024)
+                ),
+                "utf-8".to_owned(),
+            ),
+            (
+                format!(
+                    "Content-Type: text/plain; unused=\"{}{}\"; charset=utf-8\r\n\r\n",
+                    "=?AB?Q? ".repeat(1024),
+                    first_value
+                ),
+                "utf-8".to_owned(),
+            ),
+        ] {
+            assert!(raw.len() < limits.max_header_bytes);
+            let selected = mime_identity_selection(&charset);
+            let measured = allocation_counter::measure(|| {
+                assert_eq!(
+                    validate_headers(raw.as_bytes(), Some(&selected), &limits),
+                    Err(Error::Limit)
+                );
+            });
+            assert!(
+                measured.bytes_total < 64 * 1024 + raw.len() as u64 * 4,
+                "costly MIME identity normalization must stop before continuation or language materialization: {measured:?}"
+            );
         }
     }
 
@@ -1268,7 +1431,6 @@ mod planner_performance_tests {
     #[test]
     fn uncertain_encoded_mime_parameters_keep_the_entire_pinned_parser_input() {
         for value in [
-            "text/plain; unused=; charset=utf-8\r\n",
             "text/plain; x*=\"\"; charset=utf-8\r\n",
             "text/plain; x*0=\"\"; charset=utf-8\r\n",
             "text/plain; x*0*=\"\"; charset=utf-8\r\n",
@@ -1281,6 +1443,10 @@ mod planner_performance_tests {
             "text/plain; x*0*=utf-8'en'%61; x*4294967296*=%62; charset=utf-8\r\n",
             "text/plain; x*0*=utf-8'en'%61; x*1*=%62(comment); charset=utf-8\r\n",
             "text/plain; x*0*=utf-8'en'%61; x*1*=\"%62\\\"quote\"; charset=utf-8\r\n",
+            "text/plain; unused=\"tab\tvalue\"; charset=utf-8\r\n",
+            "text/plain; unused=abc(comment); charset=utf-8\r\n",
+            "text/plain; unused=\"folded\r\n value\"; charset=utf-8\r\n",
+            "text/plain; unused=\"=?utf-8?Q?a?=\"; charset=utf-8\r\n",
         ] {
             assert!(
                 matches!(
@@ -1295,6 +1461,16 @@ mod planner_performance_tests {
     #[test]
     fn mime_identity_projection_matches_the_full_pinned_parser() {
         let values = [
+            "text/plain;; unused=; charset=utf-8;",
+            "text/plain; unused=\"two words\"; x*0=first; x*1=last; charset=utf-8",
+            "text/plain; x*0=first; unused=\"(parentheses)\"; x*1=last; charset=utf-8",
+            "text/plain; charset*0=utf; unused=; charset*1=-8",
+            "text/plain; charset*0*=utf-8'en'utf; unused=\"two words\"; charset*1*=%2D8",
+            "text/plain; charset=us-ascii; charset=; unused=\"two words\"",
+            "text/plain; charset=\"two words\"; unused=\"name=a:b/c,d@e[]?<>*'\"",
+            "text/plain; charset-language=\"two words\"; unused=; charset*=utf-8'en'utf-8",
+            "inline; unused=\"two words\"; filename*0=first; filename*1=last;;",
+            "attachment; unused=; filename*0*=utf-8'en'%61; filename*1*=%62;",
             "text/plain; unused=\"\"; charset=utf-8",
             "text/plain; unused=\"\"; x*0=first; x*1=last; charset=utf-8",
             "text/plain; x*0=first; unused=\"\"; x*1=last; charset=utf-8",
@@ -1462,6 +1638,11 @@ mod planner_performance_tests {
             }
         }
         let bases: &[&[u8]] = &[
+            b"text/plain;; unused=; x*0=first; x*1=last; charset=utf-8;",
+            b"text/plain; x*0=first; unused=\"two words\"; x*1=last; charset=utf-8",
+            b"text/plain; charset*0=utf; unused=\"(parentheses)\"; charset*1=-8",
+            b"text/plain; charset=\"two words\"; unused=\"name=a:b/c,d@e[]?<>*'\"",
+            b"inline; filename*0=first; unused=; filename*1=last;;",
             b"text/plain; x*0=first; x*1=last; charset=utf-8",
             b"text/plain; x*0=first; unused=\"\"; x*1=last; charset=utf-8",
             b"text/plain; x*0=first; x*1=last; charset=\"us-ascii\"",
@@ -1474,6 +1655,10 @@ mod planner_performance_tests {
             b"inline; filename*2*=%AC; filename*0*=utf-8'en'%E2; filename*1*=%82; charset=utf-8",
         ];
         let additions: &[&[u8]] = &[
+            b"; unused=",
+            b"; unused=\"two words\"",
+            b"; unused=\"(parentheses)\"",
+            b";;",
             b"; unused=\"\"",
             b"\r\n ",
             b"\r\n\t",

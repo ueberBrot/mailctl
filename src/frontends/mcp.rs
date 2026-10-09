@@ -1,6 +1,6 @@
 //! MCP tools share normalized envelopes with the CLI.
 use super::application::Application;
-use super::mcp_transport::{BoundedStdio, Bounds};
+use super::mcp_transport::{BoundedStdio, Bounds, RequestCancellation};
 use crate::domain::{
     AccountDiscovery, Capabilities, Envelope, Error, ErrorCode, GetMessageInput, ListAccountsInput,
     ListMailboxesInput, MailboxDiscovery, MessageBody, MessageSearch, Operation, OperationResult,
@@ -20,6 +20,13 @@ struct EmailTools {
     application: Application,
     envelope_limit: usize,
     shutdown: CancellationToken,
+}
+
+fn request_cancellation(context: &RequestContext<RoleServer>) -> &CancellationToken {
+    context
+        .extensions
+        .get::<RequestCancellation>()
+        .map_or(&context.ct, RequestCancellation::token)
 }
 
 fn tool<I: schemars::JsonSchema + 'static, O: schemars::JsonSchema + 'static>(
@@ -150,7 +157,10 @@ impl ServerHandler for EmailTools {
         if request.is_some_and(|request| request.cursor.is_some()) {
             return Err(McpError::invalid_params("Invalid cursor", None));
         }
-        if context.ct.is_cancelled() || self.shutdown.is_cancelled() {
+        if context.ct.is_cancelled()
+            || request_cancellation(&context).is_cancelled()
+            || self.shutdown.is_cancelled()
+        {
             return Err(McpError::internal_error("Request cancelled", None));
         }
         Ok(ListToolsResult {
@@ -166,7 +176,10 @@ impl ServerHandler for EmailTools {
         if request.is_some_and(|request| request.cursor.is_some()) {
             return Err(McpError::invalid_params("Invalid cursor", None));
         }
-        if context.ct.is_cancelled() || self.shutdown.is_cancelled() {
+        if context.ct.is_cancelled()
+            || request_cancellation(&context).is_cancelled()
+            || self.shutdown.is_cancelled()
+        {
             return Err(McpError::internal_error("Request cancelled", None));
         }
         Ok(ListResourcesResult {
@@ -179,7 +192,10 @@ impl ServerHandler for EmailTools {
         request: ReadResourceRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, McpError> {
-        if context.ct.is_cancelled() || self.shutdown.is_cancelled() {
+        if context.ct.is_cancelled()
+            || request_cancellation(&context).is_cancelled()
+            || self.shutdown.is_cancelled()
+        {
             return Err(McpError::internal_error("Request cancelled", None));
         }
         let text = request
@@ -226,6 +242,7 @@ impl ServerHandler for EmailTools {
                 tokio::select! {
                     biased;
                     _ = context.ct.cancelled() => None,
+                    _ = request_cancellation(&context).cancelled() => None,
                     _ = self.shutdown.cancelled() => None,
                     result = self.application.execute(operation).instrument(diagnostic_request.span()) => Some(result),
                 }
@@ -540,6 +557,31 @@ accounts = ["work"]
             excessive_allocation.is_empty(),
             "MCP results must not repeatedly grow their known-size text buffer: {excessive_allocation:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn transport_cancellation_stops_email_work_without_cancelling_the_sdk_request() {
+        let (handler, request) = message_handler("synthetic body".into()).await;
+        let (client_io, server_io) = tokio::io::duplex(8192);
+        let (client, server) = tokio::join!(().serve(client_io), handler.serve(server_io));
+        let client = client.unwrap();
+        let server = server.unwrap();
+        let mut context = RequestContext::new(RequestId::Number(1), server.peer().clone());
+        let cancellation = RequestCancellation::new();
+        cancellation.token().cancel();
+        assert!(!context.ct.is_cancelled());
+        context.extensions.insert(cancellation);
+        let CallToolResponse::Complete(response) =
+            server.service().call_tool(request, context).await.unwrap()
+        else {
+            panic!("complete cancellation response");
+        };
+        assert_eq!(
+            response.structured_content.unwrap()["error"]["code"],
+            "cancelled",
+        );
+        client.cancel().await.unwrap();
+        server.cancel().await.unwrap();
     }
 
     #[tokio::test]

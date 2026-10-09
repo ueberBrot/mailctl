@@ -332,6 +332,40 @@ async fn decoder_and_work_budgets_stop_after_the_selected_literal() {
 }
 
 #[tokio::test]
+async fn costly_mime_header_recovery_stops_before_fetching_the_body() {
+    let mut headers = format!("Content-Type: text/plain; x*0={}", "a".repeat(4096));
+    for index in 1..512 {
+        headers.push_str(&format!("; x*{index}=b"));
+    }
+    headers.push_str("; unused=abc(comment); charset=utf-8\r\n\r\n");
+    assert!(headers.len() < 16 * 1024);
+    let mut fixture = fixture(TlsMode::Implicit, Limits::default(), move |mut wire| {
+        Box::pin(async move {
+            authenticate(&mut wire).await;
+            examine(&mut wire).await;
+            metadata(&mut wire, &text_part("PLAIN", 5, "NIL"), headers.len() + 5).await;
+            literal_bytes(&mut wire, "HEADER", 0, 16 * 1024, headers.as_bytes()).await;
+            dropped(&mut wire).await;
+        })
+    })
+    .await;
+    assert_eq!(
+        fixture
+            .probe
+            .read_body(
+                "fixture",
+                "disposable-password",
+                "INBOX",
+                BodyRequest::new(4, 77),
+            )
+            .await
+            .unwrap_err(),
+        Error::Limit
+    );
+    fixture.task.await.unwrap();
+}
+
+#[tokio::test]
 async fn malformed_transfer_tails_keep_the_decoded_prefix_and_mark_replacement() {
     for (transfer_encoding, wire, expected) in [
         ("BASE64", b"SGVsbG8".as_slice(), "\u{fffd}Hello"),
@@ -340,6 +374,10 @@ async fn malformed_transfer_tails_keep_the_decoded_prefix_and_mark_replacement()
         ("BASE64", b"SGVsbG8=!".as_slice(), "\u{fffd}Hello"),
         ("BASE64", b"Zh==".as_slice(), "\u{fffd}f"),
         ("BASE64", b"Zm9=".as_slice(), "\u{fffd}fo"),
+        ("BASE64", b"Zm9v\x0bYmFy".as_slice(), "\u{fffd}foo"),
+        ("BASE64", b"Zm9v\x0cYmFy".as_slice(), "\u{fffd}foo"),
+        ("BASE64", b"Zm9vYm\x0cFy".as_slice(), "\u{fffd}foo"),
+        ("BASE64", b"Zm9v\x0c".as_slice(), "\u{fffd}foo"),
         ("QUOTED-PRINTABLE", b"hello=".as_slice(), "\u{fffd}hello"),
         ("QUOTED-PRINTABLE", b"hello=A".as_slice(), "\u{fffd}hello"),
         ("QUOTED-PRINTABLE", b"hello=QZ".as_slice(), "\u{fffd}hello"),

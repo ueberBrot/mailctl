@@ -6,7 +6,7 @@ use crate::{
 use futures_util::StreamExt;
 use rmcp::{
     RoleServer,
-    model::{ClientRequest, GetExtensions, JsonRpcMessage},
+    model::{ClientNotification, ClientRequest, GetExtensions, JsonRpcMessage},
     service::{RxJsonRpcMessage, TxJsonRpcMessage},
     transport::{Transport, async_rw::AsyncRwTransport},
 };
@@ -23,9 +23,26 @@ use tokio::{
     time::{Instant, timeout, timeout_at},
 };
 use tokio_util::codec::{FramedRead, LinesCodec};
+use tokio_util::sync::CancellationToken;
 
-type SdkStdio = AsyncRwTransport<RoleServer, tokio::io::DuplexStream, tokio::io::Stdout>;
-type Pending = Arc<Mutex<HashMap<rmcp::model::RequestId, OwnedSemaphorePermit>>>;
+type Pending = Arc<Mutex<HashMap<rmcp::model::RequestId, PendingRequest>>>;
+
+struct PendingRequest {
+    _permit: OwnedSemaphorePermit,
+    cancellation: RequestCancellation,
+}
+
+#[derive(Clone)]
+pub(super) struct RequestCancellation(CancellationToken);
+impl RequestCancellation {
+    pub(super) fn new() -> Self {
+        Self(CancellationToken::new())
+    }
+
+    pub(super) fn token(&self) -> &CancellationToken {
+        &self.0
+    }
+}
 
 /// A fixed reservation for decoding/control traffic stays available even when all
 /// request reservations are occupied. These are ceilings, not eagerly allocated buffers.
@@ -148,8 +165,8 @@ fn largest_fitting(mut lower: usize, mut upper: usize, fits: impl Fn(usize) -> b
     lower
 }
 
-pub(super) struct BoundedStdio {
-    sdk: SdkStdio,
+pub(super) struct BoundedStdio<W: AsyncWrite = tokio::io::Stdout> {
+    sdk: AsyncRwTransport<RoleServer, tokio::io::DuplexStream, W>,
     ingress: JoinHandle<()>,
     slots: Arc<Semaphore>,
     pending: Pending,
@@ -191,14 +208,25 @@ async fn forward_bounded_input(
 }
 
 impl BoundedStdio {
-    pub(super) fn new(bounds: Bounds, shutdown: tokio_util::sync::CancellationToken) -> Self {
+    pub(super) fn new(bounds: Bounds, shutdown: CancellationToken) -> Self {
+        Self::with_io(bounds, shutdown, tokio::io::stdin(), tokio::io::stdout())
+    }
+}
+
+impl<W: AsyncWrite + Unpin + Send + 'static> BoundedStdio<W> {
+    fn with_io(
+        bounds: Bounds,
+        shutdown: CancellationToken,
+        input: impl AsyncRead + Unpin + Send + 'static,
+        output: W,
+    ) -> Self {
         let (reader, mut writer) = tokio::io::duplex(8192);
         // Validate complete, bounded lines before the SDK can buffer or parse them.
         let ingress = tokio::spawn(async move {
             // The SDK may drain requests after EOF; cancel active work as soon as input closes.
             let _cancel_on_exit = shutdown.drop_guard();
             let _ = forward_bounded_input(
-                tokio::io::stdin(),
+                input,
                 &mut writer,
                 bounds.input,
                 bounds.nesting,
@@ -207,7 +235,7 @@ impl BoundedStdio {
             .await;
         });
         Self {
-            sdk: AsyncRwTransport::new_server(reader, tokio::io::stdout()),
+            sdk: AsyncRwTransport::new_server(reader, output),
             ingress,
             slots: Arc::new(Semaphore::new(bounds.requests)),
             pending: Default::default(),
@@ -221,12 +249,12 @@ impl BoundedStdio {
     }
 }
 
-impl Drop for BoundedStdio {
+impl<W: AsyncWrite> Drop for BoundedStdio<W> {
     fn drop(&mut self) {
         self.ingress.abort();
     }
 }
-impl Transport<RoleServer> for BoundedStdio {
+impl<W: AsyncWrite + Unpin + Send + 'static> Transport<RoleServer> for BoundedStdio<W> {
     type Error = io::Error;
     fn send(
         &mut self,
@@ -237,17 +265,34 @@ impl Transport<RoleServer> for BoundedStdio {
             JsonRpcMessage::Error(value) => value.id.clone(),
             _ => None,
         };
-        let valid = crate::encoding::serialized_size(&item, self.output_limit).is_ok();
+        let cancelled = id.as_ref().is_some_and(|id| {
+            self.pending.lock().is_ok_and(|pending| {
+                pending
+                    .get(id)
+                    .is_some_and(|request| request.cancellation.0.is_cancelled())
+            })
+        });
+        let valid = cancelled || crate::encoding::serialized_size(&item, self.output_limit).is_ok();
         let pending = self.pending.clone();
-        let send = self.sdk.send(item);
+        let send = if cancelled {
+            // Release the reservation only after the handler's retained output
+            // has been dropped, preserving cancellation's no-response behavior.
+            drop(item);
+            None
+        } else {
+            Some(self.sdk.send(item))
+        };
         let deadline = self.deadline;
         async move {
             if !valid {
                 return Err(io::ErrorKind::InvalidData.into());
             }
-            let result = timeout(deadline, send)
-                .await
-                .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?;
+            let result = match send {
+                Some(send) => timeout(deadline, send)
+                    .await
+                    .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?,
+                None => Ok(()),
+            };
             if let Some(id) = id {
                 pending
                     .lock()
@@ -258,55 +303,83 @@ impl Transport<RoleServer> for BoundedStdio {
         }
     }
     async fn receive(&mut self) -> Option<RxJsonRpcMessage<RoleServer>> {
-        // This parsing uses the permanent control reservation. Transfer ownership
-        // to a request reservation before returning to the SDK's task scheduler.
-        // Notifications retain it in SDK extensions through their handler's return,
-        // so a flood cannot accumulate detached notification tasks. This permit is
-        // independent of request saturation; acquire it before consuming any input.
-        if self.staged.is_none() {
-            let control = self.control.clone().acquire_owned().await.ok()?;
-            // SDK receive is cancellation-safe; keep the same deadline when the SDK
-            // service loop interrupts it to send a response.
-            let item = timeout_at(self.receive_expires, self.sdk.receive())
-                .await
-                .ok()??;
-            self.receive_expires = Instant::now() + self.deadline;
-            self.staged = Some((item, control));
-        }
-        let (item, _) = self.staged.as_ref()?;
-        if let JsonRpcMessage::Request(request) = item {
-            if self.initializing {
-                match &request.request {
-                    ClientRequest::InitializeRequest(_) => self.initializing = false,
-                    ClientRequest::PingRequest(_) => {}
-                    // Newer SDKs also support initialization through per-request
-                    // metadata; this server pins the 2025 initialize lifecycle.
-                    _ => return None,
+        loop {
+            // This parsing uses the permanent control reservation. Transfer ownership
+            // to a request reservation before returning to the SDK's task scheduler.
+            // Notifications retain it in SDK extensions through their handler's return,
+            // so a flood cannot accumulate detached notification tasks. This permit is
+            // independent of request saturation; acquire it before consuming any input.
+            if self.staged.is_none() {
+                let control = self.control.clone().acquire_owned().await.ok()?;
+                // SDK receive is cancellation-safe; keep the same deadline when the SDK
+                // service loop interrupts it to send a response.
+                let item = timeout_at(self.receive_expires, self.sdk.receive())
+                    .await
+                    .ok()??;
+                self.receive_expires = Instant::now() + self.deadline;
+                self.staged = Some((item, control));
+            }
+            let (item, _) = self.staged.as_mut()?;
+            if let JsonRpcMessage::Notification(notification) = item
+                && let ClientNotification::CancelledNotification(notification) =
+                    &notification.notification
+                && let Some(request) = notification.params.request_id.as_ref().and_then(|id| {
+                    self.pending
+                        .lock()
+                        .ok()?
+                        .get(id)
+                        .map(|request| request.cancellation.clone())
+                })
+            {
+                // The SDK drops canceled handler responses before calling send.
+                // Keep its response path intact and cancel through the extension,
+                // so admission remains occupied through handler and output cleanup.
+                request.0.cancel();
+                self.staged.take();
+                continue;
+            }
+            if let JsonRpcMessage::Request(request) = item {
+                if self.initializing {
+                    match &request.request {
+                        ClientRequest::InitializeRequest(_) => self.initializing = false,
+                        ClientRequest::PingRequest(_) => {}
+                        // Newer SDKs also support initialization through per-request
+                        // metadata; this server pins the 2025 initialize lifecycle.
+                        _ => return None,
+                    }
+                }
+                // A peer can receive a response before its send future releases the
+                // request reservation. Keep this one decoded request in the control
+                // reservation while waiting; SDK select cancellation must not lose it.
+                let permit = timeout_at(self.receive_expires, self.slots.clone().acquire_owned())
+                    .await
+                    .ok()?
+                    .ok()?;
+                let mut pending = self.pending.lock().ok()?;
+                match pending.entry(request.id.clone()) {
+                    Entry::Vacant(entry) => {
+                        let cancellation = RequestCancellation::new();
+                        request
+                            .request
+                            .extensions_mut()
+                            .insert(cancellation.clone());
+                        entry.insert(PendingRequest {
+                            _permit: permit,
+                            cancellation,
+                        });
+                    }
+                    Entry::Occupied(_) => return None,
                 }
             }
-            // A peer can receive a response before its send future releases the
-            // request reservation. Keep this one decoded request in the control
-            // reservation while waiting; SDK select cancellation must not lose it.
-            let permit = timeout_at(self.receive_expires, self.slots.clone().acquire_owned())
-                .await
-                .ok()?
-                .ok()?;
-            let mut pending = self.pending.lock().ok()?;
-            match pending.entry(request.id.clone()) {
-                Entry::Vacant(entry) => {
-                    entry.insert(permit);
-                }
-                Entry::Occupied(_) => return None,
+            let (mut item, control) = self.staged.take()?;
+            if let JsonRpcMessage::Notification(notification) = &mut item {
+                notification
+                    .notification
+                    .extensions_mut()
+                    .insert(Arc::new(control));
             }
+            return Some(item);
         }
-        let (mut item, control) = self.staged.take()?;
-        if let JsonRpcMessage::Notification(notification) = &mut item {
-            notification
-                .notification
-                .extensions_mut()
-                .insert(Arc::new(control));
-        }
-        Some(item)
     }
     async fn close(&mut self) -> io::Result<()> {
         self.ingress.abort();
@@ -318,7 +391,147 @@ impl Transport<RoleServer> for BoundedStdio {
 mod tests {
     use super::*;
     use crate::{fuzz_support, mcp_corpus::MCP};
+    use rmcp::{
+        ServerHandler, ServiceExt,
+        model::{
+            CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
+            ProtocolVersion, RequestId, ServerCapabilities, ServerConfig,
+        },
+        service::RequestContext,
+    };
     use serde_json::json;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    struct GatedRequests {
+        entered: tokio::sync::mpsc::UnboundedSender<RequestId>,
+        cancelled: tokio::sync::mpsc::UnboundedSender<RequestId>,
+        cleanup: Arc<Semaphore>,
+    }
+
+    impl ServerHandler for GatedRequests {
+        fn get_info(&self) -> ServerConfig {
+            ServerConfig::new(ServerCapabilities::default())
+                .with_protocol_version(ProtocolVersion::V_2025_11_25)
+        }
+
+        async fn call_tool(
+            &self,
+            _: CallToolRequestParams,
+            context: RequestContext<RoleServer>,
+        ) -> Result<CallToolResponse, ErrorData> {
+            self.entered.send(context.id.clone()).unwrap();
+            let cancellation = context
+                .extensions
+                .get::<RequestCancellation>()
+                .map_or(&context.ct, RequestCancellation::token);
+            tokio::select! {
+                _ = cancellation.cancelled() => {},
+                _ = context.ct.cancelled() => {},
+            }
+            self.cancelled.send(context.id).unwrap();
+            // Cancellation has reached the handler, but cleanup still owns its
+            // admitted memory. The next request must wait for this gate.
+            self.cleanup.acquire().await.unwrap().forget();
+            Ok(CallToolResult::success(vec![ContentBlock::text("canceled output")]).into())
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_cancellation_retains_admission_until_cleanup_and_keeps_stdio_usable() {
+        let (client_io, server_io) = tokio::io::duplex(8192);
+        let (input, output) = tokio::io::split(server_io);
+        let transport = BoundedStdio::with_io(
+            Bounds {
+                input: 4096,
+                envelope: 1024,
+                output: 32 * 1024,
+                requests: 1,
+                nesting: 32,
+                deadline: Duration::from_secs(2),
+            },
+            CancellationToken::new(),
+            input,
+            output,
+        );
+        let slots = transport.slots.clone();
+        let pending = transport.pending.clone();
+        let (entered, mut entries) = tokio::sync::mpsc::unbounded_channel();
+        let (cancelled, mut cancellations) = tokio::sync::mpsc::unbounded_channel();
+        let cleanup = Arc::new(Semaphore::new(0));
+        let handler = GatedRequests {
+            entered,
+            cancelled,
+            cleanup: cleanup.clone(),
+        };
+        let serving = tokio::spawn(async move { handler.serve(transport).await.unwrap() });
+        let (reader, mut writer) = tokio::io::split(client_io);
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+        writer.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"cancellation-test\",\"version\":\"1\"}}}\n").await.unwrap();
+        timeout(Duration::from_secs(2), reader.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&line).unwrap()["id"],
+            0
+        );
+        writer
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+            .await
+            .unwrap();
+        let server = timeout(Duration::from_secs(2), serving)
+            .await
+            .unwrap()
+            .unwrap();
+
+        for id in 1..=3 {
+            let request = format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"tools/call\",\"params\":{{\"name\":\"gated\"}}}}\n"
+            );
+            writer.write_all(request.as_bytes()).await.unwrap();
+            assert_eq!(
+                timeout(Duration::from_secs(2), entries.recv())
+                    .await
+                    .unwrap(),
+                Some(RequestId::Number(id)),
+            );
+            let cancel = format!(
+                "{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{{\"requestId\":{id}}}}}\n"
+            );
+            writer.write_all(cancel.as_bytes()).await.unwrap();
+            assert_eq!(
+                timeout(Duration::from_secs(2), cancellations.recv())
+                    .await
+                    .unwrap(),
+                Some(RequestId::Number(id)),
+            );
+            assert_eq!(slots.available_permits(), 0);
+            assert!(pending.lock().unwrap().contains_key(&RequestId::Number(id)));
+            let ping_id = 100 + id;
+            let ping = format!("{{\"jsonrpc\":\"2.0\",\"id\":{ping_id},\"method\":\"ping\"}}\n");
+            writer.write_all(ping.as_bytes()).await.unwrap();
+            line.clear();
+            assert!(
+                timeout(Duration::from_millis(20), reader.read_line(&mut line))
+                    .await
+                    .is_err(),
+                "canceled work retains its reservation through cleanup",
+            );
+            cleanup.add_permits(1);
+            timeout(Duration::from_secs(2), reader.read_line(&mut line))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&line).unwrap()["id"],
+                ping_id,
+                "the canceled request produces no wire response and the next request succeeds",
+            );
+            assert!(!pending.lock().unwrap().contains_key(&RequestId::Number(id)));
+        }
+        server.cancel().await.unwrap();
+    }
 
     fn decoding_case(
         runtime: &tokio::runtime::Runtime,
