@@ -559,10 +559,17 @@ fn schema_is_current(connection: &Connection) -> Result<bool, DraftJournalError>
         let Some(column) = columns.next().map_err(unavailable)? else {
             return Ok(false);
         };
-        if column.get::<_, String>(1).map_err(unavailable)? != name
+        if column
+            .get_ref(1)
+            .map_err(unavailable)?
+            .as_str()
+            .map_err(|_| DraftJournalError::InvalidDatabase)?
+            != name
             || !column
-                .get::<_, String>(2)
+                .get_ref(2)
                 .map_err(unavailable)?
+                .as_str()
+                .map_err(|_| DraftJournalError::InvalidDatabase)?
                 .eq_ignore_ascii_case(ty)
             || column.get::<_, i64>(3).map_err(unavailable)? != not_null
             || column.get::<_, i64>(5).map_err(unavailable)? != primary_key

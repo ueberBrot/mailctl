@@ -225,8 +225,7 @@ impl super::AttachmentBackend for ImapBackend {
             validity,
             part,
             &crate::imap::Limits::attachment(limits),
-        )
-        .map_err(Error::from)?;
+        )?;
         Ok(Box::new(ImapAttachment {
             runtime: self.runtime.clone(),
             account: self.account.clone(),

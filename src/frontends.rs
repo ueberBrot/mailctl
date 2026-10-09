@@ -78,7 +78,7 @@ pub fn run_with_environment(
     let invocation = command
         .clone()
         .try_get_matches_from(arguments)
-        .and_then(|matches| Invocation::from_matches(executable, &matches));
+        .and_then(|matches| Invocation::from_matches(executable, matches));
     if let Err(error) = &invocation
         && matches!(
             error.kind(),

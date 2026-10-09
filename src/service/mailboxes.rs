@@ -163,25 +163,11 @@ impl Service {
         mailbox: &str,
     ) -> Result<MailboxTarget<'a>, Error> {
         let grant = self.grant(context)?;
-        let (account, id, generation) = self
-            .visible_accounts(context)
-            .find_map(|account| {
-                let (id, generation) = self.registry.identity(&account.key);
-                (id == account_id).then_some((account, id, generation))
-            })
-            .ok_or_else(|| Error::new(ErrorCode::AccountNotAllowed))?;
-        if generation != expected_generation {
+        let target = self.visible_account_target(context, account_id)?;
+        if target.generation != expected_generation {
             return Err(Error::new(ErrorCode::StaleReference));
         }
-        Self::authorize_mailbox_scope(
-            grant,
-            MailboxTarget {
-                config: account,
-                account_id: id,
-                generation,
-            },
-            mailbox,
-        )
+        Self::authorize_mailbox_scope(grant, target, mailbox)
     }
 
     pub(super) fn authorize_mailbox_scope<'a>(

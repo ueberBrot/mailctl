@@ -37,13 +37,12 @@ fn inline_single_use(schema: &mut Schema) {
             .iter()
             .filter_map(|(name, definition)| {
                 let reference = format!("#/$defs/{}", name.replace('~', "~0").replace('/', "~1"));
-                (references.get(&reference) == Some(&1))
-                    .then(|| {
-                        definition
-                            .as_object()
-                            .map(|value| (reference, (name.clone(), value.clone())))
-                    })
-                    .flatten()
+                if references.get(&reference) != Some(&1) {
+                    return None;
+                }
+                definition
+                    .as_object()
+                    .map(|value| (reference, (name.clone(), value.clone())))
             })
             .collect();
         let mut inlined = BTreeSet::new();

@@ -14,12 +14,12 @@ pub(super) fn output_options(
     command: &clap::Command,
 ) -> (bool, diagnostics::Options) {
     use clap::ValueEnum;
-    fn value_options(command: &clap::Command, names: &mut Vec<String>) {
+    fn value_options<'a>(command: &'a clap::Command, names: &mut Vec<&'a str>) {
         for argument in command.get_arguments() {
             if argument.get_action().takes_values()
                 && let Some(name) = argument.get_long()
             {
-                names.push(name.into());
+                names.push(name);
             }
         }
         for child in command.get_subcommands() {
@@ -45,7 +45,7 @@ pub(super) fn output_options(
             .split_once('=')
             .map_or((option, None), |(name, value)| (name, Some(value)));
         json |= name == "json" && attached.is_none();
-        if !values.iter().any(|value| value == name) {
+        if !values.contains(&name) {
             continue;
         }
         let value = attached.or_else(|| {
@@ -84,12 +84,8 @@ pub(super) fn output_options(
 
 pub(super) fn argument_error(error: &clap::Error, command: &clap::Command) -> crate::domain::Error {
     use clap::error::{ContextKind, ErrorKind};
-    fn known_flags(command: &clap::Command, flags: &mut Vec<String>) {
-        flags.extend(
-            command
-                .get_arguments()
-                .filter_map(|argument| argument.get_long().map(|name| format!("--{name}"))),
-        );
+    fn known_flags<'a>(command: &'a clap::Command, flags: &mut Vec<&'a str>) {
+        flags.extend(command.get_arguments().filter_map(clap::Arg::get_long));
         for child in command.get_subcommands() {
             known_flags(child, flags);
         }
@@ -102,7 +98,10 @@ pub(super) fn argument_error(error: &clap::Error, command: &clap::Command) -> cr
             value
                 .to_string()
                 .split(|character: char| character.is_whitespace() || character == ',')
-                .filter(|part| known.iter().any(|flag| flag == part))
+                .filter(|part| {
+                    part.strip_prefix("--")
+                        .is_some_and(|flag| known.contains(&flag))
+                })
                 .map(str::to_owned)
                 .collect::<Vec<_>>()
         });
@@ -636,12 +635,12 @@ impl Invocation {
     }
     pub fn from_matches(
         executable: Executable,
-        matches: &clap::ArgMatches,
+        mut matches: clap::ArgMatches,
     ) -> Result<Self, clap::Error> {
         match executable {
             #[cfg(feature = "cli")]
             Executable::Cli => {
-                let parsed = Mailctl::from_arg_matches(matches)?;
+                let parsed = Mailctl::from_arg_matches_mut(&mut matches)?;
                 let action = match parsed.command {
                     Email::Draft(Draft::Save { identity, input }) => {
                         Action::DraftSave { identity, input }
@@ -719,7 +718,7 @@ impl Invocation {
             }
             #[cfg(feature = "mcp")]
             Executable::Mcp => {
-                let parsed = Mcp::from_arg_matches(matches)?;
+                let parsed = Mcp::from_arg_matches_mut(&mut matches)?;
                 let action = parsed
                     .administration
                     .map(Action::from)

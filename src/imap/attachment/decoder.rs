@@ -59,12 +59,7 @@ impl Decoder {
         }
         // Output pages advance a prefix without shifting the remaining bytes.
         // Reclaim that prefix once when another bounded wire slice arrives.
-        if self.pending_offset != 0 {
-            let remaining = self.pending_len();
-            self.pending.copy_within(self.pending_offset.., 0);
-            self.pending.truncate(remaining);
-            self.pending_offset = 0;
-        }
+        self.compact_pending();
         match self.encoding {
             TransferEncoding::Identity => self.append(wire, limits),
             TransferEncoding::Base64 => {
@@ -129,12 +124,7 @@ impl Decoder {
         let bytes = if self.pending_len() <= max {
             // Compact only the final page and move its existing buffer, keeping
             // the complete-page allocation behavior of the original decoder.
-            if self.pending_offset != 0 {
-                let remaining = self.pending_len();
-                self.pending.copy_within(self.pending_offset.., 0);
-                self.pending.truncate(remaining);
-                self.pending_offset = 0;
-            }
+            self.compact_pending();
             std::mem::take(&mut self.pending)
         } else {
             let end = self.pending_offset + max;
@@ -150,6 +140,15 @@ impl Decoder {
 
     pub(super) fn pending_len(&self) -> usize {
         self.pending.len() - self.pending_offset
+    }
+
+    fn compact_pending(&mut self) {
+        if self.pending_offset != 0 {
+            let remaining = self.pending_len();
+            self.pending.copy_within(self.pending_offset.., 0);
+            self.pending.truncate(remaining);
+            self.pending_offset = 0;
+        }
     }
 
     pub(super) fn decoded_offset(&self) -> usize {

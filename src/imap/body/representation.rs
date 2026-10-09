@@ -39,16 +39,12 @@ pub(super) struct Rendered {
 pub(super) fn select(
     structure: &BodyStructure<'_>,
     limits: &Limits,
-    content_ids: &HashMap<Part, String>,
+    content_ids: &HashMap<Vec<NonZeroU32>, String>,
 ) -> Result<Option<Selected>, Error> {
     validate_structure(structure, limits)?;
     // The selected body owns metadata; excluded candidates need only borrowed
     // fields while validation and selection traverse the complete structure.
-    let content_ids = content_ids
-        .iter()
-        .map(|(part, id)| (part.0.as_ref(), id.as_str()))
-        .collect();
-    select_part(structure, &mut Vec::new(), &content_ids).map(|candidate| {
+    select_part(structure, &mut Vec::new(), content_ids).map(|candidate| {
         candidate.map(|mut candidate| {
             candidate.path.reverse();
             if candidate.path.is_empty() {
@@ -402,7 +398,7 @@ struct Candidate<'a> {
 fn select_part<'a>(
     structure: &'a BodyStructure<'_>,
     path: &mut Vec<NonZeroU32>,
-    content_ids: &HashMap<&[NonZeroU32], &str>,
+    content_ids: &HashMap<Vec<NonZeroU32>, String>,
 ) -> Result<Option<Candidate<'a>>, Error> {
     match structure {
         BodyStructure::Single {

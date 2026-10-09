@@ -26,11 +26,12 @@ impl MailboxScope {
     }
 
     pub fn allows(&self, mailbox: &str) -> bool {
+        let identity = crate::domain::mailbox_identity(mailbox);
         match self {
             Self::All => true,
-            Self::Only(names) => names.iter().any(|name| {
-                crate::domain::mailbox_identity(name) == crate::domain::mailbox_identity(mailbox)
-            }),
+            Self::Only(names) => names
+                .iter()
+                .any(|name| crate::domain::mailbox_identity(name) == identity),
         }
     }
 

@@ -309,11 +309,11 @@ impl Gate {
         Ok(Admission { gate: self, ticket })
     }
     async fn admit(self: Arc<Self>, active: usize, pending: usize) -> Result<Admission, Error> {
-        Ok(self.reserve(active, pending)?.wait(active).await)
+        Ok(self.reserve(active, pending)?.wait().await)
     }
 }
 impl Admission {
-    async fn wait(mut self, active: usize) -> Self {
+    async fn wait(mut self) -> Self {
         let Some((ticket, notification)) = self
             .ticket
             .as_ref()
@@ -321,19 +321,15 @@ impl Admission {
         else {
             return self;
         };
-        let gate = self.gate.clone();
         loop {
             let changed = notification.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
             {
-                let mut state = gate.state.lock().unwrap();
-                if state
-                    .waiting
-                    .front()
-                    .is_some_and(|entry| entry.ticket == ticket)
-                    && state.active < active
-                {
+                let mut state = self.gate.state.lock().unwrap();
+                if state.waiting.front().is_some_and(|entry| {
+                    entry.ticket == ticket && state.active < entry.active_limit
+                }) {
                     state.waiting.pop_front();
                     state.active += 1;
                     self.ticket = None;
@@ -698,13 +694,12 @@ impl Runtime {
                 });
                 flights.insert(key, Arc::downgrade(&flight));
                 let deadline = Duration::from_secs(limits.operation_seconds as u64);
-                let active = limits.credential_workers;
                 let running = flight.clone();
                 tokio::spawn(
                     async move {
                         let admission = tokio::select! {
                             _ = running.cancelled() => return,
-                            result = tokio::time::timeout(deadline, admission.wait(active)) => result,
+                            result = tokio::time::timeout(deadline, admission.wait()) => result,
                         };
                         let admission = match admission {
                             Ok(admission) => admission,
@@ -721,7 +716,9 @@ impl Runtime {
                             span.in_scope(|| {
                                 let _worker = admission;
                                 match kind {
-                                    WorkKind::Inspect => Ok(Work::Availability(source.availability(id))),
+                                    WorkKind::Inspect => {
+                                        Ok(Work::Availability(source.availability(id)))
+                                    }
                                     WorkKind::Resolve(resolution_limits) => source
                                         .resolve_with_limits(id, &resolution_limits)
                                         .map(|secret| Work::Secret(Arc::new(secret)))
@@ -784,7 +781,7 @@ mod tests {
         let waker = Waker::from(wakes.clone());
         let mut context = Context::from_waker(&waker);
         let mut queued = (0..32)
-            .map(|_| Box::pin(gate.clone().reserve(1, 32).unwrap().wait(1)))
+            .map(|_| Box::pin(gate.clone().reserve(1, 32).unwrap().wait()))
             .collect::<Vec<_>>();
         for request in &mut queued {
             assert!(request.as_mut().poll(&mut context).is_pending());
@@ -805,8 +802,8 @@ mod tests {
         let wakes = Arc::new(WakeCount::default());
         let waker = Waker::from(wakes.clone());
         let mut context = Context::from_waker(&waker);
-        let mut blocked = Box::pin(gate.clone().reserve(1, 2).unwrap().wait(1));
-        let mut eligible = Box::pin(gate.reserve(2, 2).unwrap().wait(2));
+        let mut blocked = Box::pin(gate.clone().reserve(1, 2).unwrap().wait());
+        let mut eligible = Box::pin(gate.reserve(2, 2).unwrap().wait());
         assert!(blocked.as_mut().poll(&mut context).is_pending());
         assert!(eligible.as_mut().poll(&mut context).is_pending());
         assert_eq!(wakes.0.load(Ordering::SeqCst), 0);

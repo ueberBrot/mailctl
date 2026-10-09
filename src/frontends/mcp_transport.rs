@@ -59,42 +59,25 @@ impl Bounds {
         // Keep room for useful discovery responses before maximizing input.
         // Maximizing draft input against a 1 KiB envelope otherwise consumes
         // the budget and rejects ordinary capabilities on a default grant.
-        let mut reserved_envelope = 1024;
-        let mut upper = response_bound.min(limits.envelope_bytes).min(64 * 1024);
-        while reserved_envelope < upper {
-            let candidate = reserved_envelope + (upper - reserved_envelope).div_ceil(2);
-            if fits(1024, candidate) {
-                reserved_envelope = candidate;
-            } else {
-                upper = candidate - 1;
-            }
-        }
+        let reserved_envelope = largest_fitting(
+            1024,
+            response_bound.min(limits.envelope_bytes).min(64 * 1024),
+            |candidate| fits(1024, candidate),
+        );
         // Draft bodies and search predicates can expand sixfold in JSON.
         // Reserve bounded input and composition storage before sizing responses.
-        let mut input = 1024;
-        let mut upper = limits.envelope_bytes.min(if drafts {
-            6 * limits.draft_mime_bytes + 256 * 1024
-        } else {
-            1024 * 1024
+        let input = largest_fitting(
+            1024,
+            limits.envelope_bytes.min(if drafts {
+                6 * limits.draft_mime_bytes + 256 * 1024
+            } else {
+                1024 * 1024
+            }),
+            |candidate| fits(candidate, reserved_envelope),
+        );
+        let envelope = largest_fitting(0, response_bound.min(limits.envelope_bytes), |candidate| {
+            fits(input, candidate)
         });
-        while input < upper {
-            let candidate = input + (upper - input).div_ceil(2);
-            if fits(candidate, reserved_envelope) {
-                input = candidate;
-            } else {
-                upper = candidate - 1;
-            }
-        }
-        let mut envelope = 0;
-        let mut upper = response_bound.min(limits.envelope_bytes);
-        while envelope < upper {
-            let candidate = envelope + (upper - envelope).div_ceil(2);
-            if fits(input, candidate) {
-                envelope = candidate;
-            } else {
-                upper = candidate - 1;
-            }
-        }
         if envelope < 1024 {
             return Err(Error::setup_required());
         }
@@ -151,6 +134,18 @@ impl Bounds {
         let request = request_input + 3 * envelope + structure + 2 * draft_mime;
         (output, control, request)
     }
+}
+
+fn largest_fitting(mut lower: usize, mut upper: usize, fits: impl Fn(usize) -> bool) -> usize {
+    while lower < upper {
+        let candidate = lower + (upper - lower).div_ceil(2);
+        if fits(candidate) {
+            lower = candidate;
+        } else {
+            upper = candidate - 1;
+        }
+    }
+    lower
 }
 
 pub(super) struct BoundedStdio {

@@ -21,13 +21,10 @@ impl AuthenticatedConnection {
         metrics: &mut Metrics,
     ) -> Result<SearchBatch, Error> {
         let mut connection = self.session.resume(metrics);
-        super::mailbox(request.mailbox).map_err(Error::from)?;
+        super::mailbox(request.mailbox)?;
         limits.validate()?;
         connection.limit_search(limits);
-        let (validity, uid_next) = connection
-            .examine_selection(request.mailbox)
-            .await
-            .map_err(Error::from)?;
+        let (validity, uid_next) = connection.examine_selection(request.mailbox).await?;
         let result = page(
             &mut Selection {
                 connection: &mut connection,
@@ -39,10 +36,7 @@ impl AuthenticatedConnection {
             limits,
         )
         .await?;
-        connection
-            .drive(ImapLogout::new())
-            .await
-            .map_err(Error::from)?;
+        connection.drive(ImapLogout::new()).await?;
         Ok(result)
     }
 }
@@ -77,11 +71,7 @@ impl SelectedMailbox for Selection<'_, '_> {
         for predicate in criteria.predicates() {
             keys.push(search_key(predicate, &mut utf8)?);
         }
-        let uids = self
-            .connection
-            .search(keys, utf8)
-            .await
-            .map_err(Error::from)?;
+        let uids = self.connection.search(keys, utf8).await?;
         Ok(uids.into_iter().map(NonZeroU32::get).collect())
     }
     async fn fetch(&mut self, uids: &[u32]) -> Result<Vec<LocatedMessage>, Error> {
@@ -100,14 +90,11 @@ impl SelectedMailbox for Selection<'_, '_> {
                     ..Default::default()
                 },
             ))
-            .await
-            .map_err(Error::from)?;
+            .await?;
         rows.into_values()
             .map(|items| {
-                let projection = Projection::parse(items.as_ref()).map_err(Error::from)?;
-                projection
-                    .check_header_bytes(self.header_bytes)
-                    .map_err(Error::from)?;
+                let projection = Projection::parse(items.as_ref())?;
+                projection.check_header_bytes(self.header_bytes)?;
                 Ok(projection.message())
             })
             .collect()

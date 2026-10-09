@@ -214,20 +214,14 @@ impl Service {
             return Err(super::denied());
         }
         let requested_account = identity.account_id.to_string();
-        let (config, account_id, generation) = self
-            .visible_accounts(context)
-            .find_map(|account| {
-                let (id, generation) = self.registry.identity(&account.key);
-                (id == requested_account).then_some((account, id, generation))
-            })
-            .ok_or_else(|| Error::new(ErrorCode::AccountNotAllowed))?;
+        let target = self.visible_account_target(context, &requested_account)?;
         if identity.operation_id.is_nil() {
             return Err(Error::new(ErrorCode::InvalidRequest));
         }
         if mailbox.is_empty() || mailbox.len() > 1024 {
             return Err(Error::new(ErrorCode::InvalidRequest));
         }
-        if generation != identity.account_generation {
+        if target.generation != identity.account_generation {
             if !grant.historical_drafts.iter().any(|scope| {
                 scope.account_id == identity.account_id
                     && scope.account_generation == identity.account_generation
@@ -237,20 +231,11 @@ impl Service {
                 return Err(super::denied());
             }
             return Ok(MailboxTarget {
-                config,
-                account_id,
                 generation: identity.account_generation,
+                ..target
             });
         }
-        let target = Self::authorize_mailbox_scope(
-            grant,
-            MailboxTarget {
-                config,
-                account_id,
-                generation,
-            },
-            mailbox,
-        )?;
+        let target = Self::authorize_mailbox_scope(grant, target, mailbox)?;
         if target
             .config
             .drafts_mailbox

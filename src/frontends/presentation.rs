@@ -1,6 +1,6 @@
 //! Terminal presentation of semantic operation results.
 use crate::domain::{Error, OperationResult};
-use std::fmt::Write;
+use std::{borrow::Cow, fmt::Write};
 
 pub(super) fn human(result: &OperationResult) -> Result<String, serde_json::Error> {
     let mut output = String::new();
@@ -235,16 +235,20 @@ pub(super) fn human_error(error: &Error) -> Result<String, serde_json::Error> {
     Ok(output)
 }
 
-fn label(text: &str) -> String {
+fn label(text: &str) -> Cow<'_, str> {
+    let Some(start) = text.find(unsafe_character) else {
+        return Cow::Borrowed(text);
+    };
     let mut output = String::with_capacity(text.len());
-    for character in text.chars() {
+    output.push_str(&text[..start]);
+    for character in text[start..].chars() {
         if unsafe_character(character) {
             let _ = write!(output, "\\u{{{:04x}}}", character as u32);
         } else {
             output.push(character);
         }
     }
-    output
+    Cow::Owned(output)
 }
 
 fn unsafe_character(character: char) -> bool {

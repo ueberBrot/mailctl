@@ -423,9 +423,11 @@ impl Service {
         let inspect_drafts = context
             .permissions()
             .contains(&Permission::InspectDraftOperation);
-        let mut history = inspect_drafts
-            .then(|| self.registry.draft_journal().ok())
-            .flatten();
+        let mut history = if inspect_drafts {
+            self.registry.draft_journal().ok()
+        } else {
+            None
+        };
         let draft_journal = inspect_drafts.then(|| {
             if history.is_some() {
                 Availability::Available
@@ -484,12 +486,7 @@ impl Service {
     }
     fn observed<T>(&self, account: &str, result: Result<T, Error>) -> Result<T, Error> {
         match &result {
-            Ok(_) => {
-                self.observations
-                    .lock()
-                    .unwrap()
-                    .insert(account.into(), Availability::Available);
-            }
+            Ok(_) => self.observe_availability(account, Availability::Available),
             Err(error) => self.observe_failure(account, error),
         }
         result
@@ -502,10 +499,15 @@ impl Service {
                 | ErrorCode::CredentialUnavailable
                 | ErrorCode::TlsFailed
         ) {
-            self.observations
-                .lock()
-                .unwrap()
-                .insert(account.into(), Availability::Unavailable);
+            self.observe_availability(account, Availability::Unavailable);
+        }
+    }
+    fn observe_availability(&self, account: &str, availability: Availability) {
+        let mut observations = self.observations.lock().unwrap();
+        if let Some(observed) = observations.get_mut(account) {
+            *observed = availability;
+        } else {
+            observations.insert(account.into(), availability);
         }
     }
     fn visible_accounts<'a>(
@@ -516,6 +518,22 @@ impl Service {
             .account_indices()
             .iter()
             .map(|&index| &self.config.accounts[index])
+    }
+    fn visible_account_target<'a>(
+        &'a self,
+        context: &'a RequestContext,
+        account_id: &str,
+    ) -> Result<MailboxTarget<'a>, Error> {
+        self.visible_accounts(context)
+            .find_map(|account| {
+                let (id, generation) = self.registry.identity(&account.key);
+                (id == account_id).then_some(MailboxTarget {
+                    config: account,
+                    account_id: id,
+                    generation,
+                })
+            })
+            .ok_or_else(|| Error::new(ErrorCode::AccountNotAllowed))
     }
     fn grant(&self, context: &RequestContext) -> Result<&crate::config::AccessGrant, Error> {
         if !context.belongs_to(self.context_id) {

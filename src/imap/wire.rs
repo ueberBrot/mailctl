@@ -721,7 +721,6 @@ impl CommandState {
         })
     }
     fn new(command: &Command<'_>) -> Result<Self, Error> {
-        let body_fetch = BodyFetch::from_command(&command.body);
         let kind = match &command.body {
             CommandBody::Capability => CommandKind::Capability,
             CommandBody::Login { .. } => CommandKind::Login,
@@ -749,7 +748,7 @@ impl CommandState {
                 }
             }
             CommandBody::Fetch { .. } => CommandKind::BodyFetch {
-                contract: body_fetch.ok_or(Error::Unsupported)?,
+                contract: BodyFetch::from_command(&command.body).ok_or(Error::Unsupported)?,
                 seen: false,
             },
             CommandBody::Logout => CommandKind::Logout {

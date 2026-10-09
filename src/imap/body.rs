@@ -154,7 +154,7 @@ async fn read_selected(
         )
         .await?;
         if let Some(id) = representation::validate_headers(&raw, None, limits)? {
-            related_ids.insert(path, id);
+            related_ids.insert(path.0.into_inner(), id);
         }
     }
     let selected = representation::select(structure, limits, &related_ids)?;

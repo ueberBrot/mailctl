@@ -9,7 +9,6 @@ use crate::{
     imap::{BodyCursor, BodyRequest},
     policy::{Permission, RequestContext},
 };
-use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     future::Future,
@@ -54,7 +53,7 @@ struct MemoryBody {
 }
 impl MemoryBodies {
     pub fn set(&self, account: &str, mailbox: &str, validity: u32, uid: u32, body: BodyText) {
-        let fingerprint = Sha256::digest(serde_json::to_vec(&body).unwrap()).into();
+        let fingerprint = crate::encoding::json_sha256(&body, usize::MAX).unwrap();
         let mut mailboxes = self.0.lock().unwrap();
         let mailbox = mailboxes
             .entry(account.into())
