@@ -1,5 +1,9 @@
 ## Agent skills
 
+### Installed skills
+
+Manage installed skills only through the skills CLI. Keep repository-specific instructions in `AGENTS.md` or `docs/agents/`.
+
 ### Issue tracker
 
 Issues and specs live in GitHub Issues for `ueberBrot/mailctl`. Before tracker operations, read `docs/agents/issue-tracker.md`.
@@ -10,7 +14,7 @@ Use the five default triage labels. Before triaging or applying triage labels, r
 
 ### Domain docs
 
-Before exploring the codebase or creating or editing `CONTEXT.md` or an ADR, read `docs/agents/domain.md`.
+Before exploring the codebase or creating or editing `GLOSSARY.md` or an ADR, read `docs/agents/domain.md`.
 
 ### Testing
 
