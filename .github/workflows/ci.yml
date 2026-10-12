@@ -67,6 +67,12 @@ jobs:
         with:
           persist-credentials: false
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f  # v2.0.0
+      # The Rust Docker client requires a newer API than the runner's bundled daemon.
+      - uses: docker/setup-docker-action@2bf61fb9464cc67f0cbdeabed6aa0380accd1c70  # v5.5.0
+        with:
+          version: v29.9.0
+          set-host: true
+      - run: docker version
       - run: docker info
       - run: openssl version
       - run: cargo clippy --locked --workspace --all-targets --features docker-tests -- -D warnings

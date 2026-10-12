@@ -1,0 +1,36 @@
+name: Release preparation
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-preparation
+  cancel-in-progress: false
+
+jobs:
+  release-pr:
+    if: github.repository == 'ueberBrot/mailctl' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f  # v2.0.0; reads rust-toolchain.toml
+        with:
+          cache: false
+      - name: Prepare the release PR
+        uses: release-plz/action@f393a7b38aca9d9b4c58447b291dbac963901df6  # v0.5.141
+        with:
+          command: release-pr
+          version: 0.3.171
+        env:
+          GITHUB_TOKEN: ${{ github.token }}

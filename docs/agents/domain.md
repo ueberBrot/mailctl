@@ -4,22 +4,22 @@ How to read and write this repo's domain documentation.
 
 ## Before writing domain docs
 
-Before creating or editing `CONTEXT.md` or an ADR, read and apply [writing-for-agents](../../.agents/skills/writing-for-agents/SKILL.md). Use [domain-modeling](../../.agents/skills/domain-modeling/SKILL.md) for glossary and ADR formats and decision criteria.
+Before creating or editing `GLOSSARY.md` or an ADR, read and apply [writing-for-agents](../../.agents/skills/writing-for-agents/SKILL.md). Use [domain-modeling](../../.agents/skills/domain-modeling/SKILL.md) for glossary and ADR formats and decision criteria.
 
 ## Before exploring, read these
 
-- **`CONTEXT.md`** at the repo root for the domain model and glossary.
+- **`GLOSSARY.md`** at the repo root for the domain model and glossary.
 - **`docs/adr/`** for decisions that touch the area you're about to work in.
 
 If these files don't exist, proceed silently. The `/domain-modeling` skill (reached via `/grill-with-docs` and `/improve-codebase-architecture`) creates them lazily when terms or decisions actually get resolved.
 
 ## File structure
 
-This repo uses a single-context layout: `CONTEXT.md` at the repo root and numbered ADRs under `docs/adr/`.
+This repo uses a single-context layout: `GLOSSARY.md` at the repo root and numbered ADRs under `docs/adr/`.
 
 ## Use the glossary's vocabulary
 
-When your output names a domain concept (in an issue title, a refactor proposal, a hypothesis, a test name), use the term as defined in `CONTEXT.md`. Don't drift to synonyms the glossary explicitly avoids.
+When your output names a domain concept (in an issue title, a refactor proposal, a hypothesis, a test name), use the term as defined in `GLOSSARY.md`. Don't drift to synonyms the glossary explicitly avoids.
 
 If the concept you need isn't in the glossary yet, that's a signal: either you're inventing language the project doesn't use (reconsider) or there's a real gap (note it for `/domain-modeling`).
 

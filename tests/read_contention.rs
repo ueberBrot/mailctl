@@ -296,7 +296,8 @@ async fn panicked_trust_initialization_returns_a_stable_error_without_retrying()
         ) -> Result<tokio_rustls::rustls::RootCertStore, mailctl::credentials::SourceError>
         {
             self.0.fetch_add(1, Ordering::SeqCst);
-            panic!("synthetic trust loader panic");
+            // Exercise unwinding without timing the global panic hook and backtrace.
+            std::panic::resume_unwind(Box::new("synthetic trust loader panic"))
         }
     }
     let host = Arc::new(PanickingTrust(AtomicUsize::new(0)));
