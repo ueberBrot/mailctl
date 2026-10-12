@@ -53,14 +53,21 @@ impl Fixture {
             .with_mapped_port(0, 8080.tcp())
             .with_host_config_modifier(|host| {
                 host.publish_all_ports = Some(false);
-                for bindings in host.port_bindings.iter_mut().flat_map(|m| m.values_mut()).flatten() {
+                for bindings in host
+                    .port_bindings
+                    .iter_mut()
+                    .flat_map(|m| m.values_mut())
+                    .flatten()
+                {
                     for binding in bindings {
                         binding.host_ip = Some("127.0.0.1".to_owned());
                     }
                 }
             })
             .with_startup_timeout(Duration::from_secs(90))
-            .start().await.map_err(|_| "Cannot start pinned GreenMail image; start local Docker and check image access")?;
+            .start()
+            .await
+            .map_err(|error| format!("Cannot start pinned GreenMail image: {error}"))?;
         let api = Api::new(container.get_host_port_ipv4(8080.tcp()).await?)?;
         let imaps = container.get_host_port_ipv4(3993.tcp()).await?;
         let smtp = container.get_host_port_ipv4(3025.tcp()).await?;
