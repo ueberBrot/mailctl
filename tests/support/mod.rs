@@ -6,6 +6,7 @@
 use serde_json::Value;
 use std::{
     fs,
+    io::Read,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     sync::Mutex,
@@ -170,16 +171,59 @@ pub(crate) fn run_bounded(mut command: Command) -> Output {
         .spawn()
         .expect("start process");
     drop(spawn_guard);
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while child.try_wait().expect("inspect process").is_none() {
+    let stdout = child.stdout.take().expect("capture stdout");
+    let stderr = child.stderr.take().expect("capture stderr");
+    let stdout = thread::spawn(move || read_pipe(stdout));
+    let stderr = thread::spawn(move || read_pipe(stderr));
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("inspect process")
+            && stdout.is_finished()
+            && stderr.is_finished()
+        {
+            break status;
+        }
         if Instant::now() >= deadline {
             let _ = child.kill();
-            let _ = child.wait();
-            panic!("process did not terminate");
+            let status = child.wait().expect("reap process");
+            // A descendant may still hold a pipe open. Never join an unfinished
+            // reader after the deadline, even if the direct child has exited.
+            let stdout = stdout
+                .is_finished()
+                .then(|| stdout.join().expect("read stdout"));
+            let stderr = stderr
+                .is_finished()
+                .then(|| stderr.join().expect("read stderr"));
+            panic!(
+                "process {:?} {:?} did not finish after {:?}; exit {:?}; stdout {}; stderr {}",
+                command.get_program(),
+                command.get_args().collect::<Vec<_>>(),
+                started.elapsed(),
+                status.code(),
+                stdout
+                    .as_deref()
+                    .map(String::from_utf8_lossy)
+                    .unwrap_or_else(|| "<capture incomplete>".into()),
+                stderr
+                    .as_deref()
+                    .map(String::from_utf8_lossy)
+                    .unwrap_or_else(|| "<capture incomplete>".into()),
+            );
         }
         thread::sleep(Duration::from_millis(10));
+    };
+    Output {
+        status,
+        stdout: stdout.join().expect("read stdout"),
+        stderr: stderr.join().expect("read stderr"),
     }
-    child.wait_with_output().expect("collect process output")
+}
+
+fn read_pipe(mut pipe: impl Read) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    pipe.read_to_end(&mut bytes).expect("read process output");
+    bytes
 }
 
 pub(crate) fn assert_success(output: &Output) {
