@@ -49,8 +49,8 @@ refactor(cli): simplify argument handling
 For security fixes, use `fix(security): summary`. CI validates PR titles. It does
 not validate individual commit messages.
 
-For a breaking change, add `!` before the colon. Include a `BREAKING CHANGE:`
-footer in the commit body that explains the effect and the migration steps.
+For a breaking change, add `!` before the colon. In the commit body, include a
+`BREAKING CHANGE:` footer that explains the effect and migration steps.
 Mark breaking changes before the first release too.
 
 This repository uses squash merges, which combine a PR into one commit. GitHub
@@ -98,7 +98,7 @@ cargo test --locked --test greenmail --features docker-tests
 
 Workspace tests use local servers and disposable installations. Allow localhost
 connections when running them in a sandbox. Run native credential and isolation
-acceptance through the disposable CI jobs.
+acceptance checks in the disposable CI jobs.
 
 For documentation changes, check the edited links and command examples. Run
 checks that cover any executable examples that you change. Report failed or
@@ -136,8 +136,9 @@ Let this workflow prepare routine version and changelog updates.
 Release-plz reads commit history on `main`. Review the proposed version and
 release notes, including compatibility changes and migration instructions.
 
-With the built-in GitHub token, a maintainer with write access must select
-"Approve workflows to run" on the generated PR before its CI checks can run.
+The workflow uses the built-in GitHub token. A maintainer with write access
+must select "Approve workflows to run" on the generated PR. That approval
+starts the CI checks.
 Review the candidate and wait for those checks before merging. Publication is a
 separate operator action. Preparation and merging create no release tags or
 published packages.
