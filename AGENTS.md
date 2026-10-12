@@ -1,3 +1,7 @@
+## Contributing
+
+Before changing files, committing, or opening a PR, read [CONTRIBUTING.md](CONTRIBUTING.md) for contribution and release requirements.
+
 ## Agent skills
 
 ### Installed skills
@@ -15,7 +19,3 @@ Use the five default triage labels. Before triaging or applying triage labels, r
 ### Domain docs
 
 Before exploring the codebase or creating or editing `GLOSSARY.md` or an ADR, read `docs/agents/domain.md`.
-
-### Testing
-
-Use compile-time fixtures to verify the published type contract. Reserve runtime tests for behavior that can fail at runtime; avoid testing guarantees already enforced by the type system.
