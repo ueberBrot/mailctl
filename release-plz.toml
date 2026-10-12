@@ -1,0 +1,27 @@
+[workspace]
+# Prepare candidates from git history; publication is a separate operator action.
+git_only = true
+publish = false
+git_tag_enable = false
+git_release_enable = false
+dependencies_update = false
+semver_check = false
+release = false
+pr_name = "chore: prepare mailctl v{{ version }}"
+
+[[package]]
+name = "mailctl"
+release = true
+changelog_path = "CHANGELOG.md"
+git_tag_name = "v{{ version }}"
+
+[changelog]
+protect_breaking_commits = true
+commit_parsers = [
+    { message = "^feat", group = "added" },
+    { message = "^fix", group = "fixed" },
+    { message = "^perf", group = "performance" },
+    { message = "^security", group = "security" },
+    { message = "^docs", group = "documentation" },
+    { message = ".*", group = "other" },
+]

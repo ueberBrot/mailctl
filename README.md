@@ -166,4 +166,18 @@ Read [AGENTS.md](AGENTS.md) for contributor guidance and
 selection, and draft coordination. The [CI workflows](.github/workflows/) contain
 the maintained formatting, lint, build, and test commands.
 
+The [release preparation workflow](.github/workflows/release-plz.yml) uses
+[release-plz](https://release-plz.dev/) and its embedded git-cliff to prepare a
+release PR with the version changes and `CHANGELOG.md`. The
+[configuration](release-plz.toml) manages one product version for CLI and MCP.
+With the built-in GitHub token, a contributor with write access must select
+**Approve workflows to run** on the generated PR before its CI checks can run.
+Review the candidate and wait for those checks before merging. Publication is a
+separate operator action; preparation and merging create no release tags or
+published packages. Keep the first release PR open while 0.1.0 is still changing:
+release-plz preserves a merged changelog entry until that version is tagged.
+When the candidate is ready, merge it and publish the qualified commit through
+the separate release process. Run preparation again after the first published
+tag if more changes need a release candidate.
+
 mailctl uses the [ISC license](LICENSE).
