@@ -11,6 +11,15 @@ use support::{Installation, assert_success, envelope, run_bounded};
 
 #[tokio::test]
 async fn independent_cli_and_mcp_create_once_and_inspect_without_provider_work() {
+    concurrent_draft_replay(std::time::Duration::ZERO).await;
+}
+
+#[tokio::test]
+async fn concurrent_draft_replay_survives_expired_writer_wait() {
+    concurrent_draft_replay(std::time::Duration::from_millis(1500)).await;
+}
+
+async fn concurrent_draft_replay(preparation_delay: std::time::Duration) {
     let mut f = DraftFixture::new();
     f.input["draft"]["subject"] = json!("Synthetic");
     f.input["draft"]["bcc"] = json!([{"address":"hidden@example.test", "name":"Hidden"}]);
@@ -71,12 +80,29 @@ async fn independent_cli_and_mcp_create_once_and_inspect_without_provider_work()
     );
     // A second executable can save an independent operation while MCP remains alive.
     f.input["operation_id"] = json!(uuid::Uuid::new_v4());
-    f.server.expect_append(server::DraftReply::Created(false));
+    f.server
+        .expect_append_after(server::DraftReply::Created(false), preparation_delay);
     let command = f.save();
     let concurrent = f.input.clone();
     let cli = tokio::task::spawn_blocking(move || run_bounded(command));
-    let (cli, mcp) = tokio::join!(cli, call(&client, "email_save_draft", concurrent));
-    let cli = cli.unwrap();
+    let (cli, mut mcp) = tokio::join!(cli, call(&client, "email_save_draft", concurrent));
+    let mut cli = cli.unwrap();
+    assert!(
+        cli.status.success() || mcp.get("result").is_some(),
+        "one concurrent caller must complete: CLI {}; MCP {mcp}",
+        envelope(&cli)
+    );
+    // The fixture's one-second writer wait can expire while its peer completes.
+    // Both calls have finished, so replay only the waiting caller with the same
+    // identity. A second provider connection or any other error still fails.
+    if !cli.status.success() {
+        assert_writer_wait_expired(&envelope(&cli));
+        cli = run_bounded(f.save());
+    }
+    if mcp.get("error").is_some() {
+        assert_writer_wait_expired(&mcp);
+        mcp = call(&client, "email_save_draft", f.input.clone()).await;
+    }
     assert_success(&cli);
     assert_eq!(envelope(&cli)["result"], mcp["result"]);
     client.cancel().await.unwrap();
@@ -106,8 +132,20 @@ async fn independent_cli_and_mcp_create_once_and_inspect_without_provider_work()
     );
     client.cancel().await.unwrap();
     assert_eq!(f.server.accepted(), provider_connections + 1);
+    assert_eq!(f.server.drafts().len(), 2);
     f.server.finish();
 }
+
+fn assert_writer_wait_expired(response: &Value) {
+    assert!(
+        matches!(
+            response["error"]["code"].as_str(),
+            Some("rate_limited" | "operation_in_progress")
+        ),
+        "unexpected concurrent save failure: {response}"
+    );
+}
+
 async fn call(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
     name: &'static str,
