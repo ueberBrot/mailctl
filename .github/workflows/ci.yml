@@ -180,39 +180,44 @@ jobs:
           dist build --artifacts=local --target aarch64-apple-darwin \
             --output-format=json >target/dist-build.json
       - name: Prepare component manifest and signing evidence from the dist archive
-        run: python3 scripts/prepare-installer.py
+        env:
+          # Candidate evidence must not be restored with the Rust target cache.
+          MAILCTL_CANDIDATE_DIR: ${{ runner.temp }}/mailctl-release-candidate
+        run: |
+          python3 scripts/prepare-installer.py --output "$MAILCTL_CANDIDATE_DIR"
+          echo "MAILCTL_CANDIDATE_DIR=$MAILCTL_CANDIDATE_DIR" >>"$GITHUB_ENV"
       - name: Qualify selected components through the standalone installer
         shell: bash
         env:
           MAILCTL_INSTALLED_BIN_DIR: ${{ runner.temp }}/mailctl-installed
         run: |
-          python3 tests/installer.py --suite packaged --artifacts target/release-candidate \
+          python3 tests/installer.py --suite packaged --artifacts "$MAILCTL_CANDIDATE_DIR" \
             --install-to "$MAILCTL_INSTALLED_BIN_DIR" 2>&1 | \
-            tee target/release-candidate/installer-acceptance.log
+            tee "$MAILCTL_CANDIDATE_DIR/installer-acceptance.log"
       - name: Qualify packaged setup, history, backup, and restore
         shell: bash
         env:
           MAILCTL_PACKAGED_BIN_DIR: ${{ runner.temp }}/mailctl-installed
         run: |
           cargo test --locked --test administration_process --test state_maintenance \
-            2>&1 | tee target/release-candidate/installed-state-acceptance.log
+            2>&1 | tee "$MAILCTL_CANDIDATE_DIR/installed-state-acceptance.log"
       - name: Qualify packaged native credentials on the disposable hosted identity
         shell: bash
         env:
           MAILCTL_PACKAGED_BIN_DIR: ${{ runner.temp }}/mailctl-installed
         run: |
           cargo test --locked --test native_credentials -- --ignored --test-threads=1 \
-            2>&1 | tee target/release-candidate/installed-native-acceptance.log
+            2>&1 | tee "$MAILCTL_CANDIDATE_DIR/installed-native-acceptance.log"
       - name: Record passing candidate acceptance
         shell: bash
         run: |
-          cd target/release-candidate
+          cd "$MAILCTL_CANDIDATE_DIR"
           shasum -a 256 -c SHA256SUMS
           {
             printf 'status=passed\ntopology=cooperative-embedded\ncredential_source=disposable-apple-keychain\n'
             sw_vers
             uname -sm
-            printf 'installer_command=python3 tests/installer.py --suite packaged --artifacts target/release-candidate --install-to <disposable-bin-directory>\n'
+            printf 'installer_command=python3 tests/installer.py --suite packaged --artifacts %s --install-to <disposable-bin-directory>\n' "$MAILCTL_CANDIDATE_DIR"
             printf 'state_command=cargo test --locked --test administration_process --test state_maintenance\n'
             printf 'native_command=cargo test --locked --test native_credentials -- --ignored --test-threads=1\n'
             printf 'real_provider=not-qualified\nisolation=not-qualified\npublication=not-performed\n'
@@ -223,7 +228,7 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: mailctl-candidate-aarch64-apple-darwin
-          path: target/release-candidate/
+          path: ${{ env.MAILCTL_CANDIDATE_DIR }}/
           if-no-files-found: error
           retention-days: 14
 
