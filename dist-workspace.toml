@@ -1,0 +1,20 @@
+[workspace]
+members = ["cargo:."]
+
+[dist]
+cargo-dist-version = "0.33.0"
+# Candidate builds run in the existing read-only CI workflow. Publication is a
+# separate operator action; do not generate a tag-triggered publishing workflow.
+ci = []
+installers = []
+targets = ["aarch64-apple-darwin"]
+unix-archive = ".tar.gz"
+checksum = "sha256"
+precise-builds = true
+default-features = false
+features = ["cli", "mcp"]
+# Only the product package opts in; test launchers must never be distributed.
+dist = false
+
+[dist.binaries]
+aarch64-apple-darwin = ["mailctl", "mailctl-mcp"]
