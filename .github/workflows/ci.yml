@@ -160,9 +160,20 @@ jobs:
         with:
           persist-credentials: false
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f  # v2.0.0
-      - uses: taiki-e/install-action@d438492cf8a250514fa2d34b30bc3c0dc37c65ff  # v2.87.8
-        with:
-          tool: cargo-dist@0.33.0
+      - name: Install dist 0.33.0 from its official release
+        shell: bash
+        env:
+          DIST_BIN_DIR: ${{ runner.temp }}/dist-bin
+        run: |
+          cd "$RUNNER_TEMP"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+            https://github.com/axodotdev/cargo-dist/releases/download/v0.33.0/cargo-dist-aarch64-apple-darwin.tar.xz \
+            --output dist.tar.xz
+          echo '7b3cbe25511de01d74c0f5fcb7909edabd379bea9cfa284d93af5a3cdfa3247c  dist.tar.xz' | shasum -a 256 -c -
+          mkdir -p "$DIST_BIN_DIR"
+          tar -xJf dist.tar.xz --strip-components=1 -C "$DIST_BIN_DIR"
+          test "$("$DIST_BIN_DIR/dist" --version)" = 'cargo-dist 0.33.0'
+          echo "$DIST_BIN_DIR" >>"$GITHUB_PATH"
       - name: Build macOS Apple Silicon archives with dist
         run: |
           mkdir -p target
