@@ -9,7 +9,7 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
-    sync::Mutex,
+    sync::{Mutex, OnceLock},
     thread,
     time::{Duration, Instant},
 };
@@ -18,6 +18,14 @@ use uuid::Uuid;
 // Avoid inheriting a writable executable-copy descriptor in a concurrent child.
 // Only copying and spawning are serialized; child processes still run together.
 static COPY_OR_SPAWN: Mutex<()> = Mutex::new(());
+
+const PRODUCT_COMPONENTS: &[(Option<&str>, &str)] = &[
+    #[cfg(feature = "cli")]
+    (option_env!("CARGO_BIN_EXE_mailctl"), "mailctl"),
+    #[cfg(feature = "mcp")]
+    (option_env!("CARGO_BIN_EXE_mailctl-mcp"), "mailctl-mcp"),
+];
+static PACKAGED_EXECUTABLES: OnceLock<Option<Vec<(&str, PathBuf)>>> = OnceLock::new();
 
 #[cfg(feature = "cli")]
 pub(crate) const MAILCTL: &str = match option_env!("CARGO_BIN_EXE_mailctl") {
@@ -35,6 +43,63 @@ pub(crate) const MAILCTL_MCP: &str = match option_env!("CARGO_BIN_EXE_mailctl-mc
         None => panic!("missing MCP test executable"),
     },
 };
+
+/// Run installed release candidates with the existing disposable fixtures.
+/// Test drivers and already copied fixture executables retain their own paths.
+fn selected_executable(executable: &str) -> PathBuf {
+    let Some((_, name)) = PRODUCT_COMPONENTS
+        .iter()
+        .find(|(compiled, _)| *compiled == Some(executable))
+    else {
+        return executable.into();
+    };
+    let Some(packaged) = PACKAGED_EXECUTABLES.get_or_init(|| {
+        let directory = PathBuf::from(std::env::var_os("MAILCTL_PACKAGED_BIN_DIR")?);
+        assert!(
+            directory.is_absolute(),
+            "MAILCTL_PACKAGED_BIN_DIR must be an absolute directory"
+        );
+        assert!(
+            directory.is_dir(),
+            "MAILCTL_PACKAGED_BIN_DIR is not a directory: {}",
+            directory.display()
+        );
+        Some(
+            PRODUCT_COMPONENTS
+                .iter()
+                .filter(|(compiled, _)| compiled.is_some())
+                .map(|(_, name)| {
+                    let path = directory.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+                    assert!(
+                        path.is_file(),
+                        "missing packaged component: {}",
+                        path.display()
+                    );
+                    let mut version = Command::new(&path);
+                    version.arg("--version");
+                    let output = run_bounded(version);
+                    assert_success(&output);
+                    assert_eq!(
+                        String::from_utf8(output.stdout)
+                            .expect("UTF-8 packaged component version")
+                            .trim(),
+                        format!("{name} {}", env!("CARGO_PKG_VERSION")),
+                        "packaged component must match the acceptance harness version"
+                    );
+                    (*name, path)
+                })
+                .collect(),
+        )
+    }) else {
+        return executable.into();
+    };
+    packaged
+        .iter()
+        .find(|(component, _)| component == name)
+        .expect("validated packaged component")
+        .1
+        .clone()
+}
 
 /// A complete disposable installation, deliberately independent of the
 /// operator's normal configuration and state directories.
@@ -130,22 +195,23 @@ mailboxes = ["INBOX", "Drafts"]
     }
 
     pub(crate) fn command(&self, executable: &str) -> Command {
-        let mut command = Command::new(executable);
+        let mut command = Command::new(selected_executable(executable));
         command.arg("--config").arg(&self.config);
         command
     }
 
     pub(crate) fn copy_executable(&self, executable: &str, name: &str) -> PathBuf {
+        let executable = selected_executable(executable);
         let _copy_guard = COPY_OR_SPAWN.lock().expect("copy/spawn fixture lock");
         #[cfg(windows)]
         let copy = self.directory.join(format!("{name}.exe"));
         #[cfg(not(windows))]
         let copy = self.directory.join(name);
-        fs::copy(executable, &copy).expect("copy executable");
+        fs::copy(&executable, &copy).expect("copy executable");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(executable)
+            let mode = fs::metadata(&executable)
                 .expect("inspect source executable")
                 .permissions()
                 .mode();
