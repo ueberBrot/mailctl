@@ -33,12 +33,8 @@ async fn mcp_message_schema_and_errors_match_the_cli_and_hide_from_drafts_only()
     setup.args(["--json", "setup"]);
     support::assert_success(&support::run_bounded(setup));
     for (grant, exposed) in [("default", true), ("writer", false)] {
-        let mut command = tokio::process::Command::new(support::MAILCTL_MCP);
-        command.arg("--config").arg(installation.config()).args([
-            "--grant",
-            grant,
-            "--use-configured-grant",
-        ]);
+        let mut command = tokio::process::Command::from(installation.mcp());
+        command.args(["--grant", grant, "--use-configured-grant"]);
         let client = ().serve(TokioChildProcess::new(command).unwrap()).await.unwrap();
         let tools = client.list_all_tools().await.unwrap();
         let tool = tools.iter().find(|tool| tool.name == "email_get_message");

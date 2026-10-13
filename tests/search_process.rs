@@ -47,8 +47,7 @@ async fn mcp_search_publishes_schemas_and_matches_cli_errors_under_the_effective
     use rmcp::{ServiceExt, model::CallToolRequestParams, transport::TokioChildProcess};
     let installation = Installation::two_accounts();
     setup(&installation);
-    let mut command = tokio::process::Command::new(support::MAILCTL_MCP);
-    command.arg("--config").arg(installation.config());
+    let command = tokio::process::Command::from(installation.mcp());
     let client = ().serve(TokioChildProcess::new(command).unwrap()).await.unwrap();
     let tools = client.list_all_tools().await.unwrap();
     let search = tools
@@ -74,12 +73,8 @@ async fn mcp_search_publishes_schemas_and_matches_cli_errors_under_the_effective
     );
     client.cancel().await.unwrap();
 
-    let mut command = tokio::process::Command::new(support::MAILCTL_MCP);
-    command.arg("--config").arg(installation.config()).args([
-        "--grant",
-        "writer",
-        "--use-configured-grant",
-    ]);
+    let mut command = tokio::process::Command::from(installation.mcp());
+    command.args(["--grant", "writer", "--use-configured-grant"]);
     let client = ().serve(TokioChildProcess::new(command).unwrap()).await.unwrap();
     assert!(
         !client
@@ -98,8 +93,7 @@ async fn mcp_accepts_the_full_search_schema_before_rejecting_a_stale_reference()
     use rmcp::{ServiceExt, model::CallToolRequestParams, transport::TokioChildProcess};
     let installation = Installation::two_accounts();
     setup(&installation);
-    let mut command = tokio::process::Command::new(support::MAILCTL_MCP);
-    command.arg("--config").arg(installation.config());
+    let command = tokio::process::Command::from(installation.mcp());
     let client = ().serve(TokioChildProcess::new(command).unwrap()).await.unwrap();
     let criteria = vec![json!({"field":"text","value":"\u{0001}".repeat(4096)}); 32];
     let response = tokio::time::timeout(
