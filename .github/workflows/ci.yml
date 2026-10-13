@@ -201,6 +201,16 @@ jobs:
         run: |
           cargo test --locked --test administration_process --test state_maintenance \
             2>&1 | tee "$MAILCTL_CANDIDATE_DIR/installed-state-acceptance.log"
+      - name: Qualify packaged interfaces and process lifecycle
+        shell: bash
+        env:
+          MAILCTL_PACKAGED_BIN_DIR: ${{ runner.temp }}/mailctl-installed
+        run: |
+          cargo test --locked \
+            --test mcp_process --test message_process --test attachment_process \
+            --test search_process --test discovery_process \
+            --test read_contention_process --test draft_process \
+            2>&1 | tee "$MAILCTL_CANDIDATE_DIR/installed-process-acceptance.log"
       - name: Qualify packaged native credentials on the disposable hosted identity
         shell: bash
         env:
@@ -219,11 +229,13 @@ jobs:
             uname -sm
             printf 'installer_command=python3 tests/installer.py --suite packaged --artifacts %s --install-to <disposable-bin-directory>\n' "$MAILCTL_CANDIDATE_DIR"
             printf 'state_command=cargo test --locked --test administration_process --test state_maintenance\n'
+            printf 'process_command=cargo test --locked --test mcp_process --test message_process --test attachment_process --test search_process --test discovery_process --test read_contention_process --test draft_process\n'
             printf 'native_command=cargo test --locked --test native_credentials -- --ignored --test-threads=1\n'
             printf 'real_provider=not-qualified\nisolation=not-qualified\npublication=not-performed\n'
           } >acceptance-evidence.txt
           shasum -a 256 acceptance-evidence.txt installer-acceptance.log \
-            installed-state-acceptance.log installed-native-acceptance.log >>SHA256SUMS
+            installed-state-acceptance.log installed-process-acceptance.log \
+            installed-native-acceptance.log >>SHA256SUMS
       - name: Keep candidate downloads and acceptance evidence
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
