@@ -1,5 +1,5 @@
 #![cfg(any(feature = "cli", feature = "mcp"))]
-#[cfg(all(feature = "cli", windows))]
+#[cfg(feature = "cli")]
 #[path = "native_support/windows_export.rs"]
 mod native_support;
 mod support;
