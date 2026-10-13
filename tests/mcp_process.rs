@@ -7,11 +7,11 @@ use rmcp::{ServiceExt, model::CallToolRequestParams, transport::TokioChildProces
 use serde_json::{Value, json};
 use std::{
     io::Write,
-    process::{Command, Stdio},
+    process::Stdio,
     thread,
     time::{Duration, Instant},
 };
-use support::{Installation, MAILCTL_MCP, assert_success, envelope, run_bounded};
+use support::{Installation, assert_success, envelope, run_bounded};
 
 fn setup(installation: &Installation) {
     let output = run_bounded({
@@ -25,11 +25,8 @@ fn setup(installation: &Installation) {
 type McpClient = rmcp::service::RunningService<rmcp::RoleClient, ()>;
 
 async fn client(installation: &Installation, arguments: &[&str]) -> McpClient {
-    let mut command = tokio::process::Command::new(MAILCTL_MCP);
-    command
-        .arg("--config")
-        .arg(installation.config())
-        .args(arguments);
+    let mut command = tokio::process::Command::from(installation.mcp());
+    command.args(arguments);
     let transport = TokioChildProcess::new(command).expect("start MCP component");
     ().serve(transport).await.expect("negotiate MCP")
 }
@@ -369,9 +366,7 @@ async fn large_discovery_matches_cli_in_both_mcp_result_forms() {
         // Drain stdout while the process runs: this result is larger than a pipe.
         let cli = tokio::time::timeout(
             Duration::from_secs(10),
-            tokio::process::Command::new(support::MAILCTL)
-                .arg("--config")
-                .arg(installation.config())
+            tokio::process::Command::from(installation.cli())
                 .args(["--json", "account", "list"])
                 .output(),
         )
@@ -609,10 +604,8 @@ fn malformed_stdio_frames_are_not_parsed_or_kept_alive() {
         format!("{}0{}\n", "[".repeat(65), "]".repeat(65)).into_bytes(),
         vec![b'x'; 65 * 1024],
     ] {
-        let mut command = Command::new(MAILCTL_MCP);
+        let mut command = installation.mcp();
         command
-            .arg("--config")
-            .arg(installation.config())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -648,10 +641,8 @@ fn mcp_does_not_dispatch_a_tool_before_initialization() {
 }
 
 fn raw_mcp(installation: &Installation, frame: &[u8]) -> std::process::Output {
-    let mut command = Command::new(MAILCTL_MCP);
+    let mut command = installation.mcp();
     command
-        .arg("--config")
-        .arg(installation.config())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
