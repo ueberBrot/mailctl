@@ -73,18 +73,109 @@ pub(crate) fn cancel(process_id: u32) {
 }
 
 fn current_sid() -> String {
-    let mut command = powershell();
-    command.args([
-        "-Command",
-        "[Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
-    ]);
+    let mut command = Command::new("whoami.exe");
+    command.args(["/user", "/fo", "csv", "/nh"]);
     let output = run_bounded(command);
     assert_success(&output);
-    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    whoami_sid(&output.stdout)
+        .expect("whoami returns one account and numeric SID in quoted CSV")
+        .to_owned()
+}
+
+fn whoami_sid(output: &[u8]) -> Option<&str> {
+    let record = output
+        .strip_suffix(b"\r\n")
+        .or_else(|| output.strip_suffix(b"\n"))
+        .unwrap_or(output)
+        .strip_prefix(b"\"")?;
+    // Account names can contain CSV escapes and bytes in the Windows code page.
+    // Decode only the SID, after consuming exactly one quoted account field.
+    let mut cursor = 0;
+    loop {
+        match record.get(cursor)? {
+            b'\r' | b'\n' => return None,
+            b'"' if record.get(cursor + 1) == Some(&b'"') => cursor += 2,
+            b'"' => break,
+            _ => cursor += 1,
+        }
+    }
+    if cursor == 0 {
+        return None;
+    }
+    let sid = std::str::from_utf8(
+        record
+            .get(cursor + 1..)?
+            .strip_prefix(b",\"")?
+            .strip_suffix(b"\"")?,
+    )
+    .ok()?;
+    for (index, number) in sid.strip_prefix("S-1-")?.split('-').enumerate() {
+        let maximum = if index == 0 {
+            (1u64 << 48) - 1
+        } else {
+            u32::MAX as u64
+        };
+        if index > 15
+            || number.is_empty()
+            || !number.bytes().all(|byte| byte.is_ascii_digit())
+            || number.parse::<u64>().ok()? > maximum
+        {
+            return None;
+        }
+    }
+    Some(sid)
 }
 
 fn powershell() -> Command {
     let mut command = Command::new("powershell.exe");
     command.args(["-NoProfile", "-NonInteractive"]);
     command
+}
+
+#[cfg(test)]
+mod tests {
+    use super::whoami_sid;
+
+    #[test]
+    fn whoami_csv_keeps_the_numeric_sid_independent_of_account_encoding() {
+        let expected = Some("S-1-5-21-123-456-789-1001");
+        for output in [
+            &b"\"runner\\account\",\"S-1-5-21-123-456-789-1001\""[..],
+            &b"\"runner\\account\",\"S-1-5-21-123-456-789-1001\"\r\n"[..],
+            &b"\"runner\\account\",\"S-1-5-21-123-456-789-1001\"\n"[..],
+            &b"\"runner\\comma,name\",\"S-1-5-21-123-456-789-1001\"\r\n"[..],
+            &b"\"runner\\quote\"\"name\",\"S-1-5-21-123-456-789-1001\"\r\n"[..],
+            &b"\"runner\\\xE9name\",\"S-1-5-21-123-456-789-1001\"\r\n"[..],
+        ] {
+            assert_eq!(whoami_sid(output), expected);
+        }
+    }
+
+    #[test]
+    fn whoami_csv_rejects_unexpected_records_and_invalid_sid_fields() {
+        for output in [
+            &b""[..],
+            &b"S-1-5-18"[..],
+            &b"\"\",\"S-1-5-18\""[..],
+            &b"account,\"S-1-5-18\""[..],
+            &b"\"account\",S-1-5-18"[..],
+            &b"\"account\",\"S-1-5-18\",\"extra\""[..],
+            &b"\"account\",\"S-1-5-18\" trailing"[..],
+            &b"\"account\",\"S-1-5-18\"\r\n\r\n"[..],
+            &b"\"account\",\"S-1-5-18\"\n\"other\",\"S-1-5-19\"\n"[..],
+            &b"\"ac\ncount\",\"S-1-5-18\""[..],
+            &b"\"account\",\"S-1-5-18\n\""[..],
+            &b"\"account\",\"SID\""[..],
+            &b"\"account\",\"S-2-5-18\""[..],
+            &b"\"account\",\"S-1-5-\""[..],
+            &b"\"account\",\"S-1-5-+18\""[..],
+            &b"\"account\",\"S-1-5-18:(F)\""[..],
+            &b"\"account\",\"S-1-281474976710656-18\""[..],
+            &b"\"account\",\"S-1-5-4294967296\""[..],
+            &b"\"account\",\"S-1-5-1-2-3-4-5-6-7-8-9-10-11-12-13-14-15-16\""[..],
+            &b"\"account\",\"S-1-5-\xE9\""[..],
+        ] {
+            assert_eq!(whoami_sid(output), None, "unexpected CSV: {output:?}");
+        }
+    }
 }
