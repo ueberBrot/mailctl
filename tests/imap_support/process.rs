@@ -30,7 +30,7 @@ struct Expected {
 
 enum ExpectedOperation {
     Authenticate,
-    Append(DraftReply),
+    Append(DraftReply, Duration),
     DraftTarget(u32),
     Reconcile,
     RejectAuthentication(bool),
@@ -126,8 +126,11 @@ impl ImapServer {
                             imap_support::capability(&mut wire, "IMAP4rev1").await;
                             match operation {
                                 ExpectedOperation::Authenticate => {},
-                                ExpectedOperation::Append(reply) => {
+                                ExpectedOperation::Append(reply, preparation_delay) => {
                                     let tag = imap_support::expect(&mut wire, "EXAMINE Drafts").await;
+                                    if !preparation_delay.is_zero() {
+                                        tokio::time::sleep(preparation_delay).await;
+                                    }
                                     imap_support::write(&mut wire, &format!("* 0 EXISTS\r\n* OK [UIDVALIDITY 77] incarnation\r\n{tag} OK [READ-ONLY] selected\r\n")).await;
                                     append_draft(&mut wire, reply, &stalled, &captured).await;
                                     return;
@@ -197,10 +200,14 @@ impl ImapServer {
     }
 
     pub fn expect_append(&self, reply: DraftReply) {
+        self.expect_append_after(reply, Duration::ZERO);
+    }
+
+    pub fn expect_append_after(&self, reply: DraftReply, preparation_delay: Duration) {
         self.expected.lock().unwrap().push_back(Expected {
             username: "work@example.test",
             password: "disposable-password",
-            operation: ExpectedOperation::Append(reply),
+            operation: ExpectedOperation::Append(reply, preparation_delay),
         });
     }
 
