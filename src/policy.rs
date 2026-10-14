@@ -50,6 +50,7 @@ pub struct Narrowing {
 pub struct RequestContext {
     authority: Arc<Authority>,
     response_limit: usize,
+    operation_seconds: usize,
 }
 
 #[derive(Debug)]
@@ -70,6 +71,7 @@ impl RequestContext {
         account_indices: Vec<usize>,
         permissions: Vec<Permission>,
         response_limit: usize,
+        operation_seconds: usize,
     ) -> Self {
         Self {
             authority: Arc::new(Authority {
@@ -80,11 +82,20 @@ impl RequestContext {
                 permissions,
             }),
             response_limit,
+            operation_seconds,
         }
     }
     pub fn with_response_limit(mut self, maximum: usize) -> Self {
         self.response_limit = self.response_limit.min(maximum);
         self
+    }
+    #[cfg(all(target_os = "macos", feature = "isolated"))]
+    pub(crate) fn with_operation_limit(mut self, seconds: usize) -> Self {
+        self.operation_seconds = self.operation_seconds.min(seconds);
+        self
+    }
+    pub(crate) fn operation_seconds(&self) -> usize {
+        self.operation_seconds
     }
     pub(crate) fn session_id(&self) -> Uuid {
         self.authority.session.id

@@ -383,10 +383,7 @@ async fn large_discovery_matches_cli_in_both_mcp_result_forms() {
             .await
             .expect("large discovery completes");
         assert_eq!(response.is_error, Some(false), "{account_count} accounts");
-        let structured = response.structured_content.unwrap();
-        let text: Value =
-            serde_json::from_str(&response.content[0].as_text().unwrap().text).unwrap();
-        assert_eq!(structured, text);
+        let structured = support::assert_mcp_envelope(response);
         assert_eq!(structured["result"], cli_envelope["result"]);
         assert_eq!(
             structured["result"]["accounts"].as_array().unwrap().len(),
@@ -729,12 +726,8 @@ async fn mailbox_discovery_has_cli_mcp_parity_and_is_hidden_from_drafts_only_gra
         .call_tool(CallToolRequestParams::new("email_list_mailboxes"))
         .await
         .unwrap();
-    let structured = response.structured_content.unwrap();
+    let structured = support::assert_mcp_envelope(response);
     assert_eq!(structured["result"], cli["result"]);
-    assert_eq!(
-        serde_json::from_str::<Value>(&response.content[0].as_text().unwrap().text).unwrap(),
-        structured
-    );
     reader.cancel().await.unwrap();
     let writer = client(
         &installation,

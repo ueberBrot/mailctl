@@ -400,24 +400,30 @@ pub(super) fn render(selected: &Selected, wire: &[u8], limits: &Limits) -> Resul
     )?;
     let (text, charset_replacements) = decode_charset(&decoded, &selected.charset);
     replacements |= charset_replacements;
-    let mut text = if replacements {
-        match text {
-            Cow::Borrowed(text) => {
-                let mut marked = String::with_capacity(text.len() + '\u{fffd}'.len_utf8());
-                marked.push('\u{fffd}');
-                marked.push_str(text);
-                marked
+    let mut text = match text {
+        Cow::Borrowed(text) if replacements => {
+            let mut marked = String::with_capacity(text.len() + '\u{fffd}'.len_utf8());
+            marked.push('\u{fffd}');
+            marked.push_str(text);
+            marked
+        }
+        Cow::Borrowed(text) => match decoded {
+            Cow::Borrowed(_) => text.to_owned(),
+            // Transfer decoding already owns this complete buffer. A
+            // borrowed charset result confirms it is unchanged UTF-8.
+            Cow::Owned(decoded) => {
+                String::from_utf8(decoded).expect("borrowed charset output is valid UTF-8")
             }
-            Cow::Owned(mut text) => {
+        },
+        Cow::Owned(mut text) => {
+            if replacements {
                 // Charset conversions may already have spare output capacity.
                 // Preserve it; otherwise reserve only the marker before shifting.
                 text.reserve_exact('\u{fffd}'.len_utf8());
                 text.insert(0, '\u{fffd}');
-                text
             }
+            text
         }
-    } else {
-        text.into_owned()
     };
     work = add_work(work, text.len(), limits)?;
 
@@ -946,18 +952,12 @@ mod planner_performance_tests {
                     wire_size: 5,
                 };
                 let raw = format!("Content-Type: {field}{tail}\r\n\r\n");
-                let started = std::time::Instant::now();
                 let measured = allocation_counter::measure(|| {
                     assert_eq!(
                         validate_headers(raw.as_bytes(), Some(&selected), &Limits::default()),
                         Ok(None)
                     );
                 });
-                eprintln!(
-                    "mime fallback fragments={fragments} source={} tail={tail:?} elapsed={:?} {measured:?}",
-                    raw.len(),
-                    started.elapsed()
-                );
                 assert!(
                     measured.bytes_total < 64 * 1024 + raw.len() as u64 * 4,
                     "ordinary scalars and empty separators must not force unused continuation materialization: {measured:?}"
@@ -1071,6 +1071,136 @@ mod planner_performance_tests {
     }
 
     #[test]
+    fn transfer_decoded_text_reuses_its_complete_body_allocation() {
+        let source = b"A synthetic message with ordinary text and line breaks.\r\n".repeat(4_096);
+        for (encoding, wire) in [
+            ("base64", STANDARD.encode(&source).into_bytes()),
+            ("quoted-printable", source.clone()),
+        ] {
+            for charset in [
+                "utf-8",
+                "unicode-1-1-utf-8",
+                "us-ascii",
+                "windows-1252",
+                "iso-2022-jp",
+            ] {
+                let selected = Selected {
+                    part: Part(NonZeroU32::MIN.into()),
+                    media_type: "text/plain".into(),
+                    charset: charset.into(),
+                    transfer_encoding: encoding.into(),
+                    wire_size: wire.len(),
+                };
+                let measured = allocation_counter::measure(|| {
+                    let rendered = render(&selected, &wire, &Limits::default()).unwrap();
+                    assert_eq!(rendered.text.as_bytes(), source);
+                    assert!(!rendered.replacements);
+                    assert!(!rendered.converted);
+                    assert_eq!(rendered.work, wire.len() * 5 + source.len() * 2);
+                });
+                assert_eq!(
+                    measured.count_total, 1,
+                    "{encoding}/{charset}: {measured:?}"
+                );
+                assert!(
+                    measured.bytes_total <= wire.len() as u64,
+                    "charset decoding must reuse transfer-decoded bytes when they are already text: {encoding}/{charset}: {measured:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn owned_transfer_decoding_keeps_wire_decoded_and_work_admission() {
+        let source = vec![b'x'; 4_096];
+        for (encoding, wire) in [
+            ("base64", STANDARD.encode(&source).into_bytes()),
+            ("quoted-printable", source.clone()),
+        ] {
+            let selected = Selected {
+                part: Part(NonZeroU32::MIN.into()),
+                media_type: "text/plain".into(),
+                charset: "utf-8".into(),
+                transfer_encoding: encoding.into(),
+                wire_size: wire.len(),
+            };
+            let exact = Limits {
+                max_body_wire_bytes: wire.len(),
+                max_decoded_bytes: source.len() * 3,
+                max_decode_steps: wire.len() * 5 + source.len() * 4,
+                ..Limits::default()
+            };
+            let rendered = render(&selected, &wire, &exact).unwrap();
+            assert_eq!(rendered.text.as_bytes(), source);
+            assert_eq!(rendered.work, wire.len() * 5 + source.len() * 2);
+            for limits in [
+                Limits {
+                    max_body_wire_bytes: exact.max_body_wire_bytes - 1,
+                    ..exact.clone()
+                },
+                Limits {
+                    max_decoded_bytes: exact.max_decoded_bytes - 1,
+                    ..exact.clone()
+                },
+                Limits {
+                    max_decode_steps: exact.max_decode_steps - 1,
+                    ..exact
+                },
+            ] {
+                assert_eq!(render(&selected, &wire, &limits), Err(Error::Limit));
+            }
+        }
+    }
+
+    #[test]
+    fn owned_transfer_decoding_preserves_charset_and_replacement_semantics() {
+        for (source, charset, expected, replacements) in [
+            (
+                b"\xef\xbb\xbfhello".as_slice(),
+                "utf-8",
+                "\u{feff}hello",
+                false,
+            ),
+            (b"caf\xc3\xa9".as_slice(), "utf-8", "caf\u{e9}", false),
+            (
+                b"bad\xffutf8".as_slice(),
+                "utf-8",
+                "\u{fffd}bad\u{fffd}utf8",
+                true,
+            ),
+            (b"caf\xe9".as_slice(), "windows-1252", "caf\u{e9}", false),
+            (
+                b"\xff\xfeh\0i\0".as_slice(),
+                "utf-16le",
+                "\u{feff}hi",
+                false,
+            ),
+            (
+                b"plain".as_slice(),
+                "x-unknown-fixture",
+                "\u{fffd}plain",
+                true,
+            ),
+        ] {
+            let wire = STANDARD.encode(source);
+            let selected = Selected {
+                part: Part(NonZeroU32::MIN.into()),
+                media_type: "text/plain".into(),
+                charset: charset.into(),
+                transfer_encoding: "base64".into(),
+                wire_size: wire.len(),
+            };
+            let rendered = render(&selected, wire.as_bytes(), &Limits::default()).unwrap();
+            assert_eq!(rendered.text, expected, "{charset}/{source:?}");
+            assert_eq!(rendered.replacements, replacements, "{charset}/{source:?}");
+            assert_eq!(
+                rendered.work,
+                wire.len() * 5 + source.len() + expected.len()
+            );
+        }
+    }
+
+    #[test]
     fn replacement_markers_do_not_grow_an_already_owned_body_copy() {
         let mut measurements = Vec::new();
         for size in [64 * 1_024, 256 * 1_024, 2 * 1_024 * 1_024] {
@@ -1097,10 +1227,6 @@ mod planner_performance_tests {
                     };
                     assert_eq!(payload.as_bytes(), wire);
                 });
-                eprintln!(
-                    "body replacement size={size} charset={charset} allocations={} total={} peak={}",
-                    measured.count_total, measured.bytes_total, measured.bytes_max
-                );
                 measurements.push((size, measured));
             }
         }
@@ -1136,10 +1262,6 @@ mod planner_performance_tests {
                 assert_eq!(payload.len(), SIZE * 2);
                 assert!(payload.chars().all(|character| character == 'é'));
             });
-            eprintln!(
-                "owned charset size={SIZE} transfer={transfer_encoding} allocations={} total={} peak={}",
-                measured.count_total, measured.bytes_total, measured.bytes_max
-            );
             assert_eq!(
                 measured.count_total, 1,
                 "an owned charset conversion with spare capacity must not copy into another output buffer: {measured:?}"
@@ -1208,10 +1330,6 @@ mod planner_performance_tests {
                         .is_empty()
                 );
             });
-            eprintln!(
-                "related planner depth={depth} parts={parts} allocations={} total={} peak={}",
-                measured.count_total, measured.bytes_total, measured.bytes_max
-            );
             measurements.push(measured);
         }
         for measured in measurements {
@@ -1242,10 +1360,6 @@ mod planner_performance_tests {
                 assert_eq!(selected.part.0.as_ref().len(), depth - 1);
                 assert!(selected.part.0.as_ref().iter().all(|part| part.get() == 1));
             });
-            eprintln!(
-                "body selection depth={depth} parts={parts} allocations={} total={} peak={}",
-                measured.count_total, measured.bytes_total, measured.bytes_max
-            );
             measurements.push(measured);
         }
         for measured in measurements {
@@ -1295,13 +1409,6 @@ mod planner_performance_tests {
                     Ok(None)
                 );
             });
-            eprintln!(
-                "MIME continuations fragments={fragments} source={} allocations={} total={} peak={}",
-                headers.len(),
-                measured.count_total,
-                measured.bytes_total,
-                measured.bytes_max
-            );
             measurements.push((headers.len(), measured));
         }
         for (bytes, measured) in measurements {
@@ -1362,13 +1469,6 @@ mod planner_performance_tests {
                     Ok(None)
                 );
             });
-            eprintln!(
-                "selected MIME continuations fragments={fragments} quoted={quoted} source={} allocations={} total={} peak={}",
-                headers.len(),
-                measured.count_total,
-                measured.bytes_total,
-                measured.bytes_max
-            );
             measurements.push((headers.len(), measured));
         }
         for (bytes, measured) in measurements {
@@ -1410,13 +1510,6 @@ mod planner_performance_tests {
                         Ok(None)
                     );
                 });
-                eprintln!(
-                    "selected encoded MIME continuations fragments={fragments} field={initial:?} source={} allocations={} total={} peak={}",
-                    headers.len(),
-                    measured.count_total,
-                    measured.bytes_total,
-                    measured.bytes_max
-                );
                 measurements.push((headers.len(), measured));
             }
         }
@@ -1455,6 +1548,60 @@ mod planner_performance_tests {
                 ),
                 "uncertain MIME syntax must preserve full-field parser recovery: {value:?}"
             );
+        }
+    }
+
+    fn compare_mime_identity(value: &[u8], require_header: bool) {
+        for (header, wanted) in [
+            (mail_parser::HeaderName::ContentType, Some("charset")),
+            (mail_parser::HeaderName::ContentDisposition, None),
+        ] {
+            let mut raw = format!("{header}: ").into_bytes();
+            raw.extend_from_slice(value);
+            raw.extend_from_slice(b"\r\n\r\n");
+            let reference = MessageParser::new()
+                .default_header_ignore()
+                .header_content_type(header.clone())
+                .parse_headers(&raw)
+                .unwrap();
+            let empty = mail_parser::HeaderValue::Empty;
+            let reference = reference.parts[0].headers.header_value(&header);
+            if require_header {
+                assert!(reference.is_some(), "{raw:?}");
+            }
+            let reference = reference.unwrap_or(&empty);
+            let parsed = MessageParser::new()
+                .default_header_ignore()
+                .ignore_header(header.clone())
+                .parse_headers(&raw)
+                .unwrap();
+            let projected = parsed.parts[0]
+                .headers
+                .header(header.clone())
+                .map(|value| &raw[value.offset_start as usize..value.offset_end as usize])
+                .map(|value| projected_mime_value(value, wanted));
+            if require_header {
+                assert!(projected.is_some(), "{raw:?}");
+            }
+            let projected = projected.as_ref().map_or_else(
+                || mail_parser::HeaderValue::Empty,
+                |projected| {
+                    mail_parser::parsers::MessageStream::new(projected.as_ref())
+                        .parse_content_type()
+                },
+            );
+            let identity = |value: &mail_parser::HeaderValue<'_>| {
+                value.as_content_type().map(|value| {
+                    (
+                        value.c_type.to_string(),
+                        value.c_subtype.as_deref().map(str::to_owned),
+                        wanted
+                            .and_then(|wanted| value.attribute(wanted))
+                            .map(str::to_owned),
+                    )
+                })
+            };
+            assert_eq!(identity(reference), identity(&projected), "{raw:?}");
         }
     }
 
@@ -1549,94 +1696,12 @@ mod planner_performance_tests {
             "text/plain; x*0*=utf-8'en'first; x*1*=last; charset=utf-8",
         ];
         for value in values {
-            for (header, wanted) in [
-                (mail_parser::HeaderName::ContentType, Some("charset")),
-                (mail_parser::HeaderName::ContentDisposition, None),
-            ] {
-                let raw = format!("{header}: {value}\r\n\r\n");
-                let reference = MessageParser::new()
-                    .default_header_ignore()
-                    .header_content_type(header.clone())
-                    .parse_headers(raw.as_bytes())
-                    .unwrap();
-                let reference = reference.parts[0].headers.header_value(&header).unwrap();
-                let parsed = MessageParser::new()
-                    .default_header_ignore()
-                    .ignore_header(header.clone())
-                    .parse_headers(raw.as_bytes())
-                    .unwrap();
-                let value = parsed.parts[0].headers.header(header.clone()).unwrap();
-                let value = &raw.as_bytes()[value.offset_start as usize..value.offset_end as usize];
-                let projected = projected_mime_value(value, wanted);
-                let projected = mail_parser::parsers::MessageStream::new(projected.as_ref())
-                    .parse_content_type();
-                let identity = |value: &mail_parser::HeaderValue<'_>| {
-                    value.as_content_type().map(|value| {
-                        (
-                            value.c_type.to_string(),
-                            value.c_subtype.as_deref().map(str::to_owned),
-                            wanted
-                                .and_then(|wanted| value.attribute(wanted))
-                                .map(str::to_owned),
-                        )
-                    })
-                };
-                assert_eq!(identity(reference), identity(&projected), "{raw:?}");
-            }
+            compare_mime_identity(value.as_bytes(), true);
         }
     }
 
     #[test]
     fn mime_identity_projection_matches_deterministic_syntax_mutations() {
-        fn compare(value: &[u8]) {
-            for (header, wanted) in [
-                (mail_parser::HeaderName::ContentType, Some("charset")),
-                (mail_parser::HeaderName::ContentDisposition, None),
-            ] {
-                let mut raw = format!("{header}: ").into_bytes();
-                raw.extend_from_slice(value);
-                raw.extend_from_slice(b"\r\n\r\n");
-                let reference = MessageParser::new()
-                    .default_header_ignore()
-                    .header_content_type(header.clone())
-                    .parse_headers(&raw)
-                    .unwrap();
-                let empty = mail_parser::HeaderValue::Empty;
-                let reference = reference.parts[0]
-                    .headers
-                    .header_value(&header)
-                    .unwrap_or(&empty);
-                let parsed = MessageParser::new()
-                    .default_header_ignore()
-                    .ignore_header(header.clone())
-                    .parse_headers(&raw)
-                    .unwrap();
-                let projected = parsed.parts[0]
-                    .headers
-                    .header(header.clone())
-                    .map(|value| &raw[value.offset_start as usize..value.offset_end as usize])
-                    .map(|value| projected_mime_value(value, wanted));
-                let projected = projected.as_ref().map_or_else(
-                    || mail_parser::HeaderValue::Empty,
-                    |projected| {
-                        mail_parser::parsers::MessageStream::new(projected.as_ref())
-                            .parse_content_type()
-                    },
-                );
-                let identity = |value: &mail_parser::HeaderValue<'_>| {
-                    value.as_content_type().map(|value| {
-                        (
-                            value.c_type.to_string(),
-                            value.c_subtype.as_deref().map(str::to_owned),
-                            wanted
-                                .and_then(|wanted| value.attribute(wanted))
-                                .map(str::to_owned),
-                        )
-                    })
-                };
-                assert_eq!(identity(reference), identity(&projected), "{raw:?}");
-            }
-        }
         let bases: &[&[u8]] = &[
             b"text/plain;; unused=; x*0=first; x*1=last; charset=utf-8;",
             b"text/plain; x*0=first; unused=\"two words\"; x*1=last; charset=utf-8",
@@ -1691,26 +1756,24 @@ mod planner_performance_tests {
             b"; charset-language*=utf-8'en'%64%65; charset*=utf-8'en'utf-8",
         ];
         for base in bases {
-            let mut positions = vec![0, base.len()];
             // Include token interiors as well as separators; malformed unused
             // values can influence the pinned parser's later recovery.
-            positions.extend(0..base.len());
-            for index in positions {
+            for index in 0..=base.len() {
                 for byte in 0..=127u8 {
                     let mut value = base.to_vec();
                     value.insert(index, byte);
-                    compare(&value);
+                    compare_mime_identity(&value, false);
                     if index != base.len() {
                         let mut value = base.to_vec();
                         value[index] = byte;
-                        compare(&value);
+                        compare_mime_identity(&value, false);
                     }
                 }
                 for addition in additions {
                     let mut value = base[..index].to_vec();
                     value.extend_from_slice(addition);
                     value.extend_from_slice(&base[index..]);
-                    compare(&value);
+                    compare_mime_identity(&value, false);
                 }
             }
         }

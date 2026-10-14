@@ -30,6 +30,47 @@ fn export_root_configuration_is_bounded_and_absolute() {
 
 #[cfg(all(feature = "cli", any(target_os = "macos", windows)))]
 #[test]
+fn export_denies_attachment_access_before_opening_the_approved_root() {
+    let installation = support::Installation::two_accounts();
+    let root = installation
+        .config()
+        .parent()
+        .unwrap()
+        .join("missing-exports");
+    let text = std::fs::read_to_string(installation.config()).unwrap();
+    std::fs::write(
+        installation.config(),
+        format!("export_roots = [{}]\n{text}", support::toml_string(&root)),
+    )
+    .unwrap();
+    let mut setup = installation.cli();
+    setup.args(["--json", "setup"]);
+    support::assert_success(&support::run_bounded(setup));
+
+    let mut command = installation.cli();
+    command
+        .args([
+            "--json",
+            "--grant",
+            "writer",
+            "attachment",
+            "export",
+            "--attachment",
+            "invalid",
+            "--root",
+        ])
+        .arg(&root);
+    let output = support::run_bounded(command);
+    assert_eq!(
+        support::envelope(&output)["error"]["code"],
+        "permission_denied"
+    );
+    assert_eq!(output.status.code(), Some(3));
+    assert!(!root.exists());
+}
+
+#[cfg(all(feature = "cli", any(target_os = "macos", windows)))]
+#[test]
 fn export_cleans_partial_after_reference_rejection() {
     let installation = support::Installation::two_accounts();
     let root = installation.config().parent().unwrap().join("exports");
@@ -127,15 +168,8 @@ async fn mcp_attachment_schema_and_errors_match_the_cli_and_hide_from_drafts_onl
                     .await
                     .unwrap();
                 assert_eq!(response.is_error, Some(true));
-                let structured = response.structured_content.unwrap();
+                let structured = support::assert_mcp_envelope(response);
                 assert_eq!(structured["error"]["code"], error);
-                assert_eq!(
-                    serde_json::from_str::<serde_json::Value>(
-                        &response.content[0].as_text().unwrap().text
-                    )
-                    .unwrap(),
-                    structured
-                );
             }
         }
         client.cancel().await.unwrap();

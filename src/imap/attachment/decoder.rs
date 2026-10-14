@@ -63,7 +63,17 @@ impl Decoder {
         match self.encoding {
             TransferEncoding::Identity => self.append(wire, limits),
             TransferEncoding::Base64 => {
-                for byte in wire.iter().copied() {
+                let mut offset = 0;
+                while offset < wire.len() {
+                    if self.base64.is_empty() && !self.base64_padded {
+                        let consumed = self.base64_run(&wire[offset..], limits)?;
+                        if consumed != 0 {
+                            offset += consumed;
+                            continue;
+                        }
+                    }
+                    let byte = wire[offset];
+                    offset += 1;
                     if byte.is_ascii_whitespace() {
                         continue;
                     }
@@ -165,6 +175,42 @@ impl Decoder {
 
     pub(super) fn integrity(self) -> (u64, [u8; 32]) {
         (self.decoded_offset as u64, self.digest.finalize().into())
+    }
+
+    fn base64_run(&mut self, wire: &[u8], limits: &Limits) -> Result<usize, Error> {
+        // Keep carry, padding, and non-alphabet octets on the strict quartet path.
+        // Complete unpadded groups can share one decode and one output growth.
+        let groups = wire
+            .iter()
+            .take_while(|&&byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/'))
+            .count()
+            / 4;
+        let used = self
+            .decoded_offset
+            .checked_add(self.pending_len())
+            .ok_or(Error::Limit)?;
+        let available = limits
+            .max_attachment_decoded_bytes
+            .saturating_sub(used)
+            .min(
+                Self::state_limit(limits)
+                    .saturating_sub(self.retained_bytes())
+                    .saturating_sub(4),
+            );
+        // Reserving four carry octets preserves the scalar path's state ceiling,
+        // including the quartet retained while its three decoded octets append.
+        let groups = groups.min(available / 3);
+        if groups < 2 {
+            return Ok(0);
+        }
+        let decoded = groups * 3;
+        let start = self.pending.len();
+        self.pending.resize(start + decoded, 0);
+        STANDARD
+            .decode_slice(&wire[..groups * 4], &mut self.pending[start..])
+            .map_err(|_| Error::Protocol)?;
+        self.account_state();
+        Ok(groups * 4)
     }
 
     fn raw_quoted_printable(&mut self, byte: u8, limits: &Limits) -> Result<(), Error> {
@@ -289,40 +335,110 @@ fn hex(byte: u8) -> Option<u8> {
 mod narrow_page_tests {
     use super::*;
 
+    fn assert_decodes_in_pages(
+        encoding: TransferEncoding,
+        wire: &[u8],
+        expected: &[u8],
+        wire_bytes: usize,
+        page: usize,
+    ) {
+        let limits = Limits {
+            max_attachment_decoded_bytes: expected.len(),
+            max_attachment_chunk_bytes: page,
+            ..Limits::default()
+        };
+        let mut decoder = Decoder::new(encoding);
+        let mut offset = 0;
+        for chunk in wire.chunks(wire_bytes) {
+            decoder.push(chunk, &limits).unwrap();
+            while decoder.pending_len() >= page {
+                let bytes = decoder.take_chunk(page);
+                assert_eq!(bytes.len(), page);
+                assert_eq!(bytes, expected[offset..offset + bytes.len()]);
+                offset += bytes.len();
+            }
+        }
+        decoder.finish(&limits).unwrap();
+        while decoder.pending_len() != 0 {
+            let bytes = decoder.take_chunk(page);
+            assert_eq!(bytes, expected[offset..offset + bytes.len()]);
+            offset += bytes.len();
+        }
+        assert_eq!(offset, expected.len());
+        assert_eq!(decoder.snapshot().decode_steps, wire.len());
+        assert_eq!(decoder.snapshot().decoded_bytes, expected.len());
+        assert!(decoder.snapshot().max_state_bytes <= MAX_CHUNK_BYTES + page + 128);
+        if encoding == TransferEncoding::Identity && MAX_CHUNK_BYTES.is_multiple_of(page) {
+            assert!(decoder.snapshot().max_state_bytes <= MAX_CHUNK_BYTES + 128);
+        }
+        assert_eq!(
+            decoder.integrity(),
+            (
+                expected.len() as u64,
+                <[u8; 32]>::from(Sha256::digest(expected))
+            )
+        );
+    }
+
     #[test]
-    fn narrow_attachment_pages_preserve_bytes_integrity_and_bounded_state() {
-        const SIZE: usize = 16 * 1_024;
-        let wire = vec![b'x'; SIZE];
-        for page_bytes in [1, 1_024, SIZE] {
-            let limits = Limits {
-                max_attachment_chunk_bytes: page_bytes,
-                ..Limits::default()
-            };
-            let started = std::time::Instant::now();
-            let measured = allocation_counter::measure(|| {
-                for _ in 0..64 {
-                    let mut decoder = Decoder::new(TransferEncoding::Identity);
-                    decoder.push(&wire, &limits).unwrap();
-                    decoder.finish(&limits).unwrap();
-                    while decoder.pending_len() != 0 {
-                        let bytes = decoder.take_chunk(page_bytes);
-                        assert_eq!(bytes.len(), page_bytes);
-                        assert!(bytes.iter().all(|byte| *byte == b'x'));
-                    }
-                    assert_eq!(decoder.snapshot().decoded_bytes, SIZE);
-                    assert!(decoder.snapshot().max_state_bytes <= SIZE + 128);
-                    assert_eq!(
-                        decoder.integrity(),
-                        (SIZE as u64, <[u8; 32]>::from(Sha256::digest(&wire)))
+    fn base64_runs_preserve_whitespace_carry_and_canonical_padding() {
+        for size in [64, 65, 66, MAX_CHUNK_BYTES + 5] {
+            let expected = (0..size)
+                .map(|index| (index.wrapping_mul(31) as u8).wrapping_add(17))
+                .collect::<Vec<_>>();
+            let wire = STANDARD
+                .encode(&expected)
+                .into_bytes()
+                .chunks(76)
+                .collect::<Vec<_>>()
+                .join(b" \t\r\n".as_slice());
+            for wire_bytes in [1, 3, 7, 76, MAX_CHUNK_BYTES] {
+                for page in [1, 7, 1_024] {
+                    assert_decodes_in_pages(
+                        TransferEncoding::Base64,
+                        &wire,
+                        &expected,
+                        wire_bytes,
+                        page,
                     );
                 }
-            });
-            eprintln!(
-                "attachment narrow pages size={SIZE} repetitions=64 page={page_bytes} elapsed_us={} allocations={} total={} peak={}",
-                started.elapsed().as_micros(),
-                measured.count_total,
-                measured.bytes_total,
-                measured.bytes_max
+            }
+        }
+    }
+
+    #[test]
+    fn base64_runs_preserve_strict_tails_and_limit_error_precedence() {
+        let prefix = STANDARD.encode([b'x'; 96]);
+        for tail in ["Zh==", "Zm9=", "Zg=A", "A===", "abcd!AAA", "abcdAAAA="] {
+            let wire = format!("{prefix}{tail}");
+            for wire_bytes in [1, 3, 7, 76, MAX_CHUNK_BYTES] {
+                let limits = Limits {
+                    max_attachment_chunk_bytes: 7,
+                    ..Limits::default()
+                };
+                let mut decoder = Decoder::new(TransferEncoding::Base64);
+                let result = wire.as_bytes().chunks(wire_bytes).try_for_each(|chunk| {
+                    decoder.push(chunk, &limits)?;
+                    while decoder.pending_len() >= 7 {
+                        decoder.take_chunk(7);
+                    }
+                    Ok(())
+                });
+                assert_eq!(
+                    result.and_then(|()| decoder.finish(&limits)),
+                    Err(Error::Protocol)
+                );
+            }
+        }
+        for (ceiling, expected) in [(93, Error::Limit), (96, Error::Protocol)] {
+            let limits = Limits {
+                max_attachment_decoded_bytes: ceiling,
+                ..Limits::default()
+            };
+            let mut decoder = Decoder::new(TransferEncoding::Base64);
+            assert_eq!(
+                decoder.push(format!("{prefix}!").as_bytes(), &limits),
+                Err(expected)
             );
         }
     }
@@ -332,7 +448,6 @@ mod narrow_page_tests {
         let expected = (0..32 * 1_024 + 9)
             .map(|index| (index % 256) as u8)
             .collect::<Vec<_>>();
-        let digest: [u8; 32] = Sha256::digest(&expected).into();
         for encoding in [
             TransferEncoding::Identity,
             TransferEncoding::Base64,
@@ -352,33 +467,8 @@ mod narrow_page_tests {
                     .join("=\r\n")
                     .into_bytes(),
             };
-            for page in [1, 7, 1_024] {
-                let limits = Limits {
-                    max_attachment_chunk_bytes: page,
-                    max_attachment_decoded_bytes: expected.len(),
-                    ..Limits::default()
-                };
-                let mut decoder = Decoder::new(encoding);
-                let mut offset = 0;
-                for chunk in wire.chunks(MAX_CHUNK_BYTES) {
-                    decoder.push(chunk, &limits).unwrap();
-                    while decoder.pending_len() >= page {
-                        let bytes = decoder.take_chunk(page);
-                        assert_eq!(bytes, expected[offset..offset + bytes.len()]);
-                        offset += bytes.len();
-                    }
-                }
-                decoder.finish(&limits).unwrap();
-                while decoder.pending_len() != 0 {
-                    let bytes = decoder.take_chunk(page);
-                    assert_eq!(bytes, expected[offset..offset + bytes.len()]);
-                    offset += bytes.len();
-                }
-                assert_eq!(offset, expected.len());
-                assert_eq!(decoder.snapshot().decode_steps, wire.len());
-                assert_eq!(decoder.snapshot().decoded_bytes, expected.len());
-                assert!(decoder.snapshot().max_state_bytes <= MAX_CHUNK_BYTES + page + 128);
-                assert_eq!(decoder.integrity(), (expected.len() as u64, digest));
+            for page in [1, 7, 1_024, MAX_CHUNK_BYTES] {
+                assert_decodes_in_pages(encoding, &wire, &expected, MAX_CHUNK_BYTES, page);
             }
         }
     }

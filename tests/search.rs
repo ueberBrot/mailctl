@@ -77,6 +77,46 @@ fn search_normalizes_and_terms_without_turning_repeated_fields_into_or() {
 }
 
 #[test]
+fn search_dates_require_canonical_calendar_spelling() {
+    use mailctl::domain::{ErrorCode, SearchDate};
+    for value in ["0001-01-01", "2024-02-29", "9999-12-31"] {
+        assert_eq!(
+            SearchDate::try_from(value.to_owned()).unwrap().as_str(),
+            value
+        );
+    }
+    for value in [
+        "0000-01-01",
+        "10000-01-01",
+        "2023-02-29",
+        "2024-02-30",
+        "2024-00-29",
+        "2024-13-29",
+        "2024-02-00",
+        "2024-2-29",
+        "2024-02-9",
+        "+024-02-29",
+        "-024-02-29",
+        "2024/02/29",
+        "2024- 2-29",
+        "2024-02-29 ",
+        " 2024-02-29",
+        "２０２４-02-29",
+    ] {
+        assert_eq!(
+            SearchDate::try_from(value.to_owned()).unwrap_err().code,
+            ErrorCode::InvalidRequest,
+            "{value}",
+        );
+        let encoded = serde_json::to_string(value).unwrap();
+        assert!(
+            serde_json::from_str::<SearchDate>(&encoded).is_err(),
+            "{value}"
+        );
+    }
+}
+
+#[test]
 fn contradictory_or_oversized_criteria_fail_before_application_work() {
     use mailctl::domain::SearchCriteria;
     for criteria in [

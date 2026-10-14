@@ -388,15 +388,7 @@ async fn execute_application(
         };
     }
     #[cfg(feature = "cli")]
-    let mut export = match &action {
-        Action::Export { root, name, .. } => Some(crate::export::ExportWriter::create(
-            &export_roots,
-            root,
-            name,
-            application.limits()?.attachment_decoded_bytes,
-        )?),
-        _ => None,
-    };
+    let mut export = None;
     #[cfg(feature = "cli")]
     let mut draft_identity = None;
     #[cfg(not(feature = "cli"))]
@@ -425,12 +417,13 @@ async fn execute_application(
                 application.execute(identity.save(draft)).await
             }
             #[cfg(feature = "cli")]
-            Action::Export { attachment, .. } => {
+            Action::Export {
+                attachment,
+                root,
+                name,
+            } => {
                 application
-                    .export_attachment(
-                        attachment,
-                        export.as_mut().expect("export writer initialized"),
-                    )
+                    .export_attachment(attachment, &export_roots, &root, &name, &mut export)
                     .await
             }
             Action::Doctor { check_account } => application.doctor(check_account).await,
@@ -439,7 +432,10 @@ async fn execute_application(
                 application.download_attachment(input).await
             }
             #[cfg(feature = "cli")]
-            Action::Email(operation) => application.execute(operation).await,
+            Action::Email(operation) => {
+                draft_identity = operation.draft_outcome_identity();
+                application.execute(operation).await
+            }
             #[cfg(feature = "mcp")]
             Action::Mcp { .. } => unreachable!(),
             Action::Setup(_)

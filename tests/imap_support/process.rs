@@ -32,7 +32,7 @@ enum ExpectedOperation {
     Authenticate,
     Append(DraftReply, Duration),
     DraftTarget(u32),
-    Reconcile,
+    Reconcile(bool),
     RejectAuthentication(bool),
     Mailboxes(Vec<&'static str>),
     AllMailboxes(Vec<&'static str>),
@@ -55,6 +55,7 @@ pub enum AttachmentPhase {
     Start,
     Continue,
     Interrupted,
+    InterruptedContinuation,
 }
 
 pub struct ImapServer {
@@ -63,6 +64,7 @@ pub struct ImapServer {
     expected: Arc<Mutex<VecDeque<Expected>>>,
     accepted: Arc<AtomicUsize>,
     interrupted: Arc<AtomicUsize>,
+    stalled_reconciliations: Arc<AtomicUsize>,
     drafts: Arc<Mutex<Vec<Vec<u8>>>>,
     stop: watch::Sender<bool>,
     task: Option<thread::JoinHandle<()>>,
@@ -94,6 +96,8 @@ impl ImapServer {
         let count = accepted.clone();
         let interrupted = Arc::new(AtomicUsize::new(0));
         let stalled = interrupted.clone();
+        let stalled_reconciliations = Arc::new(AtomicUsize::new(0));
+        let reconciling = stalled_reconciliations.clone();
         let drafts = Arc::new(Mutex::new(Vec::new()));
         let captured = drafts.clone();
         let task = thread::spawn(move || {
@@ -135,9 +139,9 @@ impl ImapServer {
                                     append_draft(&mut wire, reply, &stalled, &captured).await;
                                     return;
                                 },
-                                ExpectedOperation::Reconcile => {
+                                ExpectedOperation::Reconcile(stalled) => {
                                     let bytes = captured.lock().unwrap().last().unwrap().clone();
-                                    reconcile_draft(&mut wire, &bytes).await;
+                                    reconcile_draft(&mut wire, &bytes, stalled.then_some(reconciling.as_ref())).await;
                                     return;
                                 },
                                 ExpectedOperation::DraftTarget(validity) => {
@@ -170,7 +174,7 @@ impl ImapServer {
                                 ExpectedOperation::Body(mailbox, text) => body_page(&mut wire, mailbox, &text).await,
                                 ExpectedOperation::Attachment(mailbox, phase, filename) => {
                                     attachment_page(&mut wire, mailbox, phase, &filename, &stalled).await;
-                                    if phase == AttachmentPhase::Interrupted { return; }
+                                    if matches!(phase, AttachmentPhase::Interrupted | AttachmentPhase::InterruptedContinuation) { return; }
                                 },
                             }
                             imap_support::logout(&mut wire).await;
@@ -185,6 +189,7 @@ impl ImapServer {
             expected,
             accepted,
             interrupted,
+            stalled_reconciliations,
             drafts,
             stop,
             task: Some(task),
@@ -195,8 +200,20 @@ impl ImapServer {
         self.expected.lock().unwrap().push_back(Expected {
             username: "work@example.test",
             password: "disposable-password",
-            operation: ExpectedOperation::Reconcile,
+            operation: ExpectedOperation::Reconcile(false),
         });
+    }
+
+    pub fn expect_stalled_reconciliation(&self) {
+        self.expected.lock().unwrap().push_back(Expected {
+            username: "work@example.test",
+            password: "disposable-password",
+            operation: ExpectedOperation::Reconcile(true),
+        });
+    }
+
+    pub fn stalled_reconciliations(&self) -> usize {
+        self.stalled_reconciliations.load(Ordering::SeqCst)
     }
 
     pub fn expect_append(&self, reply: DraftReply) {
@@ -452,6 +469,10 @@ async fn attachment_page(
 ) {
     use imap_support::{expect, write};
     let tag = expect(wire, &format!("EXAMINE {}", mailbox_argument(mailbox))).await;
+    if payload == AttachmentPhase::InterruptedContinuation {
+        interrupt_attachment(wire, interrupted).await;
+        return;
+    }
     write(
         wire,
         &format!("* 3 EXISTS\r\n* OK [UIDVALIDITY 77] stable\r\n{tag} OK [READ-ONLY] selected\r\n"),
@@ -462,15 +483,8 @@ async fn attachment_page(
         write(wire, &format!("* 3 FETCH (UID 3 RFC822.SIZE 3000300 BODYSTRUCTURE ((\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" 13 1 NIL NIL NIL NIL)(\"APPLICATION\" \"OCTET-STREAM\" NIL NIL NIL \"BASE64\" 8 NIL (\"ATTACHMENT\" (\"FILENAME\" \"{filename}\")) NIL NIL) \"MIXED\" NIL NIL NIL NIL))\r\n{tag} OK fetched\r\n")).await;
     }
     if payload == AttachmentPhase::Interrupted {
-        use tokio::io::AsyncReadExt;
         expect(wire, "UID FETCH 3 (UID BODY.PEEK[2]<0.16384>)").await;
-        interrupted.fetch_add(1, Ordering::SeqCst);
-        let closed = wire.read(&mut [0]).await;
-        assert!(
-            matches!(closed, Ok(0))
-                || closed.is_err_and(|error| error.kind() == std::io::ErrorKind::UnexpectedEof),
-            "cancelled export disposes the connection"
-        );
+        interrupt_attachment(wire, interrupted).await;
     }
     if payload == AttachmentPhase::Start {
         let tag = expect(wire, "UID FETCH 3 (UID BODY.PEEK[2]<0.16384>)").await;
@@ -480,6 +494,17 @@ async fn attachment_page(
         )
         .await;
     }
+}
+
+async fn interrupt_attachment(wire: &mut imap_support::Wire, interrupted: &AtomicUsize) {
+    use tokio::io::AsyncReadExt;
+    interrupted.fetch_add(1, Ordering::SeqCst);
+    let closed = wire.read(&mut [0]).await;
+    assert!(
+        matches!(closed, Ok(0))
+            || closed.is_err_and(|error| error.kind() == std::io::ErrorKind::UnexpectedEof),
+        "cancelled export disposes the connection"
+    );
 }
 
 async fn append_draft(
@@ -554,7 +579,11 @@ async fn append_draft(
     );
 }
 
-async fn reconcile_draft(wire: &mut imap_support::Wire, bytes: &[u8]) {
+async fn reconcile_draft(
+    wire: &mut imap_support::Wire,
+    bytes: &[u8],
+    stalled: Option<&AtomicUsize>,
+) {
     use tokio::io::AsyncWriteExt;
     {
         let tag = imap_support::expect(wire, "EXAMINE Drafts").await;
@@ -570,6 +599,11 @@ async fn reconcile_draft(wire: &mut imap_support::Wire, bytes: &[u8]) {
         .unwrap();
     let tag =
         imap_support::expect(wire, &format!("UID SEARCH UID 1:4 HEADER Message-ID {id}")).await;
+    if let Some(stalled) = stalled {
+        stalled.fetch_add(1, Ordering::SeqCst);
+        imap_support::dropped(wire).await;
+        return;
+    }
     imap_support::write(wire, &format!("* SEARCH 4\r\n{tag} OK found\r\n")).await;
     let tag = imap_support::expect(wire, "UID FETCH 4 (UID BODY.PEEK[]<0.16384>)").await;
     imap_support::write(

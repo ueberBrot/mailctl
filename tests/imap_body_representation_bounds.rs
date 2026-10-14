@@ -90,6 +90,73 @@ async fn default_body_budget_reads_an_exact_two_mebibyte_part_in_bounded_chunks(
     fixture.task.await.unwrap();
 }
 
+#[test]
+fn selected_body_excess_probe_does_not_grow_the_complete_buffer() {
+    const SIZE: usize = 1024 * 1024;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut measurements = Vec::new();
+    for (excess, budget, expected) in [
+        (false, 2 * SIZE, Error::Limit),
+        (true, 2 * SIZE, Error::Protocol),
+        (true, SIZE, Error::Limit),
+    ] {
+        let structure = format!(
+            "({} \"MIXED\" NIL NIL NIL NIL)",
+            text_part("PLAIN", SIZE, "NIL")
+        );
+        let limits = Limits {
+            max_body_wire_bytes: budget,
+            // An exact-size body reaches representation admission. Stop there
+            // so its returned text does not obscure retrieval allocations.
+            max_decoded_bytes: 4,
+            ..Limits::default()
+        };
+        let (mut probe, server) = dedicated_fixture(TlsMode::Implicit, limits, move |mut wire| {
+            Box::pin(async move {
+                selected_prefix(&mut wire, &structure, SIZE + ROOT_HEADERS.len()).await;
+                let chunk = vec![b'x'; 16 * 1024];
+                for offset in (0..SIZE).step_by(chunk.len()) {
+                    literal_bytes(&mut wire, "1", offset, chunk.len(), &chunk).await;
+                }
+                literal_bytes(&mut wire, "1", SIZE, 1, if excess { b"x" } else { b"" }).await;
+                dropped(&mut wire).await;
+            })
+        });
+        let measured = allocation_counter::measure(|| {
+            assert_eq!(
+                runtime
+                    .block_on(probe.read_body(
+                        "fixture",
+                        "disposable-password",
+                        "INBOX",
+                        BodyRequest::new(4, 77),
+                    ))
+                    .unwrap_err(),
+                expected,
+                "excess={excess}, budget={budget}",
+            );
+        });
+        server.join().unwrap();
+        assert!(probe.metrics().wire_bytes >= SIZE);
+        assert_eq!(probe.metrics().decoded_bytes, 0);
+        eprintln!("selected body size={SIZE} excess={excess} budget={budget} {measured:?}");
+        measurements.push(measured);
+    }
+    // TLS fragmentation can vary, but rejecting the probe must not allocate
+    // another complete selected-body buffer.
+    assert!(
+        measurements[1].bytes_max <= measurements[0].bytes_max + 64 * 1024,
+        "excess-byte rejection must preserve retrieval's peak allocation: {measurements:?}"
+    );
+    assert!(
+        measurements[1].bytes_total <= measurements[0].bytes_total + 64 * 1024,
+        "excess-byte rejection must not copy the complete buffer: {measurements:?}"
+    );
+}
+
 #[tokio::test]
 async fn all_mime_nodes_count_even_when_selection_excludes_their_subtrees() {
     let attached = text_part("PLAIN", 3, "(\"ATTACHMENT\" NIL)");

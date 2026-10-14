@@ -1,15 +1,157 @@
 mod attachment_support;
 mod imap_support;
 
-use attachment_support::{decoder, metadata, structure};
+use attachment_support::{decoder, metadata, payload_session, structure};
 use imap_support::*;
 use mailctl::imap::{AttachmentListRequest, Error, Limits, TlsMode};
-use std::time::Duration;
+use sha2::Digest;
+use std::{
+    sync::{Arc, atomic::AtomicUsize},
+    time::Duration,
+};
 
 async fn start(wire: &mut Wire, encoding: &str, size: usize) {
     authenticate(wire).await;
     examine(wire).await;
     metadata(wire, &structure(encoding, size)).await;
+}
+
+#[tokio::test]
+async fn zero_output_attachment_prefixes_reach_decoded_bytes_before_returning_a_page() {
+    for (encoding, mut payload, tail) in [
+        ("BASE64", vec![b' '; 1536], b"eA==".as_slice()),
+        ("QUOTED-PRINTABLE", b"=\r\n".repeat(512), b"x".as_slice()),
+    ] {
+        payload.extend_from_slice(tail);
+        let position = Arc::new(AtomicUsize::new(0));
+        let limits = Limits {
+            max_operation_bytes: 4096,
+            max_response_bytes: 1024,
+            max_literal_bytes: 512,
+            ..Limits::default()
+        };
+        let mut fixture = fixture(TlsMode::Implicit, limits.clone(), move |mut wire| {
+            Box::pin(async move {
+                start(&mut wire, encoding, payload.len()).await;
+                payload_session(&mut wire, &payload, &position, 512).await;
+            })
+        })
+        .await;
+        let chunk = fixture
+            .probe
+            .read_attachment("fixture", "disposable-password", &mut decoder())
+            .await
+            .unwrap();
+        assert_eq!(chunk.bytes, b"x", "{encoding}");
+        assert_eq!(chunk.decoded_offset, 0);
+        let integrity = chunk.integrity.expect("the short final slice proves EOF");
+        assert_eq!(integrity.total_decoded_bytes, 1);
+        assert_eq!(
+            integrity.sha256,
+            <[u8; 32]>::from(sha2::Sha256::digest(b"x")),
+        );
+        let metrics = fixture.probe.metrics();
+        assert!(metrics.wire_bytes <= limits.max_operation_bytes);
+        assert_eq!(metrics.transfer_decoded_bytes, 1);
+        assert!(metrics.transfer_decode_steps <= limits.max_decode_steps);
+        fixture.task.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn zero_output_attachment_prefixes_exhaust_the_operation_budget_and_close_transport() {
+    for (encoding, payload) in [
+        ("BASE64", vec![b' '; 1536]),
+        ("QUOTED-PRINTABLE", b"=\r\n".repeat(512)),
+    ] {
+        let limits = Limits {
+            max_operation_bytes: 2048,
+            max_response_bytes: 1024,
+            max_literal_bytes: 512,
+            ..Limits::default()
+        };
+        let mut fixture = fixture(TlsMode::Implicit, limits.clone(), move |mut wire| {
+            Box::pin(async move {
+                start(&mut wire, encoding, payload.len()).await;
+                literal_bytes(&mut wire, "2", 0, 512, &payload[..512]).await;
+                literal_bytes(&mut wire, "2", 512, 512, &payload[512..1024]).await;
+                expect(&mut wire, "UID FETCH 4 (UID BODY.PEEK[2]<1024.512>)").await;
+                // The next literal cannot fit the operation budget; its announcement
+                // must dispose the connection before the provider sends the payload.
+                write(&mut wire, "* 1 FETCH (UID 4 BODY[2]<1024> {512}\r\n").await;
+                dropped(&mut wire).await;
+            })
+        })
+        .await;
+        assert_eq!(
+            fixture
+                .probe
+                .read_attachment("fixture", "disposable-password", &mut decoder())
+                .await
+                .unwrap_err(),
+            Error::Limit,
+            "{encoding}",
+        );
+        let metrics = fixture.probe.metrics();
+        assert!(metrics.wire_bytes <= limits.max_operation_bytes);
+        assert_eq!(metrics.transfer_wire_bytes, 1024);
+        assert_eq!(metrics.transfer_decode_steps, 1024);
+        assert_eq!(metrics.transfer_decoded_bytes, 0);
+        fixture.task.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn nonempty_attachment_prefixes_return_before_the_operation_budget_is_exhausted() {
+    let mut payload = vec![b'x'; 1536];
+    payload.push(b'y');
+    let payload: Arc<[u8]> = payload.into();
+    let position = Arc::new(AtomicUsize::new(0));
+    let mut first = true;
+    let mut fixture = repeating_fixture(
+        Limits {
+            max_operation_bytes: 4096,
+            max_response_bytes: 1024,
+            max_literal_bytes: 512,
+            max_attachment_chunk_bytes: 4096,
+            ..Limits::default()
+        },
+        2,
+        move |mut wire| {
+            let initial = first;
+            first = false;
+            let payload = payload.clone();
+            let position = position.clone();
+            Box::pin(async move {
+                if initial {
+                    start(&mut wire, "7BIT", payload.len()).await;
+                } else {
+                    authenticate(&mut wire).await;
+                    examine(&mut wire).await;
+                }
+                payload_session(&mut wire, &payload, &position, 512).await;
+            })
+        },
+    )
+    .await;
+    let mut request = decoder();
+    let prefix = fixture
+        .probe
+        .read_attachment("fixture", "disposable-password", &mut request)
+        .await
+        .unwrap();
+    assert_eq!(prefix.bytes, vec![b'x'; 1536]);
+    assert_eq!(prefix.decoded_offset, 0);
+    assert!(prefix.integrity.is_none());
+    let tail = fixture
+        .probe
+        .read_attachment("fixture", "disposable-password", &mut request)
+        .await
+        .unwrap();
+    assert_eq!(tail.bytes, b"y");
+    assert_eq!(tail.decoded_offset, 1536);
+    assert_eq!(tail.integrity.unwrap().total_decoded_bytes, 1537);
+    fixture.task.await.unwrap();
 }
 
 #[tokio::test]

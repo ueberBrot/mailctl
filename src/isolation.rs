@@ -214,14 +214,21 @@ impl Client {
         let expires =
             tokio::time::Instant::now() + Duration::from_secs(self.limits.operation_seconds as u64);
         let bytes = serialize_bounded(&request, REQUEST_BYTES)?;
-        let draft_identity = match &request {
+        let (draft_identity, uncertain_on_interrupt) = match request {
             ClientFrame::Operation {
-                operation: Operation::SaveDraft(input),
+                operation: Operation::DraftStatus(input),
                 ..
-            } => Some(input.operation_details()),
-            _ => None,
+            } => (
+                Some(crate::domain::DraftOperationDetails {
+                    identity: input.identity(),
+                    mailbox: input.mailbox,
+                    uid_validity: None,
+                }),
+                input.reconcile,
+            ),
+            ClientFrame::Operation { operation, .. } => (operation.draft_outcome_identity(), true),
+            _ => (None, false),
         };
-        drop(request);
         // Cancellation drops the taken stream, so no subsequent operation can
         // receive a response that belonged to the cancelled request.
         let mut retained = tokio::time::timeout_at(expires, self.stream.lock())
@@ -241,12 +248,23 @@ impl Client {
             ServerFrame::Result { envelope } => Ok(envelope),
             ServerFrame::Hello { .. } => Err(Error::new(ErrorCode::ProtocolMismatch)),
         })
-        .map_err(|error| match draft_identity {
-            Some(identity) => Error::draft_outcome(ErrorCode::OutcomeUnknown, identity),
-            None => error,
+        .map_err(|error| match &draft_identity {
+            Some(identity) if uncertain_on_interrupt => {
+                Error::draft_outcome(ErrorCode::OutcomeUnknown, identity.clone())
+            }
+            _ => error,
         })?;
         *retained = Some(stream);
-        envelope.into_result()
+        envelope.into_result().map_err(|mut error| {
+            if matches!(
+                error.code,
+                ErrorCode::OutcomeUnknown | ErrorCode::OperationInProgress
+            ) && error.draft_operation.is_none()
+            {
+                error.draft_operation = draft_identity.map(Box::new);
+            }
+            error
+        })
     }
 }
 
@@ -373,6 +391,7 @@ async fn serve_session(
     let context = service.context(&grant, &narrowing)?;
     drop(narrowing);
     let (limits, response_bound) = session_limits(service.limits(&context)?)?;
+    let context = context.with_operation_limit(limits.operation_seconds);
     write_frame(
         &mut stream,
         &ServerFrame::Hello {
@@ -399,36 +418,19 @@ async fn serve_session(
             if client_bound < 1024 || client_bound > response_bound {
                 return Err(Error::new(ErrorCode::InvalidRequest));
             }
-            let narrowed = context
-                .clone()
-                .with_response_limit(client_bound.saturating_sub(256));
+            let narrowed = context.clone().with_response_limit(client_bound);
             let operation_deadline = Duration::from_secs(limits.operation_seconds as u64);
-            let creates_draft = matches!(
-                &request,
-                ClientFrame::Operation {
-                    operation: Operation::SaveDraft(_),
-                    ..
+            // The application owns the narrowed deadline and retains draft
+            // uncertainty when cancellation follows dispatch or reconciliation.
+            let result = match request {
+                ClientFrame::Operation { operation, .. } => {
+                    service.execute(&narrowed, operation).await
                 }
-            );
-            let operation = async {
-                match request {
-                    ClientFrame::Operation { operation, .. } => {
-                        service.execute(&narrowed, operation).await
-                    }
-                    ClientFrame::Doctor { check_account, .. } => service
-                        .doctor(&narrowed, check_account)
-                        .await
-                        .map(OperationResult::Doctor),
-                    ClientFrame::Hello { .. } => Err(Error::new(ErrorCode::ProtocolMismatch)),
-                }
-            };
-            // Draft creation owns its deadline and preserves uncertain outcomes.
-            let result = if creates_draft {
-                operation.await
-            } else {
-                timeout(operation_deadline, operation)
+                ClientFrame::Doctor { check_account, .. } => service
+                    .doctor(&narrowed, check_account)
                     .await
-                    .map_err(|_| Error::new(ErrorCode::Timeout))?
+                    .map(OperationResult::Doctor),
+                ClientFrame::Hello { .. } => Err(Error::new(ErrorCode::ProtocolMismatch)),
             };
             timeout(
                 operation_deadline,
@@ -498,6 +500,17 @@ async fn write_result(
     result: Result<OperationResult, Error>,
     maximum: usize,
 ) -> Result<(), Error> {
+    let fallback = match &result {
+        Err(error)
+            if matches!(
+                error.code,
+                ErrorCode::OutcomeUnknown | ErrorCode::OperationInProgress
+            ) =>
+        {
+            error.code
+        }
+        _ => ErrorCode::ResponseTooLarge,
+    };
     let frame = ServerFrame::Result {
         envelope: Envelope::from_result(uuid::Uuid::new_v4().to_string(), result),
     };
@@ -507,7 +520,7 @@ async fn write_result(
             &ServerFrame::Result {
                 envelope: Envelope::from_result(
                     uuid::Uuid::new_v4().to_string(),
-                    Err(Error::new(ErrorCode::ResponseTooLarge)),
+                    Err(Error::new(fallback)),
                 ),
             },
             maximum,
@@ -938,6 +951,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn interrupted_reconciliation_preserves_identity_but_a_journal_read_does_not() {
+        for reconcile in [true, false] {
+            let (client, mut peer) = client_pair();
+            let Operation::SaveDraft(input) = draft(String::new()) else {
+                unreachable!();
+            };
+            let identity = input.operation_details();
+            let operation = Operation::DraftStatus(crate::domain::DraftStatusInput {
+                account_id: input.account_id,
+                account_generation: input.account_generation,
+                operation_id: input.operation_id,
+                mailbox: input.mailbox,
+                reconcile,
+            });
+            let disconnect = async {
+                let request: ClientFrame = read_frame(&mut peer, REQUEST_BYTES, 32).await.unwrap();
+                assert!(matches!(
+                    request,
+                    ClientFrame::Operation {
+                        operation: Operation::DraftStatus(_),
+                        ..
+                    }
+                ));
+                drop(peer);
+            };
+            let (result, ()) = tokio::join!(client.execute(operation), disconnect);
+            let error = result.unwrap_err();
+            if reconcile {
+                assert_eq!(error.code, ErrorCode::OutcomeUnknown);
+                assert_eq!(error.draft_operation.as_deref(), Some(&identity));
+            } else {
+                assert_eq!(error.code, ErrorCode::BrokerUnavailable);
+                assert!(error.draft_operation.is_none());
+            }
+            assert!(client.stream.lock().await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn compact_uncertain_errors_restore_the_callers_draft_identity() {
+        for reconcile in [true, false] {
+            for code in [ErrorCode::OutcomeUnknown, ErrorCode::OperationInProgress] {
+                let (client, mut peer) = client_pair();
+                let Operation::SaveDraft(input) = draft(String::new()) else {
+                    unreachable!();
+                };
+                let identity = input.operation_details();
+                let operation = Operation::DraftStatus(crate::domain::DraftStatusInput {
+                    account_id: input.account_id,
+                    account_generation: input.account_generation,
+                    operation_id: input.operation_id,
+                    mailbox: input.mailbox,
+                    reconcile,
+                });
+                let reply = async {
+                    let _: ClientFrame = read_frame(&mut peer, REQUEST_BYTES, 32).await.unwrap();
+                    write_frame(
+                        &mut peer,
+                        &ServerFrame::Result {
+                            envelope: Envelope::from_result(
+                                "fixture".into(),
+                                Err(Error::new(code)),
+                            ),
+                        },
+                        REQUEST_BYTES,
+                    )
+                    .await
+                    .unwrap();
+                };
+                let (result, ()) = tokio::join!(client.execute(operation), reply);
+                let error = result.unwrap_err();
+                assert_eq!(error.code, code);
+                assert_eq!(error.draft_operation.as_deref(), Some(&identity));
+                assert!(client.stream.lock().await.is_some());
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn unexpected_hello_after_a_read_remains_a_protocol_mismatch() {
         let (client, mut peer) = client_pair();
         let reply = async {
@@ -1003,6 +1095,297 @@ mod tests {
         assert!(client.stream.lock().await.is_none());
     }
 
+    struct DraftInstallation(Config);
+    impl DraftInstallation {
+        fn new() -> Self {
+            let directory = fs::canonicalize(std::env::temp_dir())
+                .unwrap()
+                .join(format!("mailctl-isolation-drafts-{}", uuid::Uuid::new_v4()));
+            Self(
+                Config::parse(&format!(
+                    r#"default_grant = "reader"
+state_dir = {state}
+[limits]
+operation_seconds = 120
+account_connections = 1
+active_requests = 1
+[[accounts]]
+key = "fixture"
+alias = "fixture"
+server = "imap.example.test"
+username = "fixture@example.test"
+mailboxes = ["Drafts"]
+from_identities = ["fixture@example.test"]
+drafts_mailbox = "Drafts"
+[accounts.credential]
+source = "session"
+[[grants]]
+name = "reader"
+accounts = ["fixture"]
+[[grants]]
+name = "writer"
+profile = "drafts_only"
+accounts = ["fixture"]
+"#,
+                    state = serde_json::to_string(&directory.join("state")).unwrap(),
+                ))
+                .unwrap(),
+            )
+        }
+    }
+    impl Drop for DraftInstallation {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(self.0.state_dir.parent().unwrap());
+        }
+    }
+
+    async fn draft_session(
+        service: Arc<Service>,
+    ) -> (
+        UnixStream,
+        tokio::task::JoinHandle<Result<(), Error>>,
+        Limits,
+        usize,
+    ) {
+        let (mut caller, server) = UnixStream::pair().unwrap();
+        let session = tokio::spawn(serve_session(server, service, "writer".into(), 4));
+        write_frame(
+            &mut caller,
+            &ClientFrame::Hello {
+                narrowing: Narrowing::default(),
+            },
+            REQUEST_BYTES,
+        )
+        .await
+        .unwrap();
+        let ServerFrame::Hello {
+            limits,
+            response_bound,
+        } = read_frame(&mut caller, REQUEST_BYTES, 32).await.unwrap()
+        else {
+            panic!("isolated session hello");
+        };
+        (caller, session, limits, response_bound)
+    }
+
+    #[tokio::test]
+    async fn isolated_drafts_use_the_advertised_deadline_and_preserve_dispatch_uncertainty() {
+        use crate::{
+            domain::{DraftStatusInput, SaveDraftInput},
+            draft_journal::{DraftJournal, DraftOperationState},
+            service::{DraftAppend, DraftBackend, DraftPreparation, MailboxTarget},
+        };
+        use std::{
+            future::{Future, pending},
+            pin::Pin,
+            sync::atomic::{AtomicBool, Ordering},
+        };
+        use tokio::{sync::Notify, time::Instant};
+
+        struct Backend {
+            dispatched: bool,
+            entered: Notify,
+            dropped: Arc<AtomicBool>,
+        }
+        struct PendingResource(Arc<AtomicBool>);
+        impl Drop for PendingResource {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        impl DraftBackend for Backend {
+            fn prepare<'a>(
+                &'a self,
+                _: MailboxTarget<'a>,
+                _: &'a str,
+                _: &'a Limits,
+            ) -> DraftPreparation<'a> {
+                Box::pin(async move {
+                    if !self.dispatched {
+                        let _resource = PendingResource(self.dropped.clone());
+                        self.entered.notify_one();
+                        pending::<()>().await;
+                    }
+                    Ok(Box::new(Append(self)) as Box<dyn DraftAppend>)
+                })
+            }
+            fn reconcile<'a>(
+                &'a self,
+                _: MailboxTarget<'a>,
+                _: &'a str,
+                _: &'a crate::draft::DraftVerification,
+                _: &'a Limits,
+            ) -> Pin<Box<dyn Future<Output = Result<crate::draft::DraftEvidence, Error>> + Send + 'a>>
+            {
+                Box::pin(async { panic!("deadline checks must not reconcile") })
+            }
+        }
+        struct Append<'a>(&'a Backend);
+        impl DraftAppend for Append<'_> {
+            fn uid_validity(&self) -> u32 {
+                77
+            }
+            fn append<'a>(
+                self: Box<Self>,
+                _: &'a crate::draft::PreparedDraft,
+                _: &'a Limits,
+            ) -> Pin<Box<dyn Future<Output = Result<crate::imap::AppendOutcome, Error>> + Send + 'a>>
+            where
+                Self: 'a,
+            {
+                Box::pin(async move {
+                    let _resource = PendingResource(self.0.dropped.clone());
+                    self.0.entered.notify_one();
+                    pending().await
+                })
+            }
+        }
+
+        async fn check(dispatched: bool) {
+            let installation = DraftInstallation::new();
+            let config = &installation.0;
+            Service::setup(config.clone()).unwrap();
+            let backend = Arc::new(Backend {
+                dispatched,
+                entered: Notify::new(),
+                dropped: Arc::new(AtomicBool::new(false)),
+            });
+            let service = Arc::new(
+                Service::open(config.clone())
+                    .unwrap()
+                    .with_draft_backend(backend.clone()),
+            );
+            let context = service.context("writer", &Narrowing::default()).unwrap();
+            let OperationResult::Accounts(accounts) = service
+                .execute(&context, Operation::ListAccounts(Default::default()))
+                .await
+                .unwrap()
+            else {
+                panic!("fixture account discovery");
+            };
+            let input = SaveDraftInput {
+                account_id: accounts.accounts[0].account_id.parse().unwrap(),
+                account_generation: accounts.accounts[0].generation,
+                operation_id: uuid::Uuid::new_v4(),
+                mailbox: "Drafts".into(),
+                draft: Box::new(crate::domain::DraftContent {
+                    body: "Synthetic isolated draft deadline.".into(),
+                    ..Default::default()
+                }),
+            };
+            let identity = input.identity();
+            let (mut caller, session, limits, response_bound) =
+                draft_session(service.clone()).await;
+            assert_eq!(limits.operation_seconds, 30);
+            let started = Instant::now();
+            write_frame(
+                &mut caller,
+                &ClientFrame::Operation {
+                    operation: Operation::SaveDraft(input),
+                    response_limit: response_bound,
+                },
+                REQUEST_BYTES,
+            )
+            .await
+            .unwrap();
+            timeout(Duration::from_secs(3), backend.entered.notified())
+                .await
+                .expect("synthetic backend did not reach its pending stage");
+            let response = timeout(
+                Duration::from_secs(35),
+                read_frame::<ServerFrame>(&mut caller, response_bound, 32),
+            )
+            .await;
+            if response.is_err() {
+                session.abort();
+                let _ = session.await;
+                panic!(
+                    "isolated draft exceeded its advertised 30-second deadline; dispatched={dispatched}"
+                );
+            }
+            let ServerFrame::Result { envelope } = response.unwrap().unwrap() else {
+                panic!("isolated draft result");
+            };
+            assert!(started.elapsed() >= Duration::from_secs(29));
+            let error = envelope.into_result().unwrap_err();
+            assert_eq!(
+                error.code,
+                if dispatched {
+                    ErrorCode::OutcomeUnknown
+                } else {
+                    ErrorCode::Timeout
+                },
+            );
+            if dispatched {
+                let operation = error.draft_operation.unwrap();
+                assert_eq!(operation.identity, identity);
+                assert_eq!(operation.mailbox, "Drafts");
+                assert_eq!(operation.uid_validity, Some(77));
+            } else {
+                assert!(error.draft_operation.is_none());
+            }
+            assert!(backend.dropped.load(Ordering::SeqCst));
+
+            // The response follows cancellation cleanup: quota and writer ownership
+            // are available, and a dispatched operation remains durably uncertain.
+            let writer = crate::file_storage::open(
+                &config
+                    .state_dir
+                    .join(format!("draft-{}.lock", identity.account_id)),
+                OpenOptions::new().read(true).write(true),
+            )
+            .unwrap();
+            writer.try_lock().expect("draft writer ownership leaked");
+            drop(writer);
+            let recorded = DraftJournal::open_existing(config.state_dir.join("drafts.sqlite"))
+                .unwrap()
+                .inspect(&identity)
+                .unwrap();
+            if dispatched {
+                assert_eq!(recorded.unwrap().state, DraftOperationState::OutcomeUnknown);
+            } else {
+                assert!(recorded.is_none());
+            }
+            write_frame(
+                &mut caller,
+                &ClientFrame::Operation {
+                    operation: Operation::DraftStatus(DraftStatusInput {
+                        account_id: identity.account_id,
+                        account_generation: identity.account_generation,
+                        operation_id: identity.operation_id,
+                        mailbox: "Drafts".into(),
+                        reconcile: false,
+                    }),
+                    response_limit: response_bound,
+                },
+                REQUEST_BYTES,
+            )
+            .await
+            .unwrap();
+            let ServerFrame::Result { envelope } = timeout(
+                Duration::from_secs(3),
+                read_frame(&mut caller, response_bound, 32),
+            )
+            .await
+            .expect("cancelled draft retained request admission")
+            .unwrap() else {
+                panic!("isolated draft status result");
+            };
+            assert_eq!(
+                envelope.into_result().unwrap_err().code,
+                if dispatched {
+                    ErrorCode::OutcomeUnknown
+                } else {
+                    ErrorCode::OperationNotFound
+                },
+            );
+            drop(caller);
+            session.await.unwrap().unwrap_err();
+        }
+
+        tokio::join!(check(false), check(true));
+    }
+
     #[test]
     fn rejected_tagged_json_fits_the_session_request_reservation() {
         let (limits, response_bound) = session_limits(&Limits::default()).unwrap();
@@ -1035,6 +1418,95 @@ mod tests {
             allocations.bytes_max <= request_reservation as u64,
             "tagged JSON allocation exceeds its session reservation: {allocations:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn small_isolated_responses_retain_uncertainty_and_its_guidance() {
+        for code in [ErrorCode::OutcomeUnknown, ErrorCode::OperationInProgress] {
+            let error = Error::draft_outcome(
+                code,
+                crate::domain::DraftOperationDetails {
+                    identity: crate::domain::DraftIdentity {
+                        account_id: uuid::Uuid::new_v4(),
+                        account_generation: 1,
+                        operation_id: uuid::Uuid::new_v4(),
+                    },
+                    mailbox: "a".repeat(900),
+                    uid_validity: Some(77),
+                },
+            );
+            let (mut sender, mut receiver) = UnixStream::pair().unwrap();
+            let (sent, frame) = tokio::join!(
+                write_result(&mut sender, Err(error), 1024),
+                read_frame::<ServerFrame>(&mut receiver, 1024, 32)
+            );
+            sent.unwrap();
+            let ServerFrame::Result { envelope } = frame.unwrap() else {
+                panic!("result frame")
+            };
+            let error = envelope.into_result().unwrap_err();
+            assert_eq!(error.code, code);
+            assert_eq!(error.message, Error::new(code).message);
+            assert!(!error.retryable);
+        }
+    }
+
+    #[tokio::test]
+    async fn minimum_isolated_response_accepts_an_ordinary_created_receipt() {
+        let installation = DraftInstallation::new();
+        let config = &installation.0;
+        Service::setup(config.clone()).unwrap();
+        let backend = Arc::new(crate::service::MemoryDrafts::default());
+        backend.set("fixture", "Drafts", 77);
+        let service = Arc::new(
+            Service::open(config.clone())
+                .unwrap()
+                .with_draft_backend(backend),
+        );
+        let context = service.context("writer", &Default::default()).unwrap();
+        let OperationResult::Accounts(accounts) = service
+            .execute(&context, Operation::ListAccounts(Default::default()))
+            .await
+            .unwrap()
+        else {
+            panic!("fixture account")
+        };
+        let (mut caller, session, _, _) = draft_session(service).await;
+        write_frame(
+            &mut caller,
+            &ClientFrame::Operation {
+                operation: Operation::SaveDraft(crate::domain::SaveDraftInput {
+                    account_id: accounts.accounts[0].account_id.parse().unwrap(),
+                    account_generation: 1,
+                    operation_id: uuid::Uuid::new_v4(),
+                    mailbox: "Drafts".into(),
+                    draft: Box::new(crate::domain::DraftContent {
+                        body: "Synthetic minimum response.".into(),
+                        ..Default::default()
+                    }),
+                }),
+                response_limit: 1024,
+            },
+            REQUEST_BYTES,
+        )
+        .await
+        .unwrap();
+        let frame = read_frame::<ServerFrame>(&mut caller, 1024, 32)
+            .await
+            .unwrap();
+        assert!(serialize_bounded(&frame, 1024).is_ok());
+        let ServerFrame::Result { envelope } = frame else {
+            panic!("result frame")
+        };
+        let OperationResult::Draft(receipt) = envelope.into_result().unwrap() else {
+            panic!("created receipt")
+        };
+        assert_eq!(
+            receipt.state,
+            crate::domain::DraftState::CreatedReferenceUnavailable
+        );
+        drop(caller);
+        session.await.unwrap().unwrap_err();
     }
 
     #[test]

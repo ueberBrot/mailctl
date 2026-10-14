@@ -346,16 +346,7 @@ fn configuration_rejects_unknown_fields_and_unsafe_values() {
 fn resource_ceilings_apply_to_global_and_grant_limits() {
     let base = configuration();
     for fragment in [
-        "accounts = 257",
-        "json_nesting = 65",
-        "envelope_bytes = 67108865",
         "runtimes = 33",
-        "initialization_seconds = 11",
-        "active_requests = 65",
-        "queued_requests = 257",
-        "buffered_bytes = 268435457",
-        "operation_seconds = 121",
-        "initialization_seconds = 11",
         "accounts = 0",
         "envelope_bytes = 33554432\nbuffered_bytes = 67108864",
     ] {

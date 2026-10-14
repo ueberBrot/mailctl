@@ -158,13 +158,7 @@ async fn call(
             )
             .await
             .unwrap_or_else(|error| panic!("{name}: {error:?}"));
-        let structured = response.structured_content.unwrap();
-        assert_eq!(response.is_error, Some(structured.get("error").is_some()));
-        assert_eq!(
-            serde_json::from_str::<Value>(&response.content[0].as_text().unwrap().text).unwrap(),
-            structured
-        );
-        structured
+        support::assert_mcp_envelope(response)
     })
     .await
     .unwrap()
@@ -269,6 +263,30 @@ impl DraftFixture {
                 "--input",
             ])
             .arg(&self.composition);
+        command
+    }
+    fn status_command(&self, reconcile: bool) -> std::process::Command {
+        let mut command = self.installation.cli();
+        command
+            .env("MAILCTL_FIXTURE_CA", &self.server.certificate)
+            .args([
+                "--json",
+                "--grant",
+                "writer",
+                "draft",
+                "status",
+                "--mailbox",
+                "Drafts",
+                "--account-id",
+                self.input["account_id"].as_str().unwrap(),
+                "--account-generation",
+                "1",
+                "--operation-id",
+                self.input["operation_id"].as_str().unwrap(),
+            ]);
+        if reconcile {
+            command.arg("--reconcile");
+        }
         command
     }
     async fn mcp(&self) -> rmcp::service::RunningService<rmcp::RoleClient, ()> {
@@ -409,6 +427,89 @@ async fn lost_acknowledgement_and_rejection_replay_across_processes() {
         client.cancel().await.unwrap();
         f.server.finish();
     }
+}
+
+#[tokio::test]
+async fn cli_reconciliation_deadline_preserves_uncertainty_and_original_identity() {
+    interrupted_cli_reconciliation(false).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cli_reconciliation_cancellation_preserves_uncertainty_and_original_identity() {
+    interrupted_cli_reconciliation(true).await;
+}
+
+async fn interrupted_cli_reconciliation(cancel: bool) {
+    let mut f = DraftFixture::new();
+    f.server.expect_append(server::DraftReply::Disconnect);
+    let first = envelope(&run_bounded(f.save()));
+    assert_eq!(first["error"]["code"], "outcome_unknown");
+    let original = first["error"]["draft_operation"].clone();
+
+    let mut config = f.configuration();
+    let limits = &mut config
+        .grants
+        .iter_mut()
+        .find(|grant| grant.name == "writer")
+        .unwrap()
+        .limits;
+    limits.operation_seconds = 2;
+    limits.connection_seconds = 2;
+    f.configure(&config);
+    f.server.expect_stalled_reconciliation();
+    let mut command = tokio::process::Command::from(f.status_command(true));
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let child = command.spawn().unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while f.server.stalled_reconciliations() == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("reconciliation must reach the stalled provider search");
+    if cancel {
+        #[cfg(unix)]
+        rustix::process::kill_process(
+            rustix::process::Pid::from_raw(child.id().unwrap() as i32).unwrap(),
+            rustix::process::Signal::TERM,
+        )
+        .unwrap();
+        #[cfg(not(unix))]
+        unreachable!("cancellation regression requires Unix signal delivery");
+    }
+    let output = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait_with_output())
+        .await
+        .expect("interrupted reconciliation must stop promptly")
+        .unwrap();
+    assert_eq!(output.status.code(), Some(7));
+    let response = envelope(&output);
+    assert_eq!(response["error"]["code"], "outcome_unknown");
+    assert_eq!(response["error"]["retryable"], false);
+    assert_eq!(
+        response["error"]["draft_operation"]["identity"],
+        original["identity"]
+    );
+    assert_eq!(
+        response["error"]["draft_operation"]["mailbox"],
+        original["mailbox"]
+    );
+
+    // Interruption leaves the recorded uncertainty inspectable and never APPENDs again.
+    for command in [f.status_command(false), f.save()] {
+        let retained = envelope(&run_bounded(command));
+        assert_eq!(retained["error"]["code"], "outcome_unknown");
+        assert_eq!(retained["error"]["draft_operation"], original);
+    }
+    assert_eq!(f.server.stalled_reconciliations(), 1);
+    assert_eq!(f.server.interrupted(), 1);
+    assert_eq!(f.server.accepted(), 2);
+    assert_eq!(f.server.drafts().len(), 1);
+    f.server.finish();
 }
 
 #[tokio::test]

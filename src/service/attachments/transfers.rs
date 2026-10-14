@@ -358,47 +358,4 @@ mod tests {
             "future transfer deadlines must not cause an inventory scan for each chunk"
         );
     }
-
-    #[test]
-    #[ignore = "native performance probe; run explicitly on a quiet host"]
-    fn continuation_bookkeeping_with_many_accounts() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let _context = runtime.enter();
-        let limits = Limits {
-            accounts: 256,
-            transfers_per_account: 4,
-            transfer_seconds: 600,
-            ..Limits::default()
-        };
-        limits.validate().unwrap();
-        for count in [1, 1024, 1, 1024] {
-            let transfers = Transfers::default();
-            let session = Uuid::new_v4();
-            let started = Instant::now();
-            let mut first = None;
-            for index in 0..count {
-                let account = format!("synthetic-account-{}", index / 4);
-                let reservation = transfers
-                    .reserve(session, &account, &limits, started)
-                    .unwrap();
-                first.get_or_insert(reservation.id());
-                reservation.retain(entry(&account)).unwrap();
-            }
-            let id = first.unwrap();
-            let start = std::time::Instant::now();
-            for _ in 0..20_000 {
-                let (reservation, entry) = transfers
-                    .checkout(session, id, "synthetic-scope", 0, |_| Ok(()))
-                    .unwrap();
-                reservation.retain(entry).unwrap();
-            }
-            println!(
-                "{{\"slots\":{count},\"continuations\":20000,\"elapsed_ns\":{}}}",
-                start.elapsed().as_nanos()
-            );
-        }
-    }
 }
