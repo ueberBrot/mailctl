@@ -64,13 +64,8 @@ async fn mcp_search_publishes_schemas_and_matches_cli_errors_under_the_effective
         .await
         .unwrap();
     assert_eq!(response.is_error, Some(true));
-    let structured = response.structured_content.unwrap();
+    let structured = support::assert_mcp_envelope(response);
     assert_eq!(structured["error"]["code"], "stale_reference");
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&response.content[0].as_text().unwrap().text)
-            .unwrap(),
-        structured
-    );
     client.cancel().await.unwrap();
 
     let mut command = tokio::process::Command::from(installation.mcp());

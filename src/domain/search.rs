@@ -41,11 +41,16 @@ impl SearchDate {
 impl TryFrom<String> for SearchDate {
     type Error = Error;
     fn try_from(value: String) -> Result<Self, Error> {
-        let date = NaiveDate::parse_from_str(&value, "%Y-%m-%d").map_err(|_| invalid())?;
         if value.len() != 10
-            || !(1..=9999).contains(&date.year())
-            || date.format("%Y-%m-%d").to_string() != value
+            || value.bytes().enumerate().any(|(index, byte)| match index {
+                4 | 7 => byte != b'-',
+                _ => !byte.is_ascii_digit(),
+            })
         {
+            return Err(invalid());
+        }
+        let date = NaiveDate::parse_from_str(&value, "%Y-%m-%d").map_err(|_| invalid())?;
+        if !(1..=9999).contains(&date.year()) {
             return Err(invalid());
         }
         Ok(Self(value))

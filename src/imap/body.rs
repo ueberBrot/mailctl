@@ -300,9 +300,11 @@ async fn bytes(
             return Err(Error::Limit);
         }
         let required = result.len() + value.len();
+        if required > ceiling {
+            return Err(Error::Protocol);
+        }
         if required > result.capacity() {
             // Grow only for received bytes, with the admitted size as a cap.
-            // The extra fetched byte still reaches the protocol check below.
             let capacity = result
                 .capacity()
                 .saturating_mul(2)
@@ -311,9 +313,6 @@ async fn bytes(
             result.reserve_exact(capacity - result.len());
         }
         result.extend_from_slice(value);
-        if result.len() > ceiling {
-            return Err(Error::Protocol);
-        }
         if value.len() < count {
             // BODYSTRUCTURE size is an admission hint: some servers include
             // MIME headers in it. A short partial response establishes EOF.

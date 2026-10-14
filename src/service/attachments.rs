@@ -7,7 +7,7 @@ use crate::{
     policy::{Permission, RequestContext},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
-use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{future::Future, pin::Pin, sync::Arc};
 use tokio::time::Instant;
 use uuid::Uuid;
 mod memory;
@@ -129,8 +129,7 @@ impl Service {
         input: domain::GetAttachmentInput,
     ) -> Result<domain::AttachmentChunk, Error> {
         let started = Instant::now();
-        let deadline =
-            started + Duration::from_secs(self.limits(context)?.operation_seconds as u64);
+        let deadline = started + self.operation_duration(context)?;
         tokio::select! {
             biased;
             result = self.get_attachment_inner(context, input, started, deadline) => result,

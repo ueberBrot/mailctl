@@ -75,11 +75,23 @@ impl Application {
     pub async fn export_attachment(
         &self,
         attachment: String,
-        writer: &mut crate::export::ExportWriter,
+        approved: &[std::path::PathBuf],
+        root: &std::path::Path,
+        name: &str,
+        writer: &mut Option<crate::export::ExportWriter>,
     ) -> Result<OperationResult, Error> {
+        let maximum = self.limits()?.attachment_decoded_bytes;
+        crate::export::ExportWriter::validate(approved, root, name, maximum)?;
         self.transfer_attachment(
             crate::domain::GetAttachmentInput::Start(crate::domain::AttachmentStart { attachment }),
             |chunk| {
+                // GetAttachment has authorized this chunk before any native file work.
+                let writer = match writer {
+                    Some(writer) => writer,
+                    None => writer.insert(crate::export::ExportWriter::create(
+                        approved, root, name, maximum,
+                    )?),
+                };
                 Ok(match writer.write_chunk(&chunk)? {
                     Some(receipt) => ControlFlow::Break(OperationResult::Export(receipt)),
                     None => ControlFlow::Continue(chunk),

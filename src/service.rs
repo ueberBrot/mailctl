@@ -163,6 +163,7 @@ impl Service {
             account_indices,
             grant.profile.permissions(narrowing.read_only),
             grant.limits.envelope_bytes,
+            grant.limits.operation_seconds,
         ))
     }
     pub fn limits(&self, context: &RequestContext) -> Result<&crate::config::Limits, Error> {
@@ -258,11 +259,16 @@ impl Service {
         context: &RequestContext,
         execution: impl std::future::Future<Output = Result<T, Error>>,
     ) -> Result<T, Error> {
-        let deadline =
-            std::time::Duration::from_secs(self.limits(context)?.operation_seconds as u64);
+        let deadline = self.operation_duration(context)?;
         tokio::time::timeout(deadline, execution)
             .await
             .map_err(|_| Error::new(ErrorCode::Timeout))?
+    }
+    fn operation_duration(&self, context: &RequestContext) -> Result<std::time::Duration, Error> {
+        self.limits(context)?;
+        Ok(std::time::Duration::from_secs(
+            context.operation_seconds() as u64
+        ))
     }
     async fn execute_inner(
         &self,
@@ -388,8 +394,44 @@ impl Service {
             }),
             Operation::Health => OperationResult::Health(self.health(context)?),
         };
-        serialized_size(&result, context.response_limit().saturating_sub(512))?;
-        Ok(result)
+        let maximum = context.response_limit().saturating_sub(512);
+        let error = match serialized_size(&result, maximum) {
+            Ok(_) => return Ok(result),
+            Err(error) => error,
+        };
+        let OperationResult::Draft(mut receipt) = result else {
+            return Err(error);
+        };
+        if receipt.message_reference.take().is_some()
+            && receipt.state == crate::domain::DraftState::Created
+        {
+            receipt.state = crate::domain::DraftState::CreatedReferenceUnavailable;
+        }
+        if serialized_size(&receipt, maximum).is_ok() {
+            return Ok(OperationResult::Draft(receipt));
+        }
+        if matches!(
+            receipt.state,
+            crate::domain::DraftState::Created
+                | crate::domain::DraftState::CreatedReferenceUnavailable
+                | crate::domain::DraftState::Duplicate
+        ) {
+            // Retained creation remains unsafe to append again even when this
+            // caller's smaller response ceiling cannot carry its receipt.
+            return Err(Error::draft_outcome(
+                ErrorCode::OutcomeUnknown,
+                crate::domain::DraftOperationDetails {
+                    identity: crate::domain::DraftIdentity {
+                        account_id: receipt.account_id,
+                        account_generation: receipt.account_generation,
+                        operation_id: receipt.operation_id,
+                    },
+                    mailbox: receipt.mailbox,
+                    uid_validity: Some(receipt.uid_validity),
+                },
+            ));
+        }
+        Err(error)
     }
     fn capacity(limits: &crate::config::Limits) -> Capacity {
         Capacity {

@@ -234,10 +234,7 @@ impl ServerHandler for EmailTools {
         let mut result = match operation {
             Err(error) => Err(error),
             Ok(operation) => {
-                let draft_identity = match &operation {
-                    Operation::SaveDraft(input) => Some(input.operation_details()),
-                    _ => None,
-                };
+                let draft_identity = operation.draft_outcome_identity();
                 // Both application adapters own the operation deadline.
                 tokio::select! {
                     biased;
@@ -270,10 +267,17 @@ impl ServerHandler for EmailTools {
         {
             Ok(bytes) => bytes,
             Err(_) => {
-                envelope = Envelope::from_result(
-                    envelope.request_id().to_owned(),
-                    Err(Error::new(ErrorCode::ResponseTooLarge)),
-                );
+                let code =
+                    envelope
+                        .error()
+                        .map_or(ErrorCode::ResponseTooLarge, |error| match error.code {
+                            ErrorCode::OutcomeUnknown | ErrorCode::OperationInProgress => {
+                                error.code
+                            }
+                            _ => ErrorCode::ResponseTooLarge,
+                        });
+                envelope =
+                    Envelope::from_result(envelope.request_id().to_owned(), Err(Error::new(code)));
                 crate::encoding::serialized_size(&envelope, self.envelope_limit)
                     .map_err(|_| McpError::internal_error("Result unavailable", None))?
             }
@@ -580,6 +584,68 @@ accounts = ["work"]
         );
         client.cancel().await.unwrap();
         server.cancel().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_reconciliation_preserves_identity_but_a_journal_read_does_not() {
+        for (reconcile, mailbox) in [
+            (true, "Drafts".into()),
+            (false, "Drafts".into()),
+            (true, "\\".repeat(1024)),
+        ] {
+            let (mut handler, _) = message_handler(String::new()).await;
+            handler.envelope_limit = 1024;
+            handler.tools = definitions(&["draft_status".into()]);
+            let operation_id = uuid::Uuid::new_v4();
+            let request = CallToolRequestParams::new("email_draft_status").with_arguments(
+                json!({
+                    "account_id": uuid::Uuid::new_v4(),
+                    "account_generation": 1,
+                    "operation_id": operation_id,
+                    "mailbox": mailbox,
+                    "reconcile": reconcile,
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            );
+            let (client_io, server_io) = tokio::io::duplex(8192);
+            let (client, server) = tokio::join!(().serve(client_io), handler.serve(server_io));
+            let client = client.unwrap();
+            let server = server.unwrap();
+            let mut context = RequestContext::new(RequestId::Number(1), server.peer().clone());
+            let cancellation = RequestCancellation::new();
+            cancellation.token().cancel();
+            context.extensions.insert(cancellation);
+            let CallToolResponse::Complete(response) =
+                server.service().call_tool(request, context).await.unwrap()
+            else {
+                panic!("complete cancellation response");
+            };
+            let envelope = response.structured_content.unwrap();
+            if reconcile {
+                assert_eq!(envelope["error"]["code"], "outcome_unknown");
+                if mailbox == "Drafts" {
+                    assert_eq!(
+                        envelope["error"]["draft_operation"]["identity"]["operation_id"],
+                        operation_id.to_string()
+                    );
+                } else {
+                    assert!(envelope["error"].get("draft_operation").is_none());
+                    assert!(
+                        envelope["error"]["message"]
+                            .as_str()
+                            .unwrap()
+                            .contains("never append")
+                    );
+                }
+            } else {
+                assert_eq!(envelope["error"]["code"], "cancelled");
+                assert!(envelope["error"].get("draft_operation").is_none());
+            }
+            client.cancel().await.unwrap();
+            server.cancel().await.unwrap();
+        }
     }
 
     #[tokio::test]

@@ -30,12 +30,7 @@ impl ExportWriter {
         name: &str,
         maximum: usize,
     ) -> Result<Self, Error> {
-        if !approved.iter().any(|allowed| allowed == root) {
-            return Err(Error::new(ErrorCode::PermissionDenied));
-        }
-        if !safe_name(name) || maximum == 0 || base64::encoded_len(maximum, true).is_none() {
-            return Err(Error::new(ErrorCode::InvalidRequest));
-        }
+        Self::validate(approved, root, name, maximum)?;
         Ok(Self {
             file: NativeFile::create(root, name)?,
             active: true,
@@ -45,6 +40,25 @@ impl ExportWriter {
             reference: None,
             buffer: Vec::new(),
         })
+    }
+
+    /// Check operator approval, the basename and platform support without opening files.
+    pub(crate) fn validate(
+        approved: &[PathBuf],
+        root: &Path,
+        name: &str,
+        maximum: usize,
+    ) -> Result<(), Error> {
+        if !approved.iter().any(|allowed| allowed == root) {
+            return Err(Error::new(ErrorCode::PermissionDenied));
+        }
+        if !safe_name(name) || maximum == 0 || base64::encoded_len(maximum, true).is_none() {
+            return Err(Error::new(ErrorCode::InvalidRequest));
+        }
+        if !cfg!(any(target_os = "macos", windows)) {
+            return Err(Error::new(ErrorCode::UnsupportedCapability));
+        }
+        Ok(())
     }
 
     pub fn write_chunk(

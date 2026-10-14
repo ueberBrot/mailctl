@@ -260,8 +260,7 @@ impl Service {
         input: SaveDraftInput,
     ) -> Result<DraftReceipt, Error> {
         let mut dispatched = None;
-        let duration =
-            std::time::Duration::from_secs(self.limits(context)?.operation_seconds as u64);
+        let duration = self.operation_duration(context)?;
         tokio::time::timeout(
             duration,
             self.save_draft_inner(context, input, &mut dispatched),
@@ -285,8 +284,7 @@ impl Service {
         let target =
             self.authorize_draft(context, &identity, &input.mailbox, Permission::AppendDraft)?;
         let limits = self.limits(context)?;
-        let verification_deadline = std::time::Instant::now()
-            + std::time::Duration::from_secs(limits.operation_seconds as u64);
+        let verification_deadline = std::time::Instant::now() + self.operation_duration(context)?;
         let _admission = self.requests.admit(target.account_id, limits).await?;
         // Ownership spans recovery, target verification, APPEND and durable completion.
         let _writer = match self
@@ -471,6 +469,22 @@ impl Service {
             return Err(Error::new(ErrorCode::DraftMailboxUnavailable));
         }
         self.registry.draft_creation_allowed()?;
+        let mut frozen = DraftReconstruction {
+            uid_validity: validity,
+            ..frozen
+        };
+        if prior.is_none() {
+            frozen.facts_sha256 = frozen
+                .fingerprint(&identity, mailbox)
+                .map_err(journal_error)?;
+        }
+        let operation = PreparedDraftOperation {
+            identity,
+            mailbox_identity: mailbox.into(),
+            content_sha256: mime.sha256(),
+            reconstruction: Some(frozen),
+        };
+        admit_draft_response(context, &operation)?;
         let prepared = journal
             .access(|journal| {
                 if let Some(prior) = prior.as_ref()
@@ -478,22 +492,7 @@ impl Service {
                 {
                     return journal.reencode_prepared(prior, mime.sha256());
                 }
-                let mut frozen = DraftReconstruction {
-                    uid_validity: validity,
-                    ..frozen
-                };
-                if prior.is_none() {
-                    frozen.facts_sha256 = frozen.fingerprint(&identity, mailbox)?;
-                }
-                journal.prepare_with_limit(
-                    PreparedDraftOperation {
-                        identity,
-                        mailbox_identity: mailbox.into(),
-                        content_sha256: mime.sha256(),
-                        reconstruction: Some(frozen),
-                    },
-                    self.config.limits.journal_records,
-                )
+                journal.prepare_with_limit(operation, self.config.limits.journal_records)
             })
             .map_err(journal_error)?;
         let dispatch = Dispatch::start(&mut journal, &prepared.operation)?;
@@ -508,8 +507,7 @@ impl Service {
         input: DraftStatusInput,
     ) -> Result<DraftReceipt, Error> {
         let mut uncertain_operation = None;
-        let duration =
-            std::time::Duration::from_secs(self.limits(context)?.operation_seconds as u64);
+        let duration = self.operation_duration(context)?;
         tokio::time::timeout(
             duration,
             self.draft_status_inner(context, input, &mut uncertain_operation),
@@ -876,4 +874,36 @@ fn operation_details(operation: &PreparedDraftOperation) -> DraftOperationDetail
         mailbox: operation.mailbox_identity.clone(),
         uid_validity: operation.reconstruction.as_ref().map(|r| r.uid_validity),
     }
+}
+
+fn admit_draft_response(
+    context: &RequestContext,
+    operation: &PreparedDraftOperation,
+) -> Result<(), Error> {
+    let uid_validity = operation
+        .reconstruction
+        .as_ref()
+        .ok_or_else(|| Error::new(ErrorCode::JournalUnavailable))?
+        .uid_validity;
+    let receipt = DraftReceipt {
+        account_id: operation.identity.account_id,
+        account_generation: operation.identity.account_generation,
+        operation_id: operation.identity.operation_id,
+        mailbox: operation.mailbox_identity.clone(),
+        uid_validity,
+        state: DraftState::CreatedReferenceUnavailable,
+        dispatched: true,
+        message_reference: None,
+        content_sha256: crate::encoding::hex(&operation.content_sha256),
+    };
+    // A reference is optional; the terminal receipt and uncertain outcome must
+    // both remain reportable before APPEND may begin. The service's envelope
+    // reservation also covers isolated framing.
+    let maximum = context.response_limit().saturating_sub(512);
+    crate::encoding::serialized_size(&crate::domain::OperationResult::Draft(receipt), maximum)?;
+    crate::encoding::serialized_size(
+        &Error::draft_outcome(ErrorCode::OutcomeUnknown, operation_details(operation)),
+        maximum,
+    )?;
+    Ok(())
 }

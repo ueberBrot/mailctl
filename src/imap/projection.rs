@@ -136,6 +136,10 @@ fn header_text(bytes: &[u8]) -> Option<String> {
     {
         return None;
     }
+    if !value.contains(['\r', '\n']) && !value.contains("=?") {
+        // One unencoded line needs only the parser's outer ASCII whitespace trim.
+        return Some(value.trim_matches([' ', '\t']).to_owned());
+    }
     // A literal is one header value; an embedded new header is malformed metadata.
     for (index, byte) in bytes.iter().enumerate() {
         if (*byte == b'\n' && !matches!(bytes.get(index + 1), Some(b' ' | b'\t')))
@@ -229,10 +233,21 @@ fn parsed_addresses(
                 let address = if dot_atom(local) {
                     format!("{local}@{host}")
                 } else {
-                    format!(
-                        "\"{}\"@{host}",
-                        local.replace('\\', "\\\\").replace('"', "\\\"")
-                    )
+                    let escapes = local
+                        .bytes()
+                        .filter(|byte| matches!(byte, b'"' | b'\\'))
+                        .count();
+                    let mut address = String::with_capacity(local.len() + escapes + host.len() + 3);
+                    address.push('"');
+                    for character in local.chars() {
+                        if matches!(character, '"' | '\\') {
+                            address.push('\\');
+                        }
+                        address.push(character);
+                    }
+                    address.push_str("\"@");
+                    address.push_str(host);
+                    address
                 };
                 addresses.push(MessageAddress { name, address });
             }
@@ -303,5 +318,168 @@ fn skip_comments(mut value: &str) -> Option<&str> {
             }
         }
         value = &value[end?..];
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{MessageAddress, Metadata};
+    use io_imap::types::envelope::Address;
+
+    fn fields(local: &str) -> Vec<MessageDataItem<'_>> {
+        vec![
+            MessageDataItem::Uid(NonZeroU32::MIN),
+            MessageDataItem::Envelope(WireEnvelope {
+                date: NString::NIL,
+                subject: NString::NIL,
+                from: vec![Address {
+                    name: NString::NIL,
+                    adl: NString::NIL,
+                    mailbox: NString(Some(local.try_into().unwrap())),
+                    host: NString(Some("example.test".try_into().unwrap())),
+                }],
+                sender: vec![],
+                reply_to: vec![],
+                to: vec![],
+                cc: vec![],
+                bcc: vec![],
+                in_reply_to: NString::NIL,
+                message_id: NString::NIL,
+            }),
+            MessageDataItem::Flags(vec![]),
+            MessageDataItem::InternalDate(
+                chrono::DateTime::parse_from_rfc3339("2024-03-01T00:30:00+14:00")
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+            ),
+            MessageDataItem::Rfc822Size(100),
+        ]
+    }
+
+    #[test]
+    fn envelope_addresses_preserve_quoted_local_parts_and_dot_atoms() {
+        for (local, expected) in [
+            ("first.last+tag", "first.last+tag@example.test"),
+            ("two words", "\"two words\"@example.test"),
+            ("say\"hi\\there", "\"say\\\"hi\\\\there\"@example.test"),
+            ("grüß", "\"grüß\"@example.test"),
+        ] {
+            let fields = fields(local);
+            let message = Projection::parse(&fields).unwrap().message();
+            assert_eq!(
+                message.metadata.from,
+                Metadata::Present(vec![MessageAddress {
+                    name: None,
+                    address: expected.into(),
+                }]),
+                "{local:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn plain_envelope_headers_allocate_only_the_returned_text() {
+        for expected in [
+            "Ordinary title  \twith spaces.".repeat(2048),
+            "Ordinary café 🦀 Ελληνικά 日本語  \twith spaces.".repeat(1024),
+        ] {
+            let source = format!("\t  {expected} \t");
+            let mut fields = fields("sender");
+            let MessageDataItem::Envelope(envelope) = &mut fields[1] else {
+                unreachable!();
+            };
+            envelope.subject = NString(Some(source.as_str().try_into().unwrap()));
+            envelope.from[0].name = NString(Some(source.as_str().try_into().unwrap()));
+            let measured = allocation_counter::measure(|| {
+                let projection = Projection::parse(&fields).unwrap();
+                projection.check_header_bytes(256 * 1024).unwrap();
+                let message = projection.message();
+                assert_eq!(message.metadata.subject.value(), Some(&expected));
+                let Metadata::Present(addresses) = message.metadata.from else {
+                    panic!("valid envelope sender");
+                };
+                assert_eq!(addresses[0].name.as_ref(), Some(&expected));
+            });
+            assert!(
+                measured.bytes_total <= (2 * expected.len()) as u64 + 1024,
+                "plain headers must not retain CRLF-terminated parsing copies: {measured:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn envelope_headers_preserve_whitespace_encoding_and_malformed_metadata() {
+        for (raw, expected) in [
+            (b"".as_slice(), Some("")),
+            (b" \t ".as_slice(), Some("")),
+            (
+                b"\t Leading  \tand trailing \t ".as_slice(),
+                Some("Leading  \tand trailing"),
+            ),
+            (
+                "\u{a0}café 🦀 Ελληνικά 日本語\u{a0}".as_bytes(),
+                Some("\u{a0}café 🦀 Ελληνικά 日本語\u{a0}"),
+            ),
+            (b"First \r\n\t second".as_slice(), Some("First second")),
+            (
+                b"=?UTF-8?Q?Gr=C3=BC?= \t =?UTF-8?Q?=C3=9Fe?=".as_slice(),
+                Some("Grüße"),
+            ),
+            (
+                b"Before =?utf-8?Q?caf=C3=A9?= after".as_slice(),
+                Some("Before café after"),
+            ),
+            (b"How =? works".as_slice(), Some("How =? works")),
+            (b"First\rbare".as_slice(), None),
+            (b"First\nInjected: header".as_slice(), None),
+            (b"First\r\nInjected: header".as_slice(), None),
+            (b"Control\x1b".as_slice(), None),
+            (b"Invalid\xff".as_slice(), None),
+        ] {
+            let mut fields = fields("sender");
+            let MessageDataItem::Envelope(envelope) = &mut fields[1] else {
+                unreachable!();
+            };
+            envelope.subject = NString(Some(raw.try_into().unwrap()));
+            envelope.from[0].name = NString(Some(raw.try_into().unwrap()));
+            let message = Projection::parse(&fields).unwrap().message();
+            match expected {
+                Some(expected) => {
+                    assert_eq!(
+                        message.metadata.subject.value().map(String::as_str),
+                        Some(expected),
+                        "{raw:?}",
+                    );
+                    let Metadata::Present(addresses) = message.metadata.from else {
+                        panic!("valid envelope sender for {raw:?}");
+                    };
+                    assert_eq!(addresses[0].name.as_deref(), Some(expected), "{raw:?}");
+                }
+                None => {
+                    assert_eq!(message.metadata.subject, Metadata::Malformed, "{raw:?}");
+                    assert_eq!(message.metadata.from, Metadata::Malformed, "{raw:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn quoted_envelope_addresses_do_not_allocate_intermediate_escaped_copies() {
+        let local = "a\"\\é ".repeat(512);
+        let expected = format!("\"{}\"@example.test", "a\\\"\\\\é ".repeat(512));
+        let fields = fields(&local);
+        let measured = allocation_counter::measure(|| {
+            let message = Projection::parse(&fields).unwrap().message();
+            let Metadata::Present(addresses) = message.metadata.from else {
+                panic!("valid envelope address");
+            };
+            assert_eq!(addresses[0].address, expected);
+        });
+        assert!(
+            measured.bytes_total <= expected.len() as u64 + 1024,
+            "normalizing one address must not materialize full escaped copies: {measured:?}"
+        );
     }
 }

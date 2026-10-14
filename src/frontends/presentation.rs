@@ -279,7 +279,12 @@ fn metadata_text(text: String) -> String {
 
 fn append_body(output: &mut String, text: &str) {
     output.reserve(text.len());
-    let mut characters = text.chars().peekable();
+    let start = text
+        .char_indices()
+        .find(|&(_, character)| character != '\n' && unsafe_character(character))
+        .map_or(text.len(), |(index, _)| index);
+    output.push_str(&text[..start]);
+    let mut characters = text[start..].chars().peekable();
     while let Some(character) = characters.next() {
         match character {
             '\r' => {
@@ -388,6 +393,24 @@ mod tests {
             .unwrap()
             .ends_with("Body:\nabcd")
         );
+    }
+
+    #[test]
+    fn body_pages_preserve_safe_prefixes_and_filter_control_suffixes() {
+        for text in [
+            "First ordinary paragraph.\n\nSecond ordinary paragraph.",
+            "First café 🦀 Ελληνικά 日本語.\n\nSecond ordinary paragraph.",
+        ] {
+            assert_eq!(
+                human(&message(text)).unwrap(),
+                format!("Message: message\n\nBody:\n{text}"),
+            );
+            let controlled = format!("{text}\t\u{1b}[31mred\u{1b}[0m\r\ntail");
+            assert_eq!(
+                human(&message(&controlled)).unwrap(),
+                format!("Message: message\n\nBody:\n{text}    red\ntail"),
+            );
+        }
     }
 
     #[test]

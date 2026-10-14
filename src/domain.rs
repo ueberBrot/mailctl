@@ -255,6 +255,20 @@ impl<'de> Deserialize<'de> for Operation {
 }
 
 impl Operation {
+    /// Retain caller identity when interrupted creation or reconciliation can leave an outcome unknown.
+    #[cfg(any(feature = "cli", feature = "mcp", target_os = "macos"))]
+    pub(crate) fn draft_outcome_identity(&self) -> Option<DraftOperationDetails> {
+        match self {
+            Self::SaveDraft(input) => Some(input.operation_details()),
+            Self::DraftStatus(input) if input.reconcile => Some(DraftOperationDetails {
+                identity: input.identity(),
+                mailbox: input.mailbox.clone(),
+                uid_validity: None,
+            }),
+            _ => None,
+        }
+    }
+
     /// Decode typed inputs shared by serialized operations and MCP tool arguments.
     pub(crate) fn from_input(
         name: &str,

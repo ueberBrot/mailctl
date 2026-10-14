@@ -361,3 +361,77 @@ fn reconciliation_ignores_unrelated_encoded_words_without_losing_identity_checks
         );
     }
 }
+
+#[test]
+fn reconciliation_admits_exact_header_ceiling_without_growing_for_an_excess_byte() {
+    use sha2::{Digest, Sha256};
+    const HEADER_BYTES: usize = 64 * 1024;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut measurements = Vec::new();
+    for excess in [false, true] {
+        let mut bytes = b"Message-ID: <operation@example.test>\r\nX-Fixture: ".to_vec();
+        bytes.resize(HEADER_BYTES - 4 + usize::from(excess), b'x');
+        bytes.extend_from_slice(b"\r\n\r\nFrozen body.\r\n");
+        let expected = DraftVerification {
+            uid_validity: 77,
+            message_id: "operation@example.test".into(),
+            content_sha256: Sha256::digest(&bytes).into(),
+        };
+        let (mut client, server) = dedicated_fixture(
+            TlsMode::Implicit,
+            Limits::default(),
+            move |mut wire| {
+                Box::pin(async move {
+                    authenticate(&mut wire).await;
+                    let tag = expect(&mut wire, "EXAMINE Drafts").await;
+                    write(&mut wire, &format!("* 1 EXISTS\r\n* OK [UIDVALIDITY 77] incarnation\r\n* OK [UIDNEXT 5] next\r\n{tag} OK [READ-ONLY] selected\r\n")).await;
+                    let tag = expect(
+                        &mut wire,
+                        "UID SEARCH UID 1:4 HEADER Message-ID operation@example.test",
+                    )
+                    .await;
+                    write(&mut wire, &format!("* SEARCH 4\r\n{tag} OK found\r\n")).await;
+                    for (index, chunk) in bytes.chunks(16 * 1024).enumerate() {
+                        literal_bytes(&mut wire, "", index * 16 * 1024, 16 * 1024, chunk).await;
+                    }
+                    dropped(&mut wire).await;
+                })
+            },
+        );
+        let limits = mailctl::config::Limits {
+            header_bytes: HEADER_BYTES,
+            ..Default::default()
+        };
+        let measured = allocation_counter::measure(|| {
+            assert_eq!(
+                runtime.block_on(client.reconcile_draft(&expected, &limits)),
+                if excess {
+                    Err(mailctl::imap::Error::Limit)
+                } else {
+                    Ok(DraftEvidence::Verified(DraftMessageIdentity {
+                        uid_validity: 77,
+                        uid: 4,
+                    }))
+                },
+                "excess={excess}"
+            );
+        });
+        server.join().unwrap();
+        assert_eq!(client.metrics().append_wire_bytes, 0);
+        eprintln!("reconciliation header ceiling={HEADER_BYTES} excess={excess} {measured:?}");
+        measurements.push(measured);
+    }
+    // Leave room for different TLS read fragmentation while distinguishing a
+    // second complete header allocation from the same bounded wire buffers.
+    assert!(
+        measurements[1].bytes_max <= measurements[0].bytes_max + 32 * 1024,
+        "rejecting byte N+1 must not double the header buffer: {measurements:?}"
+    );
+    assert!(
+        measurements[1].bytes_total <= measurements[0].bytes_total + 64 * 1024,
+        "rejecting byte N+1 must not allocate another complete header buffer: {measurements:?}"
+    );
+}

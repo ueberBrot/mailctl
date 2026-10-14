@@ -98,10 +98,10 @@ impl AuthenticatedConnection {
                     hash.update(bytes);
                     if !headers_complete {
                         for byte in bytes {
-                            headers.push(*byte);
-                            if headers.len() > limits.header_bytes {
+                            if headers.len() == limits.header_bytes {
                                 return Err(Error::Limit);
                             }
+                            headers.push(*byte);
                             if headers.ends_with(b"\r\n\r\n") {
                                 headers_complete = true;
                                 break;

@@ -82,8 +82,10 @@ impl TransferState {
         let mut fetched = false;
         while self.decoder.pending_len() < limits.max_attachment_chunk_bytes && !self.eof {
             // Return the available prefix at a clean command boundary when another maximum
-            // response pair would approach the operation budget. Every call can attempt a slice.
+            // response pair would approach the operation budget. Zero-output transfer prefixes
+            // keep reading until they produce a page, finish, or reach the ordinary resource limit.
             if fetched
+                && self.decoder.pending_len() != 0
                 && limits
                     .max_operation_bytes
                     .saturating_sub(conn.metrics().wire_bytes)

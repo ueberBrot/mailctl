@@ -559,7 +559,7 @@ fn read_preference(command: &str) -> Result<Vec<String>, ()> {
 
 fn search_handoffs(installation: &Installation, server: &server::ImapServer, cli: &str, mcp: &str) {
     use rmcp::{ServiceExt, model::CallToolRequestParams, transport::TokioChildProcess};
-    use serde_json::{Value, json};
+    use serde_json::json;
     server.expect_mailboxes("work@example.test", FIRST, &["Archive", "INBOX"]);
     let mut command = installation.command(cli);
     command
@@ -717,12 +717,7 @@ fn search_handoffs(installation: &Installation, server: &server::ImapServer, cli
                     .await
                     .unwrap();
                 assert_eq!(response.is_error, Some(false));
-                let structured = response.structured_content.unwrap();
-                assert_eq!(
-                    serde_json::from_str::<Value>(&response.content[0].as_text().unwrap().text)
-                        .unwrap(),
-                    structured
-                );
+                let structured = support::assert_mcp_envelope(response);
                 let chunk = &structured["result"];
                 assert_eq!(chunk["decoded_offset"], index * 2);
                 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -751,12 +746,7 @@ fn search_handoffs(installation: &Installation, server: &server::ImapServer, cli
                 .await
                 .unwrap();
             assert_eq!(response.is_error, Some(false));
-            let structured = response.structured_content.unwrap();
-            assert_eq!(
-                serde_json::from_str::<Value>(&response.content[0].as_text().unwrap().text)
-                    .unwrap(),
-                structured
-            );
+            let structured = support::assert_mcp_envelope(response);
             assert_eq!(structured["result"], body);
             server.expect_search("work@example.test", FIRST, "Archive", None);
             let response = reader
@@ -771,12 +761,7 @@ fn search_handoffs(installation: &Installation, server: &server::ImapServer, cli
                 .await
                 .unwrap();
             assert_eq!(response.is_error, Some(false));
-            let structured = response.structured_content.unwrap();
-            assert_eq!(
-                serde_json::from_str::<Value>(&response.content[0].as_text().unwrap().text)
-                    .unwrap(),
-                structured
-            );
+            let structured = support::assert_mcp_envelope(response);
             assert_eq!(structured["result"], first);
             server.expect_search("work@example.test", FIRST, "Archive", Some(2));
             let response = reader
@@ -869,7 +854,7 @@ fn mailbox_handoffs(
     mcp: &str,
 ) {
     use rmcp::{ServiceExt, model::CallToolRequestParams, transport::TokioChildProcess};
-    use serde_json::{Value, json};
+    use serde_json::json;
     server.expect_mailboxes("work@example.test", FIRST, &["Archive", "INBOX"]);
     let mut command = installation.command(cli);
     command
@@ -945,18 +930,12 @@ fn mailbox_handoffs(
                 )
                 .await
                 .unwrap();
-            let structured = response.structured_content.unwrap();
-            assert_eq!(
-                serde_json::from_str::<Value>(&response.content[0].as_text().unwrap().text)
-                    .unwrap(),
-                structured
-            );
+            assert_eq!(response.is_error, Some(grant == "restricted"));
+            let structured = support::assert_mcp_envelope(response);
             if grant == "restricted" {
-                assert_eq!(response.is_error, Some(true));
                 assert_eq!(structured["error"]["code"], "mailbox_not_allowed");
                 assert_eq!(server.accepted(), before);
             } else {
-                assert_eq!(response.is_error, Some(false));
                 assert_eq!(structured["result"]["mailboxes"][0], first["mailboxes"][0]);
             }
             reader.cancel().await.unwrap();

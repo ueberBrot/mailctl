@@ -212,12 +212,24 @@ fn cli_streams_attachment_to_approved_root_with_native_receipt() {
     #[cfg(windows)]
     native_support::assert_private(&default_path);
     std::fs::remove_file(default_path).unwrap();
-    for cleanup_fails in [false, true] {
+    for (after_first_chunk, cleanup_fails) in [(false, false), (true, false), (true, true)] {
+        if after_first_chunk {
+            server.expect_attachment(
+                "work@example.test",
+                "disposable-password",
+                "INBOX",
+                server::AttachmentPhase::Start,
+            );
+        }
         server.expect_attachment(
             "work@example.test",
             "disposable-password",
             "INBOX",
-            server::AttachmentPhase::Interrupted,
+            if after_first_chunk {
+                server::AttachmentPhase::InterruptedContinuation
+            } else {
+                server::AttachmentPhase::Interrupted
+            },
         );
         let interrupted = server.interrupted();
         let mut command = installation.cli();
@@ -242,14 +254,17 @@ fn cli_streams_attachment_to_approved_root_with_native_receipt() {
         }
         let mut child = command.spawn().unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while server.interrupted() == interrupted || std::fs::read_dir(&root).unwrap().count() != 2
-        {
+        while server.interrupted() == interrupted {
             if std::time::Instant::now() > deadline {
                 child.kill().unwrap();
                 panic!("export did not start");
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+        assert_eq!(
+            std::fs::read_dir(&root).unwrap().count(),
+            1 + usize::from(after_first_chunk)
+        );
         let partial = std::fs::read_dir(&root)
             .unwrap()
             .map(|entry| entry.unwrap().path())
@@ -258,16 +273,19 @@ fn cli_streams_attachment_to_approved_root_with_native_receipt() {
                     .unwrap()
                     .to_string_lossy()
                     .ends_with(".partial")
-            })
-            .expect("interrupted export owns a partial file");
+            });
+        assert_eq!(partial.is_some(), after_first_chunk);
         if cleanup_fails {
             #[cfg(target_os = "macos")]
             std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o500)).unwrap();
             #[cfg(windows)]
             {
-                let mut permissions = std::fs::metadata(&partial).unwrap().permissions();
+                let partial = partial
+                    .as_ref()
+                    .expect("first authorized chunk created a partial");
+                let mut permissions = std::fs::metadata(partial).unwrap().permissions();
                 permissions.set_readonly(true);
-                std::fs::set_permissions(&partial, permissions).unwrap();
+                std::fs::set_permissions(partial, permissions).unwrap();
             }
         }
         #[cfg(target_os = "macos")]
@@ -300,6 +318,7 @@ fn cli_streams_attachment_to_approved_root_with_native_receipt() {
         #[cfg(target_os = "macos")]
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
         if cleanup_fails {
+            let partial = partial.expect("first authorized chunk created a partial");
             let diagnostics = String::from_utf8(cancelled.stderr).unwrap();
             assert!(diagnostics.contains("cleanup failed"));
             assert!(!diagnostics.contains(reference));
