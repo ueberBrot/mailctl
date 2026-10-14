@@ -193,10 +193,24 @@ class InstallerTest(unittest.TestCase):
     def test_each_selection_is_independent_and_addition_preserves_sibling(self):
         for selected in ("cli", "mcp"):
             with self.subTest(selected=selected):
+                self.version = "0.1.0"
+                self.publish_fixture(self.version)
                 directory = self.directory / selected
                 self.successful(self.command("--components", selected, "--install-dir", directory))
                 self.installed({selected}, directory)
                 sibling = "mcp" if selected == "cli" else "cli"
+                previous = (directory / COMPONENTS[selected]).read_bytes()
+                self.version = "0.2.0"
+                candidate = self.publish_fixture(self.version, commit="b" * 40)
+                self.successful(self.command("--components", selected, "--install-dir", directory))
+                self.installed({selected}, directory)
+                self.assertNotEqual((directory / COMPONENTS[selected]).read_bytes(), previous)
+                receipt = dict(line.split("=", 1) for line in
+                               (directory / ".mailctl-components").read_text().splitlines())
+                self.assertEqual(receipt[f"{selected}_version"], self.version)
+                self.assertEqual(receipt[f"{selected}_commit"], candidate["commit"])
+                self.assertEqual(receipt[f"{selected}_sha256"], candidate[f"{selected}_sha256"])
+                self.assertNotIn(f"{sibling}_version", receipt)
                 before = (directory / COMPONENTS[selected]).read_bytes()
                 self.successful(self.command("--components", sibling, "--install-dir", directory))
                 self.installed({"cli", "mcp"}, directory)
@@ -544,34 +558,52 @@ class PackagedInstallerTest(InstallerTest):
 
     def test_packaged_components_setup_two_accounts_and_preserve_shared_state(self):
         for selected in ("cli", "mcp", "cli,mcp"):
-            with self.subTest(components=selected):
-                directory = self.directory / f"installed {selected}"
-                self.config = self.directory / f"configuration {selected}" / "config.toml"
-                self.successful(self.command("--components", selected, "--install-dir", directory))
-                self.installed(set(selected.split(",")), directory)
-                first = directory / ("mailctl" if "cli" in selected else "mailctl-mcp")
-                installation_id = self.setup_accounts(first)
-                accounts = (self.invoke(first, "account", "list") if first.name == "mailctl"
-                            else self.discover_mcp(first))
-                self.assertEqual({account["alias"] for account in accounts["accounts"]},
-                                 {"work", "personal"})
-                state_before = tree_bytes(self.config.parent)
-                self.successful(self.command("--install-dir", directory,
-                                             "--config", self.config))
-                self.installed({"cli", "mcp"}, directory)
-                self.assertEqual(tree_bytes(self.config.parent), state_before)
-                self.assertEqual(self.invoke(directory / "mailctl", "account", "list"), accounts)
-                self.assertEqual(self.discover_mcp(directory / "mailctl-mcp"), accounts)
-                for component in COMPONENTS.values():
-                    self.assertEqual(self.invoke(directory / component, "setup")["installation_id"],
-                                     installation_id)
-                self.successful(self.command("--uninstall", "--components", "cli",
-                                             "--install-dir", directory))
-                self.assertEqual(self.discover_mcp(directory / "mailctl-mcp"), accounts)
-                self.assertEqual(tree_bytes(self.config.parent), state_before)
-                self.successful(self.command("--uninstall", "--components", "mcp",
-                                             "--install-dir", directory))
-                self.assertEqual(tree_bytes(self.config.parent), state_before)
+            for removed in ("cli", "mcp"):
+                with self.subTest(components=selected, removed=removed):
+                    scenario = f"{selected} remove {removed}"
+                    directory = self.directory / f"installed {scenario}"
+                    self.config = self.directory / f"configuration {scenario}" / "config.toml"
+                    self.successful(self.command("--components", selected,
+                                                 "--install-dir", directory))
+                    self.installed(set(selected.split(",")), directory)
+                    first = directory / ("mailctl" if "cli" in selected else "mailctl-mcp")
+                    installation_id = self.setup_accounts(first)
+                    accounts = (self.invoke(first, "account", "list") if first.name == "mailctl"
+                                else self.discover_mcp(first))
+                    self.assertEqual({account["alias"] for account in accounts["accounts"]},
+                                     {"work", "personal"})
+                    state_before = tree_bytes(self.config.parent)
+                    binaries_before = tree_bytes(directory)
+                    self.successful(self.command("--components", selected,
+                                                 "--install-dir", directory,
+                                                 "--config", self.config))
+                    self.installed(set(selected.split(",")), directory)
+                    self.assertEqual(tree_bytes(directory), binaries_before)
+                    self.assertEqual(tree_bytes(self.config.parent), state_before)
+                    self.assertEqual((self.invoke(first, "account", "list")
+                                      if first.name == "mailctl" else self.discover_mcp(first)),
+                                     accounts)
+                    self.successful(self.command("--install-dir", directory,
+                                                 "--config", self.config))
+                    self.installed({"cli", "mcp"}, directory)
+                    self.assertEqual(tree_bytes(self.config.parent), state_before)
+                    self.assertEqual(self.invoke(directory / "mailctl", "account", "list"), accounts)
+                    self.assertEqual(self.discover_mcp(directory / "mailctl-mcp"), accounts)
+                    for component in COMPONENTS.values():
+                        self.assertEqual(self.invoke(directory / component, "setup")["installation_id"],
+                                         installation_id)
+                    self.successful(self.command("--uninstall", "--components", removed,
+                                                 "--install-dir", directory))
+                    survivor = "mcp" if removed == "cli" else "cli"
+                    self.installed({survivor}, directory)
+                    binary = directory / COMPONENTS[survivor]
+                    self.assertEqual((self.invoke(binary, "account", "list")
+                                      if survivor == "cli" else self.discover_mcp(binary)), accounts)
+                    self.assertEqual(tree_bytes(self.config.parent), state_before)
+                    self.successful(self.command("--uninstall", "--components", survivor,
+                                                 "--install-dir", directory))
+                    self.installed(set(), directory)
+                    self.assertEqual(tree_bytes(self.config.parent), state_before)
 
     def test_packaged_upgrade_preflight_rejects_unknown_config_and_state(self):
         self.successful(self.command())
