@@ -54,6 +54,8 @@ pub enum AttachmentPhase {
     List,
     Start,
     Continue,
+    Truncated,
+    TruncatedContinuation,
     Interrupted,
     InterruptedContinuation,
 }
@@ -174,7 +176,7 @@ impl ImapServer {
                                 ExpectedOperation::Body(mailbox, text) => body_page(&mut wire, mailbox, &text).await,
                                 ExpectedOperation::Attachment(mailbox, phase, filename) => {
                                     attachment_page(&mut wire, mailbox, phase, &filename, &stalled).await;
-                                    if matches!(phase, AttachmentPhase::Interrupted | AttachmentPhase::InterruptedContinuation) { return; }
+                                    if matches!(phase, AttachmentPhase::Truncated | AttachmentPhase::TruncatedContinuation | AttachmentPhase::Interrupted | AttachmentPhase::InterruptedContinuation) { return; }
                                 },
                             }
                             imap_support::logout(&mut wire).await;
@@ -422,6 +424,9 @@ async fn body_page(wire: &mut imap_support::Wire, mailbox: &str, text: &[u8]) {
     )
     .await;
     let tag = expect(wire, "UID FETCH 3 (UID RFC822.SIZE BODYSTRUCTURE)").await;
+    // The attachment exceeds the default 2 MiB whole-message bound. Strict
+    // command matching permits only headers and the selected body, rejecting
+    // attachment fetches and mailbox mutations independently of the client.
     write(wire, &format!("* 3 FETCH (UID 3 RFC822.SIZE 3000300 BODYSTRUCTURE ((\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"{encoding}\" {} 1 NIL NIL NIL NIL)(\"APPLICATION\" \"OCTET-STREAM\" NIL NIL NIL \"BASE64\" 3000000 NIL (\"ATTACHMENT\" NIL) NIL NIL) \"MIXED\" NIL NIL NIL NIL))\r\n{tag} OK fetched\r\n", text.len())).await;
     for (section, count, value) in [
         (
@@ -469,6 +474,11 @@ async fn attachment_page(
 ) {
     use imap_support::{expect, write};
     let tag = expect(wire, &format!("EXAMINE {}", mailbox_argument(mailbox))).await;
+    if payload == AttachmentPhase::TruncatedContinuation {
+        // The previous operation yielded a chunk. Drop this continuation before
+        // selection succeeds, without supplying another chunk or LOGOUT reply.
+        return;
+    }
     if payload == AttachmentPhase::InterruptedContinuation {
         interrupt_attachment(wire, interrupted).await;
         return;
@@ -485,6 +495,12 @@ async fn attachment_page(
     if payload == AttachmentPhase::Interrupted {
         expect(wire, "UID FETCH 3 (UID BODY.PEEK[2]<0.16384>)").await;
         interrupt_attachment(wire, interrupted).await;
+    }
+    if payload == AttachmentPhase::Truncated {
+        expect(wire, "UID FETCH 3 (UID BODY.PEEK[2]<0.16384>)").await;
+        // Close after half the promised literal; no success or LOGOUT reply.
+        write(wire, "* 3 FETCH (UID 3 BODY[2]<0> {8}\r\nYWJj").await;
+        return;
     }
     if payload == AttachmentPhase::Start {
         let tag = expect(wire, "UID FETCH 3 (UID BODY.PEEK[2]<0.16384>)").await;
