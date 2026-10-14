@@ -24,9 +24,12 @@ jobs:
       - uses: taiki-e/install-action@d438492cf8a250514fa2d34b30bc3c0dc37c65ff  # v2.87.8
         with:
           tool: cargo-deny@0.20.2
-      - run: cargo fmt --all -- --check
-      - run: cargo run --locked --example check-policy
-      - run: cargo deny --locked --all-features check
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+      - name: Check repository policy
+        run: cargo run --locked --example check-policy
+      - name: Check dependency policy
+        run: cargo deny --locked --all-features check
       - name: Check installer failure and recovery fixtures
         run: python3 tests/installer.py --suite fixtures
 
@@ -43,27 +46,25 @@ jobs:
         with:
           persist-credentials: false
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f  # v2.0.0
-      - run: cargo build --locked --workspace --all-targets --no-default-features --features "$MAILCTL_FEATURES"
+      - name: Build selected components
+        run: cargo build --locked --workspace --all-targets --no-default-features --features "$MAILCTL_FEATURES"
         shell: bash
         env:
           MAILCTL_FEATURES: ${{ matrix.features }}
-      - run: cargo clippy --locked --workspace --all-targets --no-default-features --features "$MAILCTL_FEATURES" -- -D warnings
+      - name: Lint selected components
+        run: cargo clippy --locked --workspace --all-targets --no-default-features --features "$MAILCTL_FEATURES" -- -D warnings
         shell: bash
         env:
           MAILCTL_FEATURES: ${{ matrix.features }}
-      - run: cargo test --locked --workspace --no-default-features --features "$MAILCTL_FEATURES"
+      - name: Test selected components
+        run: cargo test --locked --workspace --no-default-features --features "$MAILCTL_FEATURES"
         shell: bash
         env:
           MAILCTL_FEATURES: ${{ matrix.features }}
       - name: Repeat concurrent Windows draft acceptance
         if: matrix.os == 'windows-latest' && matrix.features == 'cli,mcp'
         shell: pwsh
-        run: |
-          1..20 | ForEach-Object {
-            cargo test --locked -p mailctl-process-tests --test drafts `
-              independent_cli_and_mcp_create_once_and_inspect_without_provider_work -- --exact
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          }
+        run: ./scripts/ci/windows-acceptance.ps1 repeat-drafts
 
   greenmail:
     runs-on: ubuntu-latest
@@ -78,11 +79,16 @@ jobs:
         with:
           version: v29.9.0
           set-host: true
-      - run: docker version
-      - run: docker info
-      - run: openssl version
-      - run: cargo clippy --locked --workspace --all-targets --features docker-tests -- -D warnings
-      - run: cargo test --locked --test greenmail --features docker-tests -- --nocapture
+      - name: Record Docker version
+        run: docker version
+      - name: Record Docker configuration
+        run: docker info
+      - name: Record OpenSSL version
+        run: openssl version
+      - name: Lint GreenMail integration
+        run: cargo clippy --locked --workspace --all-targets --features docker-tests -- -D warnings
+      - name: Test GreenMail integration
+        run: cargo test --locked --test greenmail --features docker-tests -- --nocapture
 
   systemd-credentials:
     strategy:
@@ -100,30 +106,7 @@ jobs:
         shell: bash
         env:
           MAILCTL_FEATURES: ${{ matrix.features }}
-        run: |
-          test_binaries=$(cargo test --locked --no-default-features \
-            --features "$MAILCTL_FEATURES" \
-            --test systemd_native --test systemd_credentials \
-            --no-run --message-format=json |
-            jq -s 'map(select(.reason == "compiler-artifact" and
-              .executable != null)) |
-              map({key: .target.name, value: .executable}) | from_entries')
-          test_binary=$(jq -r '.systemd_native // empty' <<<"$test_binaries")
-          acl_test_binary=$(jq -r '.systemd_credentials // empty' \
-            <<<"$test_binaries")
-          test -n "$test_binary"
-          test -n "$acl_test_binary"
-          sudo env MAILCTL_DISPOSABLE_SYSTEMD=1 \
-            "$acl_test_binary" \
-            linux::systemd_source_accepts_only_the_service_user_acl \
-            --exact --ignored --nocapture --test-threads=1
-          sudo env MAILCTL_DISPOSABLE_SYSTEMD=1 \
-            "$test_binary" --ignored --nocapture --test-threads=1
-          systemctl --version
-          uname -a
-          for binary in target/debug/mailctl target/debug/mailctl-mcp; do
-            if test -f "$binary"; then sha256sum "$binary"; fi
-          done
+        run: bash scripts/ci/native-acceptance.sh systemd
 
   windows-native-credentials:
     strategy:
@@ -142,13 +125,7 @@ jobs:
         env:
           MAILCTL_FEATURES: ${{ matrix.features }}
           MAILCTL_DISPOSABLE_WINDOWS: '1'
-        run: |
-          cargo test --locked --no-default-features --features "$env:MAILCTL_FEATURES" `
-            --test windows_credentials native_windows_credentials_cross_processes_and_rotate `
-            -- --ignored --nocapture --test-threads=1
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          Get-CimInstance Win32_OperatingSystem | Select-Object Caption, Version, OSArchitecture
-          Get-ChildItem target/debug/mailctl*.exe | Get-FileHash -Algorithm SHA256
+        run: ./scripts/ci/windows-acceptance.ps1 credentials
 
   native-credentials:
     # Qualify native credentials using the installed candidate bytes. Reuse this
@@ -164,101 +141,27 @@ jobs:
         shell: bash
         env:
           DIST_BIN_DIR: ${{ runner.temp }}/dist-bin
-        run: |
-          cd "$RUNNER_TEMP"
-          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
-            https://github.com/axodotdev/cargo-dist/releases/download/v0.33.0/cargo-dist-aarch64-apple-darwin.tar.xz \
-            --output dist.tar.xz
-          echo '7b3cbe25511de01d74c0f5fcb7909edabd379bea9cfa284d93af5a3cdfa3247c  dist.tar.xz' | shasum -a 256 -c -
-          mkdir -p "$DIST_BIN_DIR"
-          tar -xJf dist.tar.xz --strip-components=1 -C "$DIST_BIN_DIR"
-          test "$("$DIST_BIN_DIR/dist" --version)" = 'cargo-dist 0.33.0'
-          echo "$DIST_BIN_DIR" >>"$GITHUB_PATH"
+        run: bash scripts/ci/install-dist.sh
       - name: Build macOS Apple Silicon archives with dist
-        run: |
-          mkdir -p target
-          dist build --artifacts=local --target aarch64-apple-darwin \
-            --output-format=json >target/dist-build.json
+        run: bash scripts/ci/candidate.sh build
       - name: Prepare component manifest and signing evidence from the dist archive
         env:
           # Candidate evidence must not be restored with the Rust target cache.
           MAILCTL_CANDIDATE_DIR: ${{ runner.temp }}/mailctl-release-candidate
-        run: |
-          python3 scripts/prepare-installer.py --output "$MAILCTL_CANDIDATE_DIR"
-          echo "MAILCTL_CANDIDATE_DIR=$MAILCTL_CANDIDATE_DIR" >>"$GITHUB_ENV"
+          MAILCTL_PACKAGED_BIN_DIR: ${{ runner.temp }}/mailctl-installed
+        run: bash scripts/ci/candidate.sh prepare
       - name: Qualify selected components through the standalone installer
-        shell: bash
-        env:
-          MAILCTL_INSTALLED_BIN_DIR: ${{ runner.temp }}/mailctl-installed
-        run: |
-          python3 tests/installer.py --suite packaged --artifacts "$MAILCTL_CANDIDATE_DIR" \
-            --install-to "$MAILCTL_INSTALLED_BIN_DIR" 2>&1 | \
-            tee "$MAILCTL_CANDIDATE_DIR/installer-acceptance.log"
+        run: bash scripts/ci/candidate.sh installer
       - name: Qualify packaged setup, history, backup, and restore
-        shell: bash
-        env:
-          MAILCTL_PACKAGED_BIN_DIR: ${{ runner.temp }}/mailctl-installed
-        run: |
-          cargo test --locked --test administration_process --test state_maintenance \
-            2>&1 | tee "$MAILCTL_CANDIDATE_DIR/installed-state-acceptance.log"
+        run: bash scripts/ci/candidate.sh state
       - name: Qualify packaged interfaces and process lifecycle
-        shell: bash
-        env:
-          MAILCTL_PACKAGED_BIN_DIR: ${{ runner.temp }}/mailctl-installed
-        run: |
-          cargo test --locked \
-            --test mcp_process --test message_process --test attachment_process \
-            --test search_process --test discovery_process \
-            --test read_contention_process --test draft_process \
-            2>&1 | tee "$MAILCTL_CANDIDATE_DIR/installed-process-acceptance.log"
+        run: bash scripts/ci/candidate.sh process
       - name: Qualify packaged native credentials on the disposable hosted identity
-        shell: bash
-        env:
-          MAILCTL_PACKAGED_BIN_DIR: ${{ runner.temp }}/mailctl-installed
-        run: |
-          cargo test --locked --test native_credentials -- --ignored --test-threads=1 \
-            2>&1 | tee "$MAILCTL_CANDIDATE_DIR/installed-native-acceptance.log"
+        run: bash scripts/ci/candidate.sh native
       - name: Qualify packaged reading for each standalone component selection
-        shell: bash
-        run: |
-          for components in cli mcp cli,mcp; do
-            case "$components" in
-              cli,mcp) label=cli-mcp; installed="$RUNNER_TEMP/mailctl-installed" ;;
-              *) label="$components"; installed="$RUNNER_TEMP/mailctl-installed-$components" ;;
-            esac
-            {
-              if [ "$components" != cli,mcp ]; then
-                python3 tests/installer.py --artifacts "$MAILCTL_CANDIDATE_DIR" \
-                  --install-only --components "$components" --install-to "$installed"
-              fi
-              MAILCTL_PACKAGED_BIN_DIR="$installed" cargo test --locked \
-                --no-default-features --features "$components" --test packaged_reading \
-                -- --test-threads=1
-            } 2>&1 | tee "$MAILCTL_CANDIDATE_DIR/installed-reading-$label-acceptance.log"
-          done
+        run: bash scripts/ci/candidate.sh reading
       - name: Record passing candidate acceptance
-        shell: bash
-        run: |
-          cd "$MAILCTL_CANDIDATE_DIR"
-          shasum -a 256 -c SHA256SUMS
-          {
-            printf 'status=passed\ntopology=cooperative-embedded\ncredential_source=disposable-apple-keychain\n'
-            sw_vers
-            uname -sm
-            printf 'installer_command=python3 tests/installer.py --suite packaged --artifacts %s --install-to <disposable-bin-directory>\n' "$MAILCTL_CANDIDATE_DIR"
-            printf 'state_command=cargo test --locked --test administration_process --test state_maintenance\n'
-            printf 'process_command=cargo test --locked --test mcp_process --test message_process --test attachment_process --test search_process --test discovery_process --test read_contention_process --test draft_process\n'
-            printf 'native_command=cargo test --locked --test native_credentials -- --ignored --test-threads=1\n'
-            printf 'reading_credential_source=disposable-command-helper\nreading_tls_source=fixture-ca-via-SSL_CERT_FILE\n'
-            printf 'reading_installer_command=python3 tests/installer.py --artifacts <candidate-directory> --install-only --components <cli|mcp> --install-to <disposable-bin-directory>\n'
-            for components in cli mcp cli,mcp; do
-              printf 'reading_command_%s=MAILCTL_PACKAGED_BIN_DIR=<disposable-bin-directory> cargo test --locked --no-default-features --features %s --test packaged_reading -- --test-threads=1\n' "$components" "$components"
-            done
-            printf 'real_provider=not-qualified\nisolation=not-qualified\npublication=not-performed\n'
-          } >acceptance-evidence.txt
-          shasum -a 256 acceptance-evidence.txt installer-acceptance.log \
-            installed-state-acceptance.log installed-process-acceptance.log \
-            installed-native-acceptance.log installed-reading-*-acceptance.log >>SHA256SUMS
+        run: bash scripts/ci/candidate.sh record
       - name: Keep candidate downloads and acceptance evidence
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
@@ -275,17 +178,11 @@ jobs:
         with:
           persist-credentials: false
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f  # v2.0.0
-      - run: cargo clippy --locked --workspace --all-targets --features isolated -- -D warnings
-      - run: cargo test --locked --features isolated --test isolation_process
+      - name: Lint isolated access
+        run: cargo clippy --locked --workspace --all-targets --features isolated -- -D warnings
+      - name: Test isolated process access
+        run: cargo test --locked --features isolated --test isolation_process
       - name: Qualify isolated access with disposable macOS identities
         timeout-minutes: 5
         shell: bash
-        run: |
-          test_binary=$(cargo test --locked --features isolated \
-            --test isolated_native --no-run --message-format=json |
-            jq -r 'select(.reason == "compiler-artifact" and
-              .target.name == "isolated_native" and .executable != null) |
-              .executable')
-          test -n "$test_binary"
-          sudo env MAILCTL_DISPOSABLE_MACOS=1 \
-            "$test_binary" --ignored --nocapture --test-threads=1
+        run: bash scripts/ci/native-acceptance.sh isolation

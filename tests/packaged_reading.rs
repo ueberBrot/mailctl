@@ -1,6 +1,6 @@
 //! Reading acceptance through production executables and credential/CA sources.
-//! MAILCTL_PACKAGED_BIN_DIR selects installed candidate bytes; single-feature
-//! harnesses exercise installations that do not contain the other component.
+//! MAILCTL_PACKAGED_BIN_DIR selects installed candidate bytes; cli_ and mcp_
+//! test filters exercise installations that do not contain the other component.
 #![cfg(all(target_os = "macos", any(feature = "cli", feature = "mcp")))]
 
 mod imap_support;
@@ -223,58 +223,60 @@ async fn search_message(fixture: &Fixture, reader: &Reader, mailbox: &str) -> Va
         .take()
 }
 
-#[tokio::test]
-async fn components_read_and_continue_short_body_without_large_attachment_payload() {
-    let executables = [
-        #[cfg(feature = "cli")]
-        support::MAILCTL,
-        #[cfg(feature = "mcp")]
-        support::MAILCTL_MCP,
-    ];
-    for executable in executables {
-        tokio::time::timeout(std::time::Duration::from_secs(30), async {
-            let mut fixture = Fixture::new(executable);
-            let reader = Reader::start(&fixture, executable).await;
-            let (mailbox, before) = discover_message(&fixture, &reader).await;
-            let message = before["reference"].as_str().unwrap();
-            let mut cursor: Option<String> = None;
-            let mut reconstructed = String::new();
-            for expected in ["Shor", "t bo", "dy.\r", "\n"] {
-                fixture.server.expect_body(USERNAME, PASSWORD, "INBOX");
-                let mut arguments =
-                    vec!["message", "get", "--message", message, "--max-bytes", "4"];
-                if let Some(cursor) = &cursor {
-                    arguments.extend(["--cursor", cursor]);
-                }
-                let result = reader
-                    .call(
-                        &fixture,
-                        &arguments,
-                        "email_get_message",
-                        json!({"message": message, "max_bytes": 4, "cursor": cursor}),
-                    )
-                    .await;
-                let body = &result["body"];
-                assert_eq!(body["text"], expected);
-                assert_eq!(body["selected_part"], "1");
-                assert_eq!(body["source_media_type"], "text/plain");
-                assert_eq!(body["converted"], false);
-                reconstructed.push_str(expected);
-                cursor = body["next_cursor"].as_str().map(str::to_owned);
-                assert_eq!(body["continuation_available"], cursor.is_some());
-                assert_eq!(body["truncated"], cursor.is_some());
+async fn read_and_continue_short_body_without_large_attachment_payload(executable: &str) {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let mut fixture = Fixture::new(executable);
+        let reader = Reader::start(&fixture, executable).await;
+        let (mailbox, before) = discover_message(&fixture, &reader).await;
+        let message = before["reference"].as_str().unwrap();
+        let mut cursor: Option<String> = None;
+        let mut reconstructed = String::new();
+        for expected in ["Shor", "t bo", "dy.\r", "\n"] {
+            fixture.server.expect_body(USERNAME, PASSWORD, "INBOX");
+            let mut arguments = vec!["message", "get", "--message", message, "--max-bytes", "4"];
+            if let Some(cursor) = &cursor {
+                arguments.extend(["--cursor", cursor]);
             }
-            assert_eq!(reconstructed, "Short body.\r\n");
-            assert!(cursor.is_none());
-            // Strict EXAMINE/PEEK transcripts independently reject mutation and
-            // attachment payload fetches; metadata/flags also remain identical.
-            assert_eq!(search_message(&fixture, &reader, &mailbox).await, before);
-            reader.finish().await;
-            fixture.server.finish();
-        })
-        .await
-        .expect("standalone reading and shutdown deadline");
-    }
+            let result = reader
+                .call(
+                    &fixture,
+                    &arguments,
+                    "email_get_message",
+                    json!({"message": message, "max_bytes": 4, "cursor": cursor}),
+                )
+                .await;
+            let body = &result["body"];
+            assert_eq!(body["text"], expected);
+            assert_eq!(body["selected_part"], "1");
+            assert_eq!(body["source_media_type"], "text/plain");
+            assert_eq!(body["converted"], false);
+            reconstructed.push_str(expected);
+            cursor = body["next_cursor"].as_str().map(str::to_owned);
+            assert_eq!(body["continuation_available"], cursor.is_some());
+            assert_eq!(body["truncated"], cursor.is_some());
+        }
+        assert_eq!(reconstructed, "Short body.\r\n");
+        assert!(cursor.is_none());
+        // Strict EXAMINE/PEEK transcripts independently reject mutation and
+        // attachment payload fetches; metadata/flags also remain identical.
+        assert_eq!(search_message(&fixture, &reader, &mailbox).await, before);
+        reader.finish().await;
+        fixture.server.finish();
+    })
+    .await
+    .expect("standalone reading and shutdown deadline");
+}
+
+#[cfg(feature = "cli")]
+#[tokio::test]
+async fn cli_reads_and_continues_short_body_without_large_attachment_payload() {
+    read_and_continue_short_body_without_large_attachment_payload(support::MAILCTL).await;
+}
+
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn mcp_reads_and_continues_short_body_without_large_attachment_payload() {
+    read_and_continue_short_body_without_large_attachment_payload(support::MAILCTL_MCP).await;
 }
 
 #[cfg(feature = "cli")]
