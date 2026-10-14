@@ -3,7 +3,9 @@
 
 Run fixture checks with ``python3 tests/installer.py``. Add ``--artifacts DIR``
 to qualify real packaged binaries on macOS Apple Silicon. ``--install-to DIR``
-leaves a fresh combined installation for the packaged Rust acceptance suites.
+leaves a fresh installation for the packaged Rust acceptance suites, combined by
+default or selected with ``--components``. ``--install-only`` skips the suite
+when preparing additional component selections from an already checked candidate.
 Only Python's standard library and the installer's documented system tools are
 used; every download is served from a temporary loopback HTTP server.
 """
@@ -739,7 +741,7 @@ class PackagedInstallerTest(InstallerTest):
         self.assertEqual(tree_bytes(self.config.parent), state_before)
 
 
-def leave_installed_candidate(artifacts, destination):
+def leave_installed_candidate(artifacts, destination, components):
     if destination.exists() and (not destination.is_dir() or any(destination.iterdir())):
         raise SystemExit("--install-to must be a missing or empty dedicated directory")
     manifest = read_manifest(artifacts)
@@ -751,9 +753,17 @@ def leave_installed_candidate(artifacts, destination):
         try:
             subprocess.run(["/bin/sh", str(artifacts / f"install-v{manifest['version']}.sh"), "--version",
                 manifest["version"], "--base-url", server.url, "--install-dir",
-                str(destination)], env=env, check=True, timeout=60)
+                str(destination), "--components", components], env=env, check=True, timeout=60)
         finally:
             server.close()
+    selected = set(components.split(","))
+    for selection, component in COMPONENTS.items():
+        binary = destination / component
+        if selection in selected:
+            if not binary.is_file() or digest(binary) != manifest[f"{selection}_sha256"]:
+                raise SystemExit(f"installed {component} does not match the candidate")
+        elif binary.exists():
+            raise SystemExit(f"unselected component {component} was installed")
 
 
 def main():
@@ -761,14 +771,22 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--artifacts", type=Path)
     parser.add_argument("--install-to", type=Path)
+    parser.add_argument("--components", choices=("cli", "mcp", "cli,mcp"))
+    parser.add_argument("--install-only", action="store_true")
     parser.add_argument("--suite", choices=("all", "fixtures", "packaged"), default="all")
     options, unittest_args = parser.parse_known_args()
     if options.artifacts:
         ARTIFACTS = options.artifacts.resolve(strict=True)
     if options.install_to and ARTIFACTS is None:
         parser.error("--install-to requires --artifacts")
+    if (options.components or options.install_only) and not options.install_to:
+        parser.error("--components and --install-only require --install-to")
     if options.suite == "packaged" and ARTIFACTS is None:
         parser.error("--suite packaged requires --artifacts")
+    if options.install_only:
+        leave_installed_candidate(ARTIFACTS, options.install_to.resolve(),
+                                  options.components or "cli,mcp")
+        return
     # Packaged checks complement the fixture suite. Avoid inheriting all fixture
     # cases into the packaged class, whose downloads are immutable candidates.
     suite = unittest.TestSuite()
@@ -787,7 +805,8 @@ def main():
     if not result.wasSuccessful():
         raise SystemExit(1)
     if options.install_to:
-        leave_installed_candidate(ARTIFACTS, options.install_to.resolve())
+        leave_installed_candidate(ARTIFACTS, options.install_to.resolve(),
+                                  options.components or "cli,mcp")
 
 
 if __name__ == "__main__":

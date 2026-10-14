@@ -218,6 +218,24 @@ jobs:
         run: |
           cargo test --locked --test native_credentials -- --ignored --test-threads=1 \
             2>&1 | tee "$MAILCTL_CANDIDATE_DIR/installed-native-acceptance.log"
+      - name: Qualify packaged reading for each standalone component selection
+        shell: bash
+        run: |
+          for components in cli mcp cli,mcp; do
+            case "$components" in
+              cli,mcp) label=cli-mcp; installed="$RUNNER_TEMP/mailctl-installed" ;;
+              *) label="$components"; installed="$RUNNER_TEMP/mailctl-installed-$components" ;;
+            esac
+            {
+              if [ "$components" != cli,mcp ]; then
+                python3 tests/installer.py --artifacts "$MAILCTL_CANDIDATE_DIR" \
+                  --install-only --components "$components" --install-to "$installed"
+              fi
+              MAILCTL_PACKAGED_BIN_DIR="$installed" cargo test --locked \
+                --no-default-features --features "$components" --test packaged_reading \
+                -- --test-threads=1
+            } 2>&1 | tee "$MAILCTL_CANDIDATE_DIR/installed-reading-$label-acceptance.log"
+          done
       - name: Record passing candidate acceptance
         shell: bash
         run: |
@@ -231,11 +249,16 @@ jobs:
             printf 'state_command=cargo test --locked --test administration_process --test state_maintenance\n'
             printf 'process_command=cargo test --locked --test mcp_process --test message_process --test attachment_process --test search_process --test discovery_process --test read_contention_process --test draft_process\n'
             printf 'native_command=cargo test --locked --test native_credentials -- --ignored --test-threads=1\n'
+            printf 'reading_credential_source=disposable-command-helper\nreading_tls_source=fixture-ca-via-SSL_CERT_FILE\n'
+            printf 'reading_installer_command=python3 tests/installer.py --artifacts <candidate-directory> --install-only --components <cli|mcp> --install-to <disposable-bin-directory>\n'
+            for components in cli mcp cli,mcp; do
+              printf 'reading_command_%s=MAILCTL_PACKAGED_BIN_DIR=<disposable-bin-directory> cargo test --locked --no-default-features --features %s --test packaged_reading -- --test-threads=1\n' "$components" "$components"
+            done
             printf 'real_provider=not-qualified\nisolation=not-qualified\npublication=not-performed\n'
           } >acceptance-evidence.txt
           shasum -a 256 acceptance-evidence.txt installer-acceptance.log \
             installed-state-acceptance.log installed-process-acceptance.log \
-            installed-native-acceptance.log >>SHA256SUMS
+            installed-native-acceptance.log installed-reading-*-acceptance.log >>SHA256SUMS
       - name: Keep candidate downloads and acceptance evidence
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
