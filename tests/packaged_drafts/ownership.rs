@@ -6,12 +6,12 @@ async fn start_request(
     executable: &str,
     tool: &str,
     input: Value,
+    grant: &str,
 ) -> tokio::process::Child {
     use std::process::Stdio;
     #[cfg(feature = "cli")]
     if executable == support::MAILCTL {
-        let mut command =
-            tokio::process::Command::from(fixture.cli_command(tool, &input, "writer"));
+        let mut command = tokio::process::Command::from(fixture.cli_command(tool, &input, grant));
         return command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -22,7 +22,7 @@ async fn start_request(
     }
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     let mut command = fixture.command(executable);
-    command.args(["--grant", "writer", "--use-configured-grant"]);
+    command.args(["--grant", grant, "--use-configured-grant"]);
     let mut child = tokio::process::Command::from(command)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -65,6 +65,53 @@ async fn start_request(
     child
 }
 
+#[cfg(feature = "mcp")]
+async fn response(
+    stdout: &mut tokio::io::BufReader<tokio::process::ChildStdout>,
+    id: u64,
+) -> Value {
+    let response = next_response(stdout).await;
+    assert_eq!(response["id"], id, "unexpected MCP response: {response}");
+    response
+}
+
+#[cfg(feature = "mcp")]
+async fn next_response(stdout: &mut tokio::io::BufReader<tokio::process::ChildStdout>) -> Value {
+    use tokio::io::AsyncBufReadExt;
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), stdout.read_line(&mut line))
+        .await
+        .expect("MCP response deadline")
+        .unwrap();
+    serde_json::from_str(&line).unwrap()
+}
+
+#[cfg(all(feature = "cli", feature = "mcp"))]
+fn assert_owner_held(fixture: &Fixture, state: &str) {
+    let writer = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(fixture.state().join(format!(
+            "draft-{}.lock",
+            fixture.input["account_id"].as_str().unwrap()
+        )))
+        .unwrap();
+    assert!(matches!(
+        writer.try_lock(),
+        Err(std::fs::TryLockError::WouldBlock)
+    ));
+    let database = rusqlite::Connection::open(fixture.state().join("drafts.sqlite")).unwrap();
+    let operation = uuid::Uuid::parse_str(fixture.input["operation_id"].as_str().unwrap()).unwrap();
+    let retained: String = database
+        .query_row(
+            "SELECT state FROM draft_operations WHERE operation_id = ?1",
+            [operation.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(retained, state);
+}
+
 async fn interrupted_creation(executable: &str) {
     for crash in [true, false] {
         let mut fixture = Fixture::new(executable);
@@ -76,6 +123,7 @@ async fn interrupted_creation(executable: &str) {
             executable,
             "email_save_draft",
             fixture.input.clone(),
+            "writer",
         )
         .await;
         fixture.appended(1).await;
@@ -149,6 +197,7 @@ async fn interrupted_reconciliation(executable: &str) {
                 executable,
                 "email_draft_status",
                 fixture.status_input(true),
+                "writer",
             )
             .await;
             tokio::time::timeout(Duration::from_secs(3), async {
@@ -209,21 +258,7 @@ async fn mcp_reconciliation_deadline_retains_original_uncertainty() {
 #[cfg(feature = "mcp")]
 #[tokio::test]
 async fn mcp_request_cancellation_releases_append_and_reconciliation_without_ending_session() {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-
-    async fn response(stdout: &mut BufReader<tokio::process::ChildStdout>, id: u64) -> Value {
-        let mut line = String::new();
-        tokio::time::timeout(Duration::from_secs(5), stdout.read_line(&mut line))
-            .await
-            .expect("MCP response deadline")
-            .unwrap();
-        let response: Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(
-            response["id"], id,
-            "cancelled requests produce no response: {response}"
-        );
-        response
-    }
+    use tokio::io::{AsyncWriteExt, BufReader};
 
     for reconcile in [false, true] {
         let mut fixture = Fixture::new(support::MAILCTL_MCP);
@@ -238,7 +273,7 @@ async fn mcp_request_cancellation_releases_append_and_reconciliation_without_end
                 .expect_append(server::DraftReply::Hold(Default::default()));
             ("email_save_draft", fixture.input.clone())
         };
-        let mut child = start_request(&fixture, support::MAILCTL_MCP, tool, input).await;
+        let mut child = start_request(&fixture, support::MAILCTL_MCP, tool, input, "writer").await;
         if reconcile {
             tokio::time::timeout(Duration::from_secs(5), async {
                 while fixture.server.stalled_reconciliations() == 0 {
@@ -336,7 +371,15 @@ async fn cross_same_id_and_conflicting_inputs_share_one_append_across_grants() {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
+    use tokio::io::{AsyncWriteExt, BufReader};
     let mut fixture = Fixture::new(support::MAILCTL);
+    // Leave transport capacity for the ping after two pending draft calls.
+    let mut config = fixture.configuration();
+    config.limits.envelope_bytes = 64 * 1024;
+    for grant in &mut config.grants {
+        grant.limits.envelope_bytes = 64 * 1024;
+    }
+    fixture.configure(&config);
     let release = Arc::new(AtomicUsize::new(0));
     fixture
         .server
@@ -353,15 +396,63 @@ async fn cross_same_id_and_conflicting_inputs_share_one_append_across_grants() {
     );
     let mut conflict = fixture.input.clone();
     conflict["draft"]["body"] = json!("Conflicting concurrent input");
-    let unblock = async {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        release.store(1, Ordering::SeqCst);
-    };
-    let (same, different, ()) = tokio::join!(
-        caller.call(&fixture, "email_save_draft", fixture.input.clone()),
-        caller.call(&fixture, "email_save_draft", conflict),
-        unblock
-    );
+    // Both contenders must finish a bounded ownership wait while APPEND is
+    // still held. A sequential replay cannot satisfy these public responses.
+    let (same, different) = tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::join!(
+            caller.call(&fixture, "email_save_draft", fixture.input.clone()),
+            caller.call(&fixture, "email_save_draft", conflict.clone()),
+        )
+    })
+    .await
+    .expect("both saves have bounded writer waits");
+    for blocked in [same, different] {
+        assert_eq!(blocked["error"]["code"], "operation_in_progress");
+    }
+    assert_owner_held(&fixture, "in_flight");
+
+    // Submit another pair before release and keep their original successful
+    // replay/conflict assertions. FIFO STDIO followed by a ping response proves
+    // both request frames reached the server while durable ownership remains.
+    let mut pending = start_request(
+        &fixture,
+        support::MAILCTL_MCP,
+        "email_save_draft",
+        fixture.input.clone(),
+        "other-writer",
+    )
+    .await;
+    let different = json!({"jsonrpc":"2.0", "id":2, "method":"tools/call", "params":{"name":"email_save_draft", "arguments":conflict}});
+    let ping = json!({"jsonrpc":"2.0", "id":3, "method":"ping"});
+    pending
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(format!("{different}\n{ping}\n").as_bytes())
+        .await
+        .unwrap();
+    let mut stdout = BufReader::new(pending.stdout.take().unwrap());
+    let pong = response(&mut stdout, 3).await;
+    assert!(pong.get("result").is_some(), "{pong}");
+    assert_owner_held(&fixture, "in_flight");
+    assert!(!owner.is_finished());
+    release.store(1, Ordering::SeqCst);
+    let mut results = std::collections::BTreeMap::new();
+    for _ in 0..2 {
+        let received = next_response(&mut stdout).await;
+        let id = received["id"].as_u64().unwrap();
+        let value = support::assert_mcp_envelope(
+            serde_json::from_value(received["result"].clone()).unwrap(),
+        );
+        assert!(results.insert(id, value).is_none());
+    }
+    let same = results.remove(&1).unwrap();
+    let different = results.remove(&2).unwrap();
+    drop(pending.stdin.take());
+    tokio::time::timeout(Duration::from_secs(5), pending.wait())
+        .await
+        .unwrap()
+        .unwrap();
     let output = owner.await.unwrap();
     support::assert_success(&output);
     let created = envelope(&output);
@@ -396,6 +487,7 @@ async fn cross_crashed_owner_and_concurrent_reconciliation_never_append_again() 
         support::MAILCTL,
         "email_save_draft",
         fixture.input.clone(),
+        "writer",
     )
     .await;
     fixture.appended(1).await;
@@ -418,17 +510,31 @@ async fn cross_crashed_owner_and_concurrent_reconciliation_never_append_again() 
         &fixture,
     );
     assert_uncertain(&fixture.status(support::MAILCTL, false).await, &fixture);
-    fixture.server.expect_reconciliation();
+    let (search, release) = fixture.server.expect_held_reconciliation();
     let command = fixture.cli_command("email_draft_status", &fixture.status_input(true), "writer");
     let cli = tokio::task::spawn_blocking(move || run_bounded(command));
-    let (cli, mcp) = tokio::join!(
-        cli,
-        caller.call(&fixture, "email_draft_status", fixture.status_input(true))
-    );
-    let cli = cli.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), search)
+        .await
+        .expect("owner reconciliation reaches provider SEARCH")
+        .unwrap();
+    assert_owner_held(&fixture, "outcome_unknown");
+    let blocked = tokio::time::timeout(
+        Duration::from_secs(3),
+        caller.call(&fixture, "email_draft_status", fixture.status_input(true)),
+    )
+    .await
+    .expect("rival reconciliation has a bounded writer wait");
+    assert_eq!(blocked["error"]["code"], "rate_limited");
+    assert_owner_held(&fixture, "outcome_unknown");
+    assert!(!cli.is_finished());
+    release.send(()).unwrap();
+    let cli = cli.await.unwrap();
     support::assert_success(&cli);
     let verified = envelope(&cli);
     assert_eq!(verified["result"]["state"], "duplicate");
+    let mcp = caller
+        .call(&fixture, "email_draft_status", fixture.status_input(true))
+        .await;
     assert_eq!(mcp["result"], verified["result"]);
     caller.finish().await;
     assert_appended_content(&fixture, &verified);

@@ -45,7 +45,7 @@ enum ExpectedOperation {
     NamedAppend(String, DraftReply),
     DraftTarget(u32),
     NamedDraftTarget(String, u32),
-    Reconcile(bool),
+    Reconcile(ReconciliationReply),
     ReconcileBytes(Vec<u8>),
     DraftReconciliation(ReconciliationCase),
     RejectAuthentication(bool),
@@ -73,6 +73,15 @@ pub enum DraftReply {
     Rejected,
     Disconnect,
     Hold(Arc<AtomicUsize>),
+}
+
+enum ReconciliationReply {
+    Verified,
+    Stalled,
+    Hold {
+        reached: tokio::sync::oneshot::Sender<()>,
+        resume: tokio::sync::oneshot::Receiver<()>,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -226,13 +235,13 @@ impl ImapServer {
                                     imap_support::dropped(&mut wire).await;
                                     return;
                                 },
-                                ExpectedOperation::Reconcile(stalled) => {
+                                ExpectedOperation::Reconcile(reply) => {
                                     let bytes = captured.lock().unwrap().last().unwrap().clone();
-                                    reconcile_draft(&mut wire, &bytes, stalled.then_some(reconciling.as_ref())).await;
+                                    reconcile_draft(&mut wire, &bytes, reply, &reconciling).await;
                                     return;
                                 },
                                 ExpectedOperation::ReconcileBytes(bytes) => {
-                                    reconcile_draft(&mut wire, &bytes, None).await;
+                                    reconcile_draft(&mut wire, &bytes, ReconciliationReply::Verified, &reconciling).await;
                                     return;
                                 },
                                 ExpectedOperation::DraftReconciliation(case) => {
@@ -323,8 +332,24 @@ impl ImapServer {
         self.expected.lock().unwrap().push_back(Expected {
             username: "work@example.test",
             password: "disposable-password",
-            operation: ExpectedOperation::Reconcile(false),
+            operation: ExpectedOperation::Reconcile(ReconciliationReply::Verified),
         });
+    }
+
+    pub fn expect_held_reconciliation(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (reached, search) = tokio::sync::oneshot::channel();
+        let (release, resume) = tokio::sync::oneshot::channel();
+        self.expected.lock().unwrap().push_back(Expected {
+            username: "work@example.test",
+            password: "disposable-password",
+            operation: ExpectedOperation::Reconcile(ReconciliationReply::Hold { reached, resume }),
+        });
+        (search, release)
     }
 
     pub fn expect_reconciliation_case(&self, case: ReconciliationCase) {
@@ -347,7 +372,7 @@ impl ImapServer {
         self.expected.lock().unwrap().push_back(Expected {
             username: "work@example.test",
             password: "disposable-password",
-            operation: ExpectedOperation::Reconcile(true),
+            operation: ExpectedOperation::Reconcile(ReconciliationReply::Stalled),
         });
     }
 
@@ -1086,7 +1111,8 @@ async fn append_draft(
 async fn reconcile_draft(
     wire: &mut imap_support::Wire,
     bytes: &[u8],
-    stalled: Option<&AtomicUsize>,
+    reply: ReconciliationReply,
+    stalled: &AtomicUsize,
 ) {
     use tokio::io::AsyncWriteExt;
     {
@@ -1103,10 +1129,19 @@ async fn reconcile_draft(
         .unwrap();
     let tag =
         imap_support::expect(wire, &format!("UID SEARCH UID 1:4 HEADER Message-ID {id}")).await;
-    if let Some(stalled) = stalled {
-        stalled.fetch_add(1, Ordering::SeqCst);
-        imap_support::dropped(wire).await;
-        return;
+    match reply {
+        ReconciliationReply::Verified => {}
+        ReconciliationReply::Stalled => {
+            stalled.fetch_add(1, Ordering::SeqCst);
+            imap_support::dropped(wire).await;
+            return;
+        }
+        ReconciliationReply::Hold { reached, resume } => {
+            reached
+                .send(())
+                .expect("reconciliation observer is waiting");
+            resume.await.expect("reconciliation fixture released");
+        }
     }
     imap_support::write(wire, &format!("* SEARCH 4\r\n{tag} OK found\r\n")).await;
     let tag = imap_support::expect(wire, "UID FETCH 4 (UID BODY.PEEK[]<0.16384>)").await;
