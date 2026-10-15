@@ -249,6 +249,9 @@ mod mcp {
                 ("operation_seconds".into(), 1.into()),
                 ("connection_seconds".into(), 1.into()),
                 ("initialization_seconds".into(), 1.into()),
+                // Malformed SDK frames can be rejected without a response.
+                // Bound this fixture without relying on input-idle shutdown.
+                ("connection_lifetime_seconds".into(), 3.into()),
             ])),
         );
         std::fs::write(installation.config(), toml::to_string(&config).unwrap()).unwrap();

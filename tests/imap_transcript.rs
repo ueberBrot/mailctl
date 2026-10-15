@@ -913,7 +913,7 @@ async fn exact_discovery_preserves_spaces_ampersands_and_fragmented_responses() 
 async fn excessive_nesting_and_invalid_literal_declarations_dispose_connections() {
     for (response, expected) in [
         (
-            format!("* LIST {}\r\n", "(".repeat(50)),
+            format!("* LIST {}\r\n", "(".repeat(128)),
             mailctl::imap::Error::Limit,
         ),
         (

@@ -8,6 +8,14 @@ mod imap_support;
 mod server;
 mod support;
 
+#[path = "packaged_reading/body_routes.rs"]
+mod body_routes;
+#[cfg(feature = "cli")]
+#[path = "packaged_reading/export_faults.rs"]
+mod export_faults;
+#[path = "packaged_reading/transfer_lifecycle.rs"]
+mod transfer_lifecycle;
+
 use serde_json::{Value, json};
 #[cfg(feature = "cli")]
 use std::os::unix::fs::MetadataExt;
@@ -175,10 +183,12 @@ impl Reader {
                     ) => {
                         assert_eq!(output.status.code(), Some(8));
                     }
-                    Some("stale_cursor" | "stale_reference") => {
+                    Some("stale_cursor" | "stale_reference" | "transfer_expired") => {
                         assert_eq!(output.status.code(), Some(6));
                     }
-                    Some("provider_unavailable") => assert_eq!(output.status.code(), Some(5)),
+                    Some("provider_unavailable" | "timeout" | "rate_limited") => {
+                        assert_eq!(output.status.code(), Some(5));
+                    }
                     _ => {}
                 }
                 response
@@ -540,7 +550,7 @@ async fn read_adversarial_mime(executable: &str) {
             (BodyCase::PartsAtLimit, Ok(("ok", false))),
             (BodyCase::PartsOverLimit, Err("response_too_large")),
             (BodyCase::MalformedStructure, Err("provider_unavailable")),
-            (BodyCase::ExcessiveNesting, Err("provider_unavailable")),
+            (BodyCase::ExcessiveNesting, Err("response_too_large")),
             (BodyCase::Base64Tail, Ok(("�Hello", true))),
             (BodyCase::QuotedPrintableTail, Ok(("�hello", true))),
         ] {

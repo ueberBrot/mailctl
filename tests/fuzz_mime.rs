@@ -35,6 +35,7 @@ struct Case {
 enum Expected {
     BodyText(&'static str),
     BodyProtocol,
+    BodyLimit,
     IncompleteStructure,
     Replacements,
     ReplacedText(&'static str),
@@ -54,7 +55,15 @@ const CORPUS: &[Case] = &[
     },
     Case {
         input: include_bytes!("fuzz_corpus/mime/structure-depth-eight.seed"),
-        expected: Expected::BodyProtocol,
+        expected: Expected::BodyText("ok"),
+    },
+    Case {
+        input: include_bytes!("fuzz_corpus/mime/structure-depth-forty.seed"),
+        expected: Expected::BodyText("ok"),
+    },
+    Case {
+        input: include_bytes!("fuzz_corpus/mime/structure-depth-forty-one.seed"),
+        expected: Expected::BodyLimit,
     },
     Case {
         input: include_bytes!("fuzz_corpus/mime/structure-incomplete.seed"),
@@ -135,9 +144,9 @@ fn limits() -> Limits {
         max_literal_bytes: WIRE_SLICE,
         max_responses: 128,
         max_parser_steps: 1024 * 1024,
-        max_nesting: 12,
+        max_nesting: 40,
         max_header_bytes: 4096,
-        max_mime_parts: 16,
+        max_mime_parts: 64,
         max_body_wire_bytes: MAX_INPUT_BYTES,
         max_decoded_bytes: 128 * 1024,
         max_text_bytes: 4096,
@@ -488,6 +497,7 @@ fn retained_mime_inputs_replay_through_bounded_public_reads() {
         match (&fixture.expected, run(fixture.input, case)) {
             (Expected::BodyText(text), Outcome::Body(Ok(page))) => assert_eq!(page.text, *text),
             (Expected::BodyProtocol, Outcome::Body(Err(Error::Protocol)))
+            | (Expected::BodyLimit, Outcome::Body(Err(Error::Limit)))
             | (Expected::IncompleteStructure, Outcome::Body(Err(Error::Protocol | Error::Eof)))
             | (Expected::AttachmentProtocol, Outcome::Attachment(Err(Error::Protocol))) => {}
             (Expected::Replacements, Outcome::Body(Ok(page))) => {

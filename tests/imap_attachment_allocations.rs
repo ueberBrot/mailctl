@@ -3,7 +3,7 @@ mod imap_support;
 
 use attachment_support::{decoder, metadata, payload_session, structure};
 use imap_support::*;
-use mailctl::imap::{AttachmentListRequest, Limits, TlsMode};
+use mailctl::imap::{AttachmentListRequest, Error, Limits, TlsMode};
 use sha2::{Digest, Sha256};
 use std::sync::{
     Arc,
@@ -293,6 +293,193 @@ fn full_attachment_transfers_have_payload_independent_memory_and_bounded_counter
         peaks.iter().all(|peak| *peak < 512 * 1024),
         "payload growth must not grow peak client allocation: {peaks:?}"
     );
+}
+
+fn measure_rejected_transfer(
+    encoding: Encoding,
+    payload: Vec<u8>,
+    expected_prefix: usize,
+    served_bytes: usize,
+    limits: Limits,
+    expected_error: Error,
+) {
+    assert_eq!(expected_prefix % DECODED_CHUNK, 0);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let sessions = expected_prefix / DECODED_CHUNK + 1;
+    let declared_bytes = payload.len();
+    let position = Arc::new(AtomicUsize::new(0));
+    let server_bytes = Arc::new(AtomicUsize::new(sessions * GREETING.len()));
+    let counted = server_bytes.clone();
+    let source: Arc<[u8]> = payload.into();
+    let mut session = 0;
+    let (mut probe, server) =
+        dedicated_sessions(TlsMode::Implicit, limits.clone(), sessions, move |wire| {
+            session += 1;
+            let initial = session == 1;
+            let terminal = session == sessions;
+            let source = source.clone();
+            let position = position.clone();
+            let counted = counted.clone();
+            Box::pin(async move {
+                let mut wire: Wire = Box::new(CountedWire {
+                    wire,
+                    written: counted,
+                });
+                authenticate(&mut wire).await;
+                examine(&mut wire).await;
+                if initial {
+                    metadata(&mut wire, &structure(encoding.name(), source.len())).await;
+                }
+                if terminal {
+                    let offset = position.load(Ordering::Relaxed);
+                    for (index, bytes) in
+                        source[offset..served_bytes].chunks(WIRE_SLICE).enumerate()
+                    {
+                        literal_bytes(
+                            &mut wire,
+                            "2",
+                            offset + index * WIRE_SLICE,
+                            WIRE_SLICE,
+                            bytes,
+                        )
+                        .await;
+                    }
+                    dropped(&mut wire).await;
+                } else {
+                    payload_session(&mut wire, &source, &position, WIRE_SLICE).await;
+                }
+            })
+        });
+    let mut request = decoder();
+    let mut response_wire = 0;
+    let mut parser_steps = 0;
+    let allocations = allocation_counter::measure(|| {
+        runtime.block_on(async {
+            for page in 0..sessions {
+                let result = probe
+                    .read_attachment("fixture", "disposable-password", &mut request)
+                    .await;
+                if page + 1 == sessions {
+                    assert_eq!(result.unwrap_err(), expected_error, "{}", encoding.name());
+                } else {
+                    let chunk = result.unwrap();
+                    assert_eq!(chunk.decoded_offset, (page * DECODED_CHUNK) as u64);
+                    assert_eq!(chunk.bytes.len(), DECODED_CHUNK);
+                    assert!(chunk.bytes.iter().all(|byte| *byte == b'x'));
+                    assert!(chunk.integrity.is_none());
+                }
+                let metrics = probe.metrics();
+                response_wire += metrics.wire_bytes;
+                parser_steps += metrics.parser_steps;
+                assert!(metrics.wire_bytes <= limits.max_operation_bytes);
+                assert!(metrics.max_literal_bytes <= WIRE_SLICE);
+                assert!(metrics.max_response_bytes <= limits.max_response_bytes);
+                assert!(metrics.max_transfer_state_bytes <= WIRE_SLICE + DECODED_CHUNK + 128);
+            }
+        });
+    });
+    server.join().unwrap();
+    let metrics = probe.metrics();
+    assert_eq!(response_wire, server_bytes.load(Ordering::Relaxed));
+    assert_eq!(metrics.transfer_wire_bytes, served_bytes);
+    assert_eq!(metrics.transfer_decode_steps, served_bytes);
+    assert_eq!(metrics.transfer_decoded_bytes, expected_prefix);
+    // A failing push charges its entire bounded literal before checking the work ceiling.
+    assert!(metrics.transfer_decode_steps <= limits.max_decode_steps + WIRE_SLICE);
+    assert!(metrics.transfer_wire_bytes <= limits.max_attachment_wire_bytes);
+    assert!(parser_steps <= response_wire * 4 + sessions * 64);
+    assert!(allocations.bytes_max < 512 * 1024, "{allocations:?}");
+    assert!(
+        allocations.bytes_total < 128 * 1024 * 1024,
+        "{allocations:?}"
+    );
+    println!(
+        "rejected attachment allocation proof encoding={} error={expected_error:?} declared={declared_bytes} transfer_wire={served_bytes} decoded={expected_prefix} response_wire={response_wire} sessions={sessions} peak={} total={} state={} work={}",
+        encoding.name(),
+        allocations.bytes_max,
+        allocations.bytes_total,
+        metrics.max_transfer_state_bytes,
+        metrics.transfer_decode_steps,
+    );
+}
+
+#[test]
+fn late_malformed_attachment_tails_fail_without_fabricating_completed_bytes() {
+    for wire_prefix in [64 * 1024, 1024 * 1024] {
+        for encoding in [Encoding::Base64, Encoding::QuotedPrintable] {
+            let (mut payload, decoded_prefix, tail) = match encoding {
+                Encoding::Base64 => (
+                    b"eHh4".repeat(wire_prefix / 4),
+                    wire_prefix / 4 * 3,
+                    b"eA".as_slice(),
+                ),
+                Encoding::QuotedPrintable => {
+                    (vec![b'x'; wire_prefix], wire_prefix, b"=QZ".as_slice())
+                }
+                Encoding::Raw => unreachable!(),
+            };
+            payload.extend_from_slice(tail);
+            let served_bytes = payload.len();
+            measure_rejected_transfer(
+                encoding,
+                payload,
+                decoded_prefix,
+                served_bytes,
+                Limits {
+                    max_literal_bytes: WIRE_SLICE,
+                    max_attachment_chunk_bytes: DECODED_CHUNK,
+                    ..Limits::default()
+                },
+                Error::Protocol,
+            );
+        }
+    }
+}
+
+#[test]
+fn zero_output_and_retained_whitespace_attachment_prefixes_fail_with_bounded_resources() {
+    for size in [64 * 1024, 1024 * 1024] {
+        for encoding in [Encoding::Base64, Encoding::QuotedPrintable] {
+            let mut payload = match encoding {
+                Encoding::Base64 => vec![b' '; size],
+                Encoding::QuotedPrintable => b"=\r\n".repeat(size / 3),
+                Encoding::Raw => unreachable!(),
+            };
+            let max_decode_steps = payload.len();
+            payload.push(b'x');
+            let served_bytes = payload.len();
+            measure_rejected_transfer(
+                encoding,
+                payload,
+                0,
+                served_bytes,
+                Limits {
+                    max_decode_steps,
+                    max_literal_bytes: WIRE_SLICE,
+                    max_attachment_chunk_bytes: DECODED_CHUNK,
+                    ..Limits::default()
+                },
+                Error::Limit,
+            );
+        }
+        let mut whitespace = vec![b' '; size];
+        whitespace.push(b'x');
+        measure_rejected_transfer(
+            Encoding::QuotedPrintable,
+            whitespace,
+            0,
+            3 * WIRE_SLICE,
+            Limits {
+                max_literal_bytes: WIRE_SLICE,
+                max_attachment_chunk_bytes: DECODED_CHUNK,
+                ..Limits::default()
+            },
+            Error::Limit,
+        );
+    }
 }
 
 #[test]

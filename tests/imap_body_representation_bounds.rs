@@ -2,6 +2,10 @@ mod imap_support;
 
 use imap_support::*;
 use mailctl::imap::{BodyRequest, Error, Limits, TlsMode};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 const ROOT_HEADERS: &str =
     "MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=fixture\r\n\r\n";
@@ -293,9 +297,12 @@ async fn nested_and_malformed_bodystructures_fail_finitely_at_the_public_route()
     );
     limited.task.await.unwrap();
 
-    // The pinned io-imap codec accepts six multipart wrappers (a text leaf at depth seven) and
-    // rejects the seventh wrapper while decoding BODYSTRUCTURE, before our configurable limit.
-    let codec_limit = format!("({within_limit} \"MIXED\" NIL NIL NIL NIL)");
+    // The typed decoder must admit the default semantic depth ceiling so the
+    // application can reject its first excess MIME level with a bounds error.
+    let mut codec_limit = leaf;
+    for _ in 0..Limits::default().max_nesting {
+        codec_limit = format!("({codec_limit} \"MIXED\" NIL NIL NIL NIL)");
+    }
     let mut rejected = fixture(TlsMode::Implicit, Limits::default(), move |mut wire| {
         Box::pin(async move {
             authenticate(&mut wire).await;
@@ -316,7 +323,7 @@ async fn nested_and_malformed_bodystructures_fail_finitely_at_the_public_route()
             )
             .await
             .unwrap_err(),
-        Error::Protocol
+        Error::Limit
     );
     rejected.task.await.unwrap();
 
@@ -486,110 +493,130 @@ async fn malformed_transfer_tails_keep_the_decoded_prefix_and_mark_replacement()
     }
 }
 
-#[tokio::test]
-async fn hostile_html_is_clamped_or_rejected_before_unbounded_rendering() {
-    let huge_span = b"<table><tr><td colspan=18446744073709551615 rowspan=18446744073709551615>safe</td></tr></table>";
-    let structure = format!(
-        "({} \"MIXED\" NIL NIL NIL NIL)",
-        text_part("HTML", huge_span.len(), "NIL")
-    );
-    let mut clamped = fixture(TlsMode::Implicit, Limits::default(), move |mut wire| {
-        Box::pin(async move {
-            selected_prefix(&mut wire, &structure, 100).await;
-            complete_body(&mut wire, "1", huge_span).await;
-            logout(&mut wire).await;
-        })
-    })
-    .await;
-    let page = clamped
-        .probe
-        .read_body(
-            "fixture",
-            "disposable-password",
-            "INBOX",
-            BodyRequest::new(4, 77),
-        )
-        .await
-        .unwrap();
-    assert!(page.converted);
-    assert!(page.text.contains("safe"));
-    assert!(
-        page.metrics.decode_steps <= Limits::default().max_decode_steps,
-        "{:?}",
-        page.metrics
-    );
-    clamped.task.await.unwrap();
-
-    let excessive_nodes = format!("<body>{}</body>", "<i></i>".repeat(4097));
-    let excessive_cells = format!("<table><tr>{}</tr></table>", "<td>x</td>".repeat(129));
-    let excessive_source = format!("<p>{}</p>", "x".repeat(64 * 1024));
-    for body in [excessive_nodes, excessive_cells, excessive_source] {
-        let structure = format!(
-            "({} \"MIXED\" NIL NIL NIL NIL)",
-            text_part("HTML", body.len(), "NIL")
-        );
-        let mut fixture = fixture(TlsMode::Implicit, Limits::default(), move |mut wire| {
-            Box::pin(async move {
-                selected_prefix(&mut wire, &structure, 100).await;
-                complete_body(&mut wire, "1", body.as_bytes()).await;
-                dropped(&mut wire).await;
-            })
-        })
-        .await;
-        assert_eq!(
-            fixture
-                .probe
-                .read_body(
-                    "fixture",
-                    "disposable-password",
-                    "INBOX",
-                    BodyRequest::new(4, 77),
-                )
-                .await
-                .unwrap_err(),
-            Error::Limit
-        );
-        fixture.task.await.unwrap();
-    }
-}
-
 #[test]
-fn huge_html_table_spans_do_not_expand_client_allocations() {
-    let body = b"<table><tr><td colspan=18446744073709551615 rowspan=18446744073709551615>safe</td></tr></table>".to_vec();
-    let structure = format!(
-        "({} \"MIXED\" NIL NIL NIL NIL)",
-        text_part("HTML", body.len(), "NIL")
-    );
+fn hostile_html_admission_and_refusal_have_bounded_allocations() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
-    let (mut probe, server) =
-        dedicated_fixture(TlsMode::Implicit, Limits::default(), move |mut wire| {
-            Box::pin(async move {
-                selected_prefix(&mut wire, &structure, 100).await;
-                complete_body(&mut wire, "1", &body).await;
-                logout(&mut wire).await;
-            })
+    let table = |cells| format!("<table><tr>{}</tr></table>", "<td>safe</td>".repeat(cells));
+    let comment_nodes = |nodes: usize| {
+        // Document + html + head + body + the "safe" text node: five fixed nodes.
+        let body = format!(
+            "<html><head></head><body>safe{}</body></html>",
+            "<!---->".repeat(nodes - 5)
+        );
+        // Independently verify the pinned parser retains each empty comment.
+        let dom = html2text::config::plain()
+            .raw_mode(true)
+            .parse_html(body.as_bytes())
+            .unwrap();
+        let (mut total, mut comments) = (0, 0);
+        let mut pending = vec![dom.document.clone()];
+        while let Some(node) = pending.pop() {
+            total += 1;
+            comments += usize::from(matches!(
+                &node.data,
+                html2text::Comment { contents } if contents.is_empty()
+            ));
+            pending.extend(node.children.borrow().iter().cloned());
+        }
+        // Keep the root alive during traversal: its Drop clears descendants.
+        assert!(matches!(&dom.document.data, html2text::Document));
+        assert_eq!((total, comments), (nodes, nodes - 5));
+        body
+    };
+    let huge_span = "<table><tr><td colspan=18446744073709551615 rowspan=18446744073709551615>safe</td></tr></table>";
+    for (body, admitted_safe_count, nodes) in [
+        (huge_span.to_owned(), Some(1), None),
+        (table(128), Some(128), None),
+        (table(129), None, None),
+        // This remains an early parser-work refusal, before DOM preflight.
+        (
+            format!("<body>{}</body>", "<i></i>".repeat(4097)),
+            None,
+            None,
+        ),
+        (format!("<p>{}</p>", "x".repeat(64 * 1024)), None, None),
+        (comment_nodes(4096), Some(1), Some(4096)),
+        (comment_nodes(4097), None, Some(4097)),
+    ] {
+        let source_len = body.len();
+        let structure = format!(
+            "({} \"MIXED\" NIL NIL NIL NIL)",
+            text_part("HTML", source_len, "NIL")
+        );
+        let limits = Limits {
+            // <113 MiB source × markup admission fits; the node cap stays 4096.
+            max_decode_steps: nodes
+                .map_or(Limits::default().max_decode_steps, |_| 128 * 1024 * 1024),
+            ..Limits::default()
+        };
+        let server_bytes = Arc::new(AtomicUsize::new(b"* OK synthetic server ready\r\n".len()));
+        let counted = server_bytes.clone();
+        let (mut probe, server) =
+            dedicated_fixture(TlsMode::Implicit, limits.clone(), move |wire| {
+                let mut wire: Wire = Box::new(CountedWire {
+                    wire,
+                    written: counted,
+                });
+                Box::pin(async move {
+                    selected_prefix(&mut wire, &structure, source_len + ROOT_HEADERS.len()).await;
+                    complete_body(&mut wire, "1", body.as_bytes()).await;
+                    if admitted_safe_count.is_some() {
+                        logout(&mut wire).await;
+                    } else {
+                        dropped(&mut wire).await;
+                    }
+                })
+            });
+        let mut observed_wire = 0;
+        let allocations = allocation_counter::measure(|| {
+            let result = runtime.block_on(probe.read_body(
+                "fixture",
+                "disposable-password",
+                "INBOX",
+                BodyRequest::new(4, 77),
+            ));
+            let metrics = if let Some(safe_count) = admitted_safe_count {
+                let page = result.unwrap();
+                assert!(page.converted);
+                assert!(!page.replacements);
+                assert_eq!(page.text.matches("safe").count(), safe_count);
+                assert_eq!(page.selected_part.as_deref(), Some("1"));
+                assert_eq!(page.source_media_type.as_deref(), Some("text/html"));
+                assert!(!page.truncated);
+                assert!(page.continuation.is_none());
+                if nodes.is_some() {
+                    assert_eq!(page.text, "safe\n");
+                }
+                assert_eq!(page.metrics.decoded_bytes, page.text.len());
+                assert!(page.metrics.decoded_bytes <= limits.max_decoded_bytes);
+                assert!(page.metrics.decode_steps >= source_len);
+                assert!(page.metrics.decode_steps <= limits.max_decode_steps);
+                page.metrics
+            } else {
+                assert_eq!(result.unwrap_err(), Error::Limit);
+                // Failed renders do not publish decoder work or decoded bytes in client metrics.
+                // This branch measures allocation and wire/parser costs; it does not observe
+                // HTML node visits or decoder work. The renderer enforces those budgets internally.
+                probe.metrics()
+            };
+            observed_wire = metrics.wire_bytes;
+            assert!(metrics.parser_steps <= limits.max_parser_steps);
+            assert!(metrics.max_literal_bytes <= 16 * 1024);
+            assert!(metrics.max_response_bytes <= limits.max_response_bytes);
+            assert!(metrics.wire_bytes < source_len + 4096);
         });
-    let allocations = allocation_counter::measure(|| {
-        runtime.block_on(async {
-            let page = probe
-                .read_body(
-                    "fixture",
-                    "disposable-password",
-                    "INBOX",
-                    BodyRequest::new(4, 77),
-                )
-                .await
-                .unwrap();
-            assert!(page.text.contains("safe"));
-        });
-    });
-    server.join().unwrap();
-    assert!(allocations.bytes_max < 2 * 1024 * 1024, "{allocations:?}");
-    assert!(
-        allocations.bytes_total < 16 * 1024 * 1024,
-        "{allocations:?}"
-    );
+        server.join().unwrap();
+        assert_eq!(observed_wire, server_bytes.load(Ordering::Relaxed));
+        eprintln!(
+            "html source={source_len} admitted_safe_count={admitted_safe_count:?} nodes={nodes:?} {allocations:?}"
+        );
+        assert!(allocations.bytes_max < 2 * 1024 * 1024, "{allocations:?}");
+        assert!(
+            allocations.bytes_total < 16 * 1024 * 1024,
+            "{allocations:?}"
+        );
+    }
 }

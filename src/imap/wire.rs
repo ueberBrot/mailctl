@@ -41,6 +41,11 @@ use zeroize::Zeroizing;
 // follow the configured protocol limits; this threshold controls reuse only.
 const REUSED_FRAME_BYTES: usize = MAX_CHUNK_BYTES * 2;
 
+// Protocol lists include FETCH, addresses, MIME parameters and extensions. Their
+// syntax depth is independent of the semantic MIME-node ceiling, which is
+// enforced after typed decoding and before header or payload retrieval.
+const MAX_PROTOCOL_NESTING: usize = 64;
+
 trait Stream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Stream for T {}
 
@@ -575,7 +580,7 @@ impl<'a> Connection<'a> {
                         if !quoted {
                             if b == b'(' {
                                 nesting += 1;
-                                if nesting > self.session.limits.max_nesting {
+                                if nesting > MAX_PROTOCOL_NESTING {
                                     return Err(Error::Limit);
                                 }
                             }

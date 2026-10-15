@@ -90,6 +90,7 @@ impl Tokens {
             2,
             BodyText {
                 text: "a🦀éxyz".into(),
+                representation_version: mailctl::domain::BODY_REPRESENTATION_VERSION.into(),
                 selected_part: Some("1".into()),
                 source_media_type: Some("text/plain".into()),
                 converted: false,

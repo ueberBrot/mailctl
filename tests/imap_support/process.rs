@@ -4,6 +4,13 @@
 )]
 
 use super::imap_support;
+
+#[path = "body_routes.rs"]
+pub mod body_routes;
+#[path = "export_faults.rs"]
+pub mod export_faults;
+#[path = "transfer_lifecycle.rs"]
+pub mod transfer_lifecycle;
 use std::{
     collections::VecDeque,
     fs,
@@ -42,6 +49,14 @@ enum ExpectedOperation {
     BodyCase(&'static str, BodyCase),
     Attachment(&'static str, AttachmentPhase, String),
     AttachmentCase(&'static str, AttachmentCase, bool),
+    BodyRoute(&'static str, body_routes::BodyRoute),
+    MimeDepth {
+        depth: usize,
+        kind: usize,
+        admitted: bool,
+    },
+    TransferStall(transfer_lifecycle::TransferStall),
+    ExportPause(export_faults::ExportPause),
 }
 
 #[derive(Clone)]
@@ -166,6 +181,10 @@ impl ImapServer {
                         result = tokio::time::timeout(Duration::from_secs(10), async {
                             let mut wire: imap_support::Wire = Box::new(acceptor.accept(socket).await.unwrap());
                             imap_support::write(&mut wire, "* OK synthetic server ready\r\n").await;
+                            if matches!(&operation, ExpectedOperation::TransferStall(transfer_lifecycle::TransferStall::Authentication)) {
+                                transfer_lifecycle::stall_authentication(&mut wire, &stalled).await;
+                                return;
+                            }
                             imap_support::capability(&mut wire, "IMAP4rev1").await;
                             let tag = imap_support::expect(&mut wire, &format!("LOGIN \"{username}\" \"{password}\"")).await;
                             if let ExpectedOperation::RejectAuthentication(malformed) = operation {
@@ -235,6 +254,22 @@ impl ImapServer {
                                 },
                                 ExpectedOperation::AttachmentCase(mailbox, case, listing) => {
                                     attachment_case(&mut wire, mailbox, case, listing).await;
+                                    return;
+                                },
+                                ExpectedOperation::BodyRoute(mailbox, case) => {
+                                    body_routes::serve(&mut wire, mailbox, case).await;
+                                    return;
+                                },
+                                ExpectedOperation::MimeDepth { depth, kind, admitted } => {
+                                    mime_depth(&mut wire, depth, kind, admitted).await;
+                                    return;
+                                },
+                                ExpectedOperation::TransferStall(_) => {
+                                    transfer_lifecycle::stall_payload(&mut wire, &stalled).await;
+                                    return;
+                                },
+                                ExpectedOperation::ExportPause(pause) => {
+                                    export_faults::resume_attachment(&mut wire, pause).await;
                                     return;
                                 },
                             }
@@ -459,6 +494,51 @@ impl ImapServer {
             "every expected authentication occurred"
         );
     }
+
+    pub fn expect_mime_depth(&self, depth: usize, kind: usize, admitted: bool) {
+        self.expected.lock().unwrap().push_back(Expected {
+            username: "work@example.test",
+            password: "disposable-password",
+            operation: ExpectedOperation::MimeDepth {
+                depth,
+                kind,
+                admitted,
+            },
+        });
+    }
+}
+
+async fn mime_depth(wire: &mut imap_support::Wire, depth: usize, kind: usize, admitted: bool) {
+    let mut body = "(\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" 2 1)".to_owned();
+    for level in 1..depth {
+        body = if kind == 1 || (kind == 2 && level % 2 == 0) {
+            format!(
+                "(\"MESSAGE\" \"RFC822\" NIL NIL NIL \"7BIT\" 2 (NIL NIL NIL NIL NIL NIL NIL NIL NIL NIL) {body} 1)"
+            )
+        } else {
+            format!("({body} \"MIXED\")")
+        };
+    }
+    let tag = imap_support::expect(wire, "EXAMINE INBOX").await;
+    imap_support::write(
+        wire,
+        &format!("* 3 EXISTS\r\n* OK [UIDVALIDITY 77] stable\r\n{tag} OK [READ-ONLY] selected\r\n"),
+    )
+    .await;
+    let tag = imap_support::expect(wire, "UID FETCH 3 (UID RFC822.SIZE BODYSTRUCTURE)").await;
+    imap_support::write(
+        wire,
+        &format!(
+            "* 3 FETCH (UID 3 RFC822.SIZE 3000300 BODYSTRUCTURE {body})\r\n{tag} OK fetched\r\n"
+        ),
+    )
+    .await;
+    if admitted {
+        imap_support::logout(wire).await;
+    } else {
+        // Neither headers nor payloads may be requested after rejection.
+        imap_support::dropped(wire).await;
+    }
 }
 
 fn mailbox_argument(mailbox: &str) -> String {
@@ -638,9 +718,9 @@ async fn body_case(wire: &mut imap_support::Wire, mailbox: &str, case: BodyCase)
             body = "(INVALID)".into();
         }
         ExcessiveNesting => {
-            // The pinned codec rejects seven multipart wrappers. The outer
-            // MIXED in body_metadata adds the seventh, before configured depth 20.
-            for _ in 0..6 {
+            // Exceed the independent protocol nesting guard even when the codec
+            // admits structures within the configured MIME depth range.
+            for _ in 0..128 {
                 body = format!("({body} \"MIXED\" NIL NIL NIL NIL)");
             }
         }

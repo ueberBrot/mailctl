@@ -10,8 +10,5 @@ fn main() -> std::process::ExitCode {
             0
         );
     }
-    mailctl::frontends::run_with_environment(
-        mailctl::frontends::Executable::Cli,
-        std::sync::Arc::new(mailctl_process_tests::FixtureHost),
-    )
+    mailctl_process_tests::run(mailctl::frontends::Executable::Cli)
 }

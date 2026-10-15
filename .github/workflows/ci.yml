@@ -61,6 +61,12 @@ jobs:
         shell: bash
         env:
           MAILCTL_FEATURES: ${{ matrix.features }}
+      - name: Qualify optimized decoding and executable stacks on Windows
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        env:
+          MAILCTL_FEATURES: ${{ matrix.features }}
+        run: ./scripts/ci/windows-acceptance.ps1 mime-depth
       - name: Repeat concurrent Windows draft acceptance
         if: matrix.os == 'windows-latest' && matrix.features == 'cli,mcp'
         shell: pwsh

@@ -73,8 +73,6 @@ pub struct BodyPage {
     pub metrics: Metrics,
 }
 
-const REPRESENTATION: &str = "mailctl-body/mail-parser-0.11.9/html2text-0.17.1";
-
 impl super::AuthenticatedConnection {
     pub async fn read_body(
         self,
@@ -118,7 +116,7 @@ async fn read_selected(
     limits: &Limits,
     mut context: Sha256,
 ) -> Result<BodyPage, Error> {
-    context.update(REPRESENTATION.as_bytes());
+    context.update(crate::domain::BODY_REPRESENTATION_VERSION.as_bytes());
     context.update(format!("{limits:?}").as_bytes());
     mailbox(name)?;
     if request.uid == 0 || request.uid_validity == 0 {

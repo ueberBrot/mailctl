@@ -489,6 +489,155 @@ fn body_buffer_capacity_does_not_double_above_a_power_of_two() {
     );
 }
 
+struct BodyRepresentation {
+    subtype: &'static str,
+    charset: &'static str,
+    encoding: &'static str,
+    wire: Vec<u8>,
+    text: String,
+    replacements: bool,
+}
+
+fn measure_body_continuation(
+    runtime: &tokio::runtime::Runtime,
+    limits: Limits,
+    partial: bool,
+    body: BodyRepresentation,
+    allocation_mib: (u64, u64),
+) {
+    let BodyRepresentation {
+        subtype,
+        charset,
+        encoding,
+        wire,
+        text,
+        replacements,
+    } = body;
+    let body_size = wire.len();
+    let headers = format!(
+        "Content-Type: text/{subtype}; charset={charset}\r\nContent-Transfer-Encoding: {encoding}\r\n\r\n"
+    );
+    // Move the fixture payload to the server; only the independent text oracle stays here.
+    let payload = if partial {
+        wire
+    } else {
+        let mut message = headers.as_bytes().to_vec();
+        message.extend(wire);
+        message
+    };
+    let size = payload.len();
+    let payload: Arc<[u8]> = payload.into();
+    let server_bytes = Arc::new(AtomicUsize::new(0));
+    let counted = server_bytes.clone();
+    let (mut probe, server) = dedicated_sessions(
+        TlsMode::Implicit,
+        limits.clone(),
+        2,
+        move |wire| {
+            counted.fetch_add(b"* OK synthetic server ready\r\n".len(), Ordering::Relaxed);
+            let mut wire: Wire = Box::new(CountedWire {
+                wire,
+                written: counted.clone(),
+            });
+            let payload = payload.clone();
+            let headers = headers.clone();
+            Box::pin(async move {
+                authenticate(&mut wire).await;
+                examine(&mut wire).await;
+                let text_part = format!(
+                    "(\"TEXT\" \"{subtype}\" (\"CHARSET\" \"{charset}\") NIL NIL \"{encoding}\" {body_size} 1 NIL NIL NIL NIL)"
+                );
+                let structure = if partial {
+                    format!(
+                        "({text_part}(\"APPLICATION\" \"OCTET-STREAM\" NIL NIL NIL \"BASE64\" 3000000 NIL (\"ATTACHMENT\" NIL) NIL NIL) \"MIXED\" NIL NIL NIL NIL)"
+                    )
+                } else {
+                    text_part
+                };
+                let message_size = if partial { size + 3000000 } else { size };
+                metadata(&mut wire, &format!("* 1 FETCH (UID 4 RFC822.SIZE {message_size} BODYSTRUCTURE {structure})\r\n{{tag}} OK fetched\r\n")).await;
+                literal(
+                    &mut wire,
+                    "HEADER",
+                    0,
+                    16384,
+                    if partial { ROOT_HEADERS } else { &headers },
+                )
+                .await;
+                for offset in (0..=size).step_by(16384) {
+                    let count = (size + 1 - offset).min(16384);
+                    let end = (offset + count).min(size);
+                    literal_bytes(
+                        &mut wire,
+                        if partial { "1" } else { "" },
+                        offset,
+                        count,
+                        &payload[offset..end],
+                    )
+                    .await;
+                }
+                logout(&mut wire).await;
+            })
+        },
+    );
+    assert!(
+        text.len() > limits.max_text_bytes,
+        "fixture must exercise continuation"
+    );
+    let mut request = BodyRequest::new(4, 77);
+    let mut observed_bytes = 0;
+    let mut offset = 0;
+    for _ in 0..2 {
+        let allocations = allocation_counter::measure(|| {
+            let page = runtime
+                .block_on(probe.read_body(
+                    "fixture",
+                    "disposable-password",
+                    "INBOX",
+                    request.clone(),
+                ))
+                .unwrap();
+            let end = text.floor_char_boundary((offset + limits.max_text_bytes).min(text.len()));
+            assert_eq!(page.text.as_bytes(), &text.as_bytes()[offset..end]);
+            assert_eq!(page.replacements, replacements);
+            assert_eq!(page.converted, subtype == "HTML");
+            assert_eq!(page.selected_part.as_deref(), Some("1"));
+            assert_eq!(page.metrics.decoded_bytes, text.len());
+            assert!(page.metrics.decoded_bytes <= limits.max_decoded_bytes);
+            assert!(page.metrics.decode_steps >= body_size);
+            if subtype == "PLAIN" && encoding == "7BIT" {
+                assert!(page.metrics.decode_steps >= body_size * 7);
+            }
+            assert!(page.metrics.decode_steps <= limits.max_decode_steps);
+            assert!(page.metrics.parser_steps <= limits.max_parser_steps);
+            assert!(page.metrics.max_literal_bytes <= 16384);
+            assert!(page.metrics.max_response_bytes <= limits.max_response_bytes);
+            assert!(page.metrics.wire_bytes < size + 64 * 1024);
+            assert!(page.metrics.wire_bytes <= limits.max_operation_bytes);
+            assert!(page.text.len() <= limits.max_text_bytes);
+            assert_eq!(page.truncated, end < text.len());
+            assert_eq!(page.continuation.is_some(), end < text.len());
+            observed_bytes += page.metrics.wire_bytes;
+            request.continuation = page.continuation;
+            offset = end;
+        });
+        eprintln!(
+            "body subtype={subtype} charset={charset} encoding={encoding} selected={partial} source={body_size} decoded={} {allocations:?}",
+            text.len()
+        );
+        assert!(
+            allocations.bytes_max < allocation_mib.0 * 1024 * 1024,
+            "{allocations:?}"
+        );
+        assert!(
+            allocations.bytes_total < allocation_mib.1 * 1024 * 1024,
+            "{allocations:?}"
+        );
+    }
+    server.join().unwrap();
+    assert_eq!(observed_bytes, server_bytes.load(Ordering::Relaxed));
+}
+
 #[test]
 fn whole_and_partial_continuation_have_measured_finite_costs() {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -497,99 +646,115 @@ fn whole_and_partial_continuation_have_measured_finite_costs() {
         .unwrap();
     for partial in [false, true] {
         let limits = Limits::default();
-        let size = limits.max_body_wire_bytes;
-        let body_size = if partial {
-            size
-        } else {
-            size - TEXT_HEADERS.len()
-        };
-        let server_bytes = Arc::new(AtomicUsize::new(0));
-        let counted = server_bytes.clone();
-        let (mut probe, server) = dedicated_sessions(
-            TlsMode::Implicit,
-            limits.clone(),
-            2,
-            move |wire| {
-                counted.fetch_add(b"* OK synthetic server ready\r\n".len(), Ordering::Relaxed);
-                let mut wire: Wire = Box::new(CountedWire {
-                    wire,
-                    written: counted.clone(),
-                });
-                Box::pin(async move {
-                    authenticate(&mut wire).await;
-                    examine(&mut wire).await;
-                    let text_part = format!(
-                        "(\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" {body_size} 1 NIL NIL NIL NIL)"
-                    );
-                    let structure = if partial {
-                        format!(
-                            "({text_part}(\"APPLICATION\" \"OCTET-STREAM\" NIL NIL NIL \"BASE64\" 3000000 NIL (\"ATTACHMENT\" NIL) NIL NIL) \"MIXED\" NIL NIL NIL NIL)"
-                        )
-                    } else {
-                        text_part
-                    };
-                    let message_size = if partial { size + 3000000 } else { size };
-                    metadata(&mut wire, &format!("* 1 FETCH (UID 4 RFC822.SIZE {message_size} BODYSTRUCTURE {structure})\r\n{{tag}} OK fetched\r\n")).await;
-                    literal(
-                        &mut wire,
-                        "HEADER",
-                        0,
-                        16384,
-                        if partial { ROOT_HEADERS } else { TEXT_HEADERS },
-                    )
-                    .await;
-                    let payload = if partial {
-                        "x".repeat(body_size)
-                    } else {
-                        format!("{TEXT_HEADERS}{}", "x".repeat(body_size))
-                    };
-                    let section = if partial { "1" } else { "" };
-                    for offset in (0..size).step_by(16384) {
-                        literal(
-                            &mut wire,
-                            section,
-                            offset,
-                            16384,
-                            &payload[offset..offset + 16384],
-                        )
-                        .await;
-                    }
-                    literal(&mut wire, section, size, 1, "").await;
-                    logout(&mut wire).await;
-                })
+        let size = limits.max_body_wire_bytes - if partial { 0 } else { TEXT_HEADERS.len() };
+        measure_body_continuation(
+            &runtime,
+            limits,
+            partial,
+            BodyRepresentation {
+                subtype: "PLAIN",
+                charset: "UTF-8",
+                encoding: "7BIT",
+                wire: vec![b'x'; size],
+                text: "x".repeat(size),
+                replacements: false,
             },
+            (32, 128),
         );
-        let mut request = BodyRequest::new(4, 77);
-        let mut observed_bytes = 0;
-        for _ in 0..2 {
-            let allocations = allocation_counter::measure(|| {
-                runtime.block_on(async {
-                    let page = probe
-                        .read_body("fixture", "disposable-password", "INBOX", request.clone())
-                        .await
-                        .unwrap();
-                    assert_eq!(page.text.len(), limits.max_text_bytes);
-                    assert!(page.text.bytes().all(|byte| byte == b'x'));
-                    assert_eq!(page.metrics.decoded_bytes, body_size);
-                    assert!(page.metrics.decode_steps >= body_size * 7);
-                    assert!(page.metrics.decode_steps <= limits.max_decode_steps);
-                    assert!(page.metrics.parser_steps <= limits.max_parser_steps);
-                    assert!(page.metrics.max_literal_bytes <= 16384);
-                    assert!(page.metrics.max_response_bytes <= limits.max_response_bytes);
-                    assert!(page.metrics.wire_bytes < size + 64 * 1024);
-                    observed_bytes += page.metrics.wire_bytes;
-                    request.continuation = page.continuation;
-                    assert!(request.continuation.is_some());
-                });
-            });
-            assert!(allocations.bytes_max < 32 * 1024 * 1024, "{allocations:?}");
-            assert!(
-                allocations.bytes_total < 128 * 1024 * 1024,
-                "{allocations:?}"
-            );
+    }
+}
+
+#[test]
+fn body_representations_have_measured_initial_and_continuation_bounds() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    for repeats in [8192, 32768] {
+        for partial in [false, true] {
+            for (subtype, charset, encoding, unit, decoded, tail, replacements) in [
+                (
+                    "PLAIN",
+                    "UTF-8",
+                    "BASE64",
+                    b"Y2Fmw6kK".as_slice(),
+                    "café\n",
+                    b"".as_slice(),
+                    false,
+                ),
+                (
+                    "PLAIN",
+                    "UTF-8",
+                    "QUOTED-PRINTABLE",
+                    b"caf=C3=A9=0A",
+                    "café\n",
+                    b"",
+                    false,
+                ),
+                (
+                    "PLAIN",
+                    "UTF-8",
+                    "8BIT",
+                    b"x\xff\n",
+                    "x\u{fffd}\n",
+                    b"",
+                    true,
+                ),
+                (
+                    "PLAIN",
+                    "WINDOWS-1252",
+                    "8BIT",
+                    b"\x80\n",
+                    "€\n",
+                    b"",
+                    false,
+                ),
+                ("PLAIN", "UTF-8", "BASE64", b"eHh4", "xxx", b"!", true),
+                (
+                    "PLAIN",
+                    "UTF-8",
+                    "QUOTED-PRINTABLE",
+                    b"x=3D=0A",
+                    "x=\n",
+                    b"=QZ",
+                    true,
+                ),
+                ("HTML", "UTF-8", "7BIT", b"x\n", "x\n", b"", false),
+            ] {
+                // HTML's separate source ceiling is smaller than the plain-body ceiling.
+                let repeats = if subtype == "HTML" {
+                    repeats / 8
+                } else {
+                    repeats
+                };
+                let mut wire = unit.repeat(repeats);
+                wire.extend_from_slice(tail);
+                let mut text = decoded.repeat(repeats);
+                if replacements {
+                    text.insert(0, '\u{fffd}');
+                }
+                if subtype == "HTML" {
+                    wire = [b"<pre>".as_slice(), &wire, b"</pre>"].concat();
+                }
+                measure_body_continuation(
+                    &runtime,
+                    Limits {
+                        max_text_bytes: 1024,
+                        ..Limits::default()
+                    },
+                    partial,
+                    BodyRepresentation {
+                        subtype,
+                        charset,
+                        encoding,
+                        wire,
+                        text,
+                        replacements,
+                    },
+                    (2, 16),
+                );
+            }
         }
-        server.join().unwrap();
-        assert_eq!(observed_bytes, server_bytes.load(Ordering::Relaxed));
     }
 }
 

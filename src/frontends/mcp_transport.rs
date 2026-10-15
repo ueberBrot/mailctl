@@ -18,7 +18,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
+    io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
     sync::{OwnedSemaphorePermit, Semaphore},
     task::JoinHandle,
     time::{Instant, timeout, timeout_at},
@@ -218,8 +218,23 @@ async fn forward_bounded_input(
     nesting_limit: usize,
     deadline: Duration,
 ) -> Result<(), ErrorCode> {
-    let mut lines = FramedRead::new(reader, LinesCodec::new_with_max_length(input_limit));
+    let mut lines = FramedRead::new(
+        BufReader::new(reader),
+        LinesCodec::new_with_max_length(input_limit),
+    );
     for _ in 0..4096 {
+        // Idle sessions have no input assembly work to time out. Once the first
+        // byte arrives, the entire frame must finish within one fixed deadline.
+        if lines.read_buffer().is_empty()
+            && lines
+                .get_mut()
+                .fill_buf()
+                .await
+                .map_err(|_| ErrorCode::Cancelled)?
+                .is_empty()
+        {
+            return Ok(());
+        }
         let line = match timeout(deadline, lines.next()).await {
             Ok(Some(Ok(line))) => line,
             Ok(None) => return Ok(()),
@@ -409,10 +424,18 @@ impl<W: AsyncWrite + Unpin + Send + 'static> Transport<RoleServer> for BoundedSt
                 let control = self.control.clone();
                 let waiting = self.deferred.is_some();
                 let input = async {
-                    let control = control.acquire_owned().await.ok()?;
-                    // Keep the deadline and SDK decoder scratch across select
-                    // interruption by outgoing responses or released admission.
-                    let item = timeout_at(expires, self.sdk.receive()).await.ok()??;
+                    let control = timeout_at(expires, control.acquire_owned())
+                        .await
+                        .ok()?
+                        .ok()?;
+                    // Deferred requests retain their absolute admission deadline.
+                    // Otherwise ingress bounds incomplete frames, while normal
+                    // silence must not race an active operation's error response.
+                    let item = if waiting {
+                        timeout_at(expires, self.sdk.receive()).await.ok()??
+                    } else {
+                        self.sdk.receive().await?
+                    };
                     Some((item, control))
                 };
                 tokio::select! {
@@ -550,7 +573,41 @@ mod tests {
         service::RequestContext,
     };
     use serde_json::json;
-    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    #[tokio::test]
+    async fn idle_ingress_waits_but_partial_frames_keep_their_absolute_deadline() {
+        let (input, mut writer) = tokio::io::duplex(8192);
+        let mut ingress = tokio::spawn(async move {
+            forward_bounded_input(
+                input,
+                &mut tokio::io::sink(),
+                4096,
+                32,
+                Duration::from_millis(100),
+            )
+            .await
+        });
+        assert!(
+            timeout(Duration::from_millis(150), &mut ingress)
+                .await
+                .is_err(),
+            "silence must not start a frame deadline",
+        );
+        writer.write_all(b"{\"jsonrpc\":").await.unwrap();
+        assert!(
+            timeout(Duration::from_millis(60), &mut ingress)
+                .await
+                .is_err(),
+        );
+        writer.write_all(b" ").await.unwrap();
+        assert_eq!(
+            timeout(Duration::from_millis(80), ingress)
+                .await
+                .expect("later partial bytes must not reset frame assembly")
+                .unwrap(),
+            Err(ErrorCode::Timeout),
+        );
+    }
 
     fn one_request_bounds() -> Bounds {
         Bounds {
