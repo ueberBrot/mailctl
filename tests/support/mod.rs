@@ -19,13 +19,25 @@ use uuid::Uuid;
 // Only copying and spawning are serialized; child processes still run together.
 static COPY_OR_SPAWN: Mutex<()> = Mutex::new(());
 
-const PRODUCT_COMPONENTS: &[(Option<&str>, &str)] = &[
+#[cfg(feature = "cli")]
+static PACKAGED_CLI: OnceLock<PathBuf> = OnceLock::new();
+#[cfg(feature = "mcp")]
+static PACKAGED_MCP: OnceLock<PathBuf> = OnceLock::new();
+const PRODUCT_COMPONENTS: &[(Option<&str>, &str, &OnceLock<PathBuf>)] = &[
     #[cfg(feature = "cli")]
-    (option_env!("CARGO_BIN_EXE_mailctl"), "mailctl"),
+    (
+        option_env!("CARGO_BIN_EXE_mailctl"),
+        "mailctl",
+        &PACKAGED_CLI,
+    ),
     #[cfg(feature = "mcp")]
-    (option_env!("CARGO_BIN_EXE_mailctl-mcp"), "mailctl-mcp"),
+    (
+        option_env!("CARGO_BIN_EXE_mailctl-mcp"),
+        "mailctl-mcp",
+        &PACKAGED_MCP,
+    ),
 ];
-static PACKAGED_EXECUTABLES: OnceLock<Option<Vec<(&str, PathBuf)>>> = OnceLock::new();
+static PACKAGED_DIRECTORY: OnceLock<Option<PathBuf>> = OnceLock::new();
 
 #[cfg(feature = "cli")]
 pub(crate) const MAILCTL: &str = match option_env!("CARGO_BIN_EXE_mailctl") {
@@ -46,14 +58,16 @@ pub(crate) const MAILCTL_MCP: &str = match option_env!("CARGO_BIN_EXE_mailctl-mc
 
 /// Run installed release candidates with the existing disposable fixtures.
 /// Test drivers and already copied fixture executables retain their own paths.
+/// Validate each requested component once so a combined harness can also run
+/// against an installation containing only one component.
 fn selected_executable(executable: &str) -> PathBuf {
-    let Some((_, name)) = PRODUCT_COMPONENTS
+    let Some((_, name, packaged)) = PRODUCT_COMPONENTS
         .iter()
-        .find(|(compiled, _)| *compiled == Some(executable))
+        .find(|(compiled, _, _)| *compiled == Some(executable))
     else {
         return executable.into();
     };
-    let Some(packaged) = PACKAGED_EXECUTABLES.get_or_init(|| {
+    let Some(directory) = PACKAGED_DIRECTORY.get_or_init(|| {
         let directory = PathBuf::from(std::env::var_os("MAILCTL_PACKAGED_BIN_DIR")?);
         assert!(
             directory.is_absolute(),
@@ -64,40 +78,31 @@ fn selected_executable(executable: &str) -> PathBuf {
             "MAILCTL_PACKAGED_BIN_DIR is not a directory: {}",
             directory.display()
         );
-        Some(
-            PRODUCT_COMPONENTS
-                .iter()
-                .filter(|(compiled, _)| compiled.is_some())
-                .map(|(_, name)| {
-                    let path = directory.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
-                    assert!(
-                        path.is_file(),
-                        "missing packaged component: {}",
-                        path.display()
-                    );
-                    let mut version = Command::new(&path);
-                    version.arg("--version");
-                    let output = run_bounded(version);
-                    assert_success(&output);
-                    assert_eq!(
-                        String::from_utf8(output.stdout)
-                            .expect("UTF-8 packaged component version")
-                            .trim(),
-                        format!("{name} {}", env!("CARGO_PKG_VERSION")),
-                        "packaged component must match the acceptance harness version"
-                    );
-                    (*name, path)
-                })
-                .collect(),
-        )
+        Some(directory)
     }) else {
         return executable.into();
     };
     packaged
-        .iter()
-        .find(|(component, _)| component == name)
-        .expect("validated packaged component")
-        .1
+        .get_or_init(|| {
+            let path = directory.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+            assert!(
+                path.is_file(),
+                "missing packaged component: {}",
+                path.display()
+            );
+            let mut version = Command::new(&path);
+            version.arg("--version");
+            let output = run_bounded(version);
+            assert_success(&output);
+            assert_eq!(
+                String::from_utf8(output.stdout)
+                    .expect("UTF-8 packaged component version")
+                    .trim(),
+                format!("{name} {}", env!("CARGO_PKG_VERSION")),
+                "packaged component must match the acceptance harness version"
+            );
+            path
+        })
         .clone()
 }
 
