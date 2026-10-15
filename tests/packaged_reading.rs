@@ -550,7 +550,7 @@ async fn read_adversarial_mime(executable: &str) {
             (BodyCase::PartsAtLimit, Ok(("ok", false))),
             (BodyCase::PartsOverLimit, Err("response_too_large")),
             (BodyCase::MalformedStructure, Err("provider_unavailable")),
-            (BodyCase::ExcessiveNesting, Err("provider_unavailable")),
+            (BodyCase::ExcessiveNesting, Err("response_too_large")),
             (BodyCase::Base64Tail, Ok(("�Hello", true))),
             (BodyCase::QuotedPrintableTail, Ok(("�hello", true))),
         ] {

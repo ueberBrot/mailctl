@@ -10,6 +10,18 @@ use tokio_rustls::rustls::{
     pki_types::{CertificateDer, pem::PemObject},
 };
 
+/// Exercise the production lifecycle from a fixed 1 MiB caller stack on every
+/// platform. Request decoding must use the executable's runtime worker stack.
+#[cfg(any(feature = "cli", feature = "mcp"))]
+pub fn run(executable: mailctl::frontends::Executable) -> std::process::ExitCode {
+    std::thread::Builder::new()
+        .stack_size(1024 * 1024)
+        .spawn(move || mailctl::frontends::run_with_environment(executable, Arc::new(FixtureHost)))
+        .expect("start constrained executable caller")
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
 pub struct FixtureHost;
 impl HostEnvironment for FixtureHost {
     fn credential_source(&self, source: &CredentialSource) -> Arc<dyn SecretSource> {

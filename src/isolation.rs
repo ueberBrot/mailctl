@@ -276,6 +276,8 @@ pub fn run_server() -> ExitCode {
     }
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
+        // Isolated CLI/MCP sessions also decode bounded typed MIME structures.
+        .thread_stack_size(8 * 1024 * 1024)
         .enable_all()
         .build()
     {

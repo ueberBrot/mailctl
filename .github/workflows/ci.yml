@@ -61,6 +61,17 @@ jobs:
         shell: bash
         env:
           MAILCTL_FEATURES: ${{ matrix.features }}
+      - name: Qualify optimized decoding and executable stacks on Windows
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        env:
+          MAILCTL_FEATURES: ${{ matrix.features }}
+        run: |
+          cargo test --release --locked -p mailctl-process-tests \
+            --no-default-features --features "$MAILCTL_FEATURES" --test mime_depth
+          cargo test --release --locked -p mailctl --no-default-features \
+            --features "$MAILCTL_FEATURES" --test imap_allocations \
+            deep_bodystructure_codec_has_finite_work_and_stack
       - name: Repeat concurrent Windows draft acceptance
         if: matrix.os == 'windows-latest' && matrix.features == 'cli,mcp'
         shell: pwsh

@@ -23,8 +23,9 @@ fn structure(depth: usize, kind: usize, leaf: &str) -> String {
 
 #[test]
 fn deep_bodystructure_codec_has_finite_work_and_stack() {
-    // Unoptimized nom combinators need more stack. Also qualify a 1 MiB stack in
-    // optimized builds; request work can run on the calling thread.
+    // Direct library users supply the polling stack: unoptimized nom combinators
+    // need 2 MiB here; optimized decoding is also qualified at 1 MiB. Executables
+    // have a separate constrained-caller regression in the process-driver tests.
     let stack_bytes = if cfg!(debug_assertions) {
         2 * 1024 * 1024
     } else {

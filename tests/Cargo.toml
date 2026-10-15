@@ -79,5 +79,9 @@ path = "process-driver/tests/mailbox_scope.rs"
 name = "session_credentials"
 path = "process-driver/tests/session_credentials.rs"
 
+[[test]]
+name = "mime_depth"
+path = "process-driver/tests/mime_depth.rs"
+
 [lints]
 workspace = true

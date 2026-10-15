@@ -89,6 +89,9 @@ pub fn run_with_environment(
     }
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
+        // Bounded typed MIME decoding can precede the configured semantic depth
+        // check. Reserve enough stack for unoptimized codec combinators too.
+        .thread_stack_size(8 * 1024 * 1024)
         .enable_all()
         .build()
     {
@@ -99,8 +102,12 @@ pub fn run_with_environment(
         }
     };
     let request = Request::new();
-    let code = runtime.block_on(
-        async {
+    let span = request.span();
+    let request_id = request.id().to_owned();
+    // block_on polls its own future on the caller's stack, which can be 1 MiB.
+    // Poll the entire request lifecycle on the explicitly sized workers instead.
+    let task = runtime.spawn(
+        async move {
             let result = match initialized {
                 Err(error) => Err(error),
                 Ok(()) => match invocation {
@@ -122,10 +129,19 @@ pub fn run_with_environment(
                 Err(error) => report(&request, json, options.color, Err(error), (), 30).await,
             }
         }
-        .instrument(request.span()),
+        .instrument(span),
     );
+    let result = runtime.block_on(task);
     // STDIO workers may remain blocked after cancellation; process exit releases their leases.
     runtime.shutdown_timeout(Duration::from_millis(250));
+    let code = match result {
+        Ok(code) => code,
+        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+        Err(_) => {
+            diagnostics::result(&request_id, Some(&Error::new(ErrorCode::InternalError)));
+            8
+        }
+    };
     code.into()
 }
 

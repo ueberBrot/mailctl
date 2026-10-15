@@ -50,6 +50,11 @@ enum ExpectedOperation {
     Attachment(&'static str, AttachmentPhase, String),
     AttachmentCase(&'static str, AttachmentCase, bool),
     BodyRoute(&'static str, body_routes::BodyRoute),
+    MimeDepth {
+        depth: usize,
+        kind: usize,
+        admitted: bool,
+    },
     TransferStall(transfer_lifecycle::TransferStall),
     ExportPause(export_faults::ExportPause),
 }
@@ -253,6 +258,10 @@ impl ImapServer {
                                 },
                                 ExpectedOperation::BodyRoute(mailbox, case) => {
                                     body_routes::serve(&mut wire, mailbox, case).await;
+                                    return;
+                                },
+                                ExpectedOperation::MimeDepth { depth, kind, admitted } => {
+                                    mime_depth(&mut wire, depth, kind, admitted).await;
                                     return;
                                 },
                                 ExpectedOperation::TransferStall(_) => {
@@ -485,6 +494,51 @@ impl ImapServer {
             "every expected authentication occurred"
         );
     }
+
+    pub fn expect_mime_depth(&self, depth: usize, kind: usize, admitted: bool) {
+        self.expected.lock().unwrap().push_back(Expected {
+            username: "work@example.test",
+            password: "disposable-password",
+            operation: ExpectedOperation::MimeDepth {
+                depth,
+                kind,
+                admitted,
+            },
+        });
+    }
+}
+
+async fn mime_depth(wire: &mut imap_support::Wire, depth: usize, kind: usize, admitted: bool) {
+    let mut body = "(\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" 2 1)".to_owned();
+    for level in 1..depth {
+        body = if kind == 1 || (kind == 2 && level % 2 == 0) {
+            format!(
+                "(\"MESSAGE\" \"RFC822\" NIL NIL NIL \"7BIT\" 2 (NIL NIL NIL NIL NIL NIL NIL NIL NIL NIL) {body} 1)"
+            )
+        } else {
+            format!("({body} \"MIXED\")")
+        };
+    }
+    let tag = imap_support::expect(wire, "EXAMINE INBOX").await;
+    imap_support::write(
+        wire,
+        &format!("* 3 EXISTS\r\n* OK [UIDVALIDITY 77] stable\r\n{tag} OK [READ-ONLY] selected\r\n"),
+    )
+    .await;
+    let tag = imap_support::expect(wire, "UID FETCH 3 (UID RFC822.SIZE BODYSTRUCTURE)").await;
+    imap_support::write(
+        wire,
+        &format!(
+            "* 3 FETCH (UID 3 RFC822.SIZE 3000300 BODYSTRUCTURE {body})\r\n{tag} OK fetched\r\n"
+        ),
+    )
+    .await;
+    if admitted {
+        imap_support::logout(wire).await;
+    } else {
+        // Neither headers nor payloads may be requested after rejection.
+        imap_support::dropped(wire).await;
+    }
 }
 
 fn mailbox_argument(mailbox: &str) -> String {
@@ -664,9 +718,9 @@ async fn body_case(wire: &mut imap_support::Wire, mailbox: &str, case: BodyCase)
             body = "(INVALID)".into();
         }
         ExcessiveNesting => {
-            // The pinned codec rejects seven multipart wrappers. The outer
-            // MIXED in body_metadata adds the seventh, before configured depth 20.
-            for _ in 0..6 {
+            // Exceed the independent protocol nesting guard even when the codec
+            // admits structures within the configured MIME depth range.
+            for _ in 0..128 {
                 body = format!("({body} \"MIXED\" NIL NIL NIL NIL)");
             }
         }
