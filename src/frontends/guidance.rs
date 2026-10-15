@@ -76,6 +76,20 @@ Without `--json`, guides print Markdown and schemas print raw JSON Schema. With
 `--json`, guides return `result` with `topic` and `text`; schemas return the schema
 as `result`, inside the usual envelope.
 
+## Capacity and overload
+
+`result.capacity.per_process` reports configured ceilings for one process. MCP
+also reserves memory for request envelopes and results, so its transport may
+admit fewer simultaneous requests. A large envelope can leave one admitted
+request and one waiting request despite a higher configured request ceiling.
+Each process also applies its own per-account connection and waiting limits.
+These limits do not form an installation-wide account quota; another process
+has independent budgets.
+
+Submit bounded batches and reduce concurrency after capacity refusals. The
+errors guide distinguishes an application `rate_limited` result from an MCP
+transport refusal, which has no `structuredContent` envelope.
+
 ## Operator readiness
 
 On macOS or Windows, provision an account's native credential interactively:
@@ -405,6 +419,14 @@ CLI JSON and MCP structured results use `ok: false` with an `error`. Read its
 `code`, `message`, `retryable`, and any `credential_failure`, `conflict_kind`, or
 `draft_operation` details. Retain `request_id` for diagnostics. CLI failure also
 returns a nonzero exit code; ordinary stderr diagnostics are not result JSON.
+
+MCP can instead return JSON-RPC error `-32000`, message `Request capacity
+exhausted`, with `data.code: "rate_limited"`. This transport refusal happens
+before email work and has no `structuredContent`, `ok`, or `retryable` field.
+Let outstanding calls finish, lower concurrency, and retry reads with bounded
+attempts and a delay. Configured process ceilings do not promise that many MCP
+transport slots; see the overview guide. For draft work, retain the original
+identity and composition and resolve any earlier uncertain save as below.
 
 For transient read failures, retry the same request when `retryable` is true,
 with bounded attempts and a delay. Draft creation always retains the same

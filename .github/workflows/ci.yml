@@ -32,6 +32,8 @@ jobs:
         run: cargo deny --locked --all-features check
       - name: Check installer failure and recovery fixtures
         run: python3 tests/installer.py --suite fixtures
+      - name: Check offline Codex acceptance fixtures
+        run: python3 scripts/acceptance/test_codex_mcp.py
 
   components:
     strategy:
