@@ -37,7 +37,7 @@ enum ExpectedOperation {
     Mailboxes(Vec<&'static str>),
     AllMailboxes(Vec<&'static str>),
     Search(&'static str, Option<u32>),
-    Body(&'static str, Vec<u8>),
+    Body(&'static str, Vec<u8>, BodyKind),
     Attachment(&'static str, AttachmentPhase, String),
 }
 
@@ -58,6 +58,13 @@ pub enum AttachmentPhase {
     TruncatedContinuation,
     Interrupted,
     InterruptedContinuation,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum BodyKind {
+    Plain,
+    Html,
+    Alternative,
 }
 
 pub struct ImapServer {
@@ -173,7 +180,7 @@ impl ImapServer {
                                     imap_support::write(&mut wire, &format!("{tag} OK listed\r\n")).await;
                                 }
                                 ExpectedOperation::Search(mailbox, position) => search_page(&mut wire, mailbox, position).await,
-                                ExpectedOperation::Body(mailbox, text) => body_page(&mut wire, mailbox, &text).await,
+                                ExpectedOperation::Body(mailbox, text, kind) => body_page(&mut wire, mailbox, &text, kind).await,
                                 ExpectedOperation::Attachment(mailbox, phase, filename) => {
                                     attachment_page(&mut wire, mailbox, phase, &filename, &stalled).await;
                                     if matches!(phase, AttachmentPhase::Truncated | AttachmentPhase::TruncatedContinuation | AttachmentPhase::Interrupted | AttachmentPhase::InterruptedContinuation) { return; }
@@ -310,15 +317,23 @@ impl ImapServer {
         self.expected.lock().unwrap().push_back(Expected {
             username,
             password,
-            operation: ExpectedOperation::Body(mailbox, b"Short body.\r\n".to_vec()),
+            operation: ExpectedOperation::Body(
+                mailbox,
+                b"Short body.\r\n".to_vec(),
+                BodyKind::Plain,
+            ),
         });
     }
 
     pub fn expect_body_bytes(&self, mailbox: &'static str, text: &[u8]) {
+        self.expect_body_kind(mailbox, BodyKind::Plain, text);
+    }
+
+    pub fn expect_body_kind(&self, mailbox: &'static str, kind: BodyKind, text: &[u8]) {
         self.expected.lock().unwrap().push_back(Expected {
             username: "work@example.test",
             password: "disposable-password",
-            operation: ExpectedOperation::Body(mailbox, text.to_vec()),
+            operation: ExpectedOperation::Body(mailbox, text.to_vec(), kind),
         });
     }
 
@@ -407,7 +422,7 @@ async fn search_page(wire: &mut imap_support::Wire, mailbox: &str, position: Opt
     write(wire, &format!("* {uid} FETCH (UID {uid} ENVELOPE (NIL \"{subject}\" NIL NIL NIL NIL NIL NIL NIL \"<search-{uid}@example.test>\") FLAGS ({flags}) INTERNALDATE \"01-Sep-2026 12:00:00 +0000\" RFC822.SIZE 13000)\r\n{tag} OK fetched\r\n")).await;
 }
 
-async fn body_page(wire: &mut imap_support::Wire, mailbox: &str, text: &[u8]) {
+async fn body_page(wire: &mut imap_support::Wire, mailbox: &str, text: &[u8], kind: BodyKind) {
     use imap_support::{expect, write};
     let encoded;
     let (encoding, text) = if text == b"Short body.\r\n" {
@@ -427,7 +442,23 @@ async fn body_page(wire: &mut imap_support::Wire, mailbox: &str, text: &[u8]) {
     // The attachment exceeds the default 2 MiB whole-message bound. Strict
     // command matching permits only headers and the selected body, rejecting
     // attachment fetches and mailbox mutations independently of the client.
-    write(wire, &format!("* 3 FETCH (UID 3 RFC822.SIZE 3000300 BODYSTRUCTURE ((\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"{encoding}\" {} 1 NIL NIL NIL NIL)(\"APPLICATION\" \"OCTET-STREAM\" NIL NIL NIL \"BASE64\" 3000000 NIL (\"ATTACHMENT\" NIL) NIL NIL) \"MIXED\" NIL NIL NIL NIL))\r\n{tag} OK fetched\r\n", text.len())).await;
+    let (subtype, section) = match kind {
+        BodyKind::Plain => ("PLAIN", "1"),
+        BodyKind::Html => ("HTML", "1"),
+        BodyKind::Alternative => ("PLAIN", "1.2"),
+    };
+    let selected = format!(
+        "(\"TEXT\" \"{subtype}\" (\"CHARSET\" \"UTF-8\") NIL NIL \"{encoding}\" {} 1 NIL NIL NIL NIL)",
+        text.len()
+    );
+    let body = if matches!(kind, BodyKind::Alternative) {
+        format!(
+            "((\"TEXT\" \"HTML\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" 19 1 NIL NIL NIL NIL){selected} \"ALTERNATIVE\" NIL NIL NIL NIL)"
+        )
+    } else {
+        selected
+    };
+    write(wire, &format!("* 3 FETCH (UID 3 RFC822.SIZE 3000300 BODYSTRUCTURE ({body}(\"APPLICATION\" \"OCTET-STREAM\" NIL NIL NIL \"BASE64\" 3000000 NIL (\"ATTACHMENT\" NIL) NIL NIL) \"MIXED\" NIL NIL NIL NIL))\r\n{tag} OK fetched\r\n")).await;
     for (section, count, value) in [
         (
             "HEADER",
@@ -435,7 +466,7 @@ async fn body_page(wire: &mut imap_support::Wire, mailbox: &str, text: &[u8]) {
             b"MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=fixture\r\n\r\n"
                 .as_slice(),
         ),
-        ("1", text.len() + 1, text),
+        (section, text.len() + 1, text),
     ] {
         let tag = expect(
             wire,

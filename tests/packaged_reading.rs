@@ -223,60 +223,109 @@ async fn search_message(fixture: &Fixture, reader: &Reader, mailbox: &str) -> Va
         .take()
 }
 
-async fn read_and_continue_short_body_without_large_attachment_payload(executable: &str) {
-    tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        let mut fixture = Fixture::new(executable);
-        let reader = Reader::start(&fixture, executable).await;
-        let (mailbox, before) = discover_message(&fixture, &reader).await;
-        let message = before["reference"].as_str().unwrap();
-        let mut cursor: Option<String> = None;
-        let mut reconstructed = String::new();
-        for expected in ["Shor", "t bo", "dy.\r", "\n"] {
-            fixture.server.expect_body(USERNAME, PASSWORD, "INBOX");
-            let mut arguments = vec!["message", "get", "--message", message, "--max-bytes", "4"];
-            if let Some(cursor) = &cursor {
-                arguments.extend(["--cursor", cursor]);
+async fn read_and_continue_selected_bodies(executable: &str) {
+    use server::BodyKind;
+
+    let remote = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    remote.set_nonblocking(true).unwrap();
+    let url = format!("http://{}/private", remote.local_addr().unwrap());
+    let html = format!(
+        r#"<!doctype html><html><head><script src="{url}">active-secret</script><style>@import url('{url}'); style-secret</style></head><body><p>a🦀éxyz</p><img src="{url}" alt=""></body></html>"#
+    );
+    for (kind, source, pages, complete, selected_part, media_type, converted) in [
+        (
+            BodyKind::Plain,
+            b"Short body.\r\n".as_slice(),
+            ["Shor", "t bo", "dy.\r", "\n"],
+            "Short body.\r\n",
+            "1",
+            "text/plain",
+            false,
+        ),
+        (
+            BodyKind::Html,
+            html.as_bytes(),
+            ["a", "🦀", "éxy", "z\n"],
+            "a🦀éxyz\n",
+            "1",
+            "text/html",
+            true,
+        ),
+        (
+            BodyKind::Alternative,
+            "a🦀éxyz".as_bytes(),
+            ["a", "🦀", "éxy", "z"],
+            "a🦀éxyz",
+            "1.2",
+            "text/plain",
+            false,
+        ),
+    ] {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let mut fixture = Fixture::new(executable);
+            let reader = Reader::start(&fixture, executable).await;
+            let (mailbox, before) = discover_message(&fixture, &reader).await;
+            let message = before["reference"].as_str().unwrap();
+            let mut cursor: Option<String> = None;
+            let mut reconstructed = String::new();
+            for (page, expected) in pages.iter().enumerate() {
+                fixture.server.expect_body_kind("INBOX", kind, source);
+                let mut arguments =
+                    vec!["message", "get", "--message", message, "--max-bytes", "4"];
+                if let Some(cursor) = &cursor {
+                    arguments.extend(["--cursor", cursor]);
+                }
+                let result = reader
+                    .call(
+                        &fixture,
+                        &arguments,
+                        "email_get_message",
+                        json!({"message": message, "max_bytes": 4, "cursor": cursor}),
+                    )
+                    .await;
+                let body = &result["body"];
+                let text = body["text"].as_str().unwrap();
+                assert_eq!(text, *expected, "{kind:?} page {page}");
+                assert!(text.len() <= 4);
+                assert_eq!(body["selected_part"], selected_part);
+                assert_eq!(body["source_media_type"], media_type);
+                assert_eq!(body["converted"], converted);
+                assert_eq!(body["replacements"], false);
+                assert!(body["empty_reason"].is_null());
+                reconstructed.push_str(text);
+                cursor = body["next_cursor"].as_str().map(str::to_owned);
+                let more = page + 1 < pages.len();
+                assert_eq!(cursor.is_some(), more);
+                assert_eq!(body["continuation_available"], more);
+                assert_eq!(body["truncated"], more);
             }
-            let result = reader
-                .call(
-                    &fixture,
-                    &arguments,
-                    "email_get_message",
-                    json!({"message": message, "max_bytes": 4, "cursor": cursor}),
-                )
-                .await;
-            let body = &result["body"];
-            assert_eq!(body["text"], expected);
-            assert_eq!(body["selected_part"], "1");
-            assert_eq!(body["source_media_type"], "text/plain");
-            assert_eq!(body["converted"], false);
-            reconstructed.push_str(expected);
-            cursor = body["next_cursor"].as_str().map(str::to_owned);
-            assert_eq!(body["continuation_available"], cursor.is_some());
-            assert_eq!(body["truncated"], cursor.is_some());
-        }
-        assert_eq!(reconstructed, "Short body.\r\n");
-        assert!(cursor.is_none());
-        // Strict EXAMINE/PEEK transcripts independently reject mutation and
-        // attachment payload fetches; metadata/flags also remain identical.
-        assert_eq!(search_message(&fixture, &reader, &mailbox).await, before);
-        reader.finish().await;
-        fixture.server.finish();
-    })
-    .await
-    .expect("standalone reading and shutdown deadline");
+            assert_eq!(reconstructed, complete);
+            // Strict EXAMINE/PEEK transcripts independently reject mutation and
+            // attachment payload fetches; metadata/flags also remain identical.
+            assert_eq!(search_message(&fixture, &reader, &mailbox).await, before);
+            reader.finish().await;
+            fixture.server.finish();
+            assert_eq!(
+                remote.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock,
+                "HTML resources must remain inert"
+            );
+        })
+        .await
+        .expect("standalone reading and shutdown deadline");
+    }
 }
 
 #[cfg(feature = "cli")]
 #[tokio::test]
-async fn cli_reads_and_continues_short_body_without_large_attachment_payload() {
-    read_and_continue_short_body_without_large_attachment_payload(support::MAILCTL).await;
+async fn cli_reads_selected_bodies_at_utf8_boundaries_without_attachment_downloads() {
+    read_and_continue_selected_bodies(support::MAILCTL).await;
 }
 
 #[cfg(feature = "mcp")]
 #[tokio::test]
-async fn mcp_reads_and_continues_short_body_without_large_attachment_payload() {
-    read_and_continue_short_body_without_large_attachment_payload(support::MAILCTL_MCP).await;
+async fn mcp_reads_selected_bodies_at_utf8_boundaries_without_attachment_downloads() {
+    read_and_continue_selected_bodies(support::MAILCTL_MCP).await;
 }
 
 #[cfg(feature = "cli")]
