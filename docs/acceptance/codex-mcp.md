@@ -9,8 +9,9 @@ operator authorization. Ordinary PR CI must not run it.
 
 Use Python 3.9 or newer, OpenSSL, and an authenticated Codex CLI. The runner was
 checked with Codex CLI 0.162.1. Its installed `exec --help` must support
-`--ignore-user-config`, `--ignore-rules`, `--ephemeral`, `--json`, `--sandbox`,
-`--skip-git-repo-check`, and inline TOML `-c` settings. It also uses the installed
+`--strict-config`, `--ignore-user-config`, `--ignore-rules`, `--ephemeral`,
+`--json`, `--sandbox`, `--skip-git-repo-check`, and inline TOML `-c` settings.
+It also uses the installed
 `shell_tool`, `apps`, `plugins`, `multi_agent`, `skill_search`, and
 `skip_host_skill_discovery` feature settings. Unsupported clients fail acceptance;
 do not silently remove the isolation settings.
