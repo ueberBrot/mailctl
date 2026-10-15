@@ -46,6 +46,46 @@ async fn listed_accounts(installation: &Installation, arguments: &[&str]) -> (Mc
 }
 
 #[tokio::test]
+async fn idle_mcp_sessions_remain_usable_between_operation_deadlines() {
+    let installation = Installation::two_accounts();
+    let mut config: toml::Value =
+        toml::from_str(&std::fs::read_to_string(installation.config()).unwrap()).unwrap();
+    config.as_table_mut().unwrap().insert(
+        "limits".into(),
+        toml::Value::Table(toml::map::Map::from_iter([
+            ("operation_seconds".into(), 1.into()),
+            ("connection_seconds".into(), 1.into()),
+            ("initialization_seconds".into(), 1.into()),
+        ])),
+    );
+    std::fs::write(installation.config(), toml::to_string(&config).unwrap()).unwrap();
+    setup(&installation);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let client = client(&installation, &[]).await;
+        for _ in 0..2 {
+            // Keep STDIN open and send no keepalive or request while idle.
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+            let response = client
+                .call_tool(CallToolRequestParams::new("email_capabilities"))
+                .await
+                .expect("an idle MCP session must accept its next operation");
+            let envelope = support::assert_mcp_envelope(response);
+            assert_eq!(envelope["ok"], true, "{envelope}");
+            assert!(
+                envelope["result"]["operations"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|operation| operation == "get_message")
+            );
+        }
+        client.cancel().await.unwrap();
+    })
+    .await
+    .expect("idle MCP requests and shutdown complete");
+}
+
+#[tokio::test]
 async fn default_read_and_drafts_grant_can_discover_capabilities() {
     let installation = Installation::two_accounts();
     let configuration = std::fs::read_to_string(installation.config()).unwrap();

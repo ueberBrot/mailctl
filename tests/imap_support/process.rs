@@ -4,6 +4,13 @@
 )]
 
 use super::imap_support;
+
+#[path = "body_routes.rs"]
+pub mod body_routes;
+#[path = "export_faults.rs"]
+pub mod export_faults;
+#[path = "transfer_lifecycle.rs"]
+pub mod transfer_lifecycle;
 use std::{
     collections::VecDeque,
     fs,
@@ -42,6 +49,9 @@ enum ExpectedOperation {
     BodyCase(&'static str, BodyCase),
     Attachment(&'static str, AttachmentPhase, String),
     AttachmentCase(&'static str, AttachmentCase, bool),
+    BodyRoute(&'static str, body_routes::BodyRoute),
+    TransferStall(transfer_lifecycle::TransferStall),
+    ExportPause(export_faults::ExportPause),
 }
 
 #[derive(Clone)]
@@ -166,6 +176,10 @@ impl ImapServer {
                         result = tokio::time::timeout(Duration::from_secs(10), async {
                             let mut wire: imap_support::Wire = Box::new(acceptor.accept(socket).await.unwrap());
                             imap_support::write(&mut wire, "* OK synthetic server ready\r\n").await;
+                            if matches!(&operation, ExpectedOperation::TransferStall(transfer_lifecycle::TransferStall::Authentication)) {
+                                transfer_lifecycle::stall_authentication(&mut wire, &stalled).await;
+                                return;
+                            }
                             imap_support::capability(&mut wire, "IMAP4rev1").await;
                             let tag = imap_support::expect(&mut wire, &format!("LOGIN \"{username}\" \"{password}\"")).await;
                             if let ExpectedOperation::RejectAuthentication(malformed) = operation {
@@ -235,6 +249,18 @@ impl ImapServer {
                                 },
                                 ExpectedOperation::AttachmentCase(mailbox, case, listing) => {
                                     attachment_case(&mut wire, mailbox, case, listing).await;
+                                    return;
+                                },
+                                ExpectedOperation::BodyRoute(mailbox, case) => {
+                                    body_routes::serve(&mut wire, mailbox, case).await;
+                                    return;
+                                },
+                                ExpectedOperation::TransferStall(_) => {
+                                    transfer_lifecycle::stall_payload(&mut wire, &stalled).await;
+                                    return;
+                                },
+                                ExpectedOperation::ExportPause(pause) => {
+                                    export_faults::resume_attachment(&mut wire, pause).await;
                                     return;
                                 },
                             }

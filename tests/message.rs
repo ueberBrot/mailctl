@@ -118,6 +118,7 @@ fn get(reference: &str) -> Operation {
 fn body(text: &str) -> BodyText {
     BodyText {
         text: text.into(),
+        representation_version: mailctl::domain::BODY_REPRESENTATION_VERSION.into(),
         selected_part: Some("1".into()),
         source_media_type: Some("text/plain".into()),
         converted: false,
@@ -536,6 +537,10 @@ async fn authenticated_text_pages_reconstruct_the_available_representation() {
             panic!()
         };
         assert_eq!(result.body.text, expected);
+        assert_eq!(
+            result.body.representation_version,
+            mailctl::domain::BODY_REPRESENTATION_VERSION
+        );
         cursor = result.body.next_cursor;
         assert_eq!(result.body.truncated, cursor.is_some());
         assert_eq!(result.body.continuation_available, cursor.is_some());
@@ -615,12 +620,13 @@ async fn text_cursors_reject_tampering_and_changes_after_fresh_authorization() {
             .code,
         ErrorCode::StaleCursor
     );
-    for change in ["content", "part", "media", "validity", "missing"] {
+    for change in ["content", "part", "media", "version", "validity", "missing"] {
         let mut changed = original.clone();
         match change {
             "content" => changed.text = "b🦀éxyz".into(),
             "part" => changed.selected_part = Some("2".into()),
             "media" => changed.source_media_type = Some("text/html".into()),
+            "version" => changed.representation_version = "changed-renderer".into(),
             _ => {}
         }
         bodies.set(

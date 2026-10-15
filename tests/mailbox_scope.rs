@@ -285,6 +285,7 @@ async fn all_folder_reads_work_and_resources_cannot_widen_a_restricted_grant() {
         2,
         BodyText {
             text: "abcdefgh".into(),
+            representation_version: mailctl::domain::BODY_REPRESENTATION_VERSION.into(),
             selected_part: Some("1".into()),
             source_media_type: Some("text/plain".into()),
             converted: false,

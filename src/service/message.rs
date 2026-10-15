@@ -103,6 +103,7 @@ impl BodyBackend for MemoryBodies {
                 body: BodyText {
                     truncated: body.truncated || range.end < body.text.len(),
                     text: body.text[range].into(),
+                    representation_version: body.representation_version.clone(),
                     selected_part: body.selected_part.clone(),
                     source_media_type: body.source_media_type.clone(),
                     converted: body.converted,

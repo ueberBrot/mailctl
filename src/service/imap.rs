@@ -196,6 +196,7 @@ impl From<crate::imap::BodyPage> for super::BodyRead {
                     .is_none()
                     .then_some(EmptyBodyReason::NoSupportedBody),
                 text: page.text,
+                representation_version: crate::domain::BODY_REPRESENTATION_VERSION.into(),
                 selected_part: page.selected_part,
                 source_media_type: page.source_media_type,
                 converted: page.converted,

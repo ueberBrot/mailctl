@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 /// Default UTF-8 byte ceiling for each returned text page.
 pub const DEFAULT_TEXT_PAGE_BYTES: usize = 8192;
 
+/// Identifier for the selected-body decoding and rendering behavior.
+pub const BODY_REPRESENTATION_VERSION: &str = "mailctl-body/mail-parser-0.11.9/html2text-0.17.1";
+
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GetMessageInput {
@@ -39,6 +42,8 @@ pub struct MessageBody {
 #[serde(deny_unknown_fields)]
 pub struct BodyText {
     pub text: String,
+    /// Opaque version of the decoding and rendering behavior for this text.
+    pub representation_version: String,
     pub selected_part: Option<String>,
     pub source_media_type: Option<String>,
     pub converted: bool,

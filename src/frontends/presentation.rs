@@ -349,6 +349,7 @@ mod tests {
             message_reference: "message".into(),
             body: BodyText {
                 text: text.into(),
+                representation_version: crate::domain::BODY_REPRESENTATION_VERSION.into(),
                 selected_part: Some("1".into()),
                 source_media_type: Some("text/plain".into()),
                 converted: false,

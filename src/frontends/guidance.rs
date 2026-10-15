@@ -194,6 +194,10 @@ capabilities. Omitting it uses `result.limits.default_text_page_bytes`, at most
 report conversion, replacement characters, selected MIME part, and source media
 type.
 
+`body.representation_version` identifies the decoding and rendering behavior.
+Treat it as an opaque value when recording or comparing representations. A
+changed rendering version invalidates an earlier continuation with `stale_cursor`.
+
 To read the whole selected text, follow `body.next_cursor` while
 `body.continuation_available` is true, retaining the same message reference.
 Pass the cursor as `cursor` or CLI `--cursor` and keep the same `max_bytes` value
