@@ -97,16 +97,15 @@ fn first_chunk_then_pause(fixture: &Fixture) -> ExportControl {
 }
 
 fn partial(root: &Path) -> PathBuf {
-    let partials: Vec<_> = fs::read_dir(root)
+    let mut partials = fs::read_dir(root)
         .unwrap()
         .map(|entry| entry.unwrap().path())
         .filter(|path| {
             path.extension()
                 .is_some_and(|extension| extension == "partial")
-        })
-        .collect();
-    assert_eq!(partials.len(), 1);
-    let path = partials.into_iter().next().unwrap();
+        });
+    let path = partials.next().expect("one export partial");
+    assert!(partials.next().is_none(), "only one export partial");
     assert_private(&path);
     assert_eq!(fs::read(&path).unwrap(), b"abc");
     path
