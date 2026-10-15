@@ -30,6 +30,13 @@ Email access over IMAP for macOS on Apple Silicon.
 - Unsent draft creation with persistent operation identities, retries, status, and reconciliation.
 
 mailctl does not send email or edit existing drafts.
+
+### Compatibility and migration
+
+Message body responses now require `body.representation_version`. Regenerate
+strict response schemas before consuming the new CLI/MCP outputs. Treat the
+value as opaque decoding/rendering metadata. If a rendering change invalidates a
+body continuation with `stale_cursor`, restart that read from its first page.
 {%- else %}
 {% for group, commits in commits | group_by(attribute="group") %}
 ### {{ group | upper_first }}
