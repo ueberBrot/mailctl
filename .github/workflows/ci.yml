@@ -163,6 +163,8 @@ jobs:
         run: bash scripts/ci/candidate.sh native
       - name: Qualify packaged reading for each standalone component selection
         run: bash scripts/ci/candidate.sh reading
+      - name: Qualify packaged draft faults and history per component
+        run: bash scripts/ci/candidate.sh drafts
       - name: Record passing candidate acceptance
         run: bash scripts/ci/candidate.sh record
       - name: Keep candidate downloads and acceptance evidence

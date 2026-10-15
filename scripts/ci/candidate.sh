@@ -19,9 +19,9 @@ prepare)
 		"$MAILCTL_CANDIDATE_DIR" "$MAILCTL_PACKAGED_BIN_DIR" >>"$GITHUB_ENV"
 	exit
 	;;
-installer | state | process | native | reading | record) ;;
+installer | state | process | native | reading | drafts | record) ;;
 *)
-	printf 'Usage: %s {build|prepare|installer|state|process|native|reading|record}\n' "$0" >&2
+	printf 'Usage: %s {build|prepare|installer|state|process|native|reading|drafts|record}\n' "$0" >&2
 	exit 2
 	;;
 esac
@@ -36,6 +36,7 @@ process_command=(cargo test --locked
 	--test read_contention_process --test draft_process)
 native_command=(cargo test --locked --test native_credentials -- --ignored --test-threads=1)
 reading_installer_command=(python3 tests/installer.py --artifacts "$MAILCTL_CANDIDATE_DIR" --install-only)
+drafts_installer_command=(python3 tests/installer.py --artifacts "$MAILCTL_CANDIDATE_DIR" --install-only)
 
 select_reading_components() {
 	components=$1
@@ -52,6 +53,23 @@ select_reading_components() {
 		;;
 	esac
 	reading_command+=(-- --test-threads=1)
+}
+
+select_draft_components() {
+	components=$1
+	drafts_command=(cargo test --locked --test packaged_drafts)
+	case "$components" in
+	cli,mcp)
+		label=cli-mcp
+		installed=$MAILCTL_PACKAGED_BIN_DIR
+		;;
+	cli | mcp)
+		label=$components
+		installed="$MAILCTL_PACKAGED_BIN_DIR-drafts-$components"
+		drafts_command+=("${components}_")
+		;;
+	esac
+	drafts_command+=(-- --test-threads=1)
 }
 
 record_command() {
@@ -97,6 +115,23 @@ reading)
 		fi
 	done
 	;;
+drafts)
+	for components in cli mcp cli,mcp; do
+		select_draft_components "$components"
+		log="$MAILCTL_CANDIDATE_DIR/installed-drafts-$label-acceptance.log"
+		{
+			if [ "$components" != cli,mcp ]; then
+				"${drafts_installer_command[@]}" --components "$components" --install-to "$installed"
+			fi
+			MAILCTL_PACKAGED_BIN_DIR="$installed" "${drafts_command[@]}"
+		} 2>&1 | tee "$log"
+		if ! grep -Eq '^test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' "$log"; then
+			printf 'Packaged draft acceptance for %s must pass at least one test with none failed or ignored. Log: %s\n' \
+				"$components" "$log" >&2
+			exit 1
+		fi
+	done
+	;;
 record)
 	# Verify the original artifact hashes before adding passing acceptance.
 	(cd "$MAILCTL_CANDIDATE_DIR" && shasum -a 256 -c SHA256SUMS)
@@ -119,10 +154,21 @@ record)
 			record_command "reading_command_$components" env \
 				"MAILCTL_PACKAGED_BIN_DIR=$installed" "${reading_command[@]}"
 		done
+		printf 'drafts_credential_source=disposable-command-helper\ndrafts_tls_source=fixture-ca-via-SSL_CERT_FILE\n'
+		for components in cli mcp cli,mcp; do
+			select_draft_components "$components"
+			if [ "$components" != cli,mcp ]; then
+				record_command "drafts_installer_command_$components" \
+					"${drafts_installer_command[@]}" --components "$components" --install-to "$installed"
+			fi
+			record_command "drafts_command_$components" env \
+				"MAILCTL_PACKAGED_BIN_DIR=$installed" "${drafts_command[@]}"
+		done
 		printf 'real_provider=not-qualified\nisolation=not-qualified\npublication=not-performed\n'
 	} >"$MAILCTL_CANDIDATE_DIR/acceptance-evidence.txt"
 	(cd "$MAILCTL_CANDIDATE_DIR" && shasum -a 256 acceptance-evidence.txt installer-acceptance.log \
 		installed-state-acceptance.log installed-process-acceptance.log \
-		installed-native-acceptance.log installed-reading-*-acceptance.log >>SHA256SUMS)
+		installed-native-acceptance.log installed-reading-*-acceptance.log \
+		installed-drafts-*-acceptance.log >>SHA256SUMS)
 	;;
 esac
