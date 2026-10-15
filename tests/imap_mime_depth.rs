@@ -81,11 +81,11 @@ async fn configured_mime_depth_admits_exact_and_rejects_one_over() {
 
 #[tokio::test]
 async fn embedded_messages_share_the_configured_mime_depth_budget() {
-    for ceiling in [20, 40] {
+    for (alternating, ceiling) in [(false, 20), (true, 20), (false, 40), (true, 40)] {
         for depth in [ceiling, ceiling + 1] {
             let mut structure = TEXT.to_owned();
             for level in 1..depth {
-                structure = if level % 2 == 0 {
+                structure = if alternating && level % 2 == 0 {
                     format!("({structure} \"MIXED\" NIL NIL NIL NIL)")
                 } else {
                     format!(
@@ -123,7 +123,11 @@ async fn embedded_messages_share_the_configured_mime_depth_budget() {
                 )
                 .await;
             if depth > ceiling {
-                assert_eq!(result.unwrap_err(), Error::Limit, "depth={depth}");
+                assert_eq!(
+                    result.unwrap_err(),
+                    Error::Limit,
+                    "depth={depth}, alternating={alternating}"
+                );
             } else {
                 result.expect("embedded messages must preserve the configured depth range");
             }
