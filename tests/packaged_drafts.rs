@@ -5,6 +5,8 @@
 
 #[path = "packaged_drafts/bounds.rs"]
 mod bounds;
+#[path = "packaged_drafts/composition.rs"]
+mod composition;
 #[path = "packaged_drafts/history.rs"]
 mod history;
 mod imap_support;
@@ -224,6 +226,27 @@ initialization_seconds = 1
             "email_list_accounts" => {
                 command.args(["account", "list"]);
             }
+            "email_list_mailboxes" => {
+                command.args(["mailbox", "list"]);
+            }
+            "email_search_messages" => {
+                command.args([
+                    "message",
+                    "search",
+                    "--mailbox",
+                    input["mailbox"].as_str().unwrap(),
+                    "--limit",
+                    "1",
+                ]);
+            }
+            "email_get_message" => {
+                command.args([
+                    "message",
+                    "get",
+                    "--message",
+                    input["message"].as_str().unwrap(),
+                ]);
+            }
             "email_capabilities" => {
                 command.args(["capability", "show"]);
             }
@@ -331,6 +354,7 @@ impl Caller {
                 );
                 if let Some(code) = response["error"]["code"].as_str() {
                     let exit = match code {
+                        "invalid_request" => 2,
                         "outcome_unknown" | "operation_in_progress" => 7,
                         "operation_conflict" | "operation_not_found" => 6,
                         "permission_denied" | "account_not_allowed" | "mailbox_not_allowed" => 3,
@@ -434,6 +458,61 @@ fn assert_appended_content(fixture: &Fixture, response: &Value) {
     for key in ["account_id", "account_generation", "operation_id"] {
         assert_eq!(response["result"][key], fixture.input[key]);
     }
+}
+
+async fn read_only_message(fixture: &Fixture, executable: &str) -> Value {
+    let before = history::rows(fixture);
+    let appends = fixture.server.drafts();
+    let reader = Caller::start(fixture, executable, "default", false).await;
+    fixture
+        .server
+        .expect_mailboxes("work@example.test", "disposable-password", &["INBOX"]);
+    let listed = reader
+        .call(fixture, "email_list_mailboxes", json!({}))
+        .await;
+    assert!(listed.get("error").is_none(), "{listed}");
+    let mailboxes = listed["result"]["mailboxes"].as_array().unwrap();
+    assert_eq!(mailboxes.len(), 1);
+    let mailbox = &mailboxes[0];
+    assert_eq!(mailbox["account_id"], fixture.input["account_id"]);
+    assert_eq!(mailbox["generation"], fixture.input["account_generation"]);
+    assert_eq!(mailbox["metadata"]["name"], "INBOX");
+    fixture
+        .server
+        .expect_search("work@example.test", "disposable-password", "INBOX", None);
+    let search = reader
+        .call(
+            fixture,
+            "email_search_messages",
+            json!({"mailbox": mailbox["reference"], "limit": 1}),
+        )
+        .await;
+    assert!(search.get("error").is_none(), "{search}");
+    let message = &search["result"]["messages"][0];
+    assert_eq!(message["message_id"]["value"], "<search-3@example.test>");
+    assert_eq!(message["flags"], json!(["\\Seen"]));
+    fixture
+        .server
+        .expect_body_bytes("INBOX", b"Short body.\r\n");
+    let body = reader
+        .call(
+            fixture,
+            "email_get_message",
+            json!({"message": message["reference"]}),
+        )
+        .await;
+    assert!(body.get("error").is_none(), "{body}");
+    assert_eq!(body["result"]["account_id"], mailbox["account_id"]);
+    assert_eq!(body["result"]["generation"], mailbox["generation"]);
+    assert_eq!(body["result"]["message_reference"], message["reference"]);
+    assert_eq!(body["result"]["body"]["text"], "Short body.\r\n");
+    assert_eq!(body["result"]["body"]["truncated"], false);
+    reader.finish().await;
+    // Exact LIST/EXAMINE/SEARCH/PEEK transcripts forbid mutation. Reads must
+    // leave both remote draft literals and the independent journal unchanged.
+    assert_eq!(fixture.server.drafts(), appends);
+    assert_eq!(history::rows(fixture), before);
+    json!({"mailbox": mailbox, "message": message, "body": body["result"]})
 }
 
 macro_rules! component_tests {
@@ -686,6 +765,7 @@ async fn quota_and_authorization(executable: &str) {
         grant.limits.journal_records = 1;
     }
     fixture.configure(&config);
+    let ordinary = read_only_message(&fixture, executable).await;
     fixture.server.expect_append(server::DraftReply::Disconnect);
     assert_uncertain(&fixture.save(executable).await, &fixture);
     let original = fixture.input.clone();
@@ -694,6 +774,7 @@ async fn quota_and_authorization(executable: &str) {
         fixture.save(executable).await["error"]["code"],
         "journal_full"
     );
+    assert_eq!(read_only_message(&fixture, executable).await, ordinary);
     fixture.input = original;
     assert_uncertain(&fixture.status(executable, false).await, &fixture);
     fixture.server.expect_reconciliation();
@@ -728,7 +809,7 @@ async fn quota_and_authorization(executable: &str) {
         .call(executable, "email_capabilities", json!({}))
         .await;
     assert!(health.get("error").is_none());
-    assert_eq!(fixture.server.accepted(), 2);
+    assert_eq!(fixture.server.accepted(), 8);
     assert_eq!(fixture.server.interrupted(), 1);
     fixture.server.finish();
 }

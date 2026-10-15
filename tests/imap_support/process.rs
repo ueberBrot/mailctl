@@ -67,9 +67,9 @@ enum ExpectedOperation {
     ExportPause(export_faults::ExportPause),
 }
 
-#[derive(Clone)]
 pub enum DraftReply {
     Created(bool),
+    ObservedCreated(tokio::sync::oneshot::Sender<()>),
     Rejected,
     Disconnect,
     Hold(Arc<AtomicUsize>),
@@ -382,6 +382,12 @@ impl ImapServer {
 
     pub fn expect_append(&self, reply: DraftReply) {
         self.expect_append_after(reply, Duration::ZERO);
+    }
+
+    pub fn expect_observed_creation(&self) -> tokio::sync::oneshot::Receiver<()> {
+        let (acknowledged, observation) = tokio::sync::oneshot::channel();
+        self.expect_append(DraftReply::ObservedCreated(acknowledged));
+        observation
     }
 
     pub fn expect_append_after(&self, reply: DraftReply, preparation_delay: Duration) {
@@ -1083,6 +1089,10 @@ async fn append_draft(
                 ),
             )
             .await
+        }
+        DraftReply::ObservedCreated(acknowledged) => {
+            imap_support::write(wire, &format!("{tag} OK [APPENDUID 77 4] accepted\r\n")).await;
+            acknowledged.send(()).unwrap();
         }
         DraftReply::Rejected => {
             imap_support::write(wire, &format!("{tag} NO synthetic rejection\r\n")).await

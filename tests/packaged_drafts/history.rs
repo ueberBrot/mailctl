@@ -5,7 +5,7 @@ use rusqlite::types::Value as SqlValue;
 use serde_json::{Value, json};
 use std::fs;
 
-fn rows(fixture: &Fixture) -> Vec<Vec<SqlValue>> {
+pub(super) fn rows(fixture: &Fixture) -> Vec<Vec<SqlValue>> {
     let database = rusqlite::Connection::open(fixture.state().join("drafts.sqlite")).unwrap();
     let mut statement = database
         .prepare(
@@ -25,7 +25,7 @@ fn assert_error(response: &Value, code: &str) {
     assert_eq!(response["error"]["code"], code, "{response}");
 }
 
-async fn assert_read_only_ready(fixture: &Fixture, executable: &str) {
+async fn assert_read_only_health(fixture: &Fixture, executable: &str) {
     let reader = Caller::start(fixture, executable, "default", false).await;
     let health = reader.call(fixture, "email_capabilities", json!({})).await;
     assert_eq!(health["result"]["health"]["status"], "ready");
@@ -165,7 +165,7 @@ async fn snapshots_preserve_all_outcomes_and_suspend_missing_history(executable:
     assert_eq!(fixture.save(executable).await["result"], verified["result"]);
     assert_eq!(fixture.server.drafts().len(), appends);
     assert_eq!(fixture.server.accepted(), connections + 1);
-    assert_read_only_ready(&fixture, executable).await;
+    assert_read_only_health(&fixture, executable).await;
     fixture.server.finish();
 }
 
@@ -208,7 +208,7 @@ async fn journal_loss_stays_suspended_after_file_replacement(executable: &str) {
         .await;
     assert_eq!(health["result"]["health"]["draft_journal"], "available");
     assert_eq!(health["result"]["health"]["draft_creation"], "unavailable");
-    assert_read_only_ready(&fixture, executable).await;
+    assert_read_only_health(&fixture, executable).await;
     assert_eq!(fixture.server.accepted(), 1);
     assert_eq!(fixture.server.drafts().len(), 1);
     fixture.server.finish();
@@ -494,8 +494,9 @@ async fn revoked_from_and_unretained_routes_preserve_history_without_dispatch(ex
     }
 }
 
-async fn unusable_writer_preserves_status_and_account_discovery(executable: &str) {
+async fn unusable_writer_preserves_status_and_provider_reads(executable: &str) {
     let mut fixture = Fixture::new(executable);
+    let ordinary = super::read_only_message(&fixture, executable).await;
     fixture
         .server
         .expect_append(server::DraftReply::Created(true));
@@ -526,9 +527,13 @@ async fn unusable_writer_preserves_status_and_account_discovery(executable: &str
             .as_array()
             .is_some_and(|accounts| !accounts.is_empty())
     );
-    assert_eq!(fixture.server.accepted(), 1);
+    assert_eq!(
+        super::read_only_message(&fixture, executable).await,
+        ordinary
+    );
+    assert_eq!(fixture.server.accepted(), 7);
     assert_eq!(fixture.server.drafts().len(), 1);
-    assert_read_only_ready(&fixture, executable).await;
+    assert_read_only_health(&fixture, executable).await;
     fixture.server.finish();
 }
 
@@ -609,7 +614,7 @@ async fn corrupt_rows_suspend_creation_after_repair(executable: &str) {
             &fixture.status(executable, false).await,
             "journal_unavailable",
         );
-        assert_read_only_ready(&fixture, executable).await;
+        assert_read_only_health(&fixture, executable).await;
         assert_eq!(fixture.server.accepted(), 1);
         assert_eq!(fixture.server.drafts().len(), 1);
         fixture.server.finish();
@@ -654,14 +659,14 @@ async fn mcp_journal_loss_stays_suspended_after_file_replacement() {
 
 #[cfg(feature = "cli")]
 #[tokio::test]
-async fn cli_unusable_writer_preserves_status_and_account_discovery() {
-    unusable_writer_preserves_status_and_account_discovery(support::MAILCTL).await;
+async fn cli_unusable_writer_preserves_status_and_provider_reads() {
+    unusable_writer_preserves_status_and_provider_reads(support::MAILCTL).await;
 }
 
 #[cfg(feature = "mcp")]
 #[tokio::test]
-async fn mcp_unusable_writer_preserves_status_and_account_discovery() {
-    unusable_writer_preserves_status_and_account_discovery(support::MAILCTL_MCP).await;
+async fn mcp_unusable_writer_preserves_status_and_provider_reads() {
+    unusable_writer_preserves_status_and_provider_reads(support::MAILCTL_MCP).await;
 }
 
 #[cfg(feature = "cli")]

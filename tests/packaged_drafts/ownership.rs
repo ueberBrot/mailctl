@@ -112,6 +112,96 @@ fn assert_owner_held(fixture: &Fixture, state: &str) {
     assert_eq!(retained, state);
 }
 
+async fn unread_creation_response(executable: &str) {
+    use rusqlite::OptionalExtension;
+
+    let mut fixture = Fixture::new(executable);
+    let acknowledged = fixture.server.expect_observed_creation();
+    let mut owner = start_request(
+        &fixture,
+        executable,
+        "email_save_draft",
+        fixture.input.clone(),
+        "writer",
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(5), acknowledged)
+        .await
+        .expect("provider flushes tagged APPEND ACK")
+        .unwrap();
+    let database = rusqlite::Connection::open_with_flags(
+        fixture.state().join("drafts.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let operation = uuid::Uuid::parse_str(fixture.input["operation_id"].as_str().unwrap()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let state: Option<String> = database
+                .query_row(
+                    "SELECT state FROM draft_operations WHERE operation_id = ?1",
+                    [operation.as_bytes().as_slice()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .unwrap();
+            if state.as_deref() == Some("created") {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("independent reader observes committed creation after provider ACK");
+    drop(database);
+
+    // No read/poll/drain of the save response: only MCP initialization was
+    // consumed. The receipt may have reached the OS pipe; killing the process
+    // and discarding that unread pipe models caller response loss after commit,
+    // not loss of the provider ACK or a consumed-and-discarded full receipt.
+    owner.kill().await.unwrap();
+    drop(owner.stdout.take());
+    drop(owner.stdin.take());
+    tokio::time::timeout(Duration::from_secs(5), owner.wait())
+        .await
+        .expect("original caller exits without reading its receipt")
+        .unwrap();
+    let retained = history::rows(&fixture);
+    assert_eq!(retained.len(), 1);
+    let status = fixture.status(executable, false).await;
+    assert_eq!(status["result"]["state"], "created");
+    assert_eq!(status["result"]["dispatched"], true);
+    assert!(status["result"]["message_reference"].is_string());
+    assert_appended_content(&fixture, &status);
+    assert_eq!(fixture.save(executable).await["result"], status["result"]);
+    assert_eq!(
+        fixture.status(executable, true).await["result"],
+        status["result"]
+    );
+    let mut conflict = fixture.input.clone();
+    conflict["draft"]["body"] = json!("Conflicting input after unread receipt");
+    assert_eq!(
+        fixture.call(executable, "email_save_draft", conflict).await["error"]["code"],
+        "operation_conflict"
+    );
+    assert_eq!(history::rows(&fixture), retained);
+    assert_eq!(fixture.server.accepted(), 1);
+    assert_eq!(fixture.server.interrupted(), 1);
+    fixture.server.finish();
+}
+
+#[cfg(feature = "cli")]
+#[tokio::test]
+async fn cli_unread_first_creation_response_replays_committed_receipt() {
+    unread_creation_response(support::MAILCTL).await;
+}
+
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn mcp_unread_first_creation_response_replays_committed_receipt() {
+    unread_creation_response(support::MAILCTL_MCP).await;
+}
+
 async fn interrupted_creation(executable: &str) {
     for crash in [true, false] {
         let mut fixture = Fixture::new(executable);
