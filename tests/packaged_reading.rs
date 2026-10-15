@@ -165,8 +165,10 @@ impl Reader {
                 let output = fixture.cli(arguments);
                 let response = envelope(&output);
                 assert_eq!(output.status.success(), response.get("error").is_none());
-                if response["error"]["code"] == "response_too_large" {
-                    assert_eq!(output.status.code(), Some(8));
+                match response["error"]["code"].as_str() {
+                    Some("response_too_large") => assert_eq!(output.status.code(), Some(8)),
+                    Some("stale_cursor") => assert_eq!(output.status.code(), Some(6)),
+                    _ => {}
                 }
                 response
             }
@@ -422,6 +424,95 @@ async fn cli_enforces_selected_body_wire_bounds_without_attachment_downloads() {
 #[tokio::test]
 async fn mcp_enforces_selected_body_wire_bounds_without_attachment_downloads() {
     read_selected_body_wire_bounds(support::MAILCTL_MCP).await;
+}
+
+async fn reject_body_cursor_after_content_changes(executable: &str) {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let mut fixture = Fixture::new(executable);
+        let reader = Reader::start(&fixture, executable).await;
+        let (mailbox, before) = discover_message(&fixture, &reader).await;
+        let message = before["reference"].as_str().unwrap();
+        fixture
+            .server
+            .expect_body_bytes("INBOX", "a🦀éxyz".as_bytes());
+        let result = reader
+            .call(
+                &fixture,
+                &["message", "get", "--message", message, "--max-bytes", "4"],
+                "email_get_message",
+                json!({"message": message, "max_bytes": 4}),
+            )
+            .await;
+        let body = &result["body"];
+        assert_eq!(body["text"], "a");
+        assert_eq!(body["continuation_available"], true);
+        assert_eq!(body["truncated"], true);
+        let cursor = body["next_cursor"].as_str().unwrap();
+
+        // Only the final byte changes, beyond the requested continuation page.
+        // Identity, part, encoded size and MIME metadata remain unchanged.
+        fixture
+            .server
+            .expect_body_bytes("INBOX", "a🦀éxyZ".as_bytes());
+        let response = reader
+            .response(
+                &fixture,
+                &[
+                    "message",
+                    "get",
+                    "--message",
+                    message,
+                    "--max-bytes",
+                    "4",
+                    "--cursor",
+                    cursor,
+                ],
+                "email_get_message",
+                json!({"message": message, "max_bytes": 4, "cursor": cursor}),
+            )
+            .await;
+        assert_eq!(response["error"]["code"], "stale_cursor");
+        assert!(response.get("result").is_none());
+
+        fixture
+            .server
+            .expect_body_bytes("INBOX", "a🦀éxyZ".as_bytes());
+        let result = reader
+            .call(
+                &fixture,
+                &["message", "get", "--message", message],
+                "email_get_message",
+                json!({"message": message}),
+            )
+            .await;
+        let body = &result["body"];
+        assert_eq!(body["text"], "a🦀éxyZ");
+        assert_eq!(body["selected_part"], "1");
+        assert_eq!(body["source_media_type"], "text/plain");
+        assert_eq!(body["converted"], false);
+        assert_eq!(body["replacements"], false);
+        assert!(body["empty_reason"].is_null());
+        assert!(body["next_cursor"].is_null());
+        assert_eq!(body["continuation_available"], false);
+        assert_eq!(body["truncated"], false);
+        assert_eq!(search_message(&fixture, &reader, &mailbox).await, before);
+        reader.finish().await;
+        fixture.server.finish();
+    })
+    .await
+    .expect("standalone body-cursor invalidation deadline");
+}
+
+#[cfg(feature = "cli")]
+#[tokio::test]
+async fn cli_rejects_body_cursor_after_selected_content_changes() {
+    reject_body_cursor_after_content_changes(support::MAILCTL).await;
+}
+
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn mcp_rejects_body_cursor_after_selected_content_changes() {
+    reject_body_cursor_after_content_changes(support::MAILCTL_MCP).await;
 }
 
 #[cfg(feature = "cli")]
