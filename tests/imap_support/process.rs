@@ -56,6 +56,7 @@ pub enum AttachmentPhase {
     List,
     Start,
     Continue,
+    StaleContinuation,
     Truncated,
     TruncatedContinuation,
     Interrupted,
@@ -211,7 +212,7 @@ impl ImapServer {
                                 },
                                 ExpectedOperation::Attachment(mailbox, phase, filename) => {
                                     attachment_page(&mut wire, mailbox, phase, &filename, &stalled).await;
-                                    if matches!(phase, AttachmentPhase::Truncated | AttachmentPhase::TruncatedContinuation | AttachmentPhase::Interrupted | AttachmentPhase::InterruptedContinuation) { return; }
+                                    if matches!(phase, AttachmentPhase::StaleContinuation | AttachmentPhase::Truncated | AttachmentPhase::TruncatedContinuation | AttachmentPhase::Interrupted | AttachmentPhase::InterruptedContinuation) { return; }
                                 },
                             }
                             imap_support::logout(&mut wire).await;
@@ -680,6 +681,18 @@ async fn attachment_page(
     }
     if payload == AttachmentPhase::InterruptedContinuation {
         interrupt_attachment(wire, interrupted).await;
+        return;
+    }
+    if payload == AttachmentPhase::StaleContinuation {
+        write(
+            wire,
+            &format!(
+                "* 3 EXISTS\r\n* OK [UIDVALIDITY 78] replaced\r\n{tag} OK [READ-ONLY] selected\r\n"
+            ),
+        )
+        .await;
+        // Buffered decoded bytes must not bypass the mailbox identity check.
+        imap_support::dropped(wire).await;
         return;
     }
     write(
