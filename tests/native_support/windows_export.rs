@@ -3,7 +3,6 @@
     reason = "native writer and CLI process tests use different parts of this fixture"
 )]
 use crate::support::{assert_success, run_bounded};
-use serde_json::Value;
 use std::{fs, path::Path, process::Command};
 
 #[allow(
@@ -29,29 +28,121 @@ pub(crate) fn protect_root(path: &Path) {
     assert_success(&run_bounded(command));
 }
 
+#[cfg(windows)]
+#[allow(
+    unsafe_code,
+    reason = "The independent ACL observer reads native security descriptors and numeric SIDs"
+)]
 pub(crate) fn assert_private(path: &Path) {
-    let mut command = powershell();
-    command.env("MAILCTL_EXPORT_ACL_FIXTURE", path).args([
-        "-Command",
-        r#"$ErrorActionPreference = 'Stop'; $acl = Get-Acl -LiteralPath $env:MAILCTL_EXPORT_ACL_FIXTURE; [ordered]@{ owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value; current = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value; protected = $acl.AreAccessRulesProtected; rules = @($acl.Access | ForEach-Object { [ordered]@{ sid = $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value; allowed = $_.AccessControlType.ToString(); inherited = $_.IsInherited; rights = [int64]$_.FileSystemRights } }) } | ConvertTo-Json -Depth 4 -Compress"#,
-    ]);
-    let output = run_bounded(command);
-    assert_success(&output);
-    let acl: Value = serde_json::from_slice(&output.stdout).expect("ACL observation is JSON");
-    assert_eq!(acl["owner"], acl["current"], "operator owns export file");
-    assert_eq!(acl["protected"], true, "export ACL disables inheritance");
-    let current = acl["current"].as_str().unwrap();
-    let rules = acl["rules"].as_array().unwrap();
-    assert!(!rules.is_empty(), "export file has an explicit DACL");
-    assert!(rules.iter().any(|rule| rule["sid"] == current));
-    for rule in rules {
-        assert_eq!(rule["inherited"], false);
-        if rule["allowed"] == "Allow" && rule["rights"] != 0 {
-            assert!(
-                [current, "S-1-5-18", "S-1-5-32-544"].contains(&rule["sid"].as_str().unwrap()),
-                "export DACL grants another identity access: {rule}"
-            );
+    use std::{ffi::c_void, io, os::windows::ffi::OsStrExt, ptr};
+    use windows_sys::Win32::{
+        Foundation::LocalFree,
+        Security::{
+            ACCESS_ALLOWED_ACE, ACCESS_DENIED_ACE, ACE_HEADER,
+            Authorization::{ConvertStringSidToSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT},
+            DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetSecurityDescriptorControl,
+            INHERITED_ACE, IsValidAcl, IsValidSid, IsWellKnownSid, OWNER_SECURITY_INFORMATION,
+            SE_DACL_PROTECTED, WinBuiltinAdministratorsSid, WinLocalSystemSid,
+        },
+        System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE},
+    };
+
+    struct Allocation(*mut c_void);
+    impl Drop for Allocation {
+        fn drop(&mut self) {
+            unsafe { LocalFree(self.0) };
         }
+    }
+
+    let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    assert!(!path[..path.len() - 1].contains(&0));
+    let sid: Vec<u16> = current_sid().encode_utf16().chain(Some(0)).collect();
+    unsafe {
+        let mut current = ptr::null_mut();
+        assert_ne!(
+            ConvertStringSidToSidW(sid.as_ptr(), &mut current),
+            0,
+            "parse observer identity: {}",
+            io::Error::last_os_error()
+        );
+        let current = Allocation(current);
+
+        let mut owner = ptr::null_mut();
+        let mut acl = ptr::null_mut();
+        let mut descriptor = ptr::null_mut();
+        // Query the named path independently of production's open-handle validation.
+        let error = GetNamedSecurityInfoW(
+            path.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
+            ptr::null_mut(),
+            &mut acl,
+            ptr::null_mut(),
+            &mut descriptor,
+        );
+        let descriptor = Allocation(descriptor);
+        assert_eq!(
+            error,
+            0,
+            "observe export ACL: {}",
+            io::Error::from_raw_os_error(error as i32)
+        );
+        assert!(!owner.is_null() && IsValidSid(owner) != 0);
+        assert_ne!(EqualSid(owner, current.0), 0, "operator owns export file");
+        let mut control = 0;
+        let mut revision = 0;
+        assert_ne!(
+            GetSecurityDescriptorControl(descriptor.0, &mut control, &mut revision),
+            0
+        );
+        assert_ne!(
+            control & SE_DACL_PROTECTED,
+            0,
+            "export ACL disables inheritance"
+        );
+        assert!(
+            !acl.is_null() && IsValidAcl(acl) != 0,
+            "export file has an explicit DACL"
+        );
+        assert_ne!((*acl).AceCount, 0, "export file has an explicit DACL");
+        let mut current_has_rule = false;
+        for index in 0..(*acl).AceCount {
+            let mut entry = ptr::null_mut();
+            assert_ne!(GetAce(acl, u32::from(index), &mut entry), 0);
+            let header = &*entry.cast::<ACE_HEADER>();
+            assert_eq!(
+                u32::from(header.AceFlags) & INHERITED_ACE,
+                0,
+                "export ACE is explicit"
+            );
+            let (sid, allows_access) = match u32::from(header.AceType) {
+                ACCESS_ALLOWED_ACE_TYPE => {
+                    let ace = &*entry.cast::<ACCESS_ALLOWED_ACE>();
+                    (ptr::addr_of!(ace.SidStart).cast_mut().cast(), ace.Mask != 0)
+                }
+                ACCESS_DENIED_ACE_TYPE => {
+                    let ace = &*entry.cast::<ACCESS_DENIED_ACE>();
+                    (ptr::addr_of!(ace.SidStart).cast_mut().cast(), false)
+                }
+                kind => panic!("unexpected export ACE type: {kind}"),
+            };
+            assert_ne!(IsValidSid(sid), 0);
+            let is_current = EqualSid(sid, current.0) != 0;
+            current_has_rule |= is_current;
+            if allows_access {
+                assert!(
+                    is_current
+                        || IsWellKnownSid(sid, WinLocalSystemSid) != 0
+                        || IsWellKnownSid(sid, WinBuiltinAdministratorsSid) != 0,
+                    "export DACL grants another identity access at ACE {index}"
+                );
+            }
+        }
+        assert!(
+            current_has_rule,
+            "export DACL includes the operator identity"
+        );
     }
 }
 
@@ -126,12 +217,6 @@ fn whoami_sid(output: &[u8]) -> Option<&str> {
         }
     }
     Some(sid)
-}
-
-fn powershell() -> Command {
-    let mut command = Command::new("powershell.exe");
-    command.args(["-NoProfile", "-NonInteractive"]);
-    command
 }
 
 #[cfg(test)]
