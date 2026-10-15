@@ -293,9 +293,12 @@ async fn nested_and_malformed_bodystructures_fail_finitely_at_the_public_route()
     );
     limited.task.await.unwrap();
 
-    // The pinned io-imap codec accepts six multipart wrappers (a text leaf at depth seven) and
-    // rejects the seventh wrapper while decoding BODYSTRUCTURE, before our configurable limit.
-    let codec_limit = format!("({within_limit} \"MIXED\" NIL NIL NIL NIL)");
+    // The typed decoder must admit the default semantic depth ceiling so the
+    // application can reject its first excess MIME level with a bounds error.
+    let mut codec_limit = leaf;
+    for _ in 0..Limits::default().max_nesting {
+        codec_limit = format!("({codec_limit} \"MIXED\" NIL NIL NIL NIL)");
+    }
     let mut rejected = fixture(TlsMode::Implicit, Limits::default(), move |mut wire| {
         Box::pin(async move {
             authenticate(&mut wire).await;
@@ -316,7 +319,7 @@ async fn nested_and_malformed_bodystructures_fail_finitely_at_the_public_route()
             )
             .await
             .unwrap_err(),
-        Error::Protocol
+        Error::Limit
     );
     rejected.task.await.unwrap();
 
