@@ -92,7 +92,7 @@ fn cli_decodes_deep_mime_from_a_one_mib_lifecycle_caller() {
             // Deeper legal frames are typed before semantic rejection; 64/1000
             // also exercise the protocol nesting guard. No rejection may fetch
             // body bytes. The direct codec probe separately checks its budget.
-            for depth in [40, 41, 63, 64, 1000] {
+            for depth in [ceiling, ceiling + 1, 63, 64, 1000] {
                 server.expect_mime_depth(depth, kind, depth <= ceiling);
                 let output = cli(&["attachment", "list", "--message", &message]);
                 assert_eq!(
@@ -152,7 +152,7 @@ async fn mcp_decodes_deep_mime_from_a_one_mib_lifecycle_caller() {
                 .as_str()
                 .unwrap();
             for kind in 0..3 {
-                for depth in [40, 41, 63, 64, 1000] {
+                for depth in [ceiling, ceiling + 1, 63, 64, 1000] {
                     server.expect_mime_depth(depth, kind, depth <= ceiling);
                     let result = call(
                         &client,
@@ -164,8 +164,9 @@ async fn mcp_decodes_deep_mime_from_a_one_mib_lifecycle_caller() {
                 }
             }
             // The same session remains usable after every rejected structure.
+            server.expect_mailboxes("work@example.test", "disposable-password", &["INBOX"]);
             assert!(
-                call(&client, "email_capabilities", json!({}))
+                call(&client, "email_list_mailboxes", json!({}))
                     .await
                     .get("result")
                     .is_some()

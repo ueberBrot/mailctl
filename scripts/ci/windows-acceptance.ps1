@@ -1,6 +1,6 @@
 param (
     [Parameter(Mandatory)]
-    [ValidateSet('repeat-drafts', 'credentials')]
+    [ValidateSet('repeat-drafts', 'credentials', 'mime-depth')]
     [string]$Suite
 )
 
@@ -8,6 +8,15 @@ $ErrorActionPreference = 'Stop'
 Set-Location "$PSScriptRoot/../.."
 
 switch ($Suite) {
+    'mime-depth' {
+        cargo test --release --locked -p mailctl-process-tests `
+            --no-default-features --features "$env:MAILCTL_FEATURES" --test mime_depth
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        cargo test --release --locked -p mailctl --no-default-features `
+            --features "$env:MAILCTL_FEATURES" --test imap_allocations `
+            deep_bodystructure_codec_has_finite_work_and_stack
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    }
     'repeat-drafts' {
         # Match the preceding workspace/component build instead of relinking
         # the drivers with a different package-only dependency feature graph.

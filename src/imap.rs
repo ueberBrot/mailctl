@@ -1,4 +1,7 @@
 //! Bounded IMAP operations shared by the application and protocol fixtures.
+//!
+//! Typed decoding uses bounded recursive parsers. Embedded runtimes should
+//! reserve 8 MiB per decoding thread, as the shipped frontends do.
 use crate::domain::mailbox_identity;
 mod append;
 mod attachment;
