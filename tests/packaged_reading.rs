@@ -151,14 +151,24 @@ impl Reader {
         }
     }
 
-    async fn call(&self, fixture: &Fixture, arguments: &[&str], tool: &str, input: Value) -> Value {
+    async fn response(
+        &self,
+        fixture: &Fixture,
+        arguments: &[&str],
+        tool: &str,
+        input: Value,
+    ) -> Value {
         match self {
             #[cfg(feature = "cli")]
             Self::Cli => {
                 let _ = (tool, input);
                 let output = fixture.cli(arguments);
-                assert_success(&output);
-                envelope(&output)["result"].take()
+                let response = envelope(&output);
+                assert_eq!(output.status.success(), response.get("error").is_none());
+                if response["error"]["code"] == "response_too_large" {
+                    assert_eq!(output.status.code(), Some(8));
+                }
+                response
             }
             #[cfg(feature = "mcp")]
             Self::Mcp(client) => {
@@ -170,10 +180,15 @@ impl Reader {
                     )
                     .await
                     .unwrap();
-                assert_eq!(response.is_error, Some(false));
-                support::assert_mcp_envelope(response)["result"].take()
+                support::assert_mcp_envelope(response)
             }
         }
+    }
+
+    async fn call(&self, fixture: &Fixture, arguments: &[&str], tool: &str, input: Value) -> Value {
+        let mut response = self.response(fixture, arguments, tool, input).await;
+        assert!(response.get("error").is_none(), "{response}");
+        response["result"].take()
     }
 
     async fn finish(self) {
@@ -326,6 +341,87 @@ async fn cli_reads_selected_bodies_at_utf8_boundaries_without_attachment_downloa
 #[tokio::test]
 async fn mcp_reads_selected_bodies_at_utf8_boundaries_without_attachment_downloads() {
     read_and_continue_selected_bodies(support::MAILCTL_MCP).await;
+}
+
+async fn read_selected_body_wire_bounds(executable: &str) {
+    use server::BodyBound;
+
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let mut fixture = Fixture::new(executable);
+        let reader = Reader::start(&fixture, executable).await;
+        let (mailbox, before) = discover_message(&fixture, &reader).await;
+        let message = before["reference"].as_str().unwrap();
+        let mut cursor: Option<String> = None;
+        let mut received = 0;
+        for (page, expected) in b"abcdefgh".iter().enumerate() {
+            fixture.server.expect_body_bound("INBOX", BodyBound::Exact);
+            let mut arguments = vec![
+                "message",
+                "get",
+                "--message",
+                message,
+                "--max-bytes",
+                "262144",
+            ];
+            if let Some(cursor) = &cursor {
+                arguments.extend(["--cursor", cursor]);
+            }
+            let result = reader
+                .call(
+                    &fixture,
+                    &arguments,
+                    "email_get_message",
+                    json!({"message": message, "max_bytes": 262144, "cursor": cursor}),
+                )
+                .await;
+            let body = &result["body"];
+            let text = body["text"].as_str().unwrap();
+            assert_eq!(text.len(), 256 * 1024);
+            assert!(text.bytes().all(|byte| byte == *expected), "page {page}");
+            assert_eq!(body["selected_part"], "1");
+            assert_eq!(body["source_media_type"], "text/plain");
+            assert_eq!(body["converted"], false);
+            assert_eq!(body["replacements"], false);
+            assert!(body["empty_reason"].is_null());
+            received += text.len();
+            cursor = body["next_cursor"].as_str().map(str::to_owned);
+            let more = page < 7;
+            assert_eq!(cursor.is_some(), more);
+            assert_eq!(body["continuation_available"], more);
+            assert_eq!(body["truncated"], more);
+        }
+        assert_eq!(received, 2 * 1024 * 1024);
+        for bound in [BodyBound::DeclaredExcess, BodyBound::ReceivedExcess] {
+            fixture.server.expect_body_bound("INBOX", bound);
+            let response = reader
+                .response(
+                    &fixture,
+                    &["message", "get", "--message", message],
+                    "email_get_message",
+                    json!({"message": message}),
+                )
+                .await;
+            assert_eq!(response["error"]["code"], "response_too_large", "{bound:?}");
+            assert!(response.get("result").is_none());
+        }
+        assert_eq!(search_message(&fixture, &reader, &mailbox).await, before);
+        reader.finish().await;
+        fixture.server.finish();
+    })
+    .await
+    .expect("standalone selected-body bounds deadline");
+}
+
+#[cfg(feature = "cli")]
+#[tokio::test]
+async fn cli_enforces_selected_body_wire_bounds_without_attachment_downloads() {
+    read_selected_body_wire_bounds(support::MAILCTL).await;
+}
+
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn mcp_enforces_selected_body_wire_bounds_without_attachment_downloads() {
+    read_selected_body_wire_bounds(support::MAILCTL_MCP).await;
 }
 
 #[cfg(feature = "cli")]

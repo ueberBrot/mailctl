@@ -38,6 +38,7 @@ enum ExpectedOperation {
     AllMailboxes(Vec<&'static str>),
     Search(&'static str, Option<u32>),
     Body(&'static str, Vec<u8>, BodyKind),
+    BodyBound(&'static str, BodyBound),
     Attachment(&'static str, AttachmentPhase, String),
 }
 
@@ -65,6 +66,13 @@ pub enum BodyKind {
     Plain,
     Html,
     Alternative,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum BodyBound {
+    Exact,
+    DeclaredExcess,
+    ReceivedExcess,
 }
 
 pub struct ImapServer {
@@ -181,6 +189,10 @@ impl ImapServer {
                                 }
                                 ExpectedOperation::Search(mailbox, position) => search_page(&mut wire, mailbox, position).await,
                                 ExpectedOperation::Body(mailbox, text, kind) => body_page(&mut wire, mailbox, &text, kind).await,
+                                ExpectedOperation::BodyBound(mailbox, bound) => {
+                                    bounded_body(&mut wire, mailbox, bound).await;
+                                    if !matches!(bound, BodyBound::Exact) { return; }
+                                },
                                 ExpectedOperation::Attachment(mailbox, phase, filename) => {
                                     attachment_page(&mut wire, mailbox, phase, &filename, &stalled).await;
                                     if matches!(phase, AttachmentPhase::Truncated | AttachmentPhase::TruncatedContinuation | AttachmentPhase::Interrupted | AttachmentPhase::InterruptedContinuation) { return; }
@@ -337,6 +349,14 @@ impl ImapServer {
         });
     }
 
+    pub fn expect_body_bound(&self, mailbox: &'static str, bound: BodyBound) {
+        self.expected.lock().unwrap().push_back(Expected {
+            username: "work@example.test",
+            password: "disposable-password",
+            operation: ExpectedOperation::BodyBound(mailbox, bound),
+        });
+    }
+
     pub fn expect_attachment(
         &self,
         username: &'static str,
@@ -423,7 +443,6 @@ async fn search_page(wire: &mut imap_support::Wire, mailbox: &str, position: Opt
 }
 
 async fn body_page(wire: &mut imap_support::Wire, mailbox: &str, text: &[u8], kind: BodyKind) {
-    use imap_support::{expect, write};
     let encoded;
     let (encoding, text) = if text == b"Short body.\r\n" {
         ("7BIT", text)
@@ -432,16 +451,6 @@ async fn body_page(wire: &mut imap_support::Wire, mailbox: &str, text: &[u8], ki
         encoded = STANDARD.encode(text);
         ("BASE64", encoded.as_bytes())
     };
-    let tag = expect(wire, &format!("EXAMINE {}", mailbox_argument(mailbox))).await;
-    write(
-        wire,
-        &format!("* 3 EXISTS\r\n* OK [UIDVALIDITY 77] stable\r\n{tag} OK [READ-ONLY] selected\r\n"),
-    )
-    .await;
-    let tag = expect(wire, "UID FETCH 3 (UID RFC822.SIZE BODYSTRUCTURE)").await;
-    // The attachment exceeds the default 2 MiB whole-message bound. Strict
-    // command matching permits only headers and the selected body, rejecting
-    // attachment fetches and mailbox mutations independently of the client.
     let (subtype, section) = match kind {
         BodyKind::Plain => ("PLAIN", "1"),
         BodyKind::Html => ("HTML", "1"),
@@ -458,32 +467,82 @@ async fn body_page(wire: &mut imap_support::Wire, mailbox: &str, text: &[u8], ki
     } else {
         selected
     };
-    write(wire, &format!("* 3 FETCH (UID 3 RFC822.SIZE 3000300 BODYSTRUCTURE ({body}(\"APPLICATION\" \"OCTET-STREAM\" NIL NIL NIL \"BASE64\" 3000000 NIL (\"ATTACHMENT\" NIL) NIL NIL) \"MIXED\" NIL NIL NIL NIL))\r\n{tag} OK fetched\r\n")).await;
-    for (section, count, value) in [
-        (
-            "HEADER",
-            16384,
-            b"MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=fixture\r\n\r\n"
-                .as_slice(),
-        ),
-        (section, text.len() + 1, text),
-    ] {
-        let tag = expect(
-            wire,
-            &format!("UID FETCH 3 (UID BODY.PEEK[{section}]<0.{count}>)"),
-        )
-        .await;
-        write(
-            wire,
-            &format!(
-                "* 3 FETCH (UID 3 BODY[{section}]<0> {{{}}}\r\n",
-                value.len()
-            ),
-        )
-        .await;
-        use tokio::io::AsyncWriteExt;
-        wire.write_all(value).await.unwrap();
-        write(wire, &format!(")\r\n{tag} OK fetched\r\n")).await;
+    body_headers(wire, mailbox, &body, text.len()).await;
+    body_literal(wire, section, 0, text.len() + 1, text).await;
+}
+
+async fn body_headers(wire: &mut imap_support::Wire, mailbox: &str, body: &str, size: usize) {
+    use imap_support::{expect, write};
+    let tag = expect(wire, &format!("EXAMINE {}", mailbox_argument(mailbox))).await;
+    write(
+        wire,
+        &format!("* 3 EXISTS\r\n* OK [UIDVALIDITY 77] stable\r\n{tag} OK [READ-ONLY] selected\r\n"),
+    )
+    .await;
+    let tag = expect(wire, "UID FETCH 3 (UID RFC822.SIZE BODYSTRUCTURE)").await;
+    // Only the selected part is fetchable; the 3 MB attachment and all mailbox
+    // mutations are independently rejected by exact command matching.
+    let total = size + 3_000_000 + 300;
+    write(wire, &format!("* 3 FETCH (UID 3 RFC822.SIZE {total} BODYSTRUCTURE ({body}(\"APPLICATION\" \"OCTET-STREAM\" NIL NIL NIL \"BASE64\" 3000000 NIL (\"ATTACHMENT\" NIL) NIL NIL) \"MIXED\" NIL NIL NIL NIL))\r\n{tag} OK fetched\r\n")).await;
+    body_literal(
+        wire,
+        "HEADER",
+        0,
+        16384,
+        b"MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=fixture\r\n\r\n",
+    )
+    .await;
+}
+
+async fn body_literal(
+    wire: &mut imap_support::Wire,
+    section: &str,
+    offset: usize,
+    count: usize,
+    value: &[u8],
+) {
+    use tokio::io::AsyncWriteExt;
+    let tag = imap_support::expect(
+        wire,
+        &format!("UID FETCH 3 (UID BODY.PEEK[{section}]<{offset}.{count}>)"),
+    )
+    .await;
+    let mut response = format!(
+        "* 3 FETCH (UID 3 BODY[{section}]<{offset}> {{{}}}\r\n",
+        value.len()
+    )
+    .into_bytes();
+    response.extend_from_slice(value);
+    response.extend_from_slice(format!(")\r\n{tag} OK fetched\r\n").as_bytes());
+    wire.write_all(&response).await.unwrap();
+    wire.flush().await.unwrap();
+}
+
+async fn bounded_body(wire: &mut imap_support::Wire, mailbox: &str, bound: BodyBound) {
+    const SIZE: usize = 2 * 1024 * 1024;
+    let declared = SIZE + usize::from(matches!(bound, BodyBound::DeclaredExcess));
+    let body = format!(
+        "(\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"7BIT\" {declared} 1 NIL NIL NIL NIL)"
+    );
+    body_headers(wire, mailbox, &body, declared).await;
+    if !matches!(bound, BodyBound::DeclaredExcess) {
+        // Eight distinguishable 256 KiB regions make repeated or skipped pages
+        // observable without retaining a complete source or reconstructed body.
+        for (region, byte) in b"abcdefgh".iter().enumerate() {
+            let chunk = [*byte; 16 * 1024];
+            for offset in (region * 256 * 1024..(region + 1) * 256 * 1024).step_by(chunk.len()) {
+                body_literal(wire, "1", offset, chunk.len(), &chunk).await;
+            }
+        }
+        let excess = if matches!(bound, BodyBound::ReceivedExcess) {
+            b"x".as_slice()
+        } else {
+            b""
+        };
+        body_literal(wire, "1", SIZE, 1, excess).await;
+    }
+    if !matches!(bound, BodyBound::Exact) {
+        imap_support::dropped(wire).await;
     }
 }
 
