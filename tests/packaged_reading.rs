@@ -167,7 +167,9 @@ impl Reader {
                 assert_eq!(output.status.success(), response.get("error").is_none());
                 match response["error"]["code"].as_str() {
                     Some("response_too_large") => assert_eq!(output.status.code(), Some(8)),
-                    Some("stale_cursor") => assert_eq!(output.status.code(), Some(6)),
+                    Some("stale_cursor" | "stale_reference") => {
+                        assert_eq!(output.status.code(), Some(6));
+                    }
                     Some("provider_unavailable") => assert_eq!(output.status.code(), Some(5)),
                     _ => {}
                 }
@@ -693,7 +695,7 @@ async fn cli_exports_privately_without_overwrite_and_cleans_up_failed_transfers(
 
 #[cfg(feature = "mcp")]
 #[tokio::test]
-async fn mcp_transfers_bounded_attachment_chunks_with_a_verified_digest() {
+async fn mcp_binds_attachment_tokens_to_the_issuing_session_and_consumes_them_once() {
     use server::AttachmentPhase;
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
         let mut fixture = Fixture::new(support::MAILCTL_MCP);
@@ -726,6 +728,21 @@ async fn mcp_transfers_bounded_attachment_chunks_with_a_verified_digest() {
         assert_eq!(first["decoded_offset"], 0);
         assert_eq!(first["bytes_base64"], "YWJj");
         assert_eq!(first["progress"]["status"], "continue");
+        let token = &first["progress"]["next_token"];
+        let foreign = Reader::start(&fixture, support::MAILCTL_MCP).await;
+        let accepted = fixture.server.accepted();
+        let denied = foreign
+            .response(
+                &fixture,
+                &[],
+                "email_get_attachment",
+                json!({"token": token}),
+            )
+            .await;
+        assert_eq!(denied["error"]["code"], "transfer_expired");
+        assert!(denied.get("result").is_none(), "{denied}");
+        assert_eq!(fixture.server.accepted(), accepted);
+        foreign.finish().await;
         fixture
             .server
             .expect_attachment(USERNAME, PASSWORD, "INBOX", AttachmentPhase::Continue);
@@ -734,7 +751,7 @@ async fn mcp_transfers_bounded_attachment_chunks_with_a_verified_digest() {
                 &fixture,
                 &[],
                 "email_get_attachment",
-                json!({"token": first["progress"]["next_token"]}),
+                json!({"token": token}),
             )
             .await;
         assert_eq!(last["decoded_offset"], 3);
@@ -743,10 +760,127 @@ async fn mcp_transfers_bounded_attachment_chunks_with_a_verified_digest() {
             last["progress"],
             json!({"status": "complete", "total_decoded_bytes": 6, "sha256": SHA256})
         );
+        let accepted = fixture.server.accepted();
+        let replay = reader
+            .response(
+                &fixture,
+                &[],
+                "email_get_attachment",
+                json!({"token": token}),
+            )
+            .await;
+        assert_eq!(replay["error"]["code"], "transfer_expired");
+        assert!(replay.get("result").is_none(), "{replay}");
+        assert_eq!(fixture.server.accepted(), accepted);
         assert_eq!(search_message(&fixture, &reader, &mailbox).await, before);
         reader.finish().await;
         fixture.server.finish();
     })
     .await
     .expect("MCP chunk transfer and shutdown deadline");
+}
+
+async fn reject_attachment_continuation_after_mailbox_recreation(executable: &str) {
+    use server::AttachmentPhase;
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let mut fixture = Fixture::new(executable);
+        let reader = Reader::start(&fixture, executable).await;
+        let (_, message) = discover_message(&fixture, &reader).await;
+        let message = message["reference"].as_str().unwrap();
+        fixture
+            .server
+            .expect_attachment(USERNAME, PASSWORD, "INBOX", AttachmentPhase::List);
+        let listed = reader
+            .call(
+                &fixture,
+                &["attachment", "list", "--message", message],
+                "email_list_attachments",
+                json!({"message": message}),
+            )
+            .await;
+        let reference = listed["attachments"][0]["reference"].as_str().unwrap();
+        fixture
+            .server
+            .expect_attachment(USERNAME, PASSWORD, "INBOX", AttachmentPhase::Start);
+        let token: Option<Value> = match &reader {
+            #[cfg(feature = "cli")]
+            Reader::Cli => None,
+            #[cfg(feature = "mcp")]
+            Reader::Mcp(_) => {
+                let first = reader
+                    .call(
+                        &fixture,
+                        &[],
+                        "email_get_attachment",
+                        json!({"attachment": reference}),
+                    )
+                    .await;
+                assert_eq!(first["decoded_offset"], 0);
+                assert_eq!(first["bytes_base64"], "YWJj");
+                assert_eq!(first["progress"]["status"], "continue");
+                Some(first["progress"]["next_token"].clone())
+            }
+        };
+        // Start fetches all six decoded bytes, so the remaining "def" is
+        // already buffered when the continuation observes UIDVALIDITY 78.
+        fixture.server.expect_attachment(
+            USERNAME,
+            PASSWORD,
+            "INBOX",
+            AttachmentPhase::StaleContinuation,
+        );
+        let input = token.as_ref().map_or_else(
+            || json!({"attachment": reference}),
+            |token| json!({"token": token}),
+        );
+        let failed = reader
+            .response(
+                &fixture,
+                &["attachment", "get", "--attachment", reference],
+                "email_get_attachment",
+                input,
+            )
+            .await;
+        assert_eq!(failed["error"]["code"], "stale_reference");
+        assert!(failed.get("result").is_none(), "{failed}");
+        if let Some(token) = token {
+            let accepted = fixture.server.accepted();
+            let replay = reader
+                .response(
+                    &fixture,
+                    &[],
+                    "email_get_attachment",
+                    json!({"token": token}),
+                )
+                .await;
+            assert_eq!(replay["error"]["code"], "transfer_expired");
+            assert!(replay.get("result").is_none(), "{replay}");
+            assert_eq!(fixture.server.accepted(), accepted);
+            // The serial server cannot serve this request until it observes
+            // disposal of the stale connection, while MCP remains running.
+            fixture
+                .server
+                .expect_mailboxes(USERNAME, PASSWORD, &["INBOX"]);
+            let listed = reader
+                .call(&fixture, &[], "email_list_mailboxes", json!({}))
+                .await;
+            assert_eq!(listed["mailboxes"].as_array().unwrap().len(), 1);
+        }
+        reader.finish().await;
+        fixture.server.finish();
+    })
+    .await
+    .expect("stale attachment continuation and shutdown deadline");
+}
+
+#[cfg(feature = "cli")]
+#[tokio::test]
+async fn cli_rejects_buffered_attachment_bytes_after_mailbox_recreation() {
+    reject_attachment_continuation_after_mailbox_recreation(support::MAILCTL).await;
+}
+
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn mcp_rejects_buffered_attachment_bytes_after_mailbox_recreation() {
+    reject_attachment_continuation_after_mailbox_recreation(support::MAILCTL_MCP).await;
 }
