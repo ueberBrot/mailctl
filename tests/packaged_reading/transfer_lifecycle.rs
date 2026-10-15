@@ -258,11 +258,12 @@ async fn mcp_attachment_cancellation_disposes_transport_and_releases_capacity() 
                 || json!({"attachment": reference}),
                 |token| json!({"token": token}),
             );
-            let client = match &reader {
-                Reader::Mcp(client) => client,
-                #[cfg(feature = "cli")]
-                Reader::Cli => unreachable!("MCP cancellation uses the MCP executable"),
+            #[cfg(feature = "cli")]
+            let Reader::Mcp(client) = &reader else {
+                unreachable!("MCP cancellation uses the MCP executable");
             };
+            #[cfg(not(feature = "cli"))]
+            let Reader::Mcp(client) = &reader;
             let request = client
                 .send_request_with_option(
                     ClientRequest::CallToolRequest(CallToolRequest::new(
