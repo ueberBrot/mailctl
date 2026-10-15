@@ -62,12 +62,14 @@ pub(crate) fn junction(path: &Path, target: &Path) {
 }
 
 pub(crate) fn cancel(process_id: u32) {
-    let mut command = powershell();
+    let mut command = Command::new(std::env::current_exe().unwrap());
     command
         .env("MAILCTL_EXPORT_PROCESS_FIXTURE", process_id.to_string())
         .args([
-            "-Command",
-            r#"$ErrorActionPreference = 'Stop'; Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class ExportConsole { [DllImport("kernel32.dll", SetLastError=true)] public static extern bool FreeConsole(); [DllImport("kernel32.dll", SetLastError=true)] public static extern bool AttachConsole(uint process); [DllImport("kernel32.dll", SetLastError=true)] public static extern bool SetConsoleCtrlHandler(IntPtr handler, bool ignore); [DllImport("kernel32.dll", SetLastError=true)] public static extern bool GenerateConsoleCtrlEvent(uint control, uint group); }'; [void][ExportConsole]::FreeConsole(); if (-not [ExportConsole]::AttachConsole([uint32]$env:MAILCTL_EXPORT_PROCESS_FIXTURE)) { throw 'Cannot attach export console' }; try { if (-not [ExportConsole]::SetConsoleCtrlHandler([IntPtr]::Zero, $true)) { throw 'Cannot protect signal fixture' }; if (-not [ExportConsole]::GenerateConsoleCtrlEvent(0, 0)) { throw 'Cannot cancel export' }; Start-Sleep -Milliseconds 200 } finally { [void][ExportConsole]::FreeConsole() }"#,
+            "--exact",
+            "native_support::tests::cancel_export_console",
+            "--ignored",
+            "--nocapture",
         ]);
     assert_success(&run_bounded(command));
 }
@@ -135,6 +137,59 @@ fn powershell() -> Command {
 #[cfg(test)]
 mod tests {
     use super::whoami_sid;
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "private subprocess entry point for export console cancellation"]
+    #[allow(
+        unsafe_code,
+        reason = "The subprocess fixture attaches to the export console to send real Ctrl+C"
+    )]
+    fn cancel_export_console() {
+        use windows_sys::Win32::System::Console::{
+            AttachConsole, CTRL_C_EVENT, FreeConsole, GenerateConsoleCtrlEvent,
+            SetConsoleCtrlHandler,
+        };
+
+        let process_id = std::env::var("MAILCTL_EXPORT_PROCESS_FIXTURE")
+            .expect("export process ID")
+            .parse::<u32>()
+            .expect("numeric export process ID");
+        struct Console;
+        impl Drop for Console {
+            fn drop(&mut self) {
+                unsafe {
+                    FreeConsole();
+                }
+            }
+        }
+        unsafe {
+            // A helper may already be detached; only attachment must succeed.
+            FreeConsole();
+            assert_ne!(
+                AttachConsole(process_id),
+                0,
+                "attach export console: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        let _console = Console;
+        unsafe {
+            assert_ne!(
+                SetConsoleCtrlHandler(None, 1),
+                0,
+                "protect signal fixture: {}",
+                std::io::Error::last_os_error()
+            );
+            assert_ne!(
+                GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0),
+                0,
+                "cancel export: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
 
     #[test]
     fn whoami_csv_keeps_the_numeric_sid_independent_of_account_encoding() {
