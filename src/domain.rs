@@ -651,8 +651,11 @@ pub struct IsolationCapacity {
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessCapacity {
+    /// Configured process ceiling; MCP transport memory and per-account bounds may admit fewer requests.
     pub active_requests: u64,
+    /// Configured process queue ceiling; this does not guarantee that many MCP transport slots.
     pub queued_requests: u64,
+    /// Process-local buffer budget, including MCP request and result reservations.
     pub buffered_bytes: u64,
 }
 
