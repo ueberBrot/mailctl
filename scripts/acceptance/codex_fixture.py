@@ -8,7 +8,6 @@ credentials, message payloads, or other raw protocol transcripts in its summary.
 import base64
 import collections
 import hmac
-import imaplib
 import json
 import os
 from pathlib import Path
@@ -18,6 +17,7 @@ import shutil
 import socket
 import ssl
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -39,6 +39,13 @@ def _write_private(path, data):
         output.write(data)
 
 
+def remaining(deadline, limit=None):
+    budget = deadline - time.monotonic()
+    if budget <= 0:
+        raise TimeoutError("overall execution bound exhausted")
+    return min(budget, limit) if limit is not None else budget
+
+
 class Fixture:
     """One private installation shared by independently started MCP processes."""
 
@@ -46,7 +53,9 @@ class Fixture:
     flags = FLAGS
     subject = SUBJECT
 
-    def __init__(self, directory, executable, envelope_bytes=None):
+    def __init__(self, directory, executable, envelope_bytes=None, *, deadline):
+        remaining(deadline)
+        self._deadline = deadline
         parent = Path(directory).resolve()
         parent.mkdir(parents=True, exist_ok=True)
         self.directory = Path(tempfile.mkdtemp(prefix="synthetic-imap-", dir=parent))
@@ -80,7 +89,7 @@ class Fixture:
             result = subprocess.run(
                 [str(Path(executable).resolve()), "--config", str(self.config), "--json", "setup"],
                 env=self.command_env(), cwd=self.directory,
-                capture_output=True, timeout=25, check=False,
+                capture_output=True, timeout=remaining(self._deadline, 25), check=False,
             )
             try:
                 setup_ok = json.loads(result.stdout).get("ok") is True
@@ -89,6 +98,7 @@ class Fixture:
             if result.returncode != 0 or not setup_ok:
                 raise RuntimeError("production fixture setup failed")
             self._probe_wrong_password()
+            remaining(self._deadline)
         except BaseException:
             self.close()
             raise
@@ -106,7 +116,7 @@ class Fixture:
              "-keyout", str(self.directory / "fixture-key.pem"),
              "-out", str(self.certificate)],
             env={"PATH": "/usr/bin:/bin"}, cwd=self.directory,
-            capture_output=True, timeout=20, check=False,
+            capture_output=True, timeout=remaining(self._deadline, 20), check=False,
         )
         if result.returncode:
             raise RuntimeError("disposable TLS certificate generation failed")
@@ -147,18 +157,29 @@ class Fixture:
         return {"PATH": str(self._empty_path), "SSL_CERT_FILE": str(self.certificate)}
 
     def _probe_wrong_password(self):
-        context = ssl.create_default_context(cafile=str(self.certificate))
-        connection = imaplib.IMAP4_SSL("127.0.0.1", self.port, ssl_context=context, timeout=5)
-        try:
-            try:
-                connection.login("synthetic-blue@example.test", "incorrect-synthetic-password")
-            except imaplib.IMAP4.error:
-                with self._lock:
-                    self._wrong_password_rejected = self._counts["rejected_logins"] == 1
-            if not self._wrong_password_rejected:
-                raise RuntimeError("synthetic provider did not reject the wrong-password probe")
-        finally:
-            connection.logout()
+        # imaplib's socket timeout resets on each read. Bound the whole exchange,
+        # including greeting, CAPABILITY, LOGIN and LOGOUT, in one subprocess.
+        probe = """import imaplib, ssl, sys
+context = ssl.create_default_context(cafile=sys.argv[1])
+connection = imaplib.IMAP4_SSL('127.0.0.1', int(sys.argv[2]), ssl_context=context, timeout=5)
+try:
+    try:
+        connection.login('synthetic-blue@example.test', 'incorrect-synthetic-password')
+    except imaplib.IMAP4.error:
+        pass
+    else:
+        raise SystemExit(1)
+finally:
+    connection.logout()
+"""
+        result = subprocess.run([sys.executable, "-c", probe, str(self.certificate), str(self.port)],
+                                env=self.command_env(),
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                timeout=remaining(self._deadline, 5), check=False)
+        with self._lock:
+            self._wrong_password_rejected = result.returncode == 0 and self._counts["rejected_logins"] == 1
+        if not self._wrong_password_rejected:
+            raise RuntimeError("synthetic provider did not reject the wrong-password probe")
 
     def _accept(self):
         while not self._stop.is_set():

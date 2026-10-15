@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import re
+import select
 import shutil
 import signal
 import subprocess
@@ -16,6 +17,8 @@ import sys
 import tempfile
 import threading
 import time
+
+from codex_fixture import Fixture, remaining
 
 
 def write_json(path, value):
@@ -236,30 +239,55 @@ def run_agent(arguments, prompt, timeout, output):
     child = subprocess.Popen(arguments, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE, env=environment, start_new_session=True)
     events, errors = [], []
+    stopping = threading.Event()
 
-    def consume():
-        for line in child.stdout:
-            try:
-                event = json.loads(line)
-            except ValueError:
-                errors.append("invalid_json_event")
+    def read_lines(stream, receive):
+        pending = b""
+        while not stopping.is_set():
+            if not select.select([stream], [], [], 0.05)[0]:
                 continue
-            event["_received_ns"] = time.monotonic_ns()
-            events.append(event)
+            block = os.read(stream.fileno(), 65536)
+            if not block:
+                if pending:
+                    receive(pending)
+                return
+            lines = (pending + block).split(b"\n")
+            pending = lines.pop()
+            for line in lines:
+                receive(line)
+        errors.append("cleanup_reader_incomplete")
+
+    def consume(line):
+        try:
+            event = json.loads(line)
+        except ValueError:
+            errors.append("invalid_json_event")
+            return
+        event["_received_ns"] = time.monotonic_ns()
+        events.append(event)
 
     # Drain diagnostics without retaining potentially sensitive arbitrary messages.
-    def diagnostics():
-        for _ in child.stderr:
-            errors.append("stderr_line")
+    def diagnostics(_line):
+        errors.append("stderr_line")
 
-    readers = [threading.Thread(target=consume), threading.Thread(target=diagnostics)]
+    readers = [threading.Thread(target=read_lines, args=(stream, receive), daemon=True)
+               for stream, receive in ((child.stdout, consume), (child.stderr, diagnostics))]
     for reader in readers:
         reader.start()
     expired = False
 
     def deliver():
         try:
-            child.stdin.write(prompt.encode())
+            os.set_blocking(child.stdin.fileno(), False)
+            pending = memoryview(prompt.encode())
+            while pending and not stopping.is_set():
+                if select.select([], [child.stdin], [], 0.05)[1]:
+                    try:
+                        pending = pending[os.write(child.stdin.fileno(), pending[:65536]):]
+                    except BlockingIOError:
+                        pass
+            if pending:
+                errors.append("cleanup_writer_incomplete")
         except (BrokenPipeError, OSError):
             errors.append("prompt_delivery_failed")
         finally:
@@ -300,14 +328,19 @@ def run_agent(arguments, prompt, timeout, output):
             if child.poll() is None:
                 child.kill()
         child.wait(timeout=3)
-    for reader in readers:
-        reader.join(timeout=5)
-    writer.join(timeout=3)
-    if not any(reader.is_alive() for reader in readers) and not writer.is_alive():
+        # A descendant can leave the group while retaining a pipe. Readers must
+        # stop even when neither EOF nor another complete line arrives.
+        drain_deadline = time.monotonic() + 0.2
+        for worker in [*readers, writer]:
+            worker.join(max(0, drain_deadline - time.monotonic()))
+        stopping.set()
+        join_deadline = time.monotonic() + 0.2
+        for worker in [*readers, writer]:
+            worker.join(max(0, join_deadline - time.monotonic()))
+        if any(worker.is_alive() for worker in [*readers, writer]):
+            errors.append("cleanup_worker_incomplete")
         child.stdout.close()
         child.stderr.close()
-    else:
-        errors.append("cleanup_reader_incomplete")
     sanitized = []
     calls = []
     answers = []
@@ -362,12 +395,21 @@ def evaluate(calls, fixture):
     probes = {server: {} for server in ("mail_a", "mail_b")}
     peer_reads = []
     attachments = {server: [] for server in ("mail_a", "mail_b")}
+    amber_inboxes = set()
+    peer_amber_denied = False
     for item in calls:
         observed[(item.get("server"), item.get("tool"))] += 1
         result = envelope(item)
         args = item.get("arguments", {})
         server = item.get("server")
         tool = item.get("tool")
+        if server == "mail_a" and tool == "email_list_mailboxes" and args.get("account") == "synthetic-amber" and result.get("ok"):
+            amber_inboxes.update(mailbox["reference"] for mailbox in result["result"].get("mailboxes", [])
+                                 if mailbox.get("metadata", {}).get("name") == "INBOX" and mailbox.get("reference"))
+        if (server == "mail_b" and tool == "email_search_messages" and
+                args.get("mailbox") in amber_inboxes and result.get("ok") is False and
+                result.get("error", {}).get("code") == "account_not_allowed"):
+            peer_amber_denied = True
         if result.get("ok") and tool in ("email_capabilities", "email_list_accounts"):
             successful_discovery.add((server, tool))
         if server in guides and tool == "read_mcp_resource" and item.get("result") and not item.get("error"):
@@ -457,6 +499,7 @@ def evaluate(calls, fixture):
                 args.get("message") == pages[0][0].get("message") and not args.get("cursor") and
                 bool(body.get("text")) and fixture.body.startswith(body["text"])
                 for args, body in peer_reads),
+            "peer_amber_mailbox_search_denied": peer_amber_denied,
             "foreign_transfer_token_rejected": token_rejected,
             "attachment_restarted_in_peer": attachment_restarted,
             "attachment_bytes_offsets_size_digest_verified": attachment_valid,
@@ -483,15 +526,14 @@ def main():
     parser.add_argument("--candidate-commit", required=True)
     parser.add_argument("--readme", type=Path, help="README from the selected candidate source")
     parser.add_argument("--profile", choices=("small", "default", "both"), default="both")
-    parser.add_argument("--timeout", type=int, default=240, help="overall authenticated-run bound in seconds")
+    parser.add_argument("--timeout", type=int, default=240,
+                        help="combined fixture/client deadline in seconds; bounded cleanup follows")
     parser.add_argument("--output", type=Path, help="new private evidence directory; defaults to temporary")
     args = parser.parse_args()
     if not args.run:
         parser.error("--run is required; this opt-in check uses the current native Codex account")
     if not 30 <= args.timeout <= 600:
         parser.error("--timeout must be between 30 and 600 seconds")
-    from codex_fixture import Fixture
-
     repository = Path(__file__).resolve().parents[2]
     readme = args.readme or repository / "README.md"
     selected_binary = args.bin_dir.resolve() / "mailctl-mcp"
@@ -531,7 +573,9 @@ def main():
         run_output = output / profile
         run_output.mkdir(mode=0o700)
         with tempfile.TemporaryDirectory(prefix="mailctl-codex-fixture-") as directory:
-            fixture = Fixture(Path(directory), binary, 65536 if profile == "small" else None)
+            remaining(deadline)
+            fixture = Fixture(Path(directory), binary, 65536 if profile == "small" else None,
+                              deadline=deadline)
             workspace = Path(directory) / "agent-workspace"
             workspace.mkdir()
             prompt = WORKFLOW + "\n\n" + public
@@ -539,10 +583,7 @@ def main():
             arguments = command(args.codex, args.model, workspace, binary, fixture, run_output)
             write_json(run_output / "invocation.json", arguments)
             try:
-                remaining = deadline - time.monotonic()
-                if remaining < 1:
-                    raise TimeoutError("overall execution bound exhausted")
-                status, calls, _ = run_agent(arguments, prompt, remaining, run_output)
+                status, calls, _ = run_agent(arguments, prompt, remaining(deadline), run_output)
                 summary = {"client": status, "behavior": evaluate(calls, fixture)}
             finally:
                 fixture.close()
@@ -579,7 +620,7 @@ def main():
                 summary["behavior"]["foreign_transfer_token_rejected"],
                 summary["behavior"]["attachment_restarted_in_peer"],
                 summary["behavior"]["attachment_bytes_offsets_size_digest_verified"],
-                summary["behavior"]["application_codes"].get("account_not_allowed", 0) >= 1,
+                summary["behavior"]["peer_amber_mailbox_search_denied"],
                 summary["behavior"]["no_draft_tool_calls"],
                 all(len(probes) == 6 and all(p["client_probe_peak"] >= 2 for p in probes)
                     for probes in summary["behavior"]["mailbox_probes"].values()),

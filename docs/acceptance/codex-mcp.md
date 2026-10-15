@@ -69,9 +69,14 @@ server. Provider LIST replies have a fixed 0.8-second delay; the STDIO proxy add
 no artificial delay, startup barrier, request generation, or serialization.
 
 `--timeout` bounds the combined authenticated execution, including fixture
-preparation after public-material collection. Fixture subprocesses have separate
-bounded startup timeouts. Owned process groups, local sockets and temporary
-credential/state files are cleaned up on completion, timeout or interruption.
+preparation for both profiles after public-material collection. Certificate
+generation, production setup, the entire wrong-password exchange and each client
+run share that deadline; their individual limits can only shorten it. Expiry is
+followed by bounded cleanup, including the client's three-second process-group
+grace, up to three seconds to reap it and bounded pipe-worker joins. Each fixture
+allows up to three seconds to join its provider threads. Owned process groups,
+local sockets and temporary credential/state files are cleaned up on completion,
+timeout or interruption.
 
 ## Evidence and evaluation
 
@@ -106,7 +111,8 @@ Inspect the results as separate evidence:
 - Mechanical checks verify discovered capabilities/accounts and all five guide
   reads on both servers, exact four-page Unicode text, unchanged 32-byte budget
   and continuation chain, the new opaque representation version, cross-process
-  message-reference reuse, restricted-account denial, foreign transfer-token
+  message-reference reuse, denial of mail_b searching the exact amber INBOX
+  reference previously discovered through mail_a, foreign transfer-token
   refusal, and a restarted attachment's exact bytes/offsets/count/SHA-256. The
   independent provider rejects unknown or mutating commands and reports safe
   counters. No draft tool may be called.
@@ -138,3 +144,10 @@ Source results are provisional. Repeat against the final candidate after byte
 changes; earlier 7113046 binaries cannot qualify representation-version metadata
 added later. This procedure does not qualify live-provider refresh, draft fault
 behavior, publication, or the remaining release gates.
+
+Retained source-provisional runs with Codex CLI 0.162.1 recorded overlapping
+initialization in both profiles. `tools/list` discovery overlapped only in
+`small`; `default` discovery was sequential. The default agent answer claimed
+it computed an attachment hash, but no observable hashing action substantiates
+that claim. Only the runner's independent digest calculation is verified.
+Final packaged qualification remains pending.
