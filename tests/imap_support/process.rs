@@ -29,6 +29,10 @@ use tokio_rustls::{
     rustls::{ServerConfig, pki_types::PrivatePkcs8KeyDer},
 };
 
+#[path = "process/drafts.rs"]
+mod draft_cases;
+pub use draft_cases::ReconciliationCase;
+
 struct Expected {
     username: &'static str,
     password: &'static str,
@@ -38,8 +42,12 @@ struct Expected {
 enum ExpectedOperation {
     Authenticate,
     Append(DraftReply, Duration),
+    NamedAppend(String, DraftReply),
     DraftTarget(u32),
+    NamedDraftTarget(String, u32),
     Reconcile(bool),
+    ReconcileBytes(Vec<u8>),
+    DraftReconciliation(ReconciliationCase),
     RejectAuthentication(bool),
     Mailboxes(Vec<&'static str>),
     AllMailboxes(Vec<&'static str>),
@@ -205,12 +213,31 @@ impl ImapServer {
                                         tokio::time::sleep(preparation_delay).await;
                                     }
                                     imap_support::write(&mut wire, &format!("* 0 EXISTS\r\n* OK [UIDVALIDITY 77] incarnation\r\n{tag} OK [READ-ONLY] selected\r\n")).await;
-                                    append_draft(&mut wire, reply, &stalled, &captured).await;
+                                    append_draft(&mut wire, "Drafts", reply, &stalled, &captured).await;
+                                    return;
+                                },
+                                ExpectedOperation::NamedAppend(mailbox, reply) => {
+                                    draft_cases::target(&mut wire, &mailbox, 77).await;
+                                    append_draft(&mut wire, &mailbox, reply, &stalled, &captured).await;
+                                    return;
+                                },
+                                ExpectedOperation::NamedDraftTarget(mailbox, validity) => {
+                                    draft_cases::target(&mut wire, &mailbox, validity).await;
+                                    imap_support::dropped(&mut wire).await;
                                     return;
                                 },
                                 ExpectedOperation::Reconcile(stalled) => {
                                     let bytes = captured.lock().unwrap().last().unwrap().clone();
                                     reconcile_draft(&mut wire, &bytes, stalled.then_some(reconciling.as_ref())).await;
+                                    return;
+                                },
+                                ExpectedOperation::ReconcileBytes(bytes) => {
+                                    reconcile_draft(&mut wire, &bytes, None).await;
+                                    return;
+                                },
+                                ExpectedOperation::DraftReconciliation(case) => {
+                                    let bytes = captured.lock().unwrap().last().unwrap().clone();
+                                    draft_cases::reconcile(&mut wire, &bytes, case).await;
                                     return;
                                 },
                                 ExpectedOperation::DraftTarget(validity) => {
@@ -300,6 +327,22 @@ impl ImapServer {
         });
     }
 
+    pub fn expect_reconciliation_case(&self, case: ReconciliationCase) {
+        self.expected.lock().unwrap().push_back(Expected {
+            username: "work@example.test",
+            password: "disposable-password",
+            operation: ExpectedOperation::DraftReconciliation(case),
+        });
+    }
+
+    pub fn expect_reconciliation_bytes(&self, bytes: Vec<u8>) {
+        self.expected.lock().unwrap().push_back(Expected {
+            username: "work@example.test",
+            password: "disposable-password",
+            operation: ExpectedOperation::ReconcileBytes(bytes),
+        });
+    }
+
     pub fn expect_stalled_reconciliation(&self) {
         self.expected.lock().unwrap().push_back(Expected {
             username: "work@example.test",
@@ -329,6 +372,22 @@ impl ImapServer {
             username: "work@example.test",
             password: "disposable-password",
             operation: ExpectedOperation::DraftTarget(validity),
+        });
+    }
+
+    pub fn expect_named_append(&self, mailbox: &str, reply: DraftReply) {
+        self.expected.lock().unwrap().push_back(Expected {
+            username: "work@example.test",
+            password: "disposable-password",
+            operation: ExpectedOperation::NamedAppend(mailbox.into(), reply),
+        });
+    }
+
+    pub fn expect_named_draft_target(&self, mailbox: &str, validity: u32) {
+        self.expected.lock().unwrap().push_back(Expected {
+            username: "work@example.test",
+            password: "disposable-password",
+            operation: ExpectedOperation::NamedDraftTarget(mailbox.into(), validity),
         });
     }
     pub fn drafts(&self) -> Vec<Vec<u8>> {
@@ -940,11 +999,13 @@ async fn interrupt_attachment(wire: &mut imap_support::Wire, interrupted: &Atomi
 
 async fn append_draft(
     wire: &mut imap_support::Wire,
+    mailbox: &str,
     reply: DraftReply,
     observed: &AtomicUsize,
     captured: &Mutex<Vec<Vec<u8>>>,
 ) {
     use io_imap::codec::{CommandCodec, decode::Decoder};
+    use io_imap::types::{command::CommandBody, mailbox::Mailbox};
     use tokio::io::AsyncReadExt;
     let mut header = Vec::new();
     while !header.ends_with(b"\r\n") {
@@ -957,10 +1018,22 @@ async fn append_draft(
     assert!(length < 1024 * 1024);
     let command = format!("{prefix}{{0}}\r\n\r\n");
     let codec = CommandCodec::new();
-    let (_, actual) = codec.decode(command.as_bytes()).unwrap();
-    let (_, expected) = codec
-        .decode(b"expected APPEND Drafts (\\Draft) {0}\r\n\r\n")
-        .unwrap();
+    let (_, mut actual) = codec.decode(command.as_bytes()).unwrap();
+    let expected = format!(
+        "expected APPEND {} (\\Draft) {{0}}\r\n\r\n",
+        mailbox_argument(mailbox)
+    );
+    let (_, mut expected) = codec.decode(expected.as_bytes()).unwrap();
+    // Atom/quoted/literal spelling does not change the exact mailbox identity.
+    let normalize = |body: &mut CommandBody<'_>| {
+        if let CommandBody::Append { mailbox, .. } = body
+            && let Mailbox::Other(name) = mailbox
+        {
+            *mailbox = name.as_ref().to_vec().try_into().unwrap();
+        }
+    };
+    normalize(&mut actual.body);
+    normalize(&mut expected.body);
     assert_eq!(actual.body, expected.body);
     let tag = actual.tag.as_ref().to_owned();
     imap_support::write(wire, "+ continue\r\n").await;
