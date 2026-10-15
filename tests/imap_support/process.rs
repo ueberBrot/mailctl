@@ -39,6 +39,7 @@ enum ExpectedOperation {
     Search(&'static str, Option<u32>),
     Body(&'static str, Vec<u8>, BodyKind),
     BodyBound(&'static str, BodyBound),
+    BodyCase(&'static str, BodyCase),
     Attachment(&'static str, AttachmentPhase, String),
 }
 
@@ -73,6 +74,18 @@ pub enum BodyBound {
     Exact,
     DeclaredExcess,
     ReceivedExcess,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum BodyCase {
+    HeadersAtLimit,
+    HeadersOverLimit,
+    PartsAtLimit,
+    PartsOverLimit,
+    MalformedStructure,
+    ExcessiveNesting,
+    Base64Tail,
+    QuotedPrintableTail,
 }
 
 pub struct ImapServer {
@@ -192,6 +205,9 @@ impl ImapServer {
                                 ExpectedOperation::BodyBound(mailbox, bound) => {
                                     bounded_body(&mut wire, mailbox, bound).await;
                                     if !matches!(bound, BodyBound::Exact) { return; }
+                                },
+                                ExpectedOperation::BodyCase(mailbox, case) => {
+                                    if !body_case(&mut wire, mailbox, case).await { return; }
                                 },
                                 ExpectedOperation::Attachment(mailbox, phase, filename) => {
                                     attachment_page(&mut wire, mailbox, phase, &filename, &stalled).await;
@@ -357,6 +373,14 @@ impl ImapServer {
         });
     }
 
+    pub fn expect_body_case(&self, mailbox: &'static str, case: BodyCase) {
+        self.expected.lock().unwrap().push_back(Expected {
+            username: "work@example.test",
+            password: "disposable-password",
+            operation: ExpectedOperation::BodyCase(mailbox, case),
+        });
+    }
+
     pub fn expect_attachment(
         &self,
         username: &'static str,
@@ -472,6 +496,18 @@ async fn body_page(wire: &mut imap_support::Wire, mailbox: &str, text: &[u8], ki
 }
 
 async fn body_headers(wire: &mut imap_support::Wire, mailbox: &str, body: &str, size: usize) {
+    body_metadata(wire, mailbox, body, size).await;
+    body_literal(
+        wire,
+        "HEADER",
+        0,
+        16384,
+        b"MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=fixture\r\n\r\n",
+    )
+    .await;
+}
+
+async fn body_metadata(wire: &mut imap_support::Wire, mailbox: &str, body: &str, size: usize) {
     use imap_support::{expect, write};
     let tag = expect(wire, &format!("EXAMINE {}", mailbox_argument(mailbox))).await;
     write(
@@ -484,14 +520,6 @@ async fn body_headers(wire: &mut imap_support::Wire, mailbox: &str, body: &str, 
     // mutations are independently rejected by exact command matching.
     let total = size + 3_000_000 + 300;
     write(wire, &format!("* 3 FETCH (UID 3 RFC822.SIZE {total} BODYSTRUCTURE ({body}(\"APPLICATION\" \"OCTET-STREAM\" NIL NIL NIL \"BASE64\" 3000000 NIL (\"ATTACHMENT\" NIL) NIL NIL) \"MIXED\" NIL NIL NIL NIL))\r\n{tag} OK fetched\r\n")).await;
-    body_literal(
-        wire,
-        "HEADER",
-        0,
-        16384,
-        b"MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=fixture\r\n\r\n",
-    )
-    .await;
 }
 
 async fn body_literal(
@@ -544,6 +572,87 @@ async fn bounded_body(wire: &mut imap_support::Wire, mailbox: &str, bound: BodyB
     if !matches!(bound, BodyBound::Exact) {
         imap_support::dropped(wire).await;
     }
+}
+
+async fn body_case(wire: &mut imap_support::Wire, mailbox: &str, case: BodyCase) -> bool {
+    use BodyCase::*;
+
+    let (encoding, payload) = match case {
+        Base64Tail => ("BASE64", b"SGVsbG8".as_slice()),
+        QuotedPrintableTail => ("QUOTED-PRINTABLE", b"hello=".as_slice()),
+        _ => ("7BIT", b"ok".as_slice()),
+    };
+    let mut body = format!(
+        "(\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"{encoding}\" {} 1 NIL NIL NIL NIL)",
+        payload.len()
+    );
+    match case {
+        PartsAtLimit | PartsOverLimit => {
+            // Count the outer MIXED node, selected leaf, and 3 MB attachment too.
+            let extra = if matches!(case, PartsAtLimit) {
+                197
+            } else {
+                198
+            };
+            body.push_str(&"(\"APPLICATION\" \"OCTET-STREAM\" NIL NIL NIL \"7BIT\" 0 NIL (\"ATTACHMENT\" NIL) NIL NIL)".repeat(extra));
+        }
+        MalformedStructure => {
+            // Body types must be strings, so this unquoted atom cannot decode.
+            body = "(INVALID)".into();
+        }
+        ExcessiveNesting => {
+            // The pinned codec rejects seven multipart wrappers. The outer
+            // MIXED in body_metadata adds the seventh, before configured depth 20.
+            for _ in 0..6 {
+                body = format!("({body} \"MIXED\" NIL NIL NIL NIL)");
+            }
+        }
+        _ => {}
+    }
+    let header_case = matches!(case, HeadersAtLimit | HeadersOverLimit);
+    let metadata_rejected = matches!(case, PartsOverLimit | MalformedStructure | ExcessiveNesting);
+    if header_case || metadata_rejected {
+        body_metadata(wire, mailbox, &body, payload.len()).await;
+    } else {
+        body_headers(wire, mailbox, &body, payload.len()).await;
+    }
+    if metadata_rejected {
+        imap_support::dropped(wire).await;
+        return false;
+    }
+    if header_case {
+        const LIMIT: usize = 64 * 1024;
+        let size = LIMIT + usize::from(matches!(case, HeadersOverLimit));
+        let mut headers =
+            b"MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=fixture\r\n".to_vec();
+        // Ordinary ignored fields exercise the byte ceiling without relying on
+        // overlong lines or another parser-work limit to reject the headers.
+        while size - headers.len() > 256 {
+            headers.extend_from_slice(b"X-Pad: ");
+            headers.resize(headers.len() + 119, b'x');
+            headers.extend_from_slice(b"\r\n");
+        }
+        headers.extend_from_slice(b"X-Pad: ");
+        headers.resize(size - 4, b'x');
+        headers.extend_from_slice(b"\r\n\r\n");
+        for offset in (0..LIMIT).step_by(16 * 1024) {
+            body_literal(
+                wire,
+                "HEADER",
+                offset,
+                16 * 1024,
+                &headers[offset..offset + 16 * 1024],
+            )
+            .await;
+        }
+        body_literal(wire, "HEADER", LIMIT, 1, &headers[LIMIT..]).await;
+        if matches!(case, HeadersOverLimit) {
+            imap_support::dropped(wire).await;
+            return false;
+        }
+    }
+    body_literal(wire, "1", 0, payload.len() + 1, payload).await;
+    true
 }
 
 impl Drop for ImapServer {

@@ -168,6 +168,7 @@ impl Reader {
                 match response["error"]["code"].as_str() {
                     Some("response_too_large") => assert_eq!(output.status.code(), Some(8)),
                     Some("stale_cursor") => assert_eq!(output.status.code(), Some(6)),
+                    Some("provider_unavailable") => assert_eq!(output.status.code(), Some(5)),
                     _ => {}
                 }
                 response
@@ -513,6 +514,73 @@ async fn cli_rejects_body_cursor_after_selected_content_changes() {
 #[tokio::test]
 async fn mcp_rejects_body_cursor_after_selected_content_changes() {
     reject_body_cursor_after_content_changes(support::MAILCTL_MCP).await;
+}
+
+async fn read_adversarial_mime(executable: &str) {
+    use server::BodyCase;
+
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let mut fixture = Fixture::new(executable);
+        let reader = Reader::start(&fixture, executable).await;
+        let (mailbox, before) = discover_message(&fixture, &reader).await;
+        let message = before["reference"].as_str().unwrap();
+        for (case, expected) in [
+            (BodyCase::HeadersAtLimit, Ok(("ok", false))),
+            (BodyCase::HeadersOverLimit, Err("response_too_large")),
+            (BodyCase::PartsAtLimit, Ok(("ok", false))),
+            (BodyCase::PartsOverLimit, Err("response_too_large")),
+            (BodyCase::MalformedStructure, Err("provider_unavailable")),
+            (BodyCase::ExcessiveNesting, Err("provider_unavailable")),
+            (BodyCase::Base64Tail, Ok(("�Hello", true))),
+            (BodyCase::QuotedPrintableTail, Ok(("�hello", true))),
+        ] {
+            fixture.server.expect_body_case("INBOX", case);
+            let response = reader
+                .response(
+                    &fixture,
+                    &["message", "get", "--message", message],
+                    "email_get_message",
+                    json!({"message": message}),
+                )
+                .await;
+            match expected {
+                Ok((text, replacements)) => {
+                    assert!(response.get("error").is_none(), "{case:?}: {response}");
+                    let body = &response["result"]["body"];
+                    assert_eq!(body["text"], text, "{case:?}");
+                    assert_eq!(body["selected_part"], "1");
+                    assert_eq!(body["source_media_type"], "text/plain");
+                    assert_eq!(body["converted"], false);
+                    assert_eq!(body["replacements"], replacements, "{case:?}");
+                    assert!(body["empty_reason"].is_null());
+                    assert!(body["next_cursor"].is_null());
+                    assert_eq!(body["continuation_available"], false);
+                    assert_eq!(body["truncated"], false);
+                }
+                Err(code) => {
+                    assert_eq!(response["error"]["code"], code, "{case:?}");
+                    assert!(response.get("result").is_none());
+                }
+            }
+        }
+        assert_eq!(search_message(&fixture, &reader, &mailbox).await, before);
+        reader.finish().await;
+        fixture.server.finish();
+    })
+    .await
+    .expect("standalone adversarial MIME deadline");
+}
+
+#[cfg(feature = "cli")]
+#[tokio::test]
+async fn cli_bounds_mime_and_marks_malformed_transfer_replacements() {
+    read_adversarial_mime(support::MAILCTL).await;
+}
+
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn mcp_bounds_mime_and_marks_malformed_transfer_replacements() {
+    read_adversarial_mime(support::MAILCTL_MCP).await;
 }
 
 #[cfg(feature = "cli")]
