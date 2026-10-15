@@ -500,20 +500,58 @@ fn hostile_html_admission_and_refusal_have_bounded_allocations() {
         .build()
         .unwrap();
     let table = |cells| format!("<table><tr>{}</tr></table>", "<td>safe</td>".repeat(cells));
+    let comment_nodes = |nodes: usize| {
+        // Document + html + head + body + the "safe" text node: five fixed nodes.
+        let body = format!(
+            "<html><head></head><body>safe{}</body></html>",
+            "<!---->".repeat(nodes - 5)
+        );
+        // Independently verify the pinned parser retains each empty comment.
+        let dom = html2text::config::plain()
+            .raw_mode(true)
+            .parse_html(body.as_bytes())
+            .unwrap();
+        let (mut total, mut comments) = (0, 0);
+        let mut pending = vec![dom.document.clone()];
+        while let Some(node) = pending.pop() {
+            total += 1;
+            comments += usize::from(matches!(
+                &node.data,
+                html2text::Comment { contents } if contents.is_empty()
+            ));
+            pending.extend(node.children.borrow().iter().cloned());
+        }
+        // Keep the root alive during traversal: its Drop clears descendants.
+        assert!(matches!(&dom.document.data, html2text::Document));
+        assert_eq!((total, comments), (nodes, nodes - 5));
+        body
+    };
     let huge_span = "<table><tr><td colspan=18446744073709551615 rowspan=18446744073709551615>safe</td></tr></table>";
-    for (body, admitted_cells) in [
-        (huge_span.to_owned(), Some(1)),
-        (table(128), Some(128)),
-        (table(129), None),
-        (format!("<body>{}</body>", "<i></i>".repeat(4097)), None),
-        (format!("<p>{}</p>", "x".repeat(64 * 1024)), None),
+    for (body, admitted_safe_count, nodes) in [
+        (huge_span.to_owned(), Some(1), None),
+        (table(128), Some(128), None),
+        (table(129), None, None),
+        // This remains an early parser-work refusal, before DOM preflight.
+        (
+            format!("<body>{}</body>", "<i></i>".repeat(4097)),
+            None,
+            None,
+        ),
+        (format!("<p>{}</p>", "x".repeat(64 * 1024)), None, None),
+        (comment_nodes(4096), Some(1), Some(4096)),
+        (comment_nodes(4097), None, Some(4097)),
     ] {
         let source_len = body.len();
         let structure = format!(
             "({} \"MIXED\" NIL NIL NIL NIL)",
             text_part("HTML", source_len, "NIL")
         );
-        let limits = Limits::default();
+        let limits = Limits {
+            // <113 MiB source × markup admission fits; the node cap stays 4096.
+            max_decode_steps: nodes
+                .map_or(Limits::default().max_decode_steps, |_| 128 * 1024 * 1024),
+            ..Limits::default()
+        };
         let server_bytes = Arc::new(AtomicUsize::new(b"* OK synthetic server ready\r\n".len()));
         let counted = server_bytes.clone();
         let (mut probe, server) =
@@ -525,7 +563,7 @@ fn hostile_html_admission_and_refusal_have_bounded_allocations() {
                 Box::pin(async move {
                     selected_prefix(&mut wire, &structure, source_len + ROOT_HEADERS.len()).await;
                     complete_body(&mut wire, "1", body.as_bytes()).await;
-                    if admitted_cells.is_some() {
+                    if admitted_safe_count.is_some() {
                         logout(&mut wire).await;
                     } else {
                         dropped(&mut wire).await;
@@ -540,12 +578,18 @@ fn hostile_html_admission_and_refusal_have_bounded_allocations() {
                 "INBOX",
                 BodyRequest::new(4, 77),
             ));
-            let metrics = if let Some(cells) = admitted_cells {
+            let metrics = if let Some(safe_count) = admitted_safe_count {
                 let page = result.unwrap();
                 assert!(page.converted);
                 assert!(!page.replacements);
-                assert_eq!(page.text.matches("safe").count(), cells);
+                assert_eq!(page.text.matches("safe").count(), safe_count);
+                assert_eq!(page.selected_part.as_deref(), Some("1"));
+                assert_eq!(page.source_media_type.as_deref(), Some("text/html"));
+                assert!(!page.truncated);
                 assert!(page.continuation.is_none());
+                if nodes.is_some() {
+                    assert_eq!(page.text, "safe\n");
+                }
                 assert_eq!(page.metrics.decoded_bytes, page.text.len());
                 assert!(page.metrics.decoded_bytes <= limits.max_decoded_bytes);
                 assert!(page.metrics.decode_steps >= source_len);
@@ -566,7 +610,9 @@ fn hostile_html_admission_and_refusal_have_bounded_allocations() {
         });
         server.join().unwrap();
         assert_eq!(observed_wire, server_bytes.load(Ordering::Relaxed));
-        eprintln!("html source={source_len} admitted_cells={admitted_cells:?} {allocations:?}");
+        eprintln!(
+            "html source={source_len} admitted_safe_count={admitted_safe_count:?} nodes={nodes:?} {allocations:?}"
+        );
         assert!(allocations.bytes_max < 2 * 1024 * 1024, "{allocations:?}");
         assert!(
             allocations.bytes_total < 16 * 1024 * 1024,
