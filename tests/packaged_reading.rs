@@ -30,6 +30,10 @@ struct Fixture {
 
 impl Fixture {
     fn new(executable: &str) -> Self {
+        Self::with_limits(executable, "attachment_chunk_bytes = 3")
+    }
+
+    fn with_limits(executable: &str, limits: &str) -> Self {
         let installation = Installation::empty();
         let directory = installation.config().parent().unwrap();
         let server = server::ImapServer::new(directory);
@@ -49,7 +53,7 @@ export_roots = [{root}]
 
 [limits]
 wire_fetch_bytes = 2097152
-attachment_chunk_bytes = 3
+{limits}
 
 [[accounts]]
 key = "work"
@@ -166,7 +170,11 @@ impl Reader {
                 let response = envelope(&output);
                 assert_eq!(output.status.success(), response.get("error").is_none());
                 match response["error"]["code"].as_str() {
-                    Some("response_too_large") => assert_eq!(output.status.code(), Some(8)),
+                    Some(
+                        "response_too_large" | "attachment_too_large" | "unsupported_capability",
+                    ) => {
+                        assert_eq!(output.status.code(), Some(8));
+                    }
                     Some("stale_cursor" | "stale_reference") => {
                         assert_eq!(output.status.code(), Some(6));
                     }
@@ -883,4 +891,132 @@ async fn cli_rejects_buffered_attachment_bytes_after_mailbox_recreation() {
 #[tokio::test]
 async fn mcp_rejects_buffered_attachment_bytes_after_mailbox_recreation() {
     reject_attachment_continuation_after_mailbox_recreation(support::MAILCTL_MCP).await;
+}
+
+async fn validate_attachment_payloads_and_bounds(executable: &str) {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use server::{AttachmentCase::*, AttachmentPhase};
+
+    for (case, expected) in [
+        (Base64Truncated, Err("provider_unavailable")),
+        (Base64BadPadding, Err("provider_unavailable")),
+        (QuotedPrintableTruncated, Err("provider_unavailable")),
+        (WrongUid, Err("provider_unavailable")),
+        (WrongSection, Err("provider_unavailable")),
+        (WrongOrigin, Err("provider_unavailable")),
+        (NilPayload, Err("provider_unavailable")),
+        (OversizedLiteral, Err("attachment_too_large")),
+        (WireAtLimit, Ok(())),
+        (WireOverLimit, Err("attachment_too_large")),
+        (DecodedAtLimit, Ok(())),
+        (DecodedOverLimit, Err("attachment_too_large")),
+        (BinaryEncoding, Err("unsupported_capability")),
+        (UnknownEncoding, Err("unsupported_capability")),
+    ] {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let ceilings = match case {
+                WireAtLimit | WireOverLimit => {
+                    "attachment_wire_bytes = 16384\nattachment_decoded_bytes = 32768"
+                }
+                DecodedAtLimit | DecodedOverLimit => {
+                    "attachment_wire_bytes = 32768\nattachment_decoded_bytes = 16384"
+                }
+                _ => "attachment_wire_bytes = 32768\nattachment_decoded_bytes = 32768",
+            };
+            let mut fixture = Fixture::with_limits(
+                executable,
+                &format!("attachment_chunk_bytes = 32768\ntransfers_per_account = 1\n{ceilings}"),
+            );
+            let reader = Reader::start(&fixture, executable).await;
+            let (mailbox, before) = discover_message(&fixture, &reader).await;
+            let message = before["reference"].as_str().unwrap();
+            fixture.server.expect_attachment_case("INBOX", case, true);
+            let listed = reader
+                .call(
+                    &fixture,
+                    &["attachment", "list", "--message", message],
+                    "email_list_attachments",
+                    json!({"message": message}),
+                )
+                .await;
+            let attachments = listed["attachments"].as_array().unwrap();
+            assert_eq!(attachments.len(), 1, "{case:?}");
+            let attachment = &attachments[0];
+            assert_eq!(attachment["display_name"], "fixture.bin");
+            assert_eq!(attachment["media_type"], "application/octet-stream");
+            assert_eq!(
+                attachment["available"],
+                !matches!(case, BinaryEncoding | UnknownEncoding),
+                "{case:?}"
+            );
+            let reference = attachment["reference"].as_str().unwrap();
+            fixture.server.expect_attachment_case("INBOX", case, false);
+            let response = reader
+                .response(
+                    &fixture,
+                    &["attachment", "get", "--attachment", reference],
+                    "email_get_attachment",
+                    json!({"attachment": reference}),
+                )
+                .await;
+            match expected {
+                Ok(()) => {
+                    assert!(response.get("error").is_none(), "{case:?}: {response}");
+                    let result = &response["result"];
+                    assert_eq!(result["attachment_reference"], reference);
+                    assert_eq!(result["decoded_offset"], 0);
+                    assert_eq!(
+                        STANDARD.decode(result["bytes_base64"].as_str().unwrap()).unwrap(),
+                        vec![b'x'; 16384],
+                        "{case:?}"
+                    );
+                    assert_eq!(result["progress"], json!({
+                        "status": "complete", "total_decoded_bytes": 16384,
+                        "sha256": "1536c422c31cc98834759d7085cda394a3510a03d78188248986a6b1a7207d03"
+                    }));
+                }
+                Err(code) => {
+                    assert_eq!(response["error"]["code"], code, "{case:?}: {response}");
+                    assert!(response.get("result").is_none(), "{case:?}: {response}");
+                }
+            }
+            // This serial provider must observe immediate disposal before it
+            // can serve another request, while the same MCP session stays live.
+            assert_eq!(search_message(&fixture, &reader, &mailbox).await, before);
+            if matches!(case, WireOverLimit | DecodedOverLimit) {
+                // A single available transfer slot makes leaked reservations
+                // observable when the next transfer starts in this MCP session.
+                fixture.server.expect_attachment(USERNAME, PASSWORD, "INBOX", AttachmentPhase::Start);
+                let recovered = reader
+                    .call(
+                        &fixture,
+                        &["attachment", "get", "--attachment", reference],
+                        "email_get_attachment",
+                        json!({"attachment": reference}),
+                    )
+                    .await;
+                assert_eq!(recovered["decoded_offset"], 0);
+                assert_eq!(recovered["bytes_base64"], "YWJjZGVm");
+                assert_eq!(recovered["progress"], json!({
+                    "status": "complete", "total_decoded_bytes": 6, "sha256": SHA256
+                }));
+            }
+            reader.finish().await;
+            fixture.server.finish();
+        })
+        .await
+        .unwrap_or_else(|_| panic!("standalone attachment validation deadline: {case:?}"));
+    }
+}
+
+#[cfg(feature = "cli")]
+#[tokio::test]
+async fn cli_validates_attachment_payloads_and_enforces_transfer_bounds() {
+    validate_attachment_payloads_and_bounds(support::MAILCTL).await;
+}
+
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn mcp_validates_attachment_payloads_and_enforces_transfer_bounds() {
+    validate_attachment_payloads_and_bounds(support::MAILCTL_MCP).await;
 }

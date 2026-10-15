@@ -41,6 +41,7 @@ enum ExpectedOperation {
     BodyBound(&'static str, BodyBound),
     BodyCase(&'static str, BodyCase),
     Attachment(&'static str, AttachmentPhase, String),
+    AttachmentCase(&'static str, AttachmentCase, bool),
 }
 
 #[derive(Clone)]
@@ -61,6 +62,24 @@ pub enum AttachmentPhase {
     TruncatedContinuation,
     Interrupted,
     InterruptedContinuation,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum AttachmentCase {
+    Base64Truncated,
+    Base64BadPadding,
+    QuotedPrintableTruncated,
+    WrongUid,
+    WrongSection,
+    WrongOrigin,
+    NilPayload,
+    OversizedLiteral,
+    WireAtLimit,
+    WireOverLimit,
+    DecodedAtLimit,
+    DecodedOverLimit,
+    BinaryEncoding,
+    UnknownEncoding,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -213,6 +232,10 @@ impl ImapServer {
                                 ExpectedOperation::Attachment(mailbox, phase, filename) => {
                                     attachment_page(&mut wire, mailbox, phase, &filename, &stalled).await;
                                     if matches!(phase, AttachmentPhase::StaleContinuation | AttachmentPhase::Truncated | AttachmentPhase::TruncatedContinuation | AttachmentPhase::Interrupted | AttachmentPhase::InterruptedContinuation) { return; }
+                                },
+                                ExpectedOperation::AttachmentCase(mailbox, case, listing) => {
+                                    attachment_case(&mut wire, mailbox, case, listing).await;
+                                    return;
                                 },
                             }
                             imap_support::logout(&mut wire).await;
@@ -409,6 +432,19 @@ impl ImapServer {
 
     pub fn accepted(&self) -> usize {
         self.accepted.load(Ordering::SeqCst)
+    }
+
+    pub fn expect_attachment_case(
+        &self,
+        mailbox: &'static str,
+        case: AttachmentCase,
+        listing: bool,
+    ) {
+        self.expected.lock().unwrap().push_back(Expected {
+            username: "work@example.test",
+            password: "disposable-password",
+            operation: ExpectedOperation::AttachmentCase(mailbox, case, listing),
+        });
     }
 
     pub fn finish(&mut self) {
@@ -701,8 +737,7 @@ async fn attachment_page(
     )
     .await;
     if payload != AttachmentPhase::Continue {
-        let tag = expect(wire, "UID FETCH 3 (UID RFC822.SIZE BODYSTRUCTURE)").await;
-        write(wire, &format!("* 3 FETCH (UID 3 RFC822.SIZE 3000300 BODYSTRUCTURE ((\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" 13 1 NIL NIL NIL NIL)(\"APPLICATION\" \"OCTET-STREAM\" NIL NIL NIL \"BASE64\" 8 NIL (\"ATTACHMENT\" (\"FILENAME\" \"{filename}\")) NIL NIL) \"MIXED\" NIL NIL NIL NIL))\r\n{tag} OK fetched\r\n")).await;
+        attachment_metadata(wire, "BASE64", 8, filename).await;
     }
     if payload == AttachmentPhase::Interrupted {
         expect(wire, "UID FETCH 3 (UID BODY.PEEK[2]<0.16384>)").await;
@@ -722,6 +757,94 @@ async fn attachment_page(
         )
         .await;
     }
+}
+
+async fn attachment_metadata(
+    wire: &mut imap_support::Wire,
+    encoding: &str,
+    size: usize,
+    filename: &str,
+) {
+    let tag = imap_support::expect(wire, "UID FETCH 3 (UID RFC822.SIZE BODYSTRUCTURE)").await;
+    imap_support::write(wire, &format!("* 3 FETCH (UID 3 RFC822.SIZE 3000300 BODYSTRUCTURE ((\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" 13 1 NIL NIL NIL NIL)(\"APPLICATION\" \"OCTET-STREAM\" NIL NIL NIL \"{encoding}\" {size} NIL (\"ATTACHMENT\" (\"FILENAME\" \"{filename}\")) NIL NIL) \"MIXED\" NIL NIL NIL NIL))\r\n{tag} OK fetched\r\n")).await;
+}
+
+async fn attachment_case(
+    wire: &mut imap_support::Wire,
+    mailbox: &str,
+    case: AttachmentCase,
+    listing: bool,
+) {
+    use AttachmentCase::*;
+
+    let (encoding, payload) = match case {
+        Base64Truncated => ("BASE64", b"SGVsbG8".as_slice()),
+        Base64BadPadding => ("BASE64", b"Zg=A".as_slice()),
+        QuotedPrintableTruncated => ("QUOTED-PRINTABLE", b"unfinished=".as_slice()),
+        BinaryEncoding => ("BINARY", b"".as_slice()),
+        UnknownEncoding => ("X-UNKNOWN", b"".as_slice()),
+        _ => ("7BIT", b"".as_slice()),
+    };
+    let size = match case {
+        WireAtLimit | DecodedAtLimit => 16384,
+        WireOverLimit | DecodedOverLimit => 16385,
+        Base64Truncated | Base64BadPadding | QuotedPrintableTruncated => payload.len(),
+        _ => 40000,
+    };
+    let tag = imap_support::expect(wire, &format!("EXAMINE {}", mailbox_argument(mailbox))).await;
+    imap_support::write(
+        wire,
+        &format!("* 3 EXISTS\r\n* OK [UIDVALIDITY 77] stable\r\n{tag} OK [READ-ONLY] selected\r\n"),
+    )
+    .await;
+    attachment_metadata(wire, encoding, size, "fixture.bin").await;
+    if listing {
+        imap_support::logout(wire).await;
+        return;
+    }
+    match case {
+        BinaryEncoding | UnknownEncoding => {
+            // Refuse the unavailable encoding before any payload request.
+        }
+        WrongUid | WrongSection | WrongOrigin | NilPayload | OversizedLiteral => {
+            imap_support::expect(wire, "UID FETCH 3 (UID BODY.PEEK[2]<0.16384>)").await;
+            let frame = match case {
+                WrongUid => "* 3 FETCH (UID 4 BODY[2]<0> {1}\r\nx)\r\n",
+                WrongSection => "* 3 FETCH (UID 3 BODY[1]<0> {1}\r\nx)\r\n",
+                WrongOrigin => "* 3 FETCH (UID 3 BODY[2]<1> {1}\r\nx)\r\n",
+                NilPayload => "* 3 FETCH (UID 3 BODY[2]<0> NIL)\r\n",
+                // The declaration alone must close the connection, without
+                // allocating or waiting for this payload, or attempting LOGOUT.
+                OversizedLiteral => "* 3 FETCH (UID 3 BODY[2]<0> {4294967295}\r\n",
+                _ => unreachable!(),
+            };
+            imap_support::write(wire, frame).await;
+        }
+        WireAtLimit | WireOverLimit | DecodedAtLimit | DecodedOverLimit => {
+            body_literal(wire, "2", 0, 16384, &[b'x'; 16384]).await;
+            let count = if matches!(case, WireAtLimit | WireOverLimit) {
+                1
+            } else {
+                16384
+            };
+            let tail = if matches!(case, WireOverLimit | DecodedOverLimit) {
+                b"x".as_slice()
+            } else {
+                b"".as_slice()
+            };
+            // A full first literal cannot prove EOF. The wire ceiling narrows
+            // the next request to one byte; decoded limits are tested separately.
+            body_literal(wire, "2", 16384, count, tail).await;
+            if matches!(case, WireAtLimit | DecodedAtLimit) {
+                imap_support::logout(wire).await;
+                return;
+            }
+        }
+        Base64Truncated | Base64BadPadding | QuotedPrintableTruncated => {
+            body_literal(wire, "2", 0, 16384, payload).await;
+        }
+    }
+    imap_support::dropped(wire).await;
 }
 
 async fn interrupt_attachment(wire: &mut imap_support::Wire, interrupted: &AtomicUsize) {
