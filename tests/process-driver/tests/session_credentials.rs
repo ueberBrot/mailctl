@@ -160,6 +160,8 @@ fn session_prompt_restores_terminal_on_cancellation_invalid_input_and_deadline()
     let (installation, mut server) = installation();
     let mut config = Config::parse(&fs::read_to_string(installation.config()).unwrap()).unwrap();
     config.limits.operation_seconds = 2;
+    // Let the prompt deadline expire before the enclosing operation deadline.
+    config.limits.secret_command_seconds = 1;
     config.limits.connection_seconds = 1;
     config.limits.initialization_seconds = 1;
     for grant in &mut config.grants {
@@ -176,8 +178,10 @@ fn session_prompt_restores_terminal_on_cancellation_invalid_input_and_deadline()
         (json!({"secret": "123456789"}), 4),
         (json!({"signal": "SIGINT"}), 130),
         (json!({"signal": "SIGTERM"}), 130),
-        (json!({"wait": true}), 5),
+        (json!({"wait": true}), 4),
     ] {
+        let waiting = request["wait"] == true;
+        let started = std::time::Instant::now();
         let result = invoke_terminal(
             &installation,
             &server,
@@ -185,6 +189,13 @@ fn session_prompt_restores_terminal_on_cancellation_invalid_input_and_deadline()
             request,
         );
         assert_prompt(&result, exit);
+        if waiting {
+            assert!(started.elapsed() >= std::time::Duration::from_secs(1));
+            assert!(started.elapsed() < std::time::Duration::from_secs(4));
+            let output = result["output"].as_str().unwrap();
+            assert!(output.contains("\"code\": \"credential_unavailable\""));
+            assert!(output.contains("\"credential_failure\": \"unavailable\""));
+        }
     }
     assert_eq!(server.accepted(), 0);
     server.finish();
