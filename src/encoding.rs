@@ -151,8 +151,13 @@ impl Write for JsonHash {
 
 pub(crate) fn serialize_bounded<T: Serialize>(value: &T, maximum: usize) -> Result<Vec<u8>, Error> {
     let length = serialized_size(value, maximum)?;
+    serialize_sized(value, length)
+}
+
+/// Serialize into a fixed buffer using an already measured JSON length.
+pub(crate) fn serialize_sized<T: Serialize>(value: &T, length: usize) -> Result<Vec<u8>, Error> {
     let mut bytes = vec![0; length];
-    // A slice writer cannot grow, even if a serializer emits more on its second pass.
+    // A slice writer cannot grow, even if a serializer emits more than its measured size.
     let mut output = bytes.as_mut_slice();
     serde_json::to_writer(&mut output, value)
         .map_err(|_| Error::new(ErrorCode::ResponseTooLarge))?;

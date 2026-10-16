@@ -163,7 +163,7 @@ pub(super) struct Options {
 enum Administration {
     /// Read an offline workflow guide; available before setup.
     Guide {
-        #[arg(default_value = "overview", value_parser = clap::builder::PossibleValuesParser::new(super::guidance::topics().iter().copied()))]
+        #[arg(default_value = "overview", value_parser = clap::builder::PossibleValuesParser::new(super::guidance::GUIDES.iter().map(|(topic, _)| *topic)))]
         topic: String,
     },
     /// Print a JSON input schema, including search predicates and draft_content.

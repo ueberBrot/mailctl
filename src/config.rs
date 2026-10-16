@@ -147,11 +147,8 @@ macro_rules! limits {
         #[serde(default, deny_unknown_fields)]
         struct LimitOverrides { $($name: Option<usize>,)+ }
         impl LimitOverrides {
-            fn resolve(self, ceiling: &Limits) -> Result<Limits, Error> {
-                let resolved = Limits { $($name: self.$name.unwrap_or(ceiling.$name),)+ };
-                if !resolved.fits_within(ceiling) { return Err(invalid()); }
-                resolved.validate()?;
-                Ok(resolved)
+            fn resolve(self, ceiling: &Limits) -> Limits {
+                Limits { $($name: self.$name.unwrap_or(ceiling.$name),)+ }
             }
         }
         impl Limits {
@@ -355,17 +352,15 @@ impl Config {
         let grants = raw
             .grants
             .into_iter()
-            .map(|grant| {
-                Ok(AccessGrant {
-                    name: grant.name,
-                    profile: grant.profile,
-                    accounts: grant.accounts,
-                    mailboxes: grant.mailboxes,
-                    historical_drafts: grant.historical_drafts,
-                    limits: grant.limits.resolve(&raw.limits)?,
-                })
+            .map(|grant| AccessGrant {
+                name: grant.name,
+                profile: grant.profile,
+                accounts: grant.accounts,
+                mailboxes: grant.mailboxes,
+                historical_drafts: grant.historical_drafts,
+                limits: grant.limits.resolve(&raw.limits),
             })
-            .collect::<Result<_, Error>>()?;
+            .collect();
         let config = Self {
             default_grant: raw.default_grant,
             topology: raw.topology,
