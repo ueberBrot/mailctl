@@ -293,7 +293,11 @@ impl super::AuthenticatedConnection {
 }
 impl Limits {
     pub(crate) fn attachment(limits: &crate::config::Limits) -> Self {
+        let defaults = Self::default();
+        let max_response_bytes = defaults.max_response_bytes.min(limits.wire_fetch_bytes);
         Self {
+            max_response_bytes,
+            max_literal_bytes: defaults.max_literal_bytes.min(max_response_bytes),
             max_header_bytes: limits.header_bytes,
             max_nesting: limits.mime_depth,
             max_mime_parts: limits.mime_parts,
@@ -301,7 +305,7 @@ impl Limits {
             max_attachment_decoded_bytes: limits.attachment_decoded_bytes,
             max_attachment_chunk_bytes: limits.attachment_chunk_bytes,
             max_operation_bytes: limits.wire_fetch_bytes,
-            ..Self::default()
+            ..defaults
         }
     }
 }
