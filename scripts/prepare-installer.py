@@ -68,7 +68,7 @@ def prepare(manifest_path, destination, allow_dirty):
         shutil.copy2(archive_path, staging / archive_name)
         shutil.copy2(checksum_path, staging / checksum_path.name)
         shutil.copy2(manifest_path, staging / "dist-manifest.json")
-        shutil.copy2(ROOT / "install.sh", staging / ("install-v" + version + ".sh"))
+        shutil.copy2(ROOT / "install.sh", staging / "install.sh")
         values = {"format": "1", "version": version, "target": TARGET,
                   "commit": commit, "compatibility": compatibility}
         # Read exact regular members, never extract archive paths to disk.
@@ -99,7 +99,7 @@ def prepare(manifest_path, destination, allow_dirty):
                                component + "_sha256": digest(output),
                                component + "_size": str(output.stat().st_size),
                                component + "_signing": signing})
-        (staging / ("manifest-v" + version + "-" + TARGET + ".txt")).write_text(
+        (staging / ("manifest-" + TARGET + ".txt")).write_text(
             "".join(key + "=" + value + "\n" for key, value in values.items()))
         evidence = dict(status="prepared", source=source, commit=commit, version=version,
                         target=TARGET, compatibility=compatibility,

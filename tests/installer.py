@@ -25,6 +25,7 @@ import shutil
 import signal
 import sqlite3
 import subprocess
+import sys
 import tarfile
 import tempfile
 import threading
@@ -57,10 +58,7 @@ def read_fields(path):
 
 
 def read_manifest(directory):
-    manifests = list(directory.glob(f"manifest-v*-{TARGET}.txt"))
-    if len(manifests) != 1:
-        raise AssertionError("artifact directory must contain one candidate manifest")
-    return read_fields(manifests[0])
+    return read_fields(directory / f"manifest-{TARGET}.txt")
 
 
 def verify_installed_candidate(manifest, directory, components):
@@ -199,21 +197,23 @@ class InstallerTest(unittest.TestCase):
             manifest[f"{selection}_size"] = str(path.stat().st_size)
             manifest[f"{selection}_signing"] = "unsigned"
         self.write_manifest(manifest)
-        shutil.copy2(ROOT / "install.sh", self.downloads / f"install-v{version}.sh")
+        shutil.copy2(ROOT / "install.sh", self.downloads / "install.sh")
         return manifest
 
     def write_manifest(self, manifest):
-        path = self.downloads / f"manifest-v{manifest['version']}-{TARGET}.txt"
+        path = self.downloads / f"manifest-{TARGET}.txt"
         path.write_text("".join(f"{key}={value}\n" for key, value in manifest.items()))
         return path
 
     def command(self, *args, version=None, env=None, **kwargs):
         command = [
             "/bin/sh", str(self.installer),
-            "--version", version or self.version,
             "--base-url", self.server.url,
-            *map(str, args),
         ]
+        version = self.version if version is None else version
+        if version:
+            command.extend(("--version", version))
+        command.extend(map(str, args))
         return subprocess.run(command, env=env or self.env, capture_output=True,
                               text=True, timeout=30, **kwargs)
 
@@ -236,10 +236,78 @@ class InstallerTest(unittest.TestCase):
     def test_default_install_is_combined_and_needs_no_rust(self):
         self.assertIsNone(shutil.which("cargo", path=self.env["PATH"]))
         self.assertIsNone(shutil.which("rustup", path=self.env["PATH"]))
-        result = self.command()
+        result = self.command(version="")
         self.successful(result)
         self.installed({"cli", "mcp"})
         self.assertIn(str(self.bin), result.stdout + result.stderr)
+
+    def test_latest_manifest_pins_binary_urls_and_receipt_to_its_release(self):
+        release = self.downloads / "releases" / "download" / f"v{self.version}"
+        release.mkdir(parents=True)
+        for path in list(self.downloads.iterdir()):
+            if path.is_file():
+                shutil.copy2(path, release / path.name)
+        latest = self.downloads / "releases" / "latest" / "download"
+        latest.mkdir(parents=True)
+        # Latest exposes metadata only. Binary requests must use the resolved tag.
+        shutil.copy2(release / f"manifest-{TARGET}.txt", latest)
+        curl = self.tools / "curl"
+        curl.write_text(
+            f"#!{sys.executable}\n"
+            "import os, sys\n"
+            "arguments = sys.argv[1:]\n"
+            "for index, argument in enumerate(arguments):\n"
+            "    if argument == '--proto':\n"
+            "        arguments[index + 1] = '=http,https'\n"
+            "    elif argument.startswith('https://github.com/ueberBrot/mailctl/'):\n"
+            f"        arguments[index] = {self.server.url!r} + argument.removeprefix('https://github.com/ueberBrot/mailctl')\n"
+            "    elif argument.startswith(('http://', 'https://')):\n"
+            "        raise SystemExit('Unexpected fixture download URL')\n"
+            "os.execv('/usr/bin/curl', ['curl', *arguments])\n"
+        )
+        curl.chmod(0o755)
+        result = subprocess.run(["/bin/sh", str(self.installer)], env=self.env,
+                                capture_output=True, text=True, timeout=30)
+        self.successful(result)
+        self.installed({"cli", "mcp"})
+        self.assertEqual(self.server.requests, [
+            f"/releases/latest/download/manifest-{TARGET}.txt",
+            *[f"/releases/download/v{self.version}/{binary}-v{self.version}-{TARGET}"
+              for binary in COMPONENTS.values()],
+        ])
+        receipt = read_fields(self.bin / ".mailctl-components")
+        for component in COMPONENTS:
+            self.assertEqual(receipt[f"{component}_origin"],
+                             f"https://github.com/ueberBrot/mailctl/releases/download/v{self.version}")
+        self.successful(self.command("--uninstall", version=""))
+        self.server.requests.clear()
+        self.successful(subprocess.run([
+            "/bin/sh", str(self.installer), "--version", f"v{self.version}", "--components", "cli",
+        ], env=self.env, capture_output=True, text=True, timeout=30))
+        self.installed({"cli"})
+        self.assertEqual(self.server.requests, [
+            f"/releases/download/v{self.version}/manifest-{TARGET}.txt",
+            f"/releases/download/v{self.version}/mailctl-v{self.version}-{TARGET}",
+        ])
+
+    def test_latest_metadata_failures_and_explicit_version_mismatch_preserve_installation(self):
+        self.successful(self.command())
+        before = tree_bytes(self.bin)
+        for version in ("0.2.0-beta.1", "01.0.0", "0.01.0", "0.1.00", "v0.1.0", "0.1.0+build"):
+            with self.subTest(version=version):
+                manifest = self.publish_fixture(self.version)
+                manifest["version"] = version
+                self.write_manifest(manifest)
+                self.server.requests.clear()
+                self.failed(self.command(version=""))
+                self.assertEqual(tree_bytes(self.bin), before)
+                self.assertEqual(self.server.requests, [f"/manifest-{TARGET}.txt"])
+        manifest = self.publish_fixture(self.version)
+        self.failed(self.command(version="0.2.0"))
+        self.assertEqual(tree_bytes(self.bin), before)
+        self.write_manifest(manifest).unlink()
+        self.failed(self.command(version=""))
+        self.assertEqual(tree_bytes(self.bin), before)
 
     def test_each_selection_is_independent_and_addition_preserves_sibling(self):
         for selected in ("cli", "mcp"):
@@ -253,7 +321,7 @@ class InstallerTest(unittest.TestCase):
                 previous = (directory / COMPONENTS[selected]).read_bytes()
                 self.version = "0.2.0"
                 candidate = self.publish_fixture(self.version, commit="b" * 40)
-                self.successful(self.command("--components", selected, "--install-dir", directory))
+                self.successful(self.command("--install-dir", directory))
                 self.installed({selected}, directory)
                 self.assertNotEqual((directory / COMPONENTS[selected]).read_bytes(), previous)
                 receipt = dict(line.split("=", 1) for line in
@@ -294,9 +362,9 @@ class InstallerTest(unittest.TestCase):
 
     def test_curl_pipeline_installs_the_downloaded_script(self):
         curl = subprocess.run(["/usr/bin/curl", "-fsSL",
-            f"{self.server.url}/install-v{self.version}.sh"], capture_output=True,
+            f"{self.server.url}/install.sh"], capture_output=True,
             check=True, timeout=10, env=self.env)
-        result = subprocess.run(["/bin/sh", "-s", "--", "--version", self.version,
+        result = subprocess.run(["/bin/sh", "-s", "--",
             "--base-url", self.server.url], input=curl.stdout, capture_output=True,
             timeout=30, env=self.env)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -332,10 +400,14 @@ class InstallerTest(unittest.TestCase):
         before = tree_bytes(self.bin)
         self.successful(self.command())
         self.assertEqual(tree_bytes(self.bin), before)
-        self.successful(self.command("--uninstall"))
+        self.server.requests.clear()
+        self.successful(self.command("--uninstall", "--base-url", "https://unavailable.invalid", version=""))
         self.assertFalse((self.bin / "mailctl").exists())
         self.assertFalse((self.bin / "mailctl-mcp").exists())
         self.assertEqual(sentinel.read_bytes(), b"opaque installation history\n")
+        self.assertEqual(self.server.requests, [])
+        self.successful(self.command(version=""))
+        self.installed({"cli", "mcp"})
 
     def test_invalid_configuration_paths_are_rejected_before_download(self):
         self.successful(self.command())
@@ -395,7 +467,8 @@ class InstallerTest(unittest.TestCase):
                     self.assertIn("Component versions or source commits differ", result.stderr)
                     self.assertEqual(tree_bytes(self.bin), before)
                     self.assertEqual(self.server.requests,
-                                     [f"/manifest-v{version}-{TARGET}.txt"])
+                                     [f"/manifest-{TARGET}.txt"])
+        self.publish_fixture("0.2.0", commit="b" * 40)
         self.successful(self.command(version="0.2.0"))
         self.version = "0.2.0"
         self.installed({"cli", "mcp"})
@@ -484,7 +557,9 @@ class InstallerTest(unittest.TestCase):
                 process.communicate(timeout=5)
             wrapper.unlink()
         self.failed(self.command(version="0.2.0"))
-        self.successful(self.command("--recover"))
+        self.server.requests.clear()
+        self.successful(self.command("--recover", "--base-url", "https://unavailable.invalid", version=""))
+        self.assertEqual(self.server.requests, [])
         self.assertEqual(tree_bytes(self.bin), before)
         self.successful(self.command(version="0.2.0"))
         self.version = "0.2.0"
@@ -493,7 +568,7 @@ class InstallerTest(unittest.TestCase):
     def test_remote_plain_http_and_unknown_options_are_rejected(self):
         for arguments in (("--base-url", "http://example.test/releases"),
                           ("--components", "broker"), ("--unknown",),
-                          ("--version", "../../0.1.0")):
+                          ("--version", "../../0.1.0"), ("--version", "v")):
             with self.subTest(arguments=arguments):
                 self.failed(self.command(*arguments))
                 self.assertFalse(self.bin.exists())
@@ -531,7 +606,7 @@ class PackagedInstallerTest(InstallerTest):
         shutil.copytree(ARTIFACTS, self.downloads)
         self.manifest = read_manifest(self.downloads)
         self.version = self.manifest["version"]
-        self.installer = self.downloads / f"install-v{self.version}.sh"
+        self.installer = self.downloads / "install.sh"
         self.env["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
         self.config = self.directory / "operator configuration" / "config.toml"
 
@@ -661,8 +736,7 @@ class PackagedInstallerTest(InstallerTest):
                                      {"work", "personal"})
                     state_before = tree_bytes(self.config.parent)
                     binaries_before = tree_bytes(directory)
-                    self.successful(self.command("--components", selected,
-                                                 "--install-dir", directory,
+                    self.successful(self.command("--install-dir", directory,
                                                  "--config", self.config))
                     self.installed(set(selected.split(",")), directory)
                     self.assertEqual(tree_bytes(directory), binaries_before)
@@ -670,7 +744,7 @@ class PackagedInstallerTest(InstallerTest):
                     self.assertEqual((self.invoke(first, "account", "list")
                                       if first.name == "mailctl" else self.discover_mcp(first)),
                                      accounts)
-                    self.successful(self.command("--install-dir", directory,
+                    self.successful(self.command("--components", "cli,mcp", "--install-dir", directory,
                                                  "--config", self.config))
                     self.installed({"cli", "mcp"}, directory)
                     self.assertEqual(tree_bytes(self.config.parent), state_before)
@@ -839,7 +913,7 @@ def leave_installed_candidate(artifacts, destination, components, reuse=False):
         env = {"HOME": str(home), "PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C"}
         server = DownloadServer(artifacts)
         try:
-            subprocess.run(["/bin/sh", str(artifacts / f"install-v{manifest['version']}.sh"), "--version",
+            subprocess.run(["/bin/sh", str(artifacts / "install.sh"), "--version",
                 manifest["version"], "--base-url", server.url, "--install-dir",
                 str(destination), "--components", components], env=env, check=True, timeout=60)
         finally:
