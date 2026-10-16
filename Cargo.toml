@@ -26,11 +26,6 @@ dist = true
 inherits = "release"
 lto = "thin"
 
-[patch.crates-io]
-# Preserve bounded MIME depth across multipart and embedded-message parsing.
-# This revision is the exact alpha.9 source plus the focused recursion fix.
-imap-codec = { git = "https://github.com/ueberBrot/imap-codec", rev = "d69e4bd1b26b812518a0e47a2cf636ed7671ba66" }
-
 [dependencies]
 clap = { version = "4.6.7", default-features = false, features = ["std", "help", "usage", "error-context", "derive"] }
 serde = { version = "1.0.229", features = ["derive"] }
