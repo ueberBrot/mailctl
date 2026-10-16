@@ -219,5 +219,8 @@ export PATH="$PWD/target/release:$PATH"
 For CLI only, add `--no-default-features --features cli` to the build command.
 For MCP only, use `--no-default-features --features mcp`.
 
+The [IMAP support notes](docs/imap-support.md) describe provider syntax, resource limits,
+and the published protocol dependencies.
+
 Use `mailctl --help`, `mailctl guide`, or `mailctl guide errors` for more help.
 Released under the [ISC license](LICENSE).
