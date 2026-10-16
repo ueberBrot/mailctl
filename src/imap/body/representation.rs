@@ -534,17 +534,11 @@ fn select_part<'a>(
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum BodyKind {
-    Plain,
-    Html,
-}
-
 fn related_headers(
     structure: &BodyStructure<'_>,
     path: &mut Vec<NonZeroU32>,
     paths: &mut Vec<Part>,
-) -> Result<Option<BodyKind>, Error> {
+) -> Result<Option<&'static str>, Error> {
     match structure {
         BodyStructure::Single {
             body,
@@ -553,17 +547,7 @@ fn related_headers(
             if attachment(extension_data.as_ref().and_then(|data| data.tail.as_ref())) {
                 return Ok(None);
             }
-            let SpecificFields::Text { subtype, .. } = &body.specific else {
-                return Ok(None);
-            };
-            let subtype = imap_text(subtype)?;
-            Ok(if subtype.eq_ignore_ascii_case("plain") {
-                Some(BodyKind::Plain)
-            } else if subtype.eq_ignore_ascii_case("html") {
-                Some(BodyKind::Html)
-            } else {
-                None
-            })
+            text_media_type(body)
         }
         BodyStructure::Multi {
             bodies,
@@ -607,7 +591,7 @@ fn related_headers(
                 // Eligibility is stable without Content-IDs: a related child
                 // falls back to its first readable candidate. Return its type
                 // from this traversal so ancestors need no repeated selection.
-                if selected.is_none() || alternative && candidate == Some(BodyKind::Plain) {
+                if selected.is_none() || alternative && candidate == Some("text/plain") {
                     selected = candidate;
                 }
                 if root.is_some() && !matched_root && structure_content_id(child)? == root {
@@ -617,7 +601,7 @@ fn related_headers(
                     selected = candidate.or(selected);
                 }
                 if (first_wins || matched_root) && selected.is_some()
-                    || alternative && paths.len() == before && candidate == Some(BodyKind::Plain)
+                    || alternative && paths.len() == before && candidate == Some("text/plain")
                 {
                     break;
                 }
@@ -628,15 +612,7 @@ fn related_headers(
 }
 
 fn leaf<'a>(body: &'a Body<'_>) -> Result<Option<Candidate<'a>>, Error> {
-    let SpecificFields::Text { subtype, .. } = &body.specific else {
-        return Ok(None);
-    };
-    let subtype = imap_text(subtype)?;
-    let media_type = if subtype.eq_ignore_ascii_case("plain") {
-        "text/plain"
-    } else if subtype.eq_ignore_ascii_case("html") {
-        "text/html"
-    } else {
+    let Some(media_type) = text_media_type(body)? else {
         return Ok(None);
     };
     Ok(Some(Candidate {
@@ -646,6 +622,20 @@ fn leaf<'a>(body: &'a Body<'_>) -> Result<Option<Candidate<'a>>, Error> {
         transfer_encoding: imap_text(&body.basic.content_transfer_encoding)?,
         wire_size: body.basic.size as usize,
     }))
+}
+
+fn text_media_type(body: &Body<'_>) -> Result<Option<&'static str>, Error> {
+    let SpecificFields::Text { subtype, .. } = &body.specific else {
+        return Ok(None);
+    };
+    let subtype = imap_text(subtype)?;
+    Ok(if subtype.eq_ignore_ascii_case("plain") {
+        Some("text/plain")
+    } else if subtype.eq_ignore_ascii_case("html") {
+        Some("text/html")
+    } else {
+        None
+    })
 }
 
 fn structure_content_id<'a>(structure: &'a BodyStructure<'_>) -> Result<Option<&'a str>, Error> {

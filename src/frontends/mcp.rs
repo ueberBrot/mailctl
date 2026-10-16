@@ -288,12 +288,8 @@ impl ServerHandler for EmailTools {
             .map_err(|_| McpError::internal_error("Result unavailable", None))?;
         // Value preserves the envelope's encoded length, including escaped strings.
         // A fixed slice retains that measured bound without geometric String growth.
-        let mut encoded = vec![0; envelope_bytes];
-        let mut output = encoded.as_mut_slice();
-        serde_json::to_writer(&mut output, &value)
+        let encoded = crate::encoding::serialize_sized(&value, envelope_bytes)
             .map_err(|_| McpError::internal_error("Result unavailable", None))?;
-        let written = envelope_bytes - output.len();
-        encoded.truncate(written);
         let text = String::from_utf8(encoded)
             .map_err(|_| McpError::internal_error("Result unavailable", None))?;
         let mut response = if success {
@@ -307,9 +303,9 @@ impl ServerHandler for EmailTools {
 }
 
 fn guide_resources() -> Vec<Resource> {
-    super::guidance::topics()
+    super::guidance::GUIDES
         .iter()
-        .map(|topic| {
+        .map(|(topic, _)| {
             Resource::new(
                 format!("mailctl://guide/{topic}"),
                 format!("mailctl {topic} guide"),
@@ -350,8 +346,7 @@ pub(super) async fn run(application: Application) -> Result<(), Error> {
         crate::encoding::serialized_size(&super::guidance::instructions(), limits.buffered_bytes)
             .map_err(|_| Error::setup_required())?,
     );
-    for topic in super::guidance::topics() {
-        let guide = super::guidance::guide(topic).ok_or_else(Error::setup_required)?;
+    for (_, guide) in super::guidance::GUIDES {
         control_bytes = control_bytes.max(
             crate::encoding::serialized_size(&guide, limits.buffered_bytes)
                 .map_err(|_| Error::setup_required())?,
