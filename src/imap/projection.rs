@@ -78,11 +78,27 @@ impl<'a, 'b> Projection<'a, 'b> {
         Ok(())
     }
     pub(super) fn message(self) -> crate::search::LocatedMessage {
-        use crate::domain::MessageMetadata;
+        use crate::domain::{MessageMetadata, StandardFlag};
+        let standard_flags = [
+            StandardFlag::Answered,
+            StandardFlag::Deleted,
+            StandardFlag::Draft,
+            StandardFlag::Flagged,
+            StandardFlag::Recent,
+            StandardFlag::Seen,
+        ]
+        .map(StandardFlag::imap_name);
         let mut flags = self
             .flags
             .iter()
-            .map(ToString::to_string)
+            .map(|flag| {
+                standard_flags
+                    .iter()
+                    .copied()
+                    .find(|name| name.eq_ignore_ascii_case(flag))
+                    .unwrap_or(flag)
+                    .to_owned()
+            })
             .collect::<Vec<_>>();
         flags.sort_unstable();
         flags.dedup();
