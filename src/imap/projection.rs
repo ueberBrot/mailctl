@@ -108,6 +108,11 @@ impl<'a, 'b> Projection<'a, 'b> {
                 sent_date: metadata(&self.envelope.date, |bytes| {
                     let value = std::str::from_utf8(bytes).ok()?;
                     let date = mail_parser::DateTime::parse_rfc822(value)?;
+                    chrono::NaiveDate::from_ymd_opt(
+                        date.year.into(),
+                        date.month.into(),
+                        date.day.into(),
+                    )?;
                     date.is_valid().then(|| date.to_rfc3339())
                 }),
                 flags,
@@ -375,6 +380,40 @@ mod tests {
                     address: expected.into(),
                 }]),
                 "{local:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn envelope_sent_dates_require_valid_calendar_days_and_preserve_offsets() {
+        for (raw, expected) in [
+            ("31 Feb 2024 12:00:00 +0000", None),
+            ("29 Feb 2023 12:00:00 +0000", None),
+            ("29 Feb 1900 12:00:00 +0000", None),
+            ("31 Apr 2024 12:00:00 +0000", None),
+            ("29 Feb 2024 24:00:00 +0000", None),
+            ("01 Jan 3001 12:00:00 +0000", None),
+            (
+                "29 Feb 2024 23:30:00 -1200",
+                Some("2024-02-29T23:30:00-12:00"),
+            ),
+            (
+                "29 Feb 2000 00:30:00 +1400",
+                Some("2000-02-29T00:30:00+14:00"),
+            ),
+            ("28 Feb 1900 12:00:00 +0000", Some("1900-02-28T12:00:00Z")),
+            ("30 Apr 2024 12:00:00 +0000", Some("2024-04-30T12:00:00Z")),
+        ] {
+            let mut fields = fields("sender");
+            let MessageDataItem::Envelope(envelope) = &mut fields[1] else {
+                unreachable!();
+            };
+            envelope.date = NString(Some(raw.try_into().unwrap()));
+            let message = Projection::parse(&fields).unwrap().message();
+            assert_eq!(
+                message.metadata.sent_date,
+                expected.map_or(Metadata::Malformed, |value| Metadata::Present(value.into())),
+                "{raw}"
             );
         }
     }
