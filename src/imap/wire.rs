@@ -69,6 +69,12 @@ impl Session {
             metrics,
         }
     }
+
+    fn reset_response_parsers(&mut self) {
+        let maximum = self.limits.max_response_bytes as u32;
+        self.fragmentizer = Fragmentizer::new(maximum);
+        self.response_guard = Fragmentizer::new(maximum);
+    }
 }
 impl<'a> Connection<'a> {
     pub(super) fn into_session(self) -> Session {
@@ -112,8 +118,7 @@ impl<'a> Connection<'a> {
     }
     pub(super) fn limit_body(&mut self, limits: &Limits) {
         self.session.limits = limits.clone();
-        self.session.fragmentizer = Fragmentizer::new(limits.max_response_bytes as u32);
-        self.session.response_guard = Fragmentizer::new(limits.max_response_bytes as u32);
+        self.session.reset_response_parsers();
     }
     pub(super) fn limit_search(&mut self, limits: &crate::config::Limits) {
         self.session.limits.max_literal_bytes = limits.header_bytes;
@@ -126,10 +131,7 @@ impl<'a> Connection<'a> {
         self.session.limits.max_operation_bytes = limits.wire_fetch_bytes;
         // Authentication completed at a clean command boundary. Both parsers
         // must apply the selected operation's frame ceiling.
-        self.session.fragmentizer =
-            Fragmentizer::new(self.session.limits.max_response_bytes as u32);
-        self.session.response_guard =
-            Fragmentizer::new(self.session.limits.max_response_bytes as u32);
+        self.session.reset_response_parsers();
     }
     pub(super) async fn upper_uid(&mut self, uid_next: Option<u32>) -> Result<u32, Error> {
         if let Some(next) = uid_next {
@@ -191,10 +193,7 @@ impl<'a> Connection<'a> {
         .map_err(|_| Error::Timeout)?
         .map_err(|_| Error::Tls)?;
         self.session.stream = BufReader::with_capacity(4096, Box::new(tls));
-        self.session.fragmentizer =
-            Fragmentizer::new(self.session.limits.max_response_bytes as u32);
-        self.session.response_guard =
-            Fragmentizer::new(self.session.limits.max_response_bytes as u32);
+        self.session.reset_response_parsers();
         Ok(self)
     }
     /// The streaming coroutine keeps the frozen MIME out of backend command buffers.
