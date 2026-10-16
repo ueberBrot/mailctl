@@ -861,6 +861,15 @@ impl Drop for Dispatch<'_> {
     }
 }
 fn journal_error(error: DraftJournalError) -> Error {
+    #[cfg(windows)]
+    crate::draft_journal::diagnostic(
+        "journal_operation",
+        Some(match error {
+            DraftJournalError::Busy => 1,
+            DraftJournalError::InvalidDatabase => 2,
+            _ => 3,
+        }),
+    );
     match error {
         DraftJournalError::OperationConflict => Error::draft_conflict(),
         DraftJournalError::Full => Error::new(ErrorCode::JournalFull),

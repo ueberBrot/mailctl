@@ -77,7 +77,8 @@ switch ($Suite) {
         $listing = & $binary $test --exact --list
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         if ($listing -notcontains "${test}: test") { throw 'Required concurrent draft test is missing' }
-        for ($attempt = 1; $attempt -le 20; $attempt++) {
+        $env:MAILCTL_TEST_JOURNAL_DIAGNOSTICS = '1'
+        for ($attempt = 1; $attempt -le 200; $attempt++) {
             & $binary $test --exact
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         }

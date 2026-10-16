@@ -51,7 +51,11 @@ pub(super) fn open_lock(directory: &Path, name: &str) -> Result<File, Error> {
             .create(true)
             .truncate(false),
     )
-    .map_err(|_| invalid())
+    .map_err(|_error| {
+        #[cfg(windows)]
+        crate::draft_journal::diagnostic("lock_file_open", _error.raw_os_error());
+        invalid()
+    })
 }
 #[derive(Clone, Copy)]
 pub(super) enum LockMode {
