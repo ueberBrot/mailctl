@@ -3,8 +3,10 @@
 
 mod support;
 
-use std::{collections::BTreeMap, thread};
-use support::{Installation, MAILCTL, assert_success, envelope, run_bounded};
+use std::{collections::BTreeMap, thread, time::Duration};
+use support::{
+    Installation, MAILCTL, assert_success, envelope, run_bounded, run_bounded_with_timeout,
+};
 
 fn setup(installation: &Installation) {
     let output = run_bounded({
@@ -87,10 +89,17 @@ fn default_grant_and_explicit_narrowing_discover_only_authorized_account_aliases
 #[test]
 fn concurrent_first_setup_preserves_one_shared_account_identity() {
     let installation = Installation::two_accounts();
+    // Give concurrent durable setup the supported maximum lock-wait allowance.
+    let configuration = std::fs::read_to_string(installation.config()).unwrap();
+    std::fs::write(
+        installation.config(),
+        format!("{configuration}\n[limits]\ninitialization_seconds = 10\n"),
+    )
+    .unwrap();
     let first = {
         let mut command = installation.cli();
         command.args(["--json", "setup"]);
-        thread::spawn(move || run_bounded(command))
+        thread::spawn(move || run_bounded_with_timeout(command, Duration::from_secs(30)))
     };
     let second = {
         #[cfg(feature = "mcp")]
@@ -98,7 +107,7 @@ fn concurrent_first_setup_preserves_one_shared_account_identity() {
         #[cfg(not(feature = "mcp"))]
         let mut command = installation.cli();
         command.args(["--json", "setup"]);
-        thread::spawn(move || run_bounded(command))
+        thread::spawn(move || run_bounded_with_timeout(command, Duration::from_secs(30)))
     };
     let first = first.join().unwrap();
     let second = second.join().unwrap();

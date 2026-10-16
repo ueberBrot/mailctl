@@ -287,7 +287,7 @@ impl Service {
         let verification_deadline = std::time::Instant::now() + self.operation_duration(context)?;
         let _admission = self.requests.admit(target.account_id, limits).await?;
         // Ownership spans recovery, target verification, APPEND and durable completion.
-        let mut _writer = match self
+        let writer = match self
             .registry
             .draft_writer(identity.account_id, limits.initialization_seconds)
             .await
@@ -313,7 +313,8 @@ impl Service {
         let mut journal = self
             .registry
             .wait_for_draft_journal(limits.initialization_seconds)
-            .await?;
+            .await?
+            .with_writer(Some(writer));
         let mut prior = authorized_operation(&mut journal, &identity, &input.mailbox)?;
         if let Some(pending) = &prior
             && pending.state == DraftOperationState::InFlight
@@ -373,19 +374,15 @@ impl Service {
         self.registry.draft_creation_allowed()?;
         // Revisit retained rows before dispatch even if a previous storage failure
         // prevented recording a corruption fence. Status and reads skip this scan.
-        // Drop the journal before the writer even if blocking work unwinds or
-        // outlives a cancelled request. Restore the original bindings afterward
-        // so the writer also outlives journal teardown on every later exit.
-        let mut verification = (journal, _writer);
         let (verified, result) = tokio::task::spawn_blocking(move || {
-            let result = verification.0.access(|journal| {
+            let result = journal.access(|journal| {
                 journal.verify_for_dispatch(verification_deadline, Limits::MAXIMUM.journal_records)
             });
-            (verification, result)
+            (journal, result)
         })
         .await
         .map_err(|_| Error::new(ErrorCode::JournalUnavailable))?;
-        (journal, _writer) = verified;
+        journal = verified;
         result.map_err(journal_error)?;
         self.registry.draft_creation_allowed()?;
         let frozen = prior
@@ -550,7 +547,7 @@ impl Service {
         let _admission = self.requests.admit(target.account_id, limits).await?;
         // Open and close the journal under writer ownership so another process cannot
         // race this connection's final WAL checkpoint with its own reconciliation.
-        let _writer = if input.reconcile {
+        let writer = if input.reconcile {
             match self
                 .registry
                 .draft_writer(identity.account_id, limits.initialization_seconds)
@@ -578,7 +575,8 @@ impl Service {
         let mut journal = self
             .registry
             .wait_for_draft_journal(limits.initialization_seconds)
-            .await?;
+            .await?
+            .with_writer(writer);
         let mut prior = authorized_operation(&mut journal, &identity, &input.mailbox)?
             .ok_or_else(|| self.registry.absent_draft())?;
         if input.reconcile {
