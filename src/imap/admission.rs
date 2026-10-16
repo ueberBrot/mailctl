@@ -203,11 +203,12 @@ impl<S: AsyncRead> Admission<S> {
     fn finish(&mut self) -> Result<(), Error> {
         let mut state = self.control.0.lock().expect("admission mutex");
         charge(&mut state, self.frame.len().saturating_mul(3))?;
-        self.output = normalize(
+        normalize(
             &self.frame,
             self.kind.unwrap_or(Kind::Other),
             &state.contract,
             &state.limits,
+            &mut self.output,
         )?;
         if self.output.len() > self.frame.len() {
             charge(&mut state, self.output.len() - self.frame.len())?;
@@ -543,12 +544,14 @@ fn normalize(
     kind: Kind,
     contract: &FrameContract,
     limits: &Limits,
-) -> Result<Vec<u8>, Error> {
+    output: &mut Vec<u8>,
+) -> Result<(), Error> {
+    output.clear();
     if kind == Kind::Other {
-        return Ok(frame.to_vec());
+        return extend(output, frame, limits.max_response_bytes);
     }
     let mut scanner = Scanner { frame, position: 0 };
-    let mut output = Vec::with_capacity(frame.len());
+    reserve(output, frame.len(), limits.max_response_bytes)?;
     let mut copied = 0;
     let mut depth = 0usize;
     let mut attr = &b""[..];
@@ -655,11 +658,11 @@ fn normalize(
                             // a literal in the exact requested partial BODY field.
                             if frame.get(scanner.position) == Some(&b'{') {
                                 extend(
-                                    &mut output,
+                                    output,
                                     &frame[copied..scanner.position],
                                     limits.max_response_bytes,
                                 )?;
-                                extend(&mut output, b" ", limits.max_response_bytes)?;
+                                extend(output, b" ", limits.max_response_bytes)?;
                                 copied = scanner.position;
                             } else if frame.get(scanner.position) != Some(&b' ') {
                                 return Err(Error::Protocol);
@@ -707,7 +710,7 @@ fn normalize(
         }
         if convert && matches!(token.kind, TokenKind::Quoted { escaped: true }) {
             extend(
-                &mut output,
+                output,
                 &frame[copied..token.start],
                 limits.max_response_bytes,
             )?;
@@ -716,11 +719,11 @@ fn normalize(
                 return Err(Error::Limit);
             }
             extend(
-                &mut output,
+                output,
                 format!("{{{length}}}\r\n").as_bytes(),
                 limits.max_response_bytes,
             )?;
-            reserve(&mut output, length, limits.max_response_bytes)?;
+            reserve(output, length, limits.max_response_bytes)?;
             let mut i = 0;
             while i < token.data.len() {
                 if token.data[i] == b'\\' {
@@ -735,11 +738,11 @@ fn normalize(
             }
         }
     }
-    extend(&mut output, &frame[copied..], limits.max_response_bytes)?;
+    extend(output, &frame[copied..], limits.max_response_bytes)?;
     if output.len() > limits.max_response_bytes {
         return Err(Error::Limit);
     }
-    Ok(output)
+    Ok(())
 }
 
 fn unescaped_len(bytes: &[u8]) -> usize {
@@ -1082,6 +1085,34 @@ mod tests {
                 Error::Protocol
             );
         }
+    }
+    #[test]
+    fn admitted_frames_reuse_bounded_output_storage() {
+        use tokio::io::AsyncReadExt;
+        const FRAME_BYTES: usize = 4096;
+        const FRAMES: usize = 32;
+        let mut frame = vec![b'x'; FRAME_BYTES];
+        frame[..5].copy_from_slice(b"* OK ");
+        frame[FRAME_BYTES - 2..].copy_from_slice(b"\r\n");
+        let (mut wire, _) = Admission::new(
+            Fixture::new(&frame.repeat(FRAMES)),
+            Limits::default(),
+            Metrics::default(),
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let measured = allocation_counter::measure(|| {
+            runtime.block_on(async {
+                let mut output = [0; FRAME_BYTES];
+                for _ in 0..FRAMES {
+                    wire.read_exact(&mut output).await.unwrap();
+                    assert_eq!(output.as_slice(), frame);
+                }
+            });
+        });
+        assert!(measured.bytes_total <= 16 * 1024, "{measured:?}");
     }
     async fn rejected(input: &[u8], limits: Limits, contract: FrameContract) -> Error {
         let (wire, control) =

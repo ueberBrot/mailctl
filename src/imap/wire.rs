@@ -404,17 +404,10 @@ impl<'a> Connection<'a> {
         if rows.len() != 1 {
             return Err(Error::Protocol);
         }
-        let Response::Capabilities(values) = &rows[0] else {
+        let Some(Response::Capabilities(values)) = rows.into_iter().next() else {
             return Err(Error::Protocol);
         };
-        Ok(values
-            .iter()
-            .map(|v| match v {
-                Capability::Imap4rev1 => Capability::Imap4rev1,
-                Capability::Atom(a) => Capability::Atom(a.to_string().into()),
-                Capability::Auth(a) => Capability::Auth(a.to_string().into()),
-            })
-            .collect())
+        Ok(values)
     }
     pub(super) async fn login(&mut self, user: &str, password: &str) -> Result<(), Error> {
         let command = Zeroizing::new(format!("LOGIN {} {}", quote(user)?, quote(password)?));
@@ -544,10 +537,10 @@ impl<'a> Connection<'a> {
         }
         self.write(pending.as_bytes()).await?;
         let rows = self.collect(&tag, Kind::Search).await?;
-        let Response::MailboxData(MailboxDatum::Search(ids)) = &rows[0] else {
+        let Some(Response::MailboxData(MailboxDatum::Search(ids))) = rows.into_iter().next() else {
             return Err(Error::Protocol);
         };
-        Ok(ids.clone())
+        Ok(ids)
     }
     /// Frozen MIME is streamed after one synchronizing continuation. Outcome is
     /// recorded before returning, including when cancellation drops this future.
