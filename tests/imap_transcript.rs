@@ -472,7 +472,7 @@ async fn unsafe_selection_never_reaches_search() {
 #[tokio::test]
 async fn malformed_referral_and_mismatched_completion_dispose_the_connection() {
     for (response, expected) in [
-        ("* bogus malformed\r\n", mailctl::imap::Error::Protocol),
+        ("* bogus malformed\r\n", mailctl::imap::Error::Unsupported),
         ("wrongtag OK listed\r\n", mailctl::imap::Error::Protocol),
         (
             "{tag} NO [REFERRAL imap://other.invalid/INBOX] redirected\r\n",
@@ -861,9 +861,16 @@ fn client_allocations_remain_bounded_for_discovery_envelopes_and_oversized_liter
         );
         assert!(allocations.count_total < 100_000);
         if route == "all-discovery" {
+            // async-imap owns a fresh 8 KiB response block and a 4 KiB reset
+            // buffer per frame. Bound that linear work independently of retained
+            // memory, which remains subject to the unchanged peak ceiling above.
             assert!(
-                allocations.count_total < 9_000,
-                "mailbox discovery must avoid repeated frame allocation: {allocations:?}"
+                allocations.count_total <= metrics.responses as u64 * 12 + 512,
+                "mailbox discovery allocation work must stay linear: {allocations:?}"
+            );
+            assert!(
+                allocations.bytes_total <= metrics.responses as u64 * 14 * 1024 + 256 * 1024,
+                "mailbox discovery allocation bytes must stay linear: {allocations:?}"
             );
         }
         if route == "large-envelope" {
@@ -918,7 +925,7 @@ async fn excessive_nesting_and_invalid_literal_declarations_dispose_connections(
         ),
         (
             "* LIST () \"/\" {18446744073709551616}\r\n".into(),
-            mailctl::imap::Error::Protocol,
+            mailctl::imap::Error::Limit,
         ),
     ] {
         let mut fixture = fixture(TlsMode::Implicit, Limits::default(), move |mut wire| {

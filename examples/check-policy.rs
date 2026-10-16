@@ -50,6 +50,20 @@ fn check_dependencies(
         .features(features)
         .other_options(vec!["--locked".into()])
         .exec()?;
+    for package in &metadata.packages {
+        let name = package.name.as_str();
+        if ["io-imap", "imap-codec", "imap-types"].contains(&name) {
+            return Err(format!("Unsupported former IMAP dependency: {name}").into());
+        }
+        if ["async-imap", "imap-proto"].contains(&name)
+            && !package
+                .source
+                .as_ref()
+                .is_some_and(|source| source.is_crates_io())
+        {
+            return Err(format!("Use the published crates.io {name} package").into());
+        }
+    }
     let nodes: HashMap<_, _> = metadata
         .resolve
         .as_ref()
@@ -80,7 +94,7 @@ fn check_dependencies(
             .filter(|dep| dep.kind != DependencyKind::Development)
             .collect();
         for dependency in &dependencies {
-            if ["io-imap", "tokio-rustls"].contains(&dependency.name.as_str())
+            if ["async-imap", "tokio-rustls"].contains(&dependency.name.as_str())
                 && dependency.uses_default_features
             {
                 return Err(format!(
@@ -90,13 +104,19 @@ fn check_dependencies(
                 .into());
             }
         }
-        if name == "io-imap"
-            && (!node.features.is_empty() || package.version.to_string() != "0.7.1")
+        if name == "async-imap"
+            && (package.version.to_string() != "0.12.0"
+                || node
+                    .features
+                    .iter()
+                    .map(|feature| feature.as_str())
+                    .collect::<HashSet<_>>()
+                    != HashSet::from(["runtime-tokio", "tokio"]))
         {
-            return Err(
-                "Use pinned io-imap 0.7.1 coroutines without client, TLS, or SASL extensions"
-                    .into(),
-            );
+            return Err("Use pinned async-imap 0.12.0 with only runtime-tokio".into());
+        }
+        if name == "imap-proto" && package.version.to_string() != "0.17.0" {
+            return Err("Use pinned published imap-proto 0.17.0".into());
         }
         if name == "tokio-rustls"
             && (package.version.to_string() != "0.26.6"
@@ -125,7 +145,8 @@ fn check_dependencies(
         }
         if name == "mailctl" {
             for (dependency_name, version) in [
-                ("io-imap", "=0.7.1"),
+                ("async-imap", "=0.12.0"),
+                ("imap-proto", "=0.17.0"),
                 ("tokio", "=1.53.2"),
                 ("tokio-rustls", "=0.26.6"),
                 ("mail-builder", "=1.0.0"),

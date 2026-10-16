@@ -1,7 +1,7 @@
 //! Verify uncertain drafts through bounded, read-only provider evidence.
+use super::wire::SearchTerm;
 use super::{AuthenticatedConnection, Error, Metrics, fetch::Fetch};
 use crate::draft::{DraftEvidence, DraftMessageIdentity, DraftVerification};
-use io_imap::types::search::SearchKey;
 use sha2::{Digest, Sha256};
 
 impl AuthenticatedConnection {
@@ -41,28 +41,17 @@ impl AuthenticatedConnection {
                     let uids = connection
                         .search(
                             vec![
-                                SearchKey::Uid(
-                                    (first as u32..=last as u32)
-                                        .try_into()
-                                        .map_err(|_| Error::InvalidInput)?,
-                                ),
-                                SearchKey::Header(
-                                    "Message-ID".try_into().unwrap(),
-                                    expected
-                                        .message_id
-                                        .clone()
-                                        .try_into()
-                                        .map_err(|_| Error::InvalidInput)?,
-                                ),
+                                SearchTerm::Atom(format!("UID {first}:{last}")),
+                                SearchTerm::Text("HEADER Message-ID", expected.message_id.clone()),
                             ],
                             false,
                         )
                         .await?;
                     for uid in uids {
-                        if !(first..=last).contains(&u64::from(uid.get())) {
+                        if !(first..=last).contains(&u64::from(uid)) {
                             return Err(Error::Protocol);
                         }
-                        if candidate.replace(uid.get()).is_some() {
+                        if candidate.replace(uid).is_some() {
                             return Ok(DraftEvidence::Ambiguous);
                         }
                     }
@@ -90,7 +79,7 @@ impl AuthenticatedConnection {
                         count: count as u32,
                     };
                     let fields = request.execute(&mut connection).await?;
-                    let bytes = request.data(&fields)?;
+                    let bytes = request.data(Fetch::items(&fields)?)?;
                     offset += bytes.len();
                     if offset > limits.draft_mime_bytes {
                         return Err(Error::Limit);

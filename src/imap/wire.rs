@@ -1,34 +1,14 @@
+//! Supported commands over the maintained async-imap response stream.
 use super::{
     AppendOutcome, Error, Limits, Metrics, TlsMode,
-    fetch::{Fetch as BodyFetch, MAX_CHUNK_BYTES},
+    admission::{Admission, Control, FrameContract},
+    fetch::Fetch,
     projection::Projection,
 };
-use io_imap::{
-    codec::{
-        CommandCodec, ResponseCodec,
-        decode::Decoder,
-        encode::{Encoder, Fragment},
-        fragmentizer::{FragmentInfo, Fragmentizer, LineEnding},
-    },
-    coroutine::{ImapCoroutine, ImapCoroutineState, ImapYield},
-    rfc3501::{
-        append::ImapMessageAppendOptions,
-        append_stream::{ImapMessageAppendStream, ImapMessageAppendStreamYield},
-        examine::ImapMailboxExamine,
-    },
-    send::ImapSend,
-    types::{
-        command::{Command, CommandBody},
-        core::{LiteralMode, TagGenerator},
-        fetch::MacroOrMessageDataItemNames,
-        flag::Flag,
-        response::{Code, Data, Response, Status, StatusKind},
-        search::SearchKey,
-    },
-};
-use std::{collections::BTreeSet, io, num::NonZeroU32, sync::Arc};
+use imap_proto::{Capability, MailboxDatum, Outcome, Response, ResponseCode, Status};
+use std::{collections::BTreeSet, fmt, io, sync::Arc};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
 };
 use tokio_rustls::{
@@ -37,48 +17,153 @@ use tokio_rustls::{
 };
 use zeroize::Zeroizing;
 
-// Keep storage for ordinary 16 KiB FETCH frames. Accepted response sizes still
-// follow the configured protocol limits; this threshold controls reuse only.
-const REUSED_FRAME_BYTES: usize = MAX_CHUNK_BYTES * 2;
-
-// Protocol lists include FETCH, addresses, MIME parameters and extensions. Their
-// syntax depth is independent of the semantic MIME-node ceiling, which is
-// enforced after typed decoding and before header or payload retrieval.
-const MAX_PROTOCOL_NESTING: usize = 64;
-
 trait Stream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Stream for T {}
+struct Transport(Box<dyn Stream>);
+impl fmt::Debug for Transport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("IMAP transport")
+    }
+}
+impl AsyncRead for Transport {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.0).poll_read(cx, buf)
+    }
+}
+impl AsyncWrite for Transport {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bytes: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        std::pin::Pin::new(&mut self.0).poll_write(cx, bytes)
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.0).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.0).poll_shutdown(cx)
+    }
+}
+type Client = async_imap::Client<Admission<Transport>>;
 
+pub(super) struct Session {
+    client: Option<Client>,
+    control: Control,
+    limits: Limits,
+    next_tag: u64,
+    uid_validity: Option<u32>,
+}
 pub(super) struct Connection<'a> {
     session: Session,
-    metrics: &'a mut Metrics,
+    progress: Progress<'a>,
 }
-/// Transport state kept between completed operations, without borrowed metrics.
-pub(super) struct Session {
-    stream: BufReader<Box<dyn Stream>>,
-    fragmentizer: Fragmentizer,
-    response_guard: Fragmentizer,
-    limits: Limits,
-    command: CommandState,
-    uid_validity: Option<NonZeroU32>,
+struct Progress<'a> {
+    metrics: &'a mut Metrics,
+    control: Control,
+}
+fn protocol_metrics(target: &mut Metrics, source: Metrics) {
+    target.wire_bytes = source.wire_bytes;
+    target.responses = source.responses;
+    target.parser_steps = source.parser_steps;
+    target.max_response_bytes = source.max_response_bytes;
+    target.max_literal_bytes = source.max_literal_bytes;
+    target.append_outcome = source.append_outcome;
+    target.append_wire_bytes = source.append_wire_bytes;
+}
+impl Drop for Progress<'_> {
+    fn drop(&mut self) {
+        protocol_metrics(self.metrics, self.control.metrics());
+    }
 }
 impl Session {
     pub(super) fn resume(self, metrics: &mut Metrics) -> Connection<'_> {
+        self.control.set_metrics(*metrics);
         Connection {
+            progress: Progress {
+                metrics,
+                control: self.control.clone(),
+            },
             session: self,
-            metrics,
         }
     }
-
-    fn reset_response_parsers(&mut self) {
-        let maximum = self.limits.max_response_bytes as u32;
-        self.fragmentizer = Fragmentizer::new(maximum);
-        self.response_guard = Fragmentizer::new(maximum);
+}
+#[derive(Clone)]
+pub(super) enum Kind {
+    Capability,
+    Login,
+    StartTls,
+    List,
+    Examine,
+    Search,
+    Projection,
+    Body(Fetch),
+    Logout,
+}
+impl Kind {
+    fn contract(&self) -> FrameContract {
+        match self {
+            Self::List => FrameContract::List,
+            Self::Projection => FrameContract::Metadata,
+            Self::Body(fetch) => fetch.contract(),
+            _ => FrameContract::Other,
+        }
     }
+}
+pub(super) enum SearchTerm {
+    Atom(String),
+    Text(&'static str, String),
 }
 impl<'a> Connection<'a> {
     pub(super) fn into_session(self) -> Session {
         self.session
+    }
+    fn client(&mut self) -> &mut Client {
+        self.session
+            .client
+            .as_mut()
+            .expect("live protocol transport")
+    }
+    fn prepare(&mut self, contract: FrameContract) {
+        self.session.control.set_metrics(self.metrics());
+        self.session
+            .control
+            .configure(self.session.limits.clone(), contract);
+    }
+    pub(super) fn metrics_mut(&mut self) -> &mut Metrics {
+        protocol_metrics(self.progress.metrics, self.session.control.metrics());
+        self.progress.metrics
+    }
+    pub fn metrics(&self) -> Metrics {
+        let mut result = *self.progress.metrics;
+        protocol_metrics(&mut result, self.session.control.metrics());
+        result
+    }
+    pub(super) fn literal_limit(&self) -> usize {
+        self.session.limits.max_literal_bytes
+    }
+    pub(super) fn limit_body(&mut self, limits: &Limits) {
+        self.session.limits = limits.clone();
+    }
+    pub(super) fn limit_search(&mut self, limits: &crate::config::Limits) {
+        self.session.limits.max_literal_bytes = limits.header_bytes;
+        self.session.limits.max_response_bytes = limits
+            .header_bytes
+            .saturating_mul(2)
+            .saturating_add(16 * 1024)
+            .max(120_000)
+            .min(limits.wire_fetch_bytes);
+        self.session.limits.max_operation_bytes = limits.wire_fetch_bytes;
     }
     pub async fn connect(
         host: &str,
@@ -100,876 +185,468 @@ impl<'a> Connection<'a> {
             ),
             TlsMode::StartTls => Box::new(tcp),
         };
+        let (transport, control) = Admission::new(Transport(stream), limits.clone(), *metrics);
         Ok(Session {
-            stream: BufReader::with_capacity(4096, stream),
-            fragmentizer: Fragmentizer::new(limits.max_response_bytes as u32),
-            response_guard: Fragmentizer::new(limits.max_response_bytes as u32),
+            client: Some(async_imap::Client::new(transport)),
+            control,
             limits,
-            command: CommandState::greeting(),
+            next_tag: 0,
             uid_validity: None,
         }
         .resume(metrics))
     }
-    pub(super) fn metrics_mut(&mut self) -> &mut Metrics {
-        self.metrics
+    fn io_error(&self, error: io::Error) -> Error {
+        self.session
+            .control
+            .failure()
+            .unwrap_or(match error.kind() {
+                io::ErrorKind::UnexpectedEof => Error::Eof,
+                io::ErrorKind::InvalidData => Error::Protocol,
+                _ => Error::Transport,
+            })
     }
-    pub fn metrics(&self) -> Metrics {
-        *self.metrics
-    }
-    pub(super) fn limit_body(&mut self, limits: &Limits) {
-        self.session.limits = limits.clone();
-        self.session.reset_response_parsers();
-    }
-    pub(super) fn limit_search(&mut self, limits: &crate::config::Limits) {
-        self.session.limits.max_literal_bytes = limits.header_bytes;
-        self.session.limits.max_response_bytes = limits
-            .header_bytes
-            .saturating_mul(2)
-            .saturating_add(16 * 1024)
-            .max(120_000)
-            .min(limits.wire_fetch_bytes);
-        self.session.limits.max_operation_bytes = limits.wire_fetch_bytes;
-        // Authentication completed at a clean command boundary. Both parsers
-        // must apply the selected operation's frame ceiling.
-        self.session.reset_response_parsers();
-    }
-    pub(super) async fn upper_uid(&mut self, uid_next: Option<u32>) -> Result<u32, Error> {
-        if let Some(next) = uid_next {
-            return next.checked_sub(1).ok_or(Error::Protocol);
+    async fn read(&mut self) -> Result<Response<'static>, Error> {
+        let mut response = self
+            .client()
+            .read_response()
+            .await
+            .map_err(|_| self.session.control.failure().unwrap_or(Error::Protocol))?
+            .ok_or(Error::Eof)?;
+        match response.parsed() {
+            Response::Done { outcome, .. }
+            | Response::Data { outcome, .. }
+            | Response::Continue(outcome) => self.check_outcome(outcome)?,
+            _ => {}
         }
-        let uids = self
-            .search(vec![SearchKey::Uid("*".try_into().unwrap())], false)
-            .await?;
-        if uids.len() > 1 {
+        // The library's response owner is intentionally private. Move its tree
+        // through its public closure API, then own the bounded borrowed fields.
+        Ok(response.with_dependent_mut(|_, parsed| {
+            std::mem::replace(parsed, Response::Expunge(0)).into_owned()
+        }))
+    }
+    fn check_outcome(&self, outcome: &Outcome<'_>) -> Result<(), Error> {
+        if matches!(outcome.code, Some(ResponseCode::ReadWrite)) {
+            return Err(Error::UnsafeSelection);
+        }
+        if outcome.information.as_deref().is_some_and(|text| {
+            text.split_ascii_whitespace()
+                .next()
+                .is_some_and(|word| word.eq_ignore_ascii_case("[REFERRAL"))
+        }) {
+            return Err(Error::Unsupported);
+        }
+        if let Some(ResponseCode::UidValidity(validity)) = outcome.code
+            && (validity == 0
+                || self
+                    .session
+                    .uid_validity
+                    .is_some_and(|expected| validity != expected))
+        {
+            return Err(Error::UnsafeSelection);
+        }
+        Ok(())
+    }
+    async fn write(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        self.client()
+            .get_mut()
+            .write_all(bytes)
+            .await
+            .map_err(|e| self.io_error(e))?;
+        self.client()
+            .get_mut()
+            .flush()
+            .await
+            .map_err(|e| self.io_error(e))
+    }
+    fn tag(&mut self) -> Result<String, Error> {
+        self.session.next_tag = self.session.next_tag.checked_add(1).ok_or(Error::Limit)?;
+        Ok(format!("M{}", self.session.next_tag))
+    }
+    pub(super) async fn greeting(&mut self) -> Result<(), Error> {
+        self.prepare(FrameContract::Other);
+        match &self.read().await? {
+            Response::Data {
+                status: Status::Ok, ..
+            } => Ok(()),
+            _ => Err(Error::Protocol),
+        }
+    }
+    pub(super) async fn request(
+        &mut self,
+        command: &str,
+        kind: Kind,
+    ) -> Result<Vec<Response<'static>>, Error> {
+        self.prepare(kind.contract());
+        let tag = self.tag()?;
+        let bytes = Zeroizing::new(format!("{tag} {command}\r\n"));
+        self.write(bytes.as_bytes()).await?;
+        self.collect(&tag, kind).await
+    }
+    async fn collect(&mut self, tag: &str, kind: Kind) -> Result<Vec<Response<'static>>, Error> {
+        let mut rows = Vec::new();
+        let mut sequences = BTreeSet::new();
+        let mut uids = BTreeSet::new();
+        let mut validity = None;
+        let mut bye = false;
+        loop {
+            let row = self.read().await?;
+            match &row {
+                Response::Done {
+                    tag: returned,
+                    status,
+                    outcome,
+                } => {
+                    if returned.0 != tag {
+                        return Err(Error::Protocol);
+                    }
+                    if *status != Status::Ok {
+                        return Err(if matches!(kind, Kind::Login) {
+                            Error::Authentication
+                        } else {
+                            Error::Protocol
+                        });
+                    }
+                    match kind {
+                        Kind::Examine => {
+                            if outcome.code != Some(ResponseCode::ReadOnly) || validity.is_none() {
+                                return Err(Error::UnsafeSelection);
+                            }
+                            self.session.uid_validity = validity;
+                        }
+                        Kind::Body(_) if rows.is_empty() => return Err(Error::MessageNotFound),
+                        Kind::Search if rows.len() != 1 => return Err(Error::Protocol),
+                        Kind::Logout if !bye => return Err(Error::Protocol),
+                        _ => {}
+                    }
+                    return Ok(rows);
+                }
+                Response::Data {
+                    status: Status::Bye,
+                    ..
+                } => {
+                    if !matches!(kind, Kind::Logout) {
+                        return Err(Error::Eof);
+                    }
+                    if bye {
+                        return Err(Error::Protocol);
+                    }
+                    bye = true;
+                }
+                Response::Data {
+                    status: Status::Ok,
+                    outcome,
+                } => {
+                    if matches!(kind, Kind::Examine) {
+                        if let Some(ResponseCode::UidValidity(value)) = outcome.code
+                            && (value == 0 || validity.replace(value).is_some())
+                        {
+                            return Err(Error::Protocol);
+                        }
+                        rows.push(row);
+                    }
+                }
+                Response::Capabilities(_) if matches!(kind, Kind::Capability | Kind::Login) => {
+                    rows.push(row)
+                }
+                Response::MailboxData(MailboxDatum::List(_)) if matches!(kind, Kind::List) => {
+                    if rows.len() == self.session.limits.max_mailboxes {
+                        return Err(Error::Limit);
+                    }
+                    rows.push(row);
+                }
+                Response::MailboxData(MailboxDatum::Search(ids))
+                    if matches!(kind, Kind::Search) =>
+                {
+                    if !rows.is_empty()
+                        || ids.contains(&0)
+                        || ids.iter().any(|uid| !uids.insert(*uid))
+                    {
+                        return Err(Error::Protocol);
+                    }
+                    rows.push(row);
+                }
+                Response::Fetch(seq, attrs) => {
+                    if *seq == 0 || !sequences.insert(*seq) {
+                        return Err(Error::Protocol);
+                    }
+                    match &kind {
+                        Kind::Projection => {
+                            Projection::parse(attrs)?;
+                        }
+                        Kind::Body(fetch) if rows.is_empty() => fetch.validate(attrs)?,
+                        _ => return Err(Error::Protocol),
+                    }
+                    let uid = attrs
+                        .iter()
+                        .find_map(|a| {
+                            if let imap_proto::AttributeValue::Uid(id) = a {
+                                Some(*id)
+                            } else {
+                                None
+                            }
+                        })
+                        .ok_or(Error::Protocol)?;
+                    if uid == 0 || !uids.insert(uid) {
+                        return Err(Error::Protocol);
+                    }
+                    rows.push(row);
+                }
+                Response::MailboxData(
+                    MailboxDatum::Flags(_) | MailboxDatum::Exists(_) | MailboxDatum::Recent(_),
+                )
+                | Response::Expunge(_) => {}
+                _ => return Err(Error::Unsupported),
+            }
+        }
+    }
+    pub(super) async fn capabilities(&mut self) -> Result<Vec<Capability<'static>>, Error> {
+        let rows = self.request("CAPABILITY", Kind::Capability).await?;
+        if rows.len() != 1 {
             return Err(Error::Protocol);
         }
-        Ok(uids.first().map_or(0, |uid| uid.get()))
+        let Response::Capabilities(values) = &rows[0] else {
+            return Err(Error::Protocol);
+        };
+        Ok(values
+            .iter()
+            .map(|v| match v {
+                Capability::Imap4rev1 => Capability::Imap4rev1,
+                Capability::Atom(a) => Capability::Atom(a.to_string().into()),
+                Capability::Auth(a) => Capability::Auth(a.to_string().into()),
+            })
+            .collect())
+    }
+    pub(super) async fn login(&mut self, user: &str, password: &str) -> Result<(), Error> {
+        let command = Zeroizing::new(format!("LOGIN {} {}", quote(user)?, quote(password)?));
+        self.request(&command, Kind::Login).await?;
+        Ok(())
+    }
+    pub(super) async fn logout(&mut self) -> Result<(), Error> {
+        self.request("LOGOUT", Kind::Logout).await?;
+        Ok(())
+    }
+    pub async fn upgrade(mut self, host: &str, tls: Arc<ClientConfig>) -> Result<Self, Error> {
+        self.request("STARTTLS", Kind::StartTls).await?;
+        let admitted = self
+            .session
+            .client
+            .take()
+            .expect("live transport")
+            .into_inner();
+        if !admitted.is_empty() {
+            return Err(Error::Protocol);
+        }
+        let stream = admitted.into_inner();
+        let upgraded = tokio::time::timeout(
+            self.session.limits.connect_timeout,
+            TlsConnector::from(tls).connect(server_name(host)?, stream),
+        )
+        .await
+        .map_err(|_| Error::Timeout)?
+        .map_err(|_| Error::Tls)?;
+        let (admitted, control) = Admission::new(
+            Transport(Box::new(upgraded)),
+            self.session.limits.clone(),
+            self.metrics(),
+        );
+        self.progress.control = control.clone();
+        self.session.control = control;
+        self.session.client = Some(async_imap::Client::new(admitted));
+        Ok(self)
     }
     pub async fn examine(&mut self, name: &str) -> Result<u32, Error> {
-        self.examine_selection(name)
-            .await
-            .map(|(validity, _)| validity)
+        self.examine_selection(name).await.map(|(v, _)| v)
     }
     pub(super) async fn examine_selection(
         &mut self,
         name: &str,
     ) -> Result<(u32, Option<u32>), Error> {
-        let selection = self
-            .drive(ImapMailboxExamine::new(
-                name.to_owned()
-                    .try_into()
-                    .map_err(|_| Error::InvalidInput)?,
-                Default::default(),
-            ))
+        let rows = self
+            .request(
+                &format!("EXAMINE {}", quote(&super::mailbox_pattern(name))?),
+                Kind::Examine,
+            )
             .await?;
-        self.session
-            .uid_validity
-            .map(|validity| (validity.get(), selection.uid_next.map(NonZeroU32::get)))
-            .ok_or(Error::UnsafeSelection)
-    }
-    pub async fn upgrade(mut self, host: &str, tls: Arc<ClientConfig>) -> Result<Self, Error> {
-        let command = Command {
-            tag: TagGenerator::new().generate(),
-            body: CommandBody::StartTLS,
-        };
-        let result = self
-            .drive(ImapSend::new(CommandCodec::new(), command))
-            .await?;
-        if !result
-            .tagged
-            .is_some_and(|tagged| tagged.body.kind == StatusKind::Ok)
-        {
-            return Err(Error::Tls);
+        let mut next = None;
+        for row in rows {
+            if let Response::Data {
+                outcome:
+                    Outcome {
+                        code: Some(ResponseCode::UidNext(value)),
+                        ..
+                    },
+                ..
+            } = &row
+                && (*value == 0 || next.replace(*value).is_some())
+            {
+                return Err(Error::Protocol);
+            }
         }
-        let stream = self.session.stream;
-        if !stream.buffer().is_empty() {
+        Ok((
+            self.session.uid_validity.ok_or(Error::UnsafeSelection)?,
+            next,
+        ))
+    }
+    pub(super) async fn upper_uid(&mut self, next: Option<u32>) -> Result<u32, Error> {
+        if let Some(next) = next {
+            return next.checked_sub(1).ok_or(Error::Protocol);
+        }
+        let ids = self
+            .search(vec![SearchTerm::Atom("UID *".into())], false)
+            .await?;
+        if ids.len() > 1 {
             return Err(Error::Protocol);
         }
-        let tls = tokio::time::timeout(
-            self.session.limits.connect_timeout,
-            TlsConnector::from(tls).connect(server_name(host)?, stream.into_inner()),
-        )
-        .await
-        .map_err(|_| Error::Timeout)?
-        .map_err(|_| Error::Tls)?;
-        self.session.stream = BufReader::with_capacity(4096, Box::new(tls));
-        self.session.reset_response_parsers();
-        Ok(self)
+        Ok(ids.first().copied().unwrap_or(0))
     }
-    /// The streaming coroutine keeps the frozen MIME out of backend command buffers.
-    pub async fn append(&mut self, target: &str, mime: &[u8]) -> Result<(), Error> {
-        let mut coroutine = ImapMessageAppendStream::new(
-            target
-                .to_owned()
-                .try_into()
-                .map_err(|_| Error::InvalidInput)?,
-            u32::try_from(mime.len()).map_err(|_| Error::Limit)?,
-            ImapMessageAppendOptions {
-                flags: vec![Flag::Draft],
-                ..Default::default()
-            },
+    pub(super) async fn search(
+        &mut self,
+        terms: Vec<SearchTerm>,
+        utf8: bool,
+    ) -> Result<Vec<u32>, Error> {
+        self.prepare(FrameContract::Other);
+        let tag = self.tag()?;
+        let mut pending = format!(
+            "{tag} UID SEARCH{}",
+            if utf8 { " CHARSET UTF-8" } else { "" }
         );
-        let mut frame = None;
-        let mut header = true;
-        loop {
-            self.step(1)?;
-            let state = coroutine.resume(&mut self.session.fragmentizer, frame.as_deref());
-            frame = None;
-            match state {
-                ImapCoroutineState::Yielded(ImapMessageAppendStreamYield::WantsWrite(bytes)) => {
-                    if header {
-                        let suffix = format!("{{{}}}\r\n", mime.len());
-                        let prefix = bytes
-                            .strip_suffix(suffix.as_bytes())
-                            .ok_or(Error::Protocol)?;
-                        let mut empty = prefix.to_vec();
-                        empty.extend_from_slice(b"{0}\r\n\r\n");
-                        let (remaining, command) = CommandCodec::new()
-                            .decode(&empty)
-                            .map_err(|_| Error::Protocol)?;
-                        if !remaining.is_empty() {
+        let mut command_bytes = pending.len();
+        for term in terms {
+            pending.push(' ');
+            match term {
+                SearchTerm::Atom(value) => pending.push_str(&value),
+                SearchTerm::Text(key, value) => {
+                    pending.push_str(key);
+                    pending.push(' ');
+                    if value.bytes().all(|byte| (32..=126).contains(&byte)) {
+                        pending.push_str(&quote(&value)?);
+                    } else {
+                        pending.push_str(&format!("{{{}}}\r\n", value.len()));
+                        command_bytes = command_bytes
+                            .saturating_add(pending.len())
+                            .saturating_add(value.len());
+                        if command_bytes > 32 * 8192 + 2048 {
+                            return Err(Error::Limit);
+                        }
+                        self.write(pending.as_bytes()).await?;
+                        if !matches!(&self.read().await?, Response::Continue(_)) {
                             return Err(Error::Protocol);
                         }
-                        self.session.command = CommandState::append(command, target)?;
-                        self.metrics.append_outcome = Some(AppendOutcome::Unknown);
-                        header = false;
-                    } else if bytes != b"\r\n"
-                        || !matches!(
-                            self.session.command.kind,
-                            CommandKind::Append { streamed: true, .. }
-                        )
-                    {
-                        return Err(Error::Protocol);
+                        self.write(value.as_bytes()).await?;
+                        pending.clear();
                     }
-                    self.append_write(&bytes).await?;
                 }
-                ImapCoroutineState::Yielded(ImapMessageAppendStreamYield::WantsStream) => {
-                    let CommandKind::Append {
-                        continuation: true,
-                        streamed,
-                        ..
-                    } = &mut self.session.command.kind
-                    else {
-                        return Err(Error::Protocol);
-                    };
-                    if *streamed {
-                        return Err(Error::Protocol);
-                    }
-                    *streamed = true;
+            }
+        }
+        pending.push_str("\r\n");
+        if command_bytes.saturating_add(pending.len()) > 32 * 8192 + 2048 {
+            return Err(Error::Limit);
+        }
+        self.write(pending.as_bytes()).await?;
+        let rows = self.collect(&tag, Kind::Search).await?;
+        let Response::MailboxData(MailboxDatum::Search(ids)) = &rows[0] else {
+            return Err(Error::Protocol);
+        };
+        Ok(ids.clone())
+    }
+    /// Frozen MIME is streamed after one synchronizing continuation. Outcome is
+    /// recorded before returning, including when cancellation drops this future.
+    pub async fn append(&mut self, target: &str, mime: &[u8]) -> Result<(), Error> {
+        self.prepare(FrameContract::Other);
+        let tag = self.tag()?;
+        let header = format!(
+            "{tag} APPEND {} (\\Draft) {{{}}}\r\n",
+            quote(&super::mailbox_pattern(target))?,
+            mime.len()
+        );
+        let mut metrics = self.metrics();
+        metrics.append_outcome = Some(AppendOutcome::Unknown);
+        self.session.control.set_metrics(metrics);
+        self.append_write(header.as_bytes()).await?;
+        let mut streamed = false;
+        loop {
+            let row = self.read().await?;
+            match &row {
+                Response::Continue(_) if !streamed => {
+                    streamed = true;
                     self.append_write(mime).await?;
+                    self.append_write(b"\r\n").await?;
                 }
-                ImapCoroutineState::Yielded(ImapMessageAppendStreamYield::WantsRead) => {
-                    self.flush().await?;
-                    frame = Some(self.frame().await?);
-                    if matches!(
-                        self.metrics.append_outcome,
-                        Some(AppendOutcome::Created { .. } | AppendOutcome::Rejected)
-                    ) {
-                        // The guarded response is authoritative; the connection is disposed
-                        // without further coroutine work or optional reference lookup.
-                        return Ok(());
-                    }
+                Response::Done {
+                    tag: returned,
+                    status,
+                    outcome,
+                } if returned.0 == tag => {
+                    let result = match status {
+                        Status::No | Status::Bad => AppendOutcome::Rejected,
+                        Status::Ok if streamed => {
+                            let uid = match &outcome.code {
+                                Some(ResponseCode::AppendUid(validity, members)) => {
+                                    use imap_proto::rfc4315::UidSetMember;
+                                    match members.as_slice() {
+                                        [UidSetMember::Uid(uid)] if *validity != 0 && *uid != 0 => {
+                                            Some(crate::draft::DraftMessageIdentity {
+                                                uid_validity: *validity,
+                                                uid: *uid,
+                                            })
+                                        }
+                                        _ => return Err(Error::Protocol),
+                                    }
+                                }
+                                _ => None,
+                            };
+                            AppendOutcome::Created { uid }
+                        }
+                        _ => return Err(Error::Protocol),
+                    };
+                    let mut metrics = self.metrics();
+                    metrics.append_outcome = Some(result);
+                    self.session.control.set_metrics(metrics);
+                    return Ok(());
                 }
-                ImapCoroutineState::Complete(_) => return Err(Error::Protocol),
+                Response::MailboxData(
+                    MailboxDatum::Flags(_) | MailboxDatum::Exists(_) | MailboxDatum::Recent(_),
+                )
+                | Response::Expunge(_)
+                | Response::Data {
+                    status: Status::Ok, ..
+                } => {}
+                _ => return Err(Error::Protocol),
             }
         }
     }
     async fn append_write(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        let mut metrics = self.metrics();
         if bytes.len()
             > self
                 .session
                 .limits
                 .max_operation_bytes
-                .saturating_sub(self.metrics.wire_bytes)
-                .saturating_sub(self.metrics.append_wire_bytes)
+                .saturating_sub(metrics.wire_bytes)
+                .saturating_sub(metrics.append_wire_bytes)
         {
             return Err(Error::Limit);
         }
-        self.metrics.append_wire_bytes += bytes.len();
-        self.session
-            .stream
-            .write_all(bytes)
-            .await
-            .map_err(|_| Error::Transport)
-    }
-    async fn flush(&mut self) -> Result<(), Error> {
-        // TLS may accept plaintext while retaining ciphertext; reads do not flush it.
-        self.session
-            .stream
-            .flush()
-            .await
-            .map_err(|_| Error::Transport)
-    }
-    pub async fn drive<C, T, E>(&mut self, coroutine: C) -> Result<T, Error>
-    where
-        C: ImapCoroutine<Yield = ImapYield, Return = Result<T, E>>,
-    {
-        self.drive_inner(coroutine, false).await
-    }
-    /// The typed SEARCH command also authenticates fragmented literal writes.
-    pub(super) async fn search(
-        &mut self,
-        criteria: Vec<SearchKey<'static>>,
-        utf8: bool,
-    ) -> Result<Vec<NonZeroU32>, Error> {
-        if self.session.uid_validity.is_none() {
-            return Err(Error::UnsafeSelection);
-        }
-        let command = Command {
-            tag: TagGenerator::new().generate(),
-            body: CommandBody::Search {
-                charset: if utf8 {
-                    Some("UTF-8".try_into().map_err(|_| Error::InvalidInput)?)
-                } else {
-                    None
-                },
-                criteria: criteria.try_into().map_err(|_| Error::InvalidInput)?,
-                uid: true,
-            },
-        };
-        let mut literals = 0;
-        let mut bytes = 0usize;
-        for fragment in CommandCodec::new().encode(&command) {
-            match fragment {
-                Fragment::Line { data } => bytes += data.len(),
-                Fragment::Literal {
-                    data,
-                    mode: LiteralMode::Sync,
-                } => {
-                    literals += 1;
-                    bytes += data.len();
-                }
-                Fragment::Literal { .. } => return Err(Error::Unsupported),
-            }
-        }
-        if literals > 32 || bytes > 32 * 8192 + 2048 {
-            return Err(Error::Limit);
-        }
-        self.step(bytes)?;
-        self.session.command = CommandState::new(&command)?;
-        let CommandKind::Search {
-            remaining_literals, ..
-        } = &mut self.session.command.kind
-        else {
-            unreachable!()
-        };
-        *remaining_literals = literals;
-        let output = self
-            .drive_inner(ImapSend::new(CommandCodec::new(), command), true)
-            .await?;
-        if !output
-            .tagged
-            .is_some_and(|tagged| tagged.body.kind == StatusKind::Ok)
-        {
-            return Err(Error::Protocol);
-        }
-        output
-            .data
-            .into_iter()
-            .find_map(|data| match data {
-                Data::Search(uids, _) => Some(uids),
-                _ => None,
-            })
-            .ok_or(Error::Protocol)
-    }
-    async fn drive_inner<C, T, E>(
-        &mut self,
-        mut coroutine: C,
-        prepared_search: bool,
-    ) -> Result<T, Error>
-    where
-        C: ImapCoroutine<Yield = ImapYield, Return = Result<T, E>>,
-    {
-        let mut frame = None;
-        loop {
-            self.step(1)?;
-            let state = coroutine.resume(&mut self.session.fragmentizer, frame.as_deref());
-            frame = None;
-            match state {
-                ImapCoroutineState::Yielded(ImapYield::WantsWrite(bytes)) => {
-                    let bytes = Zeroizing::new(bytes);
-                    if prepared_search {
-                        let CommandKind::Search {
-                            remaining_literals,
-                            waiting_for_literal,
-                            ..
-                        } = &mut self.session.command.kind
-                        else {
-                            return Err(Error::Protocol);
-                        };
-                        *waiting_for_literal = *remaining_literals > 0;
-                    } else {
-                        // Other routes still validate one complete command before writing.
-                        let (remaining, command) = CommandCodec::new()
-                            .decode(&bytes)
-                            .map_err(|_| Error::Protocol)?;
-                        if !remaining.is_empty() {
-                            return Err(Error::Protocol);
-                        }
-                        self.session.command = CommandState::new(&command)?;
-                    }
-                    if self
-                        .session
-                        .command
-                        .literal_limit()
-                        .is_some_and(|count| count > self.session.limits.max_literal_bytes)
-                    {
-                        return Err(Error::Limit);
-                    }
-                    if matches!(self.session.command.kind, CommandKind::BodyFetch { .. })
-                        && self.session.uid_validity.is_none()
-                    {
-                        return Err(Error::UnsafeSelection);
-                    }
-                    self.session
-                        .stream
-                        .write_all(&bytes)
-                        .await
-                        .map_err(|_| Error::Transport)?;
-                }
-                ImapCoroutineState::Yielded(ImapYield::WantsRead) => {
-                    self.flush().await?;
-                    let mut received = self.frame().await?;
-                    while self.session.command.needs_logout_completion() {
-                        let next = self.frame().await?;
-                        if next.len()
-                            > self
-                                .session
-                                .limits
-                                .max_response_bytes
-                                .saturating_sub(received.len())
-                        {
-                            return Err(Error::Limit);
-                        }
-                        received.extend(next);
-                    }
-                    frame = Some(received);
-                }
-                ImapCoroutineState::Complete(Ok(value)) => {
-                    if let Some(uid_validity) = self.session.command.finish()? {
-                        self.session.uid_validity = Some(uid_validity);
-                    }
-                    return Ok(value);
-                }
-                ImapCoroutineState::Complete(Err(_)) => {
-                    return Err(if matches!(self.session.command.kind, CommandKind::Login) {
-                        Error::Authentication
-                    } else {
-                        Error::Protocol
-                    });
-                }
-            }
-        }
-    }
-    fn step(&mut self, count: usize) -> Result<(), Error> {
-        if count
-            > self
-                .session
-                .limits
-                .max_parser_steps
-                .saturating_sub(self.metrics.parser_steps)
-        {
-            return Err(Error::Limit);
-        }
-        self.metrics.parser_steps += count;
-        Ok(())
-    }
-    async fn frame(&mut self) -> Result<Vec<u8>, Error> {
-        // The guard and backend parser have separate state, but both retain bounded
-        // storage across frames rather than reallocating it for every response.
-        let mut bytes = 0usize;
-        let mut nesting = 0usize;
-        let mut literal_bytes = 0usize;
-        if self.metrics.responses >= self.session.limits.max_responses {
-            return Err(Error::Limit);
-        }
-        self.metrics.responses += 1;
-        loop {
-            if bytes >= self.session.limits.max_response_bytes {
-                return Err(Error::Limit);
-            }
-            if self
-                .metrics
-                .wire_bytes
-                .saturating_add(self.metrics.append_wire_bytes)
-                >= self.session.limits.max_operation_bytes
-            {
-                return Err(Error::Limit);
-            }
-            let parser_remaining = self
-                .session
-                .limits
-                .max_parser_steps
-                .saturating_sub(self.metrics.parser_steps);
-            let remaining = (self.session.limits.max_response_bytes - bytes)
-                .min(
-                    self.session
-                        .limits
-                        .max_operation_bytes
-                        .saturating_sub(self.metrics.wire_bytes)
-                        .saturating_sub(self.metrics.append_wire_bytes),
-                )
-                .min(parser_remaining.saturating_add(1));
-            let received = {
-                let available = self.session.stream.fill_buf().await.map_err(|e| {
-                    if e.kind() == io::ErrorKind::UnexpectedEof {
-                        Error::Eof
-                    } else {
-                        Error::Transport
-                    }
-                })?;
-                if available.is_empty() {
-                    return Err(Error::Eof);
-                }
-                // Stop at each syntax line so its literal announcement is checked
-                // before consuming payload. Literal bytes have no syntax meaning.
-                let count = if literal_bytes == 0 {
-                    available
-                        .iter()
-                        .position(|byte| *byte == b'\n')
-                        .map_or(available.len(), |end| end + 1)
-                } else {
-                    available.len().min(literal_bytes)
-                }
-                .min(remaining);
-                self.session
-                    .response_guard
-                    .enqueue_bytes(&available[..count]);
-                self.session.stream.consume(count);
-                count
-            };
-            bytes += received;
-            self.metrics.wire_bytes += received;
-            self.metrics.max_response_bytes = self.metrics.max_response_bytes.max(bytes);
-            let admitted = received.min(parser_remaining);
-            self.step(admitted)?;
-            if admitted < received {
-                // Preserve the counter for the last consumed byte even when its
-                // parser step cannot be admitted.
-                return Err(Error::Limit);
-            }
-            literal_bytes = literal_bytes.saturating_sub(received);
-            while let Some(info) = self.session.response_guard.progress() {
-                if let FragmentInfo::Line {
-                    announcement,
-                    ending,
-                    ..
-                } = info
-                {
-                    if ending != LineEnding::CrLf {
-                        return Err(Error::Protocol);
-                    }
-                    // Inspect syntax before invoking the recursive typed decoder. Literal
-                    // bytes are separate fragments and cannot affect this depth counter.
-                    let mut quoted = false;
-                    let mut escaped = false;
-                    for &b in self.session.response_guard.fragment_bytes(info) {
-                        if escaped {
-                            escaped = false;
-                            continue;
-                        }
-                        if quoted && b == b'\\' {
-                            escaped = true;
-                            continue;
-                        }
-                        if b == b'"' {
-                            quoted = !quoted;
-                            continue;
-                        }
-                        if !quoted {
-                            if b == b'(' {
-                                nesting += 1;
-                                if nesting > MAX_PROTOCOL_NESTING {
-                                    return Err(Error::Limit);
-                                }
-                            }
-                            if b == b')' {
-                                nesting = nesting.saturating_sub(1);
-                            }
-                        }
-                    }
-                    if let Some(a) = announcement {
-                        let length = a.length as usize;
-                        if length > self.session.limits.max_literal_bytes
-                            || self
-                                .session
-                                .command
-                                .literal_limit()
-                                .is_some_and(|count| length > count)
-                            || length > self.session.limits.max_response_bytes.saturating_sub(bytes)
-                            || length
-                                > self
-                                    .session
-                                    .limits
-                                    .max_operation_bytes
-                                    .saturating_sub(self.metrics.wire_bytes)
-                        {
-                            return Err(Error::Limit);
-                        }
-                        self.metrics.max_literal_bytes = self.metrics.max_literal_bytes.max(length);
-                        literal_bytes = length;
-                    }
-                }
-                if self.session.response_guard.is_message_complete() {
-                    self.step(bytes * 2)?;
-                    let repaired = match &self.session.command.kind {
-                        CommandKind::BodyFetch { contract, .. } => contract
-                            .repair_partial_separator(
-                                self.session.response_guard.message_bytes(),
-                                self.session.limits.max_response_bytes,
-                            )?,
-                        _ => None,
-                    };
-                    if repaired.is_some() {
-                        self.step(bytes + 1)?;
-                    }
-                    let input = repaired
-                        .as_deref()
-                        .unwrap_or_else(|| self.session.response_guard.message_bytes());
-                    let (remaining, response) = ResponseCodec::new()
-                        .decode(input)
-                        .map_err(|_| Error::Protocol)?;
-                    if !remaining.is_empty() {
-                        return Err(Error::Protocol);
-                    }
-                    self.session.command.inspect(
-                        response,
-                        self.session.uid_validity,
-                        self.session.limits.max_mailboxes,
-                    )?;
-                    if let CommandKind::Append { outcome, .. } = self.session.command.kind {
-                        self.metrics.append_outcome = Some(outcome);
-                    }
-                    let frame = repaired
-                        .unwrap_or_else(|| self.session.response_guard.message_bytes().to_vec());
-                    if frame.len() > REUSED_FRAME_BYTES {
-                        self.session.response_guard =
-                            Fragmentizer::new(self.session.limits.max_response_bytes as u32);
-                    }
-                    return Ok(frame);
-                }
-            }
-        }
+        metrics.append_wire_bytes += bytes.len();
+        self.session.control.set_metrics(metrics);
+        self.write(bytes).await
     }
 }
-
-/// A command owns the response requirements implied by its typed request.
-struct CommandState {
-    tag: Option<String>,
-    kind: CommandKind,
+pub(super) fn quote(value: &str) -> Result<String, Error> {
+    if value.bytes().any(|b| b < 32 || b == 127) {
+        return Err(Error::Unsupported);
+    }
+    let mut result = String::with_capacity(value.len() + 2);
+    result.push('"');
+    for character in value.chars() {
+        if matches!(character, '"' | '\\') {
+            result.push('\\');
+        }
+        result.push(character);
+    }
+    result.push('"');
+    Ok(result)
 }
-enum CommandKind {
-    Append {
-        continuation: bool,
-        streamed: bool,
-        outcome: AppendOutcome,
-    },
-    Greeting,
-    Capability,
-    Login,
-    StartTls,
-    List {
-        rows: usize,
-    },
-    Examine {
-        uid_validity: Option<NonZeroU32>,
-        read_only: bool,
-    },
-    Search {
-        seen: bool,
-        remaining_literals: usize,
-        waiting_for_literal: bool,
-    },
-    Fetch {
-        sequences: BTreeSet<u32>,
-    },
-    BodyFetch {
-        contract: BodyFetch,
-        seen: bool,
-    },
-    Logout {
-        bye: bool,
-        tagged: bool,
-    },
-}
-impl CommandState {
-    fn greeting() -> Self {
-        Self {
-            tag: None,
-            kind: CommandKind::Greeting,
-        }
-    }
-    fn append(command: Command<'_>, target: &str) -> Result<Self, Error> {
-        let CommandBody::Append {
-            mailbox,
-            flags,
-            date: None,
-            ..
-        } = &command.body
-        else {
-            return Err(Error::Unsupported);
-        };
-        let expected: io_imap::types::mailbox::Mailbox<'_> = super::mailbox_pattern(target)
-            .try_into()
-            .map_err(|_| Error::InvalidInput)?;
-        if mailbox != &expected || flags != &[Flag::Draft] {
-            return Err(Error::Unsupported);
-        }
-        Ok(Self {
-            tag: Some(command.tag.as_ref().to_owned()),
-            kind: CommandKind::Append {
-                continuation: false,
-                streamed: false,
-                outcome: AppendOutcome::Unknown,
-            },
-        })
-    }
-    fn new(command: &Command<'_>) -> Result<Self, Error> {
-        let kind = match &command.body {
-            CommandBody::Capability => CommandKind::Capability,
-            CommandBody::Login { .. } => CommandKind::Login,
-            CommandBody::StartTLS => CommandKind::StartTls,
-            CommandBody::List { .. } => CommandKind::List { rows: 0 },
-            CommandBody::Examine { parameters, .. } if parameters.is_empty() => {
-                CommandKind::Examine {
-                    uid_validity: None,
-                    read_only: false,
-                }
-            }
-            CommandBody::Search { uid: true, .. } => CommandKind::Search {
-                seen: false,
-                remaining_literals: 0,
-                waiting_for_literal: false,
-            },
-            CommandBody::Fetch {
-                uid: true,
-                macro_or_item_names: MacroOrMessageDataItemNames::MessageDataItemNames(names),
-                modifiers,
-                ..
-            } if modifiers.is_empty() && names.as_slice() == Projection::FIELDS => {
-                CommandKind::Fetch {
-                    sequences: BTreeSet::new(),
-                }
-            }
-            CommandBody::Fetch { .. } => CommandKind::BodyFetch {
-                contract: BodyFetch::from_command(&command.body).ok_or(Error::Unsupported)?,
-                seen: false,
-            },
-            CommandBody::Logout => CommandKind::Logout {
-                bye: false,
-                tagged: false,
-            },
-            _ => return Err(Error::Unsupported),
-        };
-        Ok(Self {
-            tag: Some(command.tag.as_ref().to_owned()),
-            kind,
-        })
-    }
-    fn needs_logout_completion(&self) -> bool {
-        matches!(
-            self.kind,
-            CommandKind::Logout {
-                bye: true,
-                tagged: false
-            }
-        )
-    }
-    fn literal_limit(&self) -> Option<usize> {
-        match &self.kind {
-            CommandKind::BodyFetch { contract, .. } => contract.literal_limit(),
-            _ => None,
-        }
-    }
-    fn finish(&self) -> Result<Option<NonZeroU32>, Error> {
-        match self.kind {
-            CommandKind::Examine {
-                uid_validity: Some(uid_validity),
-                read_only: true,
-            } => Ok(Some(uid_validity)),
-            CommandKind::Examine { .. } => Err(Error::UnsafeSelection),
-            CommandKind::Search { seen: false, .. }
-            | CommandKind::Search {
-                waiting_for_literal: true,
-                ..
-            } => Err(Error::Protocol),
-            CommandKind::Search {
-                remaining_literals, ..
-            } if remaining_literals != 0 => Err(Error::Protocol),
-            CommandKind::BodyFetch { seen: false, .. } => Err(Error::MessageNotFound),
-            CommandKind::Logout { bye: false, .. } | CommandKind::Logout { tagged: false, .. } => {
-                Err(Error::Protocol)
-            }
-            _ => Ok(None),
-        }
-    }
-    fn inspect(
-        &mut self,
-        response: Response<'_>,
-        selected: Option<NonZeroU32>,
-        max_mailboxes: usize,
-    ) -> Result<(), Error> {
-        match response {
-            Response::Status(status) => {
-                let (body, tagged) = match &status {
-                    Status::Tagged(tagged) => {
-                        if self.tag.as_deref() != Some(tagged.tag.as_ref()) {
-                            return Err(Error::Protocol);
-                        }
-                        if let CommandKind::Logout { tagged, .. } = &mut self.kind {
-                            *tagged = true;
-                        }
-                        if let CommandKind::Append {
-                            streamed, outcome, ..
-                        } = &mut self.kind
-                        {
-                            *outcome = match tagged.body.kind {
-                                StatusKind::Ok if *streamed => AppendOutcome::Created {
-                                    uid: match tagged.body.code {
-                                        Some(Code::AppendUid { uid_validity, uid }) => {
-                                            Some(crate::draft::DraftMessageIdentity {
-                                                uid_validity: uid_validity.get(),
-                                                uid: uid.get(),
-                                            })
-                                        }
-                                        _ => None,
-                                    },
-                                },
-                                StatusKind::No | StatusKind::Bad => AppendOutcome::Rejected,
-                                _ => return Err(Error::Protocol),
-                            };
-                            return Ok(());
-                        }
-                        (&tagged.body, true)
-                    }
-                    Status::Untagged(body) => (body, false),
-                    Status::Bye(bye) => {
-                        check_code(bye.code.as_ref())?;
-                        let CommandKind::Logout { bye, .. } = &mut self.kind else {
-                            return Err(Error::Eof);
-                        };
-                        if *bye {
-                            return Err(Error::Protocol);
-                        }
-                        *bye = true;
-                        return Ok(());
-                    }
-                };
-                check_code(body.code.as_ref())?;
-                if let Some(Code::UidValidity(value)) = body.code {
-                    if let CommandKind::Examine { uid_validity, .. } = &mut self.kind {
-                        if body.kind != StatusKind::Ok || uid_validity.replace(value).is_some() {
-                            return Err(Error::Protocol);
-                        }
-                    } else if selected.is_some_and(|expected| expected != value) {
-                        return Err(Error::UnsafeSelection);
-                    }
-                }
-                if let CommandKind::Examine { read_only, .. } = &mut self.kind
-                    && tagged
-                {
-                    if body.kind != StatusKind::Ok || body.code != Some(Code::ReadOnly) {
-                        return Err(Error::UnsafeSelection);
-                    }
-                    *read_only = true;
-                }
-            }
-            Response::Data(data) => match data {
-                Data::Capability(_)
-                    if matches!(self.kind, CommandKind::Capability | CommandKind::Login) => {}
-                Data::List { mailbox, .. } => {
-                    let CommandKind::List { rows } = &mut self.kind else {
-                        return Err(Error::Protocol);
-                    };
-                    *rows += 1;
-                    if *rows > max_mailboxes {
-                        return Err(Error::Limit);
-                    }
-                    super::validate_wire_mailbox_name(&mailbox)?;
-                }
-                Data::Flags(_) | Data::Exists(_) | Data::Recent(_) | Data::Expunge(_) => {}
-                Data::Search(..) => {
-                    let CommandKind::Search {
-                        seen,
-                        remaining_literals: 0,
-                        waiting_for_literal: false,
-                    } = &mut self.kind
-                    else {
-                        return Err(Error::Protocol);
-                    };
-                    if *seen {
-                        return Err(Error::Protocol);
-                    }
-                    *seen = true;
-                }
-                Data::Fetch { seq, items } => match &mut self.kind {
-                    CommandKind::Fetch { sequences } => {
-                        if !sequences.insert(seq.get()) {
-                            return Err(Error::Protocol);
-                        }
-                        Projection::parse(items.as_ref())?;
-                    }
-                    CommandKind::BodyFetch { contract, seen } => {
-                        if *seen {
-                            return Err(Error::Protocol);
-                        }
-                        contract.validate(items.as_ref())?;
-                        *seen = true;
-                    }
-                    _ => return Err(Error::Protocol),
-                },
-                // VANISHED sequence ranges can expand into billions of UIDs in the
-                // backend's EXAMINE coroutine. No extensions are enabled in this proof.
-                _ => return Err(Error::Unsupported),
-            },
-            Response::CommandContinuationRequest(_) => {
-                if let CommandKind::Search {
-                    remaining_literals,
-                    waiting_for_literal,
-                    ..
-                } = &mut self.kind
-                {
-                    if !*waiting_for_literal || *remaining_literals == 0 {
-                        return Err(Error::Protocol);
-                    }
-                    *remaining_literals -= 1;
-                    *waiting_for_literal = false;
-                    return Ok(());
-                }
-                let CommandKind::Append {
-                    continuation,
-                    streamed: false,
-                    ..
-                } = &mut self.kind
-                else {
-                    return Err(Error::Protocol);
-                };
-                if *continuation {
-                    return Err(Error::Protocol);
-                }
-                *continuation = true;
-            }
-        }
-        Ok(())
-    }
-}
-
 fn server_name(host: &str) -> Result<ServerName<'static>, Error> {
     ServerName::try_from(host.to_owned()).map_err(|_| Error::InvalidInput)
-}
-fn check_code(code: Option<&Code<'_>>) -> Result<(), Error> {
-    match code {
-        Some(Code::Referral(_)) => Err(Error::Unsupported),
-        Some(Code::ReadWrite) => Err(Error::UnsafeSelection),
-        Some(Code::Other(other))
-            if other
-                .inner()
-                .split(|b| b.is_ascii_whitespace())
-                .next()
-                .is_some_and(|name| name.eq_ignore_ascii_case(b"REFERRAL")) =>
-        {
-            Err(Error::Unsupported)
-        }
-        _ => Ok(()),
-    }
 }

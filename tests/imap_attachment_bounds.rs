@@ -534,41 +534,81 @@ async fn attachment_metadata_obeys_mime_part_limits() {
 
 #[tokio::test]
 async fn unsupported_transfer_encodings_are_listed_but_never_fetched() {
-    for encoding in ["BINARY", "X-UNKNOWN"] {
-        let mut session = 0;
-        let mut fixture = repeating_fixture(Limits::default(), 2, move |mut wire| {
-            session += 1;
-            let listing = session == 1;
-            Box::pin(async move {
-                start(&mut wire, encoding, 13).await;
-                if listing {
-                    logout(&mut wire).await;
-                } else {
-                    dropped(&mut wire).await;
-                }
-            })
+    let encoding = "X-UNKNOWN";
+    let mut session = 0;
+    let mut fixture = repeating_fixture(Limits::default(), 2, move |mut wire| {
+        session += 1;
+        let listing = session == 1;
+        Box::pin(async move {
+            start(&mut wire, encoding, 13).await;
+            if listing {
+                logout(&mut wire).await;
+            } else {
+                dropped(&mut wire).await;
+            }
         })
-        .await;
-        let listing = fixture
+    })
+    .await;
+    let listing = fixture
+        .probe
+        .list_attachments(
+            "fixture",
+            "disposable-password",
+            "INBOX",
+            AttachmentListRequest::new(4, 77),
+        )
+        .await
+        .unwrap();
+    assert_eq!(listing.len(), 1);
+    assert!(!listing[0].available);
+    assert_eq!(
+        fixture
             .probe
-            .list_attachments(
-                "fixture",
-                "disposable-password",
-                "INBOX",
-                AttachmentListRequest::new(4, 77),
-            )
+            .read_attachment("fixture", "disposable-password", &mut decoder())
             .await
-            .unwrap();
-        assert_eq!(listing.len(), 1);
-        assert!(!listing[0].available);
-        assert_eq!(
-            fixture
-                .probe
-                .read_attachment("fixture", "disposable-password", &mut decoder())
-                .await
-                .unwrap_err(),
-            Error::Unsupported
-        );
-        fixture.task.await.unwrap();
-    }
+            .unwrap_err(),
+        Error::Unsupported
+    );
+    fixture.task.await.unwrap();
+}
+
+#[tokio::test]
+async fn binary_transfer_encoding_preserves_payload_bytes() {
+    let payload: &[u8] = b"Synthetic binary\xfffixture";
+    let mut session = 0;
+    let mut fixture = repeating_fixture(Limits::default(), 2, move |mut wire| {
+        session += 1;
+        let listing = session == 1;
+        Box::pin(async move {
+            start(&mut wire, "BINARY", payload.len()).await;
+            if !listing {
+                literal_bytes(&mut wire, "2", 0, 16384, payload).await;
+            }
+            logout(&mut wire).await;
+        })
+    })
+    .await;
+    let listing = fixture
+        .probe
+        .list_attachments(
+            "fixture",
+            "disposable-password",
+            "INBOX",
+            AttachmentListRequest::new(4, 77),
+        )
+        .await
+        .unwrap();
+    assert_eq!(listing.len(), 1);
+    assert!(listing[0].available);
+    let chunk = fixture
+        .probe
+        .read_attachment("fixture", "disposable-password", &mut decoder())
+        .await
+        .unwrap();
+    assert_eq!(chunk.bytes, payload);
+    assert_eq!(
+        chunk.integrity.unwrap().total_decoded_bytes,
+        payload.len() as u64
+    );
+    fixture.task.await.unwrap();
 }

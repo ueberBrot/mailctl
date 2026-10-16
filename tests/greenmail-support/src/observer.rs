@@ -1,22 +1,15 @@
 //! Typed, read-only IMAP observations for GreenMail integration tests.
 
 use crate::{Result, fixtures::EMAIL};
-use io_imap::{
-    codec::{GreetingCodec, ResponseCodec, fragmentizer::Fragmentizer},
-    types::{
-        fetch::MessageDataItem,
-        flag::{Flag, FlagFetch},
-        response::{Code, Data, GreetingKind, Response, Status, StatusKind},
-    },
-};
-use std::time::Duration;
+use imap_proto::{AttributeValue, MailboxDatum, Response, ResponseCode, Status};
+use std::{borrow::Cow, time::Duration};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     net::TcpStream,
 };
 use tokio_rustls::{TlsConnector, rustls::pki_types::ServerName};
 
-const MAX_RESPONSE_BYTES: u32 = 64 * 1024;
+const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 const READ_BUFFER_BYTES: usize = 8 * 1024;
 const MAX_RESPONSES_PER_COMMAND: usize = 100;
 
@@ -40,7 +33,7 @@ pub struct MessageSnapshot {
 /// Observe the synthetic INBOX through a new verified TLS connection.
 ///
 /// The observer only sends LOGIN, EXAMINE, FETCH, and LOGOUT. It parses every
-/// server response with io-imap's re-exported codec, separately from the
+/// server response with the published imap-proto parser, separately from the
 /// production adapter.
 pub async fn snapshot(port: u16, tls: &TlsConnector, password: &str) -> Result<MailboxSnapshot> {
     snapshot_mailbox(port, tls, password, "INBOX").await
@@ -121,9 +114,9 @@ pub async fn authenticate(
             .await?
             .status;
         match (expected_login, status) {
-            (true, StatusKind::Ok) => wire.logout().await,
-            (false, StatusKind::No) => Ok(()),
-            (false, StatusKind::Ok) => {
+            (true, Status::Ok) => wire.logout().await,
+            (false, Status::No) => Ok(()),
+            (false, Status::Ok) => {
                 Err("Independent IMAP accepted a wrong fixture credential".into())
             }
             (false, _) => Err("Independent IMAP wrong credential did not receive tagged NO".into()),
@@ -136,7 +129,7 @@ pub async fn authenticate(
 
 struct ObserverWire<S> {
     stream: BufReader<S>,
-    parser: Fragmentizer,
+    buffered: Vec<u8>,
     next_tag: u32,
 }
 
@@ -144,28 +137,23 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ObserverWire<S> {
     fn new(stream: S) -> Self {
         Self {
             stream: BufReader::new(stream),
-            parser: Fragmentizer::new(MAX_RESPONSE_BYTES),
+            buffered: Vec::new(),
             next_tag: 1,
         }
     }
 
     async fn greeting(&mut self) -> Result<()> {
-        self.read_message().await?;
-        let greeting = self
-            .parser
-            .decode_message(&GreetingCodec::new())
-            .map_err(|_| "Independent observer received malformed IMAP greeting")?;
-        match greeting.kind {
-            GreetingKind::Ok => Ok(()),
-            GreetingKind::PreAuth | GreetingKind::Bye => {
-                Err("Independent observer received an unusable IMAP greeting".into())
-            }
+        match self.parsed_response().await? {
+            Response::Data {
+                status: Status::Ok, ..
+            } => Ok(()),
+            _ => Err("Independent observer received an unusable IMAP greeting".into()),
         }
     }
 
     async fn ok(&mut self, command: &str) -> Result<Vec<Reply>> {
         let result = self.command(command).await?;
-        if result.status == StatusKind::Ok {
+        if result.status == Status::Ok {
             Ok(result.replies)
         } else {
             Err(format!(
@@ -178,7 +166,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ObserverWire<S> {
 
     async fn logout(&mut self) -> Result<()> {
         let result = self.command("LOGOUT").await?;
-        if result.status != StatusKind::Ok || !result.saw_bye {
+        if result.status != Status::Ok || !result.saw_bye {
             return Err(
                 "Independent observer LOGOUT did not complete with BYE and tagged OK".into(),
             );
@@ -232,39 +220,40 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ObserverWire<S> {
     }
 
     async fn response(&mut self) -> Result<Reply> {
-        self.read_message().await?;
-        let response = self
-            .parser
-            .decode_message(&ResponseCodec::new())
-            .map_err(|_| "Independent observer received malformed IMAP response")?;
-        Reply::from_response(response)
+        Reply::from_response(self.parsed_response().await?)
     }
 
-    async fn read_message(&mut self) -> Result<()> {
+    async fn parsed_response(&mut self) -> Result<Response<'static>> {
         loop {
-            while self.parser.progress().is_some() {
-                if self.parser.is_message_complete() {
-                    return Ok(());
+            match Response::parse(&self.buffered) {
+                Ok((remaining, response)) => {
+                    let consumed = self.buffered.len() - remaining.len();
+                    let response = response.into_owned();
+                    self.buffered.drain(..consumed);
+                    return Ok(response);
+                }
+                Err(error) if error.is_incomplete() => {}
+                Err(_) => {
+                    return Err("Independent observer received malformed IMAP response".into());
                 }
             }
-            self.read_more().await?;
+            if self.buffered.len() >= MAX_RESPONSE_BYTES {
+                return Err("Independent observer response exceeded fixture budget".into());
+            }
+            let mut buffer = [0; READ_BUFFER_BYTES];
+            let available = READ_BUFFER_BYTES.min(MAX_RESPONSE_BYTES - self.buffered.len());
+            let read = self.stream.read(&mut buffer[..available]).await?;
+            if read == 0 {
+                return Err("Independent observer reached unexpected IMAP EOF".into());
+            }
+            self.buffered.extend_from_slice(&buffer[..read]);
         }
-    }
-
-    async fn read_more(&mut self) -> Result<()> {
-        let mut buffer = [0; READ_BUFFER_BYTES];
-        let read = self.stream.read(&mut buffer).await?;
-        if read == 0 {
-            return Err("Independent observer reached unexpected IMAP EOF".into());
-        }
-        self.parser.enqueue_bytes(&buffer[..read]);
-        Ok(())
     }
 }
 
 struct CommandResult {
     replies: Vec<Reply>,
-    status: StatusKind,
+    status: Status,
     saw_bye: bool,
 }
 
@@ -274,7 +263,7 @@ enum Reply {
     Fetch(MessageSnapshot),
     Tagged {
         tag: String,
-        status: StatusKind,
+        status: Status,
         uid_validity: Option<u32>,
     },
     Bye,
@@ -285,19 +274,26 @@ enum Reply {
 impl Reply {
     fn from_response(response: Response<'_>) -> Result<Self> {
         match response {
-            Response::Data(Data::Exists(count)) => Ok(Self::Exists(count)),
-            Response::Data(Data::Fetch { items, .. }) => Ok(Self::Fetch(message(items)?)),
-            Response::Data(_) => Ok(Self::Other),
-            Response::Status(Status::Untagged(status)) => Ok(uid_validity(status.code.as_ref())
+            Response::MailboxData(MailboxDatum::Exists(count)) => Ok(Self::Exists(count)),
+            Response::Fetch(_, items) => Ok(Self::Fetch(message(items)?)),
+            Response::Data {
+                status: Status::Bye,
+                ..
+            } => Ok(Self::Bye),
+            Response::Data { outcome, .. } => Ok(uid_validity(outcome.code.as_ref())
                 .map(Self::UidValidity)
                 .unwrap_or(Self::Other)),
-            Response::Status(Status::Tagged(tagged)) => Ok(Self::Tagged {
-                tag: tagged.tag.as_ref().to_owned(),
-                status: tagged.body.kind,
-                uid_validity: uid_validity(tagged.body.code.as_ref()),
+            Response::Done {
+                tag,
+                status,
+                outcome,
+            } => Ok(Self::Tagged {
+                tag: tag.0,
+                status,
+                uid_validity: uid_validity(outcome.code.as_ref()),
             }),
-            Response::Status(Status::Bye(_)) => Ok(Self::Bye),
-            Response::CommandContinuationRequest(_) => Ok(Self::Continuation),
+            Response::Continue(_) => Ok(Self::Continuation),
+            _ => Ok(Self::Other),
         }
     }
 
@@ -324,34 +320,30 @@ impl Reply {
     }
 }
 
-fn uid_validity(code: Option<&Code<'_>>) -> Option<u32> {
+fn uid_validity(code: Option<&ResponseCode<'_>>) -> Option<u32> {
     match code {
-        Some(Code::UidValidity(value)) => Some(value.get()),
+        Some(ResponseCode::UidValidity(value)) => Some(*value),
         _ => None,
     }
 }
 
-fn message<'a>(items: impl IntoIterator<Item = MessageDataItem<'a>>) -> Result<MessageSnapshot> {
+fn message<'a>(items: impl IntoIterator<Item = AttributeValue<'a>>) -> Result<MessageSnapshot> {
     let mut uid = None;
     let mut seen = None;
     let mut draft = None;
     let mut envelope = None;
     for item in items {
         match item {
-            MessageDataItem::Uid(value) => uid = Some(value.get()),
-            MessageDataItem::Flags(flags) => {
-                seen = Some(
-                    flags
-                        .iter()
-                        .any(|flag| matches!(flag, FlagFetch::Flag(Flag::Seen))),
-                );
+            AttributeValue::Uid(value) => uid = Some(value),
+            AttributeValue::Flags(flags) => {
+                seen = Some(flags.iter().any(|flag| flag.eq_ignore_ascii_case("\\Seen")));
                 draft = Some(
                     flags
                         .iter()
-                        .any(|flag| matches!(flag, FlagFetch::Flag(Flag::Draft))),
+                        .any(|flag| flag.eq_ignore_ascii_case("\\Draft")),
                 );
             }
-            MessageDataItem::Envelope(value) => envelope = Some(value),
+            AttributeValue::Envelope(value) => envelope = Some(value),
             _ => {}
         }
     }
@@ -365,10 +357,8 @@ fn message<'a>(items: impl IntoIterator<Item = MessageDataItem<'a>>) -> Result<M
     })
 }
 
-fn nstring(value: io_imap::types::core::NString<'_>, field: &str) -> Result<String> {
-    let value = value
-        .into_option()
-        .ok_or_else(|| format!("Independent observer envelope omitted {field}"))?;
+fn nstring(value: Option<Cow<'_, [u8]>>, field: &str) -> Result<String> {
+    let value = value.ok_or_else(|| format!("Independent observer envelope omitted {field}"))?;
     String::from_utf8(value.into_owned())
         .map_err(|_| format!("Independent observer envelope {field} was not UTF-8").into())
 }

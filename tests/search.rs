@@ -562,8 +562,9 @@ async fn imap_normalizes_envelopes_and_marks_missing_or_malformed_optional_metad
         write(&mut wire, &format!("* SEARCH 1 2\r\n{tag} OK searched\r\n")).await;
         let tag = expect(&mut wire, "UID FETCH 1:2 (UID ENVELOPE FLAGS INTERNALDATE RFC822.SIZE)").await;
         write(&mut wire, "* 1 FETCH (UID 1 ENVELOPE (\"Thu, 29 Feb 2024 23:30:00 -1200\" \"=?UTF-8?Q?Gr=C3=BC=C3=9Fe?=\" ((\"=?UTF-8?Q?Absender?=\" NIL \"sender\" \"example.test\")) NIL NIL ((NIL NIL \"Team\" NIL)(NIL NIL \"reader\" \"example.test\")(NIL NIL NIL NIL)) NIL NIL NIL \"<fixture@example.test>\") FLAGS (\\Seen \\Flagged) INTERNALDATE \"01-Mar-2024 00:30:00 +1400\" RFC822.SIZE 100)\r\n").await;
-        write(&mut wire, "* 2 FETCH (UID 2 ENVELOPE (\"not a date\" {1}\r\n").await;
-        wire.write_all(&[0xff]).await.unwrap();
+        let subject = b"First\nInjected: header";
+        write(&mut wire, &format!("* 2 FETCH (UID 2 ENVELOPE (\"not a date\" {{{}}}\r\n", subject.len())).await;
+        wire.write_all(subject).await.unwrap();
         write(&mut wire, " ((NIL NIL \"broken\" NIL)) NIL NIL NIL NIL NIL NIL \"bad id\") FLAGS () INTERNALDATE \"01-Mar-2024 01:00:00 +1400\" RFC822.SIZE 101)\r\n").await;
         write(&mut wire, &format!("{tag} OK fetched\r\n")).await;
         logout(&mut wire).await;
@@ -586,6 +587,37 @@ async fn imap_normalizes_envelopes_and_marks_missing_or_malformed_optional_metad
     assert_eq!(good["size"], 100);
     assert_eq!(good["flags"], json!(["\\Flagged", "\\Seen"]));
     assert!(good["reference"].as_str().unwrap().starts_with("ms."));
+    fixture.task.await.unwrap();
+}
+
+#[tokio::test]
+async fn invalid_utf8_envelope_metadata_is_rejected_explicitly() {
+    use imap_support::*;
+    use tokio::io::AsyncWriteExt;
+    let fixture = fixture(mailctl::imap::TlsMode::Implicit, mailctl::imap::Limits::default(), |mut wire| Box::pin(async move {
+        authenticate(&mut wire).await;
+        examine(&mut wire).await;
+        let tag = expect(&mut wire, "UID SEARCH UID *").await;
+        write(&mut wire, &format!("* SEARCH 4\r\n{tag} OK boundary\r\n")).await;
+        let tag = expect(&mut wire, "UID SEARCH UID 1:4").await;
+        write(&mut wire, &format!("* SEARCH 4\r\n{tag} OK searched\r\n")).await;
+        expect(&mut wire, "UID FETCH 4 (UID ENVELOPE FLAGS INTERNALDATE RFC822.SIZE)").await;
+        write(&mut wire, "* 1 FETCH (UID 4 ENVELOPE (NIL {1}\r\n").await;
+        wire.write_all(&[0xff]).await.unwrap();
+        write(&mut wire, " NIL NIL NIL NIL NIL NIL NIL NIL) FLAGS () INTERNALDATE \"01-Mar-2024 01:00:00 +1400\" RFC822.SIZE 100)\r\n").await;
+        dropped(&mut wire).await;
+    })).await;
+    let (service, reference) = imap_service(&fixture).await;
+    let context = service.context("reader", &Default::default()).unwrap();
+    let operation = serde_json::from_value(json!({
+        "operation": "search_messages", "input": {"mailbox": reference}
+    }))
+    .unwrap();
+    let error = service.execute(&context, operation).await.unwrap_err();
+    assert_eq!(
+        error.code,
+        mailctl::domain::ErrorCode::UnsupportedCapability
+    );
     fixture.task.await.unwrap();
 }
 

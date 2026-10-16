@@ -1,17 +1,13 @@
 //! Search windows and envelope reads on one exclusive read-only selection.
 use super::{AuthenticatedConnection, Metrics, projection::Projection, wire::Connection};
+use super::{
+    fetch::Fetch,
+    wire::{Kind, SearchTerm},
+};
 use crate::{
     domain::{Error, ErrorCode, SearchCriteria},
     search::{LocatedMessage, SearchBatch, SearchRequest, SelectedMailbox, page},
 };
-use io_imap::{
-    rfc3501::{
-        fetch::{ImapMessageFetch, ImapMessageFetchOptions},
-        logout::ImapLogout,
-    },
-    types::search::SearchKey,
-};
-use std::num::NonZeroU32;
 
 impl AuthenticatedConnection {
     pub async fn search(
@@ -36,7 +32,7 @@ impl AuthenticatedConnection {
             limits,
         )
         .await?;
-        connection.drive(ImapLogout::new()).await?;
+        connection.logout().await?;
         Ok(result)
     }
 }
@@ -63,87 +59,83 @@ impl SelectedMailbox for Selection<'_, '_> {
         last: u32,
         criteria: &SearchCriteria,
     ) -> Result<Vec<u32>, Error> {
-        let range = (first..=last)
-            .try_into()
-            .map_err(|_| Error::new(ErrorCode::InvalidRequest))?;
-        let mut keys = vec![SearchKey::Uid(range)];
+        let mut keys = vec![SearchTerm::Atom(format!("UID {first}:{last}"))];
         let mut utf8 = false;
         for predicate in criteria.predicates() {
-            keys.push(search_key(predicate, &mut utf8)?);
+            keys.push(search_key(predicate, &mut utf8));
         }
         let uids = self.connection.search(keys, utf8).await?;
-        Ok(uids.into_iter().map(NonZeroU32::get).collect())
+        Ok(uids)
     }
     async fn fetch(&mut self, uids: &[u32]) -> Result<Vec<LocatedMessage>, Error> {
-        let mut uids = uids
-            .iter()
-            .map(|uid| NonZeroU32::new(*uid).ok_or_else(|| Error::new(ErrorCode::InvalidRequest)))
-            .collect::<Result<Vec<_>, _>>()?;
+        if uids.is_empty() || uids.contains(&0) {
+            return Err(Error::new(ErrorCode::InvalidRequest));
+        }
+        let mut uids = uids.to_vec();
         uids.sort_unstable();
+        uids.dedup();
+        let set = uids
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
         let rows = self
             .connection
-            .drive(ImapMessageFetch::new(
-                uids.try_into().unwrap(),
-                Projection::FIELDS.to_vec().into(),
-                ImapMessageFetchOptions {
-                    uid: true,
-                    ..Default::default()
-                },
-            ))
+            .request(
+                &format!("UID FETCH {set} ({})", Projection::FIELDS),
+                Kind::Projection,
+            )
             .await?;
-        rows.into_values()
-            .map(|items| {
-                let projection = Projection::parse(items.as_ref())?;
+        rows.iter()
+            .map(|row| {
+                let projection = Projection::parse(Fetch::items(row)?)?;
                 projection.check_header_bytes(self.header_bytes)?;
-                Ok(projection.message())
+                let message = projection.message();
+                if uids.binary_search(&message.uid).is_err() {
+                    return Err(Error::new(ErrorCode::ProviderUnavailable));
+                }
+                Ok(message)
             })
             .collect()
     }
 }
-fn search_key(
-    predicate: &crate::domain::SearchPredicate,
-    utf8: &mut bool,
-) -> Result<SearchKey<'static>, Error> {
+
+fn search_key(predicate: &crate::domain::SearchPredicate, utf8: &mut bool) -> SearchTerm {
     use crate::domain::{SearchPredicate::*, StandardFlag};
-    let date = |value: &crate::domain::SearchDate| {
-        value
-            .date()
-            .try_into()
-            .map_err(|_| Error::new(ErrorCode::InvalidRequest))
+    let date = |keyword: &str, value: &crate::domain::SearchDate| {
+        SearchTerm::Atom(format!("{keyword} {}", value.date().format("%d-%b-%Y")))
     };
-    let mut text = |value: &String| {
+    let mut text = |keyword, value: &String| {
         *utf8 |= !value.is_ascii();
-        value
-            .clone()
-            .try_into()
-            .map_err(|_| Error::new(ErrorCode::InvalidRequest))
+        SearchTerm::Text(keyword, value.clone())
     };
-    Ok(match predicate {
-        ReceivedAfter { date: value } => SearchKey::Since(date(value)?),
-        ReceivedBefore { date: value } => SearchKey::Before(date(value)?),
-        SentAfter { date: value } => SearchKey::SentSince(date(value)?),
-        SentBefore { date: value } => SearchKey::SentBefore(date(value)?),
-        From { value } => SearchKey::From(text(value)?),
-        To { value } => SearchKey::To(text(value)?),
-        Cc { value } => SearchKey::Cc(text(value)?),
-        Bcc { value } => SearchKey::Bcc(text(value)?),
-        Subject { value } => SearchKey::Subject(text(value)?),
-        Text { value } => SearchKey::Text(text(value)?),
-        RequiredFlag { flag } => match flag {
-            StandardFlag::Answered => SearchKey::Answered,
-            StandardFlag::Deleted => SearchKey::Deleted,
-            StandardFlag::Draft => SearchKey::Draft,
-            StandardFlag::Flagged => SearchKey::Flagged,
-            StandardFlag::Recent => SearchKey::Recent,
-            StandardFlag::Seen => SearchKey::Seen,
-        },
-        ForbiddenFlag { flag } => match flag {
-            StandardFlag::Answered => SearchKey::Unanswered,
-            StandardFlag::Deleted => SearchKey::Undeleted,
-            StandardFlag::Draft => SearchKey::Undraft,
-            StandardFlag::Flagged => SearchKey::Unflagged,
-            StandardFlag::Recent => SearchKey::Old,
-            StandardFlag::Seen => SearchKey::Unseen,
-        },
-    })
+    match predicate {
+        ReceivedAfter { date: value } => date("SINCE", value),
+        ReceivedBefore { date: value } => date("BEFORE", value),
+        SentAfter { date: value } => date("SENTSINCE", value),
+        SentBefore { date: value } => date("SENTBEFORE", value),
+        From { value } => text("FROM", value),
+        To { value } => text("TO", value),
+        Cc { value } => text("CC", value),
+        Bcc { value } => text("BCC", value),
+        Subject { value } => text("SUBJECT", value),
+        Text { value } => text("TEXT", value),
+        RequiredFlag { flag } | ForbiddenFlag { flag } => {
+            let flag = match (matches!(predicate, ForbiddenFlag { .. }), flag) {
+                (false, StandardFlag::Answered) => "ANSWERED",
+                (false, StandardFlag::Deleted) => "DELETED",
+                (false, StandardFlag::Draft) => "DRAFT",
+                (false, StandardFlag::Flagged) => "FLAGGED",
+                (false, StandardFlag::Recent) => "RECENT",
+                (false, StandardFlag::Seen) => "SEEN",
+                (true, StandardFlag::Answered) => "UNANSWERED",
+                (true, StandardFlag::Deleted) => "UNDELETED",
+                (true, StandardFlag::Draft) => "UNDRAFT",
+                (true, StandardFlag::Flagged) => "UNFLAGGED",
+                (true, StandardFlag::Recent) => "OLD",
+                (true, StandardFlag::Seen) => "UNSEEN",
+            };
+            SearchTerm::Atom(flag.into())
+        }
+    }
 }

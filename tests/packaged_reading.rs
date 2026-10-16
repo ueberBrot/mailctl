@@ -920,7 +920,7 @@ async fn validate_attachment_payloads_and_bounds(executable: &str) {
         (WireOverLimit, Err("attachment_too_large")),
         (DecodedAtLimit, Ok(())),
         (DecodedOverLimit, Err("attachment_too_large")),
-        (BinaryEncoding, Err("unsupported_capability")),
+        (BinaryEncoding, Ok(())),
         (UnknownEncoding, Err("unsupported_capability")),
     ] {
         tokio::time::timeout(std::time::Duration::from_secs(30), async {
@@ -956,7 +956,7 @@ async fn validate_attachment_payloads_and_bounds(executable: &str) {
             assert_eq!(attachment["media_type"], "application/octet-stream");
             assert_eq!(
                 attachment["available"],
-                !matches!(case, BinaryEncoding | UnknownEncoding),
+                !matches!(case, UnknownEncoding),
                 "{case:?}"
             );
             let reference = attachment["reference"].as_str().unwrap();

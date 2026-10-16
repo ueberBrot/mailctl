@@ -2,14 +2,10 @@
 
 use super::super::{
     Error, Limits,
-    mime::{attachment, imap_text, validate_structure},
+    mime::{Part, attachment, common, encoding_name, single, validate_structure},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
-use io_imap::types::{
-    body::{Body, BodyStructure, SpecificFields},
-    core::IString,
-    fetch::Part,
-};
+use imap_proto::{BodyParams, BodyStructure};
 use mail_parser::{GetHeader, MessageParser, MimeHeaders};
 use std::{borrow::Cow, collections::HashMap, io::Cursor, num::NonZeroU32};
 
@@ -51,12 +47,7 @@ pub(super) fn select(
                 candidate.path.push(NonZeroU32::MIN);
             }
             Selected {
-                part: Part(
-                    candidate
-                        .path
-                        .try_into()
-                        .expect("selected path is nonempty"),
-                ),
+                part: candidate.path,
                 media_type: candidate.media_type.to_owned(),
                 charset: candidate.charset.to_owned(),
                 transfer_encoding: candidate.transfer_encoding.to_ascii_lowercase(),
@@ -457,81 +448,59 @@ fn select_part<'a>(
     path: &mut Vec<NonZeroU32>,
     content_ids: &HashMap<Vec<NonZeroU32>, String>,
 ) -> Result<Option<Candidate<'a>>, Error> {
-    match structure {
-        BodyStructure::Single {
-            body,
-            extension_data,
-        } => {
-            if attachment(extension_data.as_ref().and_then(|data| data.tail.as_ref())) {
-                return Ok(None);
-            }
-            leaf(body)
-        }
-        BodyStructure::Multi {
-            bodies,
-            subtype,
-            extension_data,
-        } => {
-            if attachment(extension_data.as_ref().and_then(|data| data.tail.as_ref())) {
-                return Ok(None);
-            }
-            let subtype = imap_text(subtype)?;
-            let children = bodies.as_ref();
-            let alternative = subtype.eq_ignore_ascii_case("alternative");
-            let root = if subtype.eq_ignore_ascii_case("related") {
-                parameter(
-                    extension_data
-                        .as_ref()
-                        .map_or(&[][..], |data| data.parameter_list.as_slice()),
-                    "start",
-                )?
-                .map(normalize_content_id)
+    let fields = common(structure);
+    if attachment(fields.disposition.as_ref()) {
+        return Ok(None);
+    }
+    let BodyStructure::Multipart { bodies, .. } = structure else {
+        return leaf(structure);
+    };
+    let alternative = fields.ty.subtype.eq_ignore_ascii_case("alternative");
+    let root = if fields.ty.subtype.eq_ignore_ascii_case("related") {
+        parameter(&fields.ty.params, "start")
+            .map(normalize_content_id)
+            .transpose()?
+    } else {
+        None
+    };
+    let mut selected: Option<Candidate<'a>> = None;
+    let mut related_root = None;
+    let mut root_matched = false;
+    for (index, child) in bodies.iter().enumerate() {
+        let number = NonZeroU32::new(u32::try_from(index + 1).map_err(|_| Error::Limit)?)
+            .ok_or(Error::Limit)?;
+        path.push(number);
+        let mut candidate = select_part(child, path, content_ids)?;
+        if let Some(root) = root
+            && !root_matched
+        {
+            let content_id = content_ids
+                .get(path.as_slice())
+                .map(|value| normalize_content_id(value))
                 .transpose()?
-            } else {
-                None
-            };
-            let mut selected: Option<Candidate<'a>> = None;
-            let mut related_root = None;
-            let mut root_matched = false;
-            for (index, child) in children.iter().enumerate() {
-                let number = NonZeroU32::new(u32::try_from(index + 1).map_err(|_| Error::Limit)?)
-                    .ok_or(Error::Limit)?;
-                path.push(number);
-                // Continue through every child even after a definite choice so
-                // malformed candidate fields keep their existing error outcome.
-                let mut candidate = select_part(child, path, content_ids)?;
-                if let Some(root) = root
-                    && !root_matched
-                {
-                    let content_id = content_ids
-                        .get(path.as_slice())
-                        .map(|value| normalize_content_id(value))
-                        .transpose()?
-                        .or(structure_content_id(child)?);
-                    if content_id == Some(root) {
-                        root_matched = true;
-                        if let Some(mut candidate) = candidate.take() {
-                            candidate.path.push(number);
-                            related_root = Some(candidate);
-                        }
-                    }
-                }
-                path.pop();
-                if let Some(mut candidate) = candidate
-                    && (selected.is_none()
-                        || alternative
-                            && candidate.media_type == "text/plain"
-                            && selected
-                                .as_ref()
-                                .is_some_and(|selected| selected.media_type != "text/plain"))
-                {
+                .or(structure_content_id(child)?);
+            if content_id == Some(root) {
+                root_matched = true;
+                if let Some(mut candidate) = candidate.take() {
                     candidate.path.push(number);
-                    selected = Some(candidate);
+                    related_root = Some(candidate);
                 }
             }
-            Ok(related_root.or(selected))
+        }
+        path.pop();
+        if let Some(mut candidate) = candidate
+            && (selected.is_none()
+                || alternative
+                    && candidate.media_type == "text/plain"
+                    && selected
+                        .as_ref()
+                        .is_some_and(|selected| selected.media_type != "text/plain"))
+        {
+            candidate.path.push(number);
+            selected = Some(candidate);
         }
     }
+    Ok(related_root.or(selected))
 }
 
 fn related_headers(
@@ -539,129 +508,91 @@ fn related_headers(
     path: &mut Vec<NonZeroU32>,
     paths: &mut Vec<Part>,
 ) -> Result<Option<&'static str>, Error> {
-    match structure {
-        BodyStructure::Single {
-            body,
-            extension_data,
-        } => {
-            if attachment(extension_data.as_ref().and_then(|data| data.tail.as_ref())) {
-                return Ok(None);
-            }
-            text_media_type(body)
+    let fields = common(structure);
+    if attachment(fields.disposition.as_ref()) {
+        return Ok(None);
+    }
+    let BodyStructure::Multipart { bodies, .. } = structure else {
+        return Ok(text_media_type(structure));
+    };
+    let root = if fields.ty.subtype.eq_ignore_ascii_case("related") {
+        parameter(&fields.ty.params, "start")
+            .map(normalize_content_id)
+            .transpose()?
+    } else {
+        None
+    };
+    let alternative = fields.ty.subtype.eq_ignore_ascii_case("alternative");
+    let first_wins = !alternative && root.is_none();
+    let mut selected = None;
+    let mut matched_root = false;
+    for (index, child) in bodies.iter().enumerate() {
+        let number = NonZeroU32::new(u32::try_from(index + 1).map_err(|_| Error::Limit)?)
+            .ok_or(Error::Limit)?;
+        path.push(number);
+        let before = paths.len();
+        if root.is_some() && matches!(child, BodyStructure::Multipart { .. }) {
+            paths.push(path.clone());
         }
-        BodyStructure::Multi {
-            bodies,
-            subtype,
-            extension_data,
-        } => {
-            if attachment(extension_data.as_ref().and_then(|data| data.tail.as_ref())) {
-                return Ok(None);
-            }
-            let subtype = imap_text(subtype)?;
-            let root = if subtype.eq_ignore_ascii_case("related") {
-                parameter(
-                    extension_data
-                        .as_ref()
-                        .map_or(&[][..], |data| data.parameter_list.as_slice()),
-                    "start",
-                )?
-                .map(normalize_content_id)
-                .transpose()?
-            } else {
-                None
-            };
-            let alternative = subtype.eq_ignore_ascii_case("alternative");
-            let first_wins = !alternative && root.is_none();
-            let mut selected = None;
-            let mut matched_root = false;
-            for (index, child) in bodies.as_ref().iter().enumerate() {
-                let number = NonZeroU32::new(u32::try_from(index + 1).map_err(|_| Error::Limit)?)
-                    .ok_or(Error::Limit)?;
-                path.push(number);
-                let before = paths.len();
-                if root.is_some() && matches!(child, BodyStructure::Multi { .. }) {
-                    paths.push(Part(
-                        path.clone()
-                            .try_into()
-                            .expect("child makes the path nonempty"),
-                    ));
-                }
-                let candidate = related_headers(child, path, paths)?;
-                path.pop();
-                // Eligibility is stable without Content-IDs: a related child
-                // falls back to its first readable candidate. Return its type
-                // from this traversal so ancestors need no repeated selection.
-                if selected.is_none() || alternative && candidate == Some("text/plain") {
-                    selected = candidate;
-                }
-                if root.is_some() && !matched_root && structure_content_id(child)? == root {
-                    matched_root = true;
-                    // A matching unreadable root uses the first readable
-                    // fallback, exactly like selection after headers arrive.
-                    selected = candidate.or(selected);
-                }
-                if (first_wins || matched_root) && selected.is_some()
-                    || alternative && paths.len() == before && candidate == Some("text/plain")
-                {
-                    break;
-                }
-            }
-            Ok(selected)
+        let candidate = related_headers(child, path, paths)?;
+        path.pop();
+        if selected.is_none() || alternative && candidate == Some("text/plain") {
+            selected = candidate;
+        }
+        if root.is_some() && !matched_root && structure_content_id(child)? == root {
+            matched_root = true;
+            selected = candidate.or(selected);
+        }
+        if (first_wins || matched_root) && selected.is_some()
+            || alternative && paths.len() == before && candidate == Some("text/plain")
+        {
+            break;
         }
     }
+    Ok(selected)
 }
 
-fn leaf<'a>(body: &'a Body<'_>) -> Result<Option<Candidate<'a>>, Error> {
-    let Some(media_type) = text_media_type(body)? else {
+fn leaf<'a>(structure: &'a BodyStructure<'_>) -> Result<Option<Candidate<'a>>, Error> {
+    let Some(media_type) = text_media_type(structure) else {
         return Ok(None);
     };
+    let fields = common(structure);
+    let other = single(structure).ok_or(Error::Protocol)?;
     Ok(Some(Candidate {
         path: Vec::new(),
         media_type,
-        charset: parameter(&body.basic.parameter_list, "charset")?.unwrap_or("us-ascii"),
-        transfer_encoding: imap_text(&body.basic.content_transfer_encoding)?,
-        wire_size: body.basic.size as usize,
+        charset: parameter(&fields.ty.params, "charset").unwrap_or("us-ascii"),
+        transfer_encoding: encoding_name(&other.transfer_encoding),
+        wire_size: other.octets as usize,
     }))
 }
 
-fn text_media_type(body: &Body<'_>) -> Result<Option<&'static str>, Error> {
-    let SpecificFields::Text { subtype, .. } = &body.specific else {
-        return Ok(None);
+fn text_media_type(structure: &BodyStructure<'_>) -> Option<&'static str> {
+    let BodyStructure::Text { common, .. } = structure else {
+        return None;
     };
-    let subtype = imap_text(subtype)?;
-    Ok(if subtype.eq_ignore_ascii_case("plain") {
+    if common.ty.subtype.eq_ignore_ascii_case("plain") {
         Some("text/plain")
-    } else if subtype.eq_ignore_ascii_case("html") {
+    } else if common.ty.subtype.eq_ignore_ascii_case("html") {
         Some("text/html")
     } else {
         None
-    })
+    }
 }
 
 fn structure_content_id<'a>(structure: &'a BodyStructure<'_>) -> Result<Option<&'a str>, Error> {
-    let BodyStructure::Single { body, .. } = structure else {
-        return Ok(None);
-    };
-    body.basic
-        .id
-        .0
-        .as_ref()
-        .map(imap_text)
-        .transpose()?
+    single(structure)
+        .and_then(|other| other.id.as_deref())
         .map(normalize_content_id)
         .transpose()
 }
 
-fn parameter<'a>(
-    parameters: &'a [(IString<'_>, IString<'_>)],
-    wanted: &str,
-) -> Result<Option<&'a str>, Error> {
-    for (name, value) in parameters {
-        if imap_text(name)?.eq_ignore_ascii_case(wanted) {
-            return Ok(Some(imap_text(value)?));
-        }
-    }
-    Ok(None)
+fn parameter<'a>(parameters: &'a BodyParams<'_>, wanted: &str) -> Option<&'a str> {
+    parameters
+        .as_ref()?
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(wanted))
+        .map(|(_, value)| value.as_ref())
 }
 
 fn complete_headers(raw: &[u8]) -> bool {
@@ -892,7 +823,7 @@ fn add_work(work: usize, additional: usize, limits: &Limits) -> Result<usize, Er
 #[cfg(test)]
 mod planner_performance_tests {
     use super::*;
-    use io_imap::types::{body::BasicFields, core::NString};
+    use imap_proto::{BodyContentCommon, BodyContentSinglePart, ContentEncoding, ContentType};
 
     #[test]
     fn base64_scan_preserves_padding_validation_and_complete_prefixes() {
@@ -935,7 +866,7 @@ mod planner_performance_tests {
                 "; charset=utf-8;;",
             ] {
                 let selected = Selected {
-                    part: Part(NonZeroU32::MIN.into()),
+                    part: vec![NonZeroU32::MIN],
                     media_type: "text/plain".into(),
                     charset: "utf-8".into(),
                     transfer_encoding: "7bit".into(),
@@ -958,7 +889,7 @@ mod planner_performance_tests {
 
     fn mime_identity_selection(charset: &str) -> Selected {
         Selected {
-            part: Part(NonZeroU32::MIN.into()),
+            part: vec![NonZeroU32::MIN],
             media_type: "text/plain".into(),
             charset: charset.into(),
             transfer_encoding: "7bit".into(),
@@ -1075,7 +1006,7 @@ mod planner_performance_tests {
                 "iso-2022-jp",
             ] {
                 let selected = Selected {
-                    part: Part(NonZeroU32::MIN.into()),
+                    part: vec![NonZeroU32::MIN],
                     media_type: "text/plain".into(),
                     charset: charset.into(),
                     transfer_encoding: encoding.into(),
@@ -1108,7 +1039,7 @@ mod planner_performance_tests {
             ("quoted-printable", source.clone()),
         ] {
             let selected = Selected {
-                part: Part(NonZeroU32::MIN.into()),
+                part: vec![NonZeroU32::MIN],
                 media_type: "text/plain".into(),
                 charset: "utf-8".into(),
                 transfer_encoding: encoding.into(),
@@ -1174,7 +1105,7 @@ mod planner_performance_tests {
         ] {
             let wire = STANDARD.encode(source);
             let selected = Selected {
-                part: Part(NonZeroU32::MIN.into()),
+                part: vec![NonZeroU32::MIN],
                 media_type: "text/plain".into(),
                 charset: charset.into(),
                 transfer_encoding: "base64".into(),
@@ -1197,7 +1128,7 @@ mod planner_performance_tests {
             let wire = vec![b'x'; size];
             for charset in ["UTF-8", "x-unknown-fixture"] {
                 let selected = Selected {
-                    part: Part(NonZeroU32::MIN.into()),
+                    part: vec![NonZeroU32::MIN],
                     media_type: "text/plain".into(),
                     charset: charset.into(),
                     transfer_encoding: "7bit".into(),
@@ -1234,7 +1165,7 @@ mod planner_performance_tests {
         let wire = vec![0xe9; SIZE];
         for transfer_encoding in ["7bit", "x-unknown-fixture"] {
             let selected = Selected {
-                part: Part(NonZeroU32::MIN.into()),
+                part: vec![NonZeroU32::MIN],
                 media_type: "text/plain".into(),
                 charset: "iso-8859-1".into(),
                 transfer_encoding: transfer_encoding.into(),
@@ -1259,34 +1190,50 @@ mod planner_performance_tests {
         }
     }
 
-    fn deep_structure(depth: usize, parts: usize) -> BodyStructure<'static> {
-        let leaf = BodyStructure::Single {
-            body: Body {
-                basic: BasicFields {
-                    parameter_list: vec![],
-                    id: NString::NIL,
-                    description: NString::NIL,
-                    content_transfer_encoding: "7BIT".try_into().unwrap(),
-                    size: 5,
+    fn text_leaf() -> BodyStructure<'static> {
+        BodyStructure::Text {
+            common: BodyContentCommon {
+                ty: ContentType {
+                    ty: "TEXT".into(),
+                    subtype: "PLAIN".into(),
+                    params: None,
                 },
-                specific: SpecificFields::Text {
-                    subtype: "PLAIN".try_into().unwrap(),
-                    number_of_lines: 1,
-                },
+                disposition: None,
+                language: None,
+                location: None,
             },
-            extension_data: None,
-        };
-        let mut structure = BodyStructure::Multi {
-            bodies: vec![leaf; parts - depth + 1].try_into().unwrap(),
-            subtype: "MIXED".try_into().unwrap(),
-            extension_data: None,
-        };
+            other: BodyContentSinglePart {
+                id: None,
+                description: None,
+                md5: None,
+                transfer_encoding: ContentEncoding::SevenBit,
+                octets: 5,
+            },
+            lines: 1,
+            extension: None,
+        }
+    }
+
+    fn deep_structure(depth: usize, parts: usize) -> BodyStructure<'static> {
+        fn multipart(bodies: Vec<BodyStructure<'static>>) -> BodyStructure<'static> {
+            BodyStructure::Multipart {
+                common: BodyContentCommon {
+                    ty: ContentType {
+                        ty: "MULTIPART".into(),
+                        subtype: "MIXED".into(),
+                        params: None,
+                    },
+                    disposition: None,
+                    language: None,
+                    location: None,
+                },
+                bodies,
+                extension: None,
+            }
+        }
+        let mut structure = multipart((0..parts - depth + 1).map(|_| text_leaf()).collect());
         for _ in 2..depth {
-            structure = BodyStructure::Multi {
-                bodies: vec![structure].try_into().unwrap(),
-                subtype: "MIXED".try_into().unwrap(),
-                extension_data: None,
-            };
+            structure = multipart(vec![structure]);
         }
         structure
     }
@@ -1300,14 +1247,10 @@ mod planner_performance_tests {
             (40, 1_000, "MIXED"),
         ] {
             let mut structure = deep_structure(depth, parts);
-            let BodyStructure::Multi {
-                subtype: root_subtype,
-                ..
-            } = &mut structure
-            else {
+            let BodyStructure::Multipart { common, .. } = &mut structure else {
                 unreachable!();
             };
-            *root_subtype = subtype.try_into().unwrap();
+            common.ty.subtype = subtype.into();
             let limits = Limits {
                 max_nesting: depth,
                 max_mime_parts: parts,
@@ -1347,8 +1290,8 @@ mod planner_performance_tests {
                 assert_eq!(selected.media_type, "text/plain");
                 assert_eq!(selected.charset, "us-ascii");
                 assert_eq!(selected.transfer_encoding, "7bit");
-                assert_eq!(selected.part.0.as_ref().len(), depth - 1);
-                assert!(selected.part.0.as_ref().iter().all(|part| part.get() == 1));
+                assert_eq!(selected.part.len(), depth - 1);
+                assert!(selected.part.iter().all(|part| part.get() == 1));
             });
             measurements.push(measured);
         }
@@ -1361,27 +1304,26 @@ mod planner_performance_tests {
     }
 
     #[test]
-    fn body_selection_still_validates_readable_siblings_after_its_first_choice() {
+    fn body_selection_keeps_utf8_parameters_and_exact_sibling_identity() {
         let mut structure = deep_structure(2, 3);
-        let BodyStructure::Multi { bodies, .. } = &structure else {
+        let BodyStructure::Multipart { common, bodies, .. } = &mut structure else {
             unreachable!();
         };
-        let mut children = bodies.clone().into_inner();
-        let BodyStructure::Single { body, .. } = &mut children[1] else {
+        common.ty.subtype = "ALTERNATIVE".into();
+        let BodyStructure::Text { common, .. } = &mut bodies[0] else {
             unreachable!();
         };
-        body.basic.parameter_list.push((
-            "CHARSET".try_into().unwrap(),
-            vec![0xff].try_into().unwrap(),
-        ));
-        let BodyStructure::Multi { bodies, .. } = &mut structure else {
+        common.ty.subtype = "HTML".into();
+        let BodyStructure::Text { common, .. } = &mut bodies[1] else {
             unreachable!();
         };
-        *bodies = children.try_into().unwrap();
-        assert_eq!(
-            select(&structure, &Limits::default(), &HashMap::new()),
-            Err(Error::Protocol)
-        );
+        common.ty.params = Some(vec![("CHARSET".into(), "UTF-8".into())]);
+        let selected = select(&structure, &Limits::default(), &HashMap::new())
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.part, vec![NonZeroU32::new(2).unwrap()]);
+        assert_eq!(selected.charset, "UTF-8");
+        assert_eq!(selected.media_type, "text/plain");
     }
 
     #[test]
@@ -1412,7 +1354,7 @@ mod planner_performance_tests {
     #[test]
     fn selected_mime_headers_still_validate_charset_encoding_and_disposition() {
         let selected = Selected {
-            part: Part(NonZeroU32::MIN.into()),
+            part: vec![NonZeroU32::MIN],
             media_type: "text/plain".into(),
             charset: "UTF-8".into(),
             transfer_encoding: "7bit".into(),
@@ -1439,7 +1381,7 @@ mod planner_performance_tests {
     #[test]
     fn selected_mime_headers_skip_unused_parameter_continuation_decoding() {
         let selected = Selected {
-            part: Part(NonZeroU32::MIN.into()),
+            part: vec![NonZeroU32::MIN],
             media_type: "text/plain".into(),
             charset: "us-ascii".into(),
             transfer_encoding: "7bit".into(),
@@ -1472,7 +1414,7 @@ mod planner_performance_tests {
     #[test]
     fn selected_mime_headers_skip_canonical_encoded_unused_continuations() {
         let selected = Selected {
-            part: Part(NonZeroU32::MIN.into()),
+            part: vec![NonZeroU32::MIN],
             media_type: "text/plain".into(),
             charset: "us-ascii".into(),
             transfer_encoding: "7bit".into(),

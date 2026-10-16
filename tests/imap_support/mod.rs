@@ -14,14 +14,9 @@ use std::{
     time::Duration,
 };
 
-use io_imap::codec::{
-    CommandCodec,
-    decode::{CommandDecodeError, Decoder},
-};
-use io_imap::types::{
-    IntoStatic,
-    command::{Command, CommandBody},
-};
+mod command;
+use command::DecodeError;
+pub use command::{Command, parse as parse_command};
 use mailctl::imap::{Limits, TlsMode};
 mod client;
 pub use client::Client;
@@ -164,7 +159,7 @@ pub async fn literal_bytes(
 
 /// Observe a bounded command independently of the production wire guard.
 /// EOF, reset, or abort before a command is allowed; partial commands and stalls fail the fixture.
-pub async fn observe_command(wire: &mut Wire, deadline: Duration) -> Option<Command<'static>> {
+pub async fn observe_command(wire: &mut Wire, deadline: Duration) -> Option<Command> {
     tokio::time::timeout(deadline, async {
         let mut input = Vec::new();
         loop {
@@ -192,15 +187,7 @@ pub async fn observe_command(wire: &mut Wire, deadline: Duration) -> Option<Comm
                 "independently observed command ceiling"
             );
             if input.ends_with(b"\r\n") {
-                let codec = CommandCodec::new();
-                let (remaining, command) = codec
-                    .decode(&input)
-                    .expect("independently observed command syntax");
-                assert!(
-                    remaining.is_empty(),
-                    "one independently observed command per frame"
-                );
-                return Some(command.into_static());
+                return Some(parse_command(&input).expect("independently observed command syntax"));
             }
         }
     })
@@ -208,15 +195,12 @@ pub async fn observe_command(wire: &mut Wire, deadline: Duration) -> Option<Comm
     .expect("independent command observation deadline")
 }
 
-/// Compare decoded command bodies, leaving tags and literal framing unconstrained.
+/// Compare lexical argument values, leaving tags and string framing unconstrained.
 pub async fn expect<S: AsyncRead + AsyncWrite + Unpin + ?Sized>(
     wire: &mut S,
     body: &str,
 ) -> String {
-    let expected = format!("expected {body}\r\n");
-    let codec = CommandCodec::new();
-    let (_, expected) = codec
-        .decode(expected.as_bytes())
+    let expected = parse_command(format!("expected {body}\r\n").as_bytes())
         .expect("valid independent command");
     let mut input = Vec::new();
     let mut last_continuation = 0;
@@ -227,20 +211,15 @@ pub async fn expect<S: AsyncRead + AsyncWrite + Unpin + ?Sized>(
             .expect("command EOF");
         input.push(byte);
         assert!(input.len() <= 16 * 1024, "fixture command bound");
-        match codec.decode(&input) {
-            Ok((remaining, actual)) => {
-                assert!(remaining.is_empty());
-                assert_eq!(
-                    normalized(actual.body),
-                    normalized(expected.body.clone()),
-                    "unexpected IMAP command"
-                );
-                return actual.tag.as_ref().to_owned();
+        match parse_command(&input) {
+            Ok(actual) => {
+                assert_eq!(actual.body, expected.body, "unexpected IMAP command");
+                return actual.tag;
             }
-            Err(CommandDecodeError::Incomplete) => {}
-            Err(CommandDecodeError::LiteralFound { .. }) => {
-                if input.ends_with(b"\r\n") && input.len() != last_continuation {
-                    last_continuation = input.len();
+            Err(DecodeError::Incomplete) => {}
+            Err(DecodeError::Literal { boundary }) => {
+                if input.len() == boundary && boundary != last_continuation {
+                    last_continuation = boundary;
                     write(wire, "+ literal accepted\r\n").await;
                 }
             }
@@ -287,6 +266,27 @@ pub async fn dropped(wire: &mut Wire) {
         matches!(read, Ok(0) | Err(_)),
         "unexpected command after terminal failure"
     );
+}
+
+/// Poll deliberately deep published-parser fixtures on the executable's worker stack.
+/// Process-driver tests separately retain their constrained 1 MiB lifecycle caller.
+pub fn protocol_stack(operation: impl FnOnce() + Send + 'static) {
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(operation)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+pub fn protocol_runtime(operation: impl Future<Output = ()> + Send + 'static) {
+    protocol_stack(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(operation);
+    });
 }
 
 /// Keep fixture allocations on a separate thread from the measured client runtime.
@@ -349,38 +349,6 @@ pub async fn plaintext_fixture(
         port,
         roots: RootCertStore::empty(),
     }
-}
-
-fn normalized(mut body: CommandBody<'_>) -> CommandBody<'_> {
-    use io_imap::types::{
-        mailbox::{ListMailbox, Mailbox},
-        secret::Secret,
-    };
-    fn mailbox(value: &mut Mailbox<'_>) {
-        if let Mailbox::Other(name) = value {
-            *value = name.as_ref().to_vec().try_into().unwrap();
-        }
-    }
-    match &mut body {
-        CommandBody::Login { username, password } => {
-            *username = username.as_ref().to_vec().try_into().unwrap();
-            *password = Secret::new(password.declassify().as_ref().to_vec().try_into().unwrap());
-        }
-        CommandBody::List {
-            reference,
-            mailbox_wildcard,
-        } => {
-            mailbox(reference);
-            let value = match mailbox_wildcard {
-                ListMailbox::Token(value) => value.as_ref().to_vec(),
-                ListMailbox::String(value) => value.as_ref().to_vec(),
-            };
-            *mailbox_wildcard = String::from_utf8(value).unwrap().try_into().unwrap();
-        }
-        CommandBody::Examine { mailbox: name, .. } => mailbox(name),
-        _ => {}
-    }
-    body
 }
 
 /// Counts bytes independently at the synthetic server's decrypted write boundary.
