@@ -281,6 +281,7 @@ async fn lost_or_invalid_acknowledgement_is_unknown() {
         "wrong OK accepted\r\n",
         "garbage\r\n",
         "+ unexpected continuation\r\n",
+        "* 1 FETCH (UNKNOWN ((x) INTERNALDATE NIL))\r\n",
     ] {
         let draft = draft();
         let bytes = draft.bytes().to_vec();

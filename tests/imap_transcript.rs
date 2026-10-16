@@ -395,6 +395,12 @@ async fn invalid_envelope_projections_dispose_the_connection() {
         ),
         mailctl::imap::Error::Unsupported,
     ));
+    // The published parser's unknown-attribute fallback misreads this nested
+    // value and panics. The shared protocol module must reject it and close.
+    cases.push((
+        "UNKNOWN ((x) INTERNALDATE NIL)".to_owned(),
+        mailctl::imap::Error::Protocol,
+    ));
     for (items, expected) in cases {
         let mut fixture = fixture(TlsMode::Implicit, Limits::default(), move |mut wire| {
             Box::pin(async move {

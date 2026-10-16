@@ -5,8 +5,9 @@ use super::{
     fetch::Fetch,
     projection::Projection,
 };
+use futures_util::FutureExt;
 use imap_proto::{Capability, MailboxDatum, Outcome, Response, ResponseCode, Status};
-use std::{borrow::Cow, collections::BTreeSet, fmt, io, sync::Arc};
+use std::{borrow::Cow, collections::BTreeSet, fmt, io, panic::AssertUnwindSafe, sync::Arc};
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
@@ -205,10 +206,19 @@ impl<'a> Connection<'a> {
             })
     }
     async fn read(&mut self) -> Result<Response<'static>, Error> {
-        let mut response = self
-            .client()
-            .read_response()
-            .await
+        // The published parser can panic on malformed input. Discard its entire
+        // client after unwinding: its partially decoded buffer cannot be reused.
+        let response = AssertUnwindSafe(self.client().read_response())
+            .catch_unwind()
+            .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(_) => {
+                self.session.client.take();
+                return Err(Error::Protocol);
+            }
+        };
+        let mut response = response
             .map_err(|_| self.session.control.failure().unwrap_or(Error::Protocol))?
             .ok_or(Error::Eof)?;
         match response.parsed() {

@@ -42,7 +42,7 @@ zeroize = "=1.9.1"
 rustls-native-certs = "=0.8.4"
 rmcp = { version = "=3.5.1", optional = true, default-features = false, features = ["server", "transport-io"] }
 tokio-util = { version = "0.7.20", optional = true, features = ["codec", "rt"] }
-futures-util = { version = "0.3.34", optional = true, default-features = false, features = ["std"] }
+futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["std", "registry", "fmt", "json", "ansi"] }
 anstream = "1.0.0"
@@ -74,7 +74,6 @@ windows-native-keyring-store = { version = "=1.1.0", default-features = false }
 windows-sys = { version = "=0.61.2", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_Threading", "Win32_System_Memory", "Win32_System_SystemServices"] }
 
 [dev-dependencies]
-futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 allocation-counter = "=0.8.1"
 jsonschema = { version = "=0.58.6", default-features = false }
 rcgen = { version = "=0.14.10", default-features = false, features = ["ring", "pem"] }
@@ -87,7 +86,7 @@ toml = "1.1.8"
 [features]
 default = ["cli", "mcp"]
 cli = []
-mcp = ["dep:rmcp", "dep:tokio-util", "dep:futures-util"]
+mcp = ["dep:rmcp", "dep:tokio-util"]
 isolated = []
 docker-tests = ["greenmail-support/docker"]
 

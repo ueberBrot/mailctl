@@ -14,6 +14,11 @@ Protocol nesting is limited to 64; the configured MIME depth and part limits als
 apply to the decoded structure. The shipped executables reserve 8 MiB stacks for
 recursive decoding. Embedded callers must provide equivalent decoding stacks.
 
+If the published response parser panics, the protocol module catches the unwind,
+closes the connection, and returns a protocol error. An already dispatched draft
+retains an unknown outcome. Rust's panic hook still runs; this recovery requires
+unwinding and cannot recover from aborts or stack overflow.
+
 The adapter treats literal payloads as bytes. In LIST mailbox names and supported
 FETCH string fields, it converts escaped quoted strings into equivalent standard
 IMAP literals. This preserves backslashes and quotes without confusing them with
