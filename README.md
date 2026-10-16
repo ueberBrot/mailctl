@@ -1,42 +1,50 @@
 # mailctl
 
-mailctl gives agents and scripts controlled access to email over IMAP. It can
-discover accounts and mailboxes, search messages, read text and attachments, and
-create unsent drafts. It does not send email or edit existing drafts.
+Search and read email, retrieve attachments, and save unsent drafts from your
+terminal or AI agent. mailctl connects to IMAP accounts over TLS. It does not
+send email or edit existing drafts.
 
-The command-line interface is `mailctl`. The MCP server is `mailctl-mcp`, which
-lets an agent harness call email tools over standard input and output. Both use
-the same account configuration, access grants, and durable draft history. You
-can use either interface on its own.
+Use `mailctl` for the command-line interface (CLI) or `mailctl-mcp` for the
+Model Context Protocol (MCP). Install both or use either on its own.
 
-The project is unreleased. The first release targets macOS on Apple Silicon with
-all current functionality. Build from source until release packages are available.
+## Install
 
-## Build from source
+The standalone installer supports macOS on Apple Silicon. It does not require Rust.
+Version 0.1.0 is not published yet. Until it is available, [build from source](#build-from-source).
 
-Use rustup-managed Cargo from the repository root. The repository pins its Rust
-toolchain in [rust-toolchain.toml](rust-toolchain.toml). A default build produces
-both executables:
+Download the installer:
 
 ```sh
-cargo build --locked --release
-export PATH="$PWD/target/release:$PATH"
-mailctl --help
-mailctl-mcp --help
+curl --fail --location --proto '=https' --proto-redir '=https' \
+  --output install-v0.1.0.sh \
+  https://github.com/ueberBrot/mailctl/releases/download/v0.1.0/install-v0.1.0.sh
 ```
 
-For a single interface, add `--no-default-features --features cli` or
-`--no-default-features --features mcp` to the build command. The executables share
-application state regardless of which components you build.
+Choose one installation. For both CLI and MCP:
 
-For an MCP-only build, use `mailctl-mcp` for the setup, credential, and doctor
-commands below.
+```sh
+sh install-v0.1.0.sh --version 0.1.0
+```
 
-## Set up an account on macOS
+For CLI only:
 
-Use an email provider that supports IMAP login over TLS. Replace the hostname and
-username below with the provider's values. `work` is your account alias, a name
-that you choose for this account:
+```sh
+sh install-v0.1.0.sh --version 0.1.0 --components cli
+```
+
+For MCP only:
+
+```sh
+sh install-v0.1.0.sh --version 0.1.0 --components mcp
+```
+
+Executables go into `~/.cargo/bin`, or `CARGO_HOME/bin` when `CARGO_HOME` is nonempty.
+Add that directory to your `PATH`. Use `--install-dir /absolute/path/to/bin` for a different destination.
+
+## Connect your account
+
+Run these commands in your own terminal. Replace the server and username with
+your provider's values. `work` is the name that you give the account:
 
 ```sh
 mailctl setup --alias work --server imap.example.com --username user@example.com
@@ -44,65 +52,49 @@ mailctl --account work credential set
 mailctl --account work doctor --check-account --json
 ```
 
-New accounts use TLS on port 993. `credential set` prompts in your terminal and
-stores the credential in macOS Keychain. Enter the password or app password that
-your provider requires for IMAP. Provision credentials before an agent starts
-the MCP server.
+Enter your password or app password at the credential prompt. macOS Keychain
+stores it. Account configuration contains a credential reference, not the password.
+The doctor command tests authentication. New accounts use TLS on port 993.
 
-In the doctor's JSON result, look for `ok: true` and
-`result.accounts[].authentication.outcome.status: "authenticated"`. Plain
-`doctor` inspects local readiness without authenticating.
+For MCP-only installations, use `mailctl-mcp` for account, credential, and guide commands.
+Use `--config /absolute/path/to/config.toml` to select a custom configuration.
 
-An access grant defines the permitted accounts, mailboxes, and operations. New
-installations grant read-only access to all current and future folders in the
-configured accounts. To restrict folders, set an explicit, nonempty `mailboxes`
-list in the account or grant configuration. Their intersection is the effective
-scope. See `mailctl guide overview` for configuration rules.
+## Read email with the CLI
 
-Use `--config /absolute/path/to/config.toml` to select a different configuration
-file. After editing configuration, stop the runtimes that use it, run `setup`,
-and restart long-running MCP processes. Keep the installation state: it holds
-account identities, the keys that validate references, and draft history.
-
-## Find and read a message
-
-Start with the effective permissions and available accounts. Then discover
-mailboxes for the account you want to read:
+List the account's mailboxes:
 
 ```sh
-mailctl capability show --json
-mailctl account list --json
 mailctl --account work mailbox list --json
 ```
 
-Choose a selectable mailbox from `result.mailboxes`. Copy its `reference` into
-the next command. A folder name such as `INBOX` is not a search reference:
+Copy a mailbox's `reference` from the result and search it:
 
 ```sh
-mailbox_reference='<returned mailbox reference>'
-mailctl message search --mailbox "$mailbox_reference" \
+mailctl message search --mailbox '<mailbox reference>' \
   --criteria '[{"field":"subject","value":"invoice"}]' --limit 10 --json
 ```
 
-Copy a message reference from `result.messages` and read its selected text:
+Copy a message's `reference` from the search result and read its text:
 
 ```sh
-message_reference='<returned message reference>'
-mailctl message get --message "$message_reference" --max-bytes 8192 --json
+mailctl message get --message '<message reference>' --max-bytes 8192 --json
 ```
 
-The text is in `result.body.text`. A body read retrieves text independently of
-attachment payloads. Discovery, search, and body reads can return partial
-results. Use `mailctl guide reading` for their completion fields and continuation
-rules before treating a page as the whole result.
+Message text is in `result.body.text`. Results can span several pages.
+Use `mailctl guide reading` for continuation and completion rules.
+Scripts must inspect `ok` before using `result`. Failures return an `error` and a nonzero exit code.
 
-For scripts, use `--json` and inspect `ok` before reading `result`. Failures carry
-`error` and return a nonzero exit code. Diagnostics go to standard error.
+The built-in guides cover attachment downloads, exports, and draft creation:
 
-## Connect an MCP client
+```sh
+mailctl guide attachments
+mailctl guide drafts
+```
 
-Configure a STDIO MCP server in your agent harness. Use these command and argument
-values in the host's configuration, replacing the executable path:
+## Use MCP with your agent
+
+Add a STDIO server to your agent's MCP configuration.
+Use the installed executable's absolute path:
 
 ```json
 {
@@ -111,62 +103,80 @@ values in the host's configuration, replacing the executable path:
 }
 ```
 
-The host starts the process and communicates over its standard input and output.
-Serving never prompts for credentials. Operator setup and credential commands
-remain outside the MCP tools.
+Set up credentials before starting the server. MCP never prompts for passwords.
+Start with `email_capabilities` and `email_list_accounts`. The server provides
+tools for mailbox discovery, search, message text, attachments, and unsent drafts.
+Guides are available at `mailctl://guide/overview`, with separate `reading`,
+`attachments`, `drafts`, and `errors` resources.
 
-Start with `email_capabilities` and `email_list_accounts`, both with `{}`.
-Available tools include mailbox discovery, message search, body reads, and
-attachment retrieval. The host can read `mailctl://guide/overview` and the
-`reading`, `attachments`, `drafts`, and `errors` guide resources. Tool results use
-the same `ok` envelope in `structuredContent` as the CLI.
+MCP is read-only by default. For drafts, configure a grant with draft permissions
+and add `--grant writer --use-configured-grant` to the server arguments.
+Replace `writer` with your grant's name. Use `mailctl-mcp guide drafts` for the configuration.
 
-MCP serving is read-only by default. Draft tools require an approved grant and
-the explicit `--use-configured-grant` flag. For example, a host can use
-`["--grant", "writer", "--use-configured-grant", "--account", "work"]` after the
-operator configures a `writer` grant.
+## Install the agent skill
 
-## Attachments and unsent drafts
+The [mailctl skill](skills/mailctl/SKILL.md) helps your agent install and update
+mailctl, set up accounts, read messages and attachments, and create approved unsent drafts.
+One skill covers CLI and MCP:
 
-Use `attachment list` to choose an attachment before retrieving its bytes.
-`attachment get` returns one bounded base64 result. `attachment export` writes
-under an operator-approved export root. MCP retrieves attachments in chunks
-within the issuing session. Read `mailctl guide attachments` for these workflows.
+```sh
+npx skills add ueberBrot/mailctl --skill mailctl
+```
 
-Draft creation needs an approved existing Drafts mailbox, approved From
-identities, and a grant with `drafts_only` or `read_and_drafts` permissions.
-Use `mailctl guide drafts` for the configuration and complete save/status recipe.
-Use `mailctl schema draft_content` for the CLI composition file.
+Choose your agent when prompted, or add `--agent codex` or `--agent claude-code`.
+Add `--global` to make the skill available across projects.
+Other compatible skill loaders can use the complete `skills/mailctl` directory.
 
-Before saving, retain the original composition and operation UUID in durable
-caller-owned state. Retain the account UUID, generation, and exact Drafts mailbox
-name with them. Reuse them unchanged for retries. If the outcome is uncertain,
-inspect that operation with `draft status` and optionally `--reconcile`.
-Reconciliation checks the original target without creating another draft.
-A new operation UUID after an uncertain save risks a duplicate.
+For example, ask your agent to find invoices, summarize a thread, download an
+attachment, or prepare an unsent reply. Enter account credentials in your terminal.
 
-## Help and access boundaries
+## Credentials and permissions
 
-`mailctl guide` opens the workflow overview without account setup. Use
-`mailctl guide errors` for failures and recovery, and
-`mailctl schema <operation>` for exact JSON inputs. `mailctl-mcp` exposes the same
-guides and schemas as offline commands. Each command also has `--help`.
+Keep passwords outside prompts, command arguments, and account configuration.
+The standard setup stores them in macOS Keychain.
+For external command credential sources, their owner controls the storage and protection.
 
-See [Operations](docs/operations.md) for permission profiles, credential rotation,
-degraded behavior, and consuming application responsibilities. The
-[acceptance routes](docs/acceptance/routes.md) record platform scope, dependency
-pins, and the limits of the current evidence.
+An access grant defines the permitted accounts, mailboxes, and operations.
+New installations allow read-only access to all folders in configured accounts.
+Use `guide overview` for access grant configuration.
+Inspect permissions with `mailctl capability show --json` or MCP `email_capabilities`.
+Agents with separate shell or filesystem access retain their OS permissions.
+Optional [macOS isolation](deployment/macos-isolated/install.sh) uses a separate service identity.
 
-Access grants constrain operations through mailctl. They do not restrict an
-agent's separate shell or filesystem access under the same OS identity.
-Optional macOS isolation uses a separate service identity and requires explicit
-provisioning. See the [isolation decision](docs/adr/0006-make-native-isolation-an-explicit-operator-choice.md)
-and [provisioning script](deployment/macos-isolated/install.sh).
+Draft history persists across restarts to prevent duplicate creation on retries.
+Keep each draft's original input and operation UUID, a unique operation identifier.
+After an interrupted save, inspect the same operation with `draft status` before retrying.
+Use `mailctl guide drafts` for status and reconciliation.
 
-## Contributing
+## Update or remove
 
-Read [CONTRIBUTING.md](CONTRIBUTING.md) for PR and commit requirements, local
-checks, Rust conventions, and release preparation. Agent-specific workflows
-live in [AGENTS.md](AGENTS.md).
+Before updating, stop the CLI commands and MCP servers that use the installation.
+Download the new version's installer and repeat the matching installation command.
+Update both components together when both are installed. For a custom configuration,
+pass `--config /absolute/path/to/config.toml`.
+Use the same destination as the original installation.
 
-mailctl uses the [ISC license](LICENSE).
+To remove both installer-owned executables:
+
+```sh
+sh install-v0.1.0.sh --uninstall
+```
+
+Add `--components cli` or `--components mcp` to remove only one.
+Uninstalling preserves account configuration, credentials, and draft history.
+Use `mailctl state --help` for backups and recovery, or `mailctl-mcp state --help` for MCP-only installations.
+
+## Build from source
+
+From the repository root, build with the toolchain in [rust-toolchain.toml](rust-toolchain.toml):
+
+```sh
+cargo build --locked --release
+export PATH="$PWD/target/release:$PATH"
+```
+
+For CLI only, add `--no-default-features --features cli` to the build command.
+For MCP only, use `--no-default-features --features mcp`.
+
+Use `mailctl --help`, `mailctl guide`, or `mailctl guide errors` for more help.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development and [LICENSE](LICENSE) for the ISC license.
