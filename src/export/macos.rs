@@ -43,7 +43,19 @@ impl NativeFile {
         self.file.write_all(bytes).map_err(|_| failed())
     }
     pub(super) fn publish(&mut self) -> Result<(PathBuf, String), Error> {
+        self.publish_with(|file, root, name| {
+            fs::fclonefileat(file, root, name, CloneFlags::NOOWNERCOPY)
+        })
+    }
+    fn publish_with(
+        &mut self,
+        mut clone_file: impl FnMut(&File, &File, &str) -> Result<(), rustix::io::Errno>,
+    ) -> Result<(PathBuf, String), Error> {
         self.file.sync_all().map_err(|_| failed())?;
+        // A later rename must not redefine the approved destination path.
+        let directory = PathBuf::from(OsString::from_vec(
+            fs::getpath(&self.root).map_err(|_| failed())?.into_bytes(),
+        ));
         let current = open_root(&self.root_path)?;
         let held = fs::fstat(&self.root).map_err(|_| failed())?;
         let now = fs::fstat(&current).map_err(|_| failed())?;
@@ -63,7 +75,7 @@ impl NativeFile {
             } else {
                 &format!("{}-{suffix}", self.name)
             };
-            match fs::fclonefileat(&self.file, &self.root, name, CloneFlags::NOOWNERCOPY) {
+            match clone_file(&self.file, &self.root, name) {
                 Ok(()) => {}
                 Err(rustix::io::Errno::EXIST) => continue,
                 Err(_) => return Err(failed()),
@@ -88,9 +100,6 @@ impl NativeFile {
             output.sync_all().map_err(|_| failed())?;
             let actual = PathBuf::from(OsString::from_vec(
                 fs::getpath(&output).map_err(|_| failed())?.into_bytes(),
-            ));
-            let directory = PathBuf::from(OsString::from_vec(
-                fs::getpath(&self.root).map_err(|_| failed())?.into_bytes(),
             ));
             if actual != directory.join(name) {
                 return Err(failed());
@@ -164,4 +173,40 @@ fn open_root(path: &Path) -> Result<File, Error> {
         return Err(failed());
     }
     Ok(directory)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{fs as std_fs, os::unix::fs::PermissionsExt};
+
+    #[test]
+    fn a_root_renamed_during_publication_never_returns_a_successful_receipt() {
+        let parent = std::env::temp_dir().join(format!("mailctl-export-{}", uuid::Uuid::new_v4()));
+        std_fs::create_dir(&parent).unwrap();
+        // Resolve macOS's temporary-directory aliases before opening without symlinks.
+        let parent = parent.canonicalize().unwrap();
+        let root = parent.join("approved");
+        let moved = parent.join("moved");
+        std_fs::create_dir(&root).unwrap();
+        std_fs::set_permissions(&root, std_fs::Permissions::from_mode(0o700)).unwrap();
+        let mut file = NativeFile::create(&root, "a").unwrap();
+        file.write_bytes(b"abc").unwrap();
+        let result = file.publish_with(|file, directory, name| {
+            std_fs::rename(&root, &moved).unwrap();
+            fs::fclonefileat(file, directory, name, CloneFlags::NOOWNERCOPY)
+        });
+        assert!(
+            result.is_err(),
+            "export escaped the approved root: {result:?}"
+        );
+        assert_eq!(
+            file.abort().unwrap_err().code,
+            ErrorCode::ExportFinalizationFailed
+        );
+        assert_eq!(std_fs::read(moved.join("a")).unwrap(), b"abc");
+        assert_eq!(std_fs::read_dir(&moved).unwrap().count(), 1);
+        drop(file);
+        std_fs::remove_dir_all(parent).unwrap();
+    }
 }
