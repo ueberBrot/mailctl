@@ -37,9 +37,9 @@ process_command=(cargo test --locked
 native_command=(cargo test --locked --test native_credentials -- --ignored --test-threads=1)
 component_command=(python3 tests/installer.py --artifacts "$MAILCTL_CANDIDATE_DIR" --install-only --reuse)
 
-select_reading_components() {
-	components=$1
-	reading_command=(cargo test --locked --test packaged_reading)
+select_packaged_components() {
+	local suite=$1 components=$2
+	packaged_command=(cargo test --locked --test "packaged_$suite")
 	case "$components" in
 	cli,mcp)
 		label=cli-mcp
@@ -48,27 +48,10 @@ select_reading_components() {
 	cli | mcp)
 		label=$components
 		installed="$MAILCTL_PACKAGED_BIN_DIR-$components"
-		reading_command+=("${components}_")
+		packaged_command+=("${components}_")
 		;;
 	esac
-	reading_command+=(-- --test-threads=1)
-}
-
-select_draft_components() {
-	components=$1
-	drafts_command=(cargo test --locked --test packaged_drafts)
-	case "$components" in
-	cli,mcp)
-		label=cli-mcp
-		installed=$MAILCTL_PACKAGED_BIN_DIR
-		;;
-	cli | mcp)
-		label=$components
-		installed="$MAILCTL_PACKAGED_BIN_DIR-$components"
-		drafts_command+=("${components}_")
-		;;
-	esac
-	drafts_command+=(-- --test-threads=1)
+	packaged_command+=(-- --test-threads=1)
 }
 
 record_command() {
@@ -82,6 +65,36 @@ run_acceptance() {
 	local log=$1
 	shift
 	"$@" 2>&1 | tee "$MAILCTL_CANDIDATE_DIR/$log"
+}
+
+run_packaged_acceptance() {
+	local suite=$1 noun=$2 components log
+	for components in cli mcp cli,mcp; do
+		select_packaged_components "$suite" "$components"
+		log="$MAILCTL_CANDIDATE_DIR/installed-$suite-$label-acceptance.log"
+		{
+			"${component_command[@]}" --components "$components" --install-to "$installed"
+			MAILCTL_PACKAGED_BIN_DIR="$installed" "${packaged_command[@]}"
+		} 2>&1 | tee "$log"
+		if ! grep -Eq '^test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' "$log"; then
+			printf 'Packaged %s acceptance for %s must pass at least one test with none failed or ignored. Log: %s\n' \
+				"$noun" "$components" "$log" >&2
+			exit 1
+		fi
+	done
+}
+
+record_packaged_acceptance() {
+	local suite=$1 components
+	printf '%s_credential_source=disposable-command-helper\n%s_tls_source=fixture-ca-via-SSL_CERT_FILE\n' \
+		"$suite" "$suite"
+	for components in cli mcp cli,mcp; do
+		select_packaged_components "$suite" "$components"
+		record_command "${suite}_components_command_$components" \
+			"${component_command[@]}" --components "$components" --install-to "$installed"
+		record_command "${suite}_command_$components" env \
+			"MAILCTL_PACKAGED_BIN_DIR=$installed" "${packaged_command[@]}"
+	done
 }
 
 case "$1" in
@@ -98,34 +111,10 @@ native)
 	run_acceptance installed-native-acceptance.log "${native_command[@]}"
 	;;
 reading)
-	for components in cli mcp cli,mcp; do
-		select_reading_components "$components"
-		log="$MAILCTL_CANDIDATE_DIR/installed-reading-$label-acceptance.log"
-		{
-			"${component_command[@]}" --components "$components" --install-to "$installed"
-			MAILCTL_PACKAGED_BIN_DIR="$installed" "${reading_command[@]}"
-		} 2>&1 | tee "$log"
-		if ! grep -Eq '^test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' "$log"; then
-			printf 'Packaged reading acceptance for %s must pass at least one test with none failed or ignored. Log: %s\n' \
-				"$components" "$log" >&2
-			exit 1
-		fi
-	done
+	run_packaged_acceptance reading reading
 	;;
 drafts)
-	for components in cli mcp cli,mcp; do
-		select_draft_components "$components"
-		log="$MAILCTL_CANDIDATE_DIR/installed-drafts-$label-acceptance.log"
-		{
-			"${component_command[@]}" --components "$components" --install-to "$installed"
-			MAILCTL_PACKAGED_BIN_DIR="$installed" "${drafts_command[@]}"
-		} 2>&1 | tee "$log"
-		if ! grep -Eq '^test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' "$log"; then
-			printf 'Packaged draft acceptance for %s must pass at least one test with none failed or ignored. Log: %s\n' \
-				"$components" "$log" >&2
-			exit 1
-		fi
-	done
+	run_packaged_acceptance drafts draft
 	;;
 record)
 	# Verify the original artifact hashes before adding passing acceptance.
@@ -139,22 +128,8 @@ record)
 		record_command state_command "${state_command[@]}"
 		record_command process_command "${process_command[@]}"
 		record_command native_command "${native_command[@]}"
-		printf 'reading_credential_source=disposable-command-helper\nreading_tls_source=fixture-ca-via-SSL_CERT_FILE\n'
-		for components in cli mcp cli,mcp; do
-			select_reading_components "$components"
-			record_command "reading_components_command_$components" \
-				"${component_command[@]}" --components "$components" --install-to "$installed"
-			record_command "reading_command_$components" env \
-				"MAILCTL_PACKAGED_BIN_DIR=$installed" "${reading_command[@]}"
-		done
-		printf 'drafts_credential_source=disposable-command-helper\ndrafts_tls_source=fixture-ca-via-SSL_CERT_FILE\n'
-		for components in cli mcp cli,mcp; do
-			select_draft_components "$components"
-			record_command "drafts_components_command_$components" \
-				"${component_command[@]}" --components "$components" --install-to "$installed"
-			record_command "drafts_command_$components" env \
-				"MAILCTL_PACKAGED_BIN_DIR=$installed" "${drafts_command[@]}"
-		done
+		record_packaged_acceptance reading
+		record_packaged_acceptance drafts
 		printf 'real_provider=not-qualified\nisolation=not-qualified\npublication=not-performed\n'
 	} >"$MAILCTL_CANDIDATE_DIR/acceptance-evidence.txt"
 	(cd "$MAILCTL_CANDIDATE_DIR" && shasum -a 256 acceptance-evidence.txt installer-acceptance.log \
