@@ -410,7 +410,8 @@ impl<'a> Connection<'a> {
         Ok(values)
     }
     pub(super) async fn login(&mut self, user: &str, password: &str) -> Result<(), Error> {
-        let command = Zeroizing::new(format!("LOGIN {} {}", quote(user)?, quote(password)?));
+        let password = Zeroizing::new(quote(password)?);
+        let command = Zeroizing::new(format!("LOGIN {} {}", quote(user)?, password.as_str()));
         self.request(&command, Kind::Login).await?;
         Ok(())
     }
@@ -629,7 +630,8 @@ pub(super) fn quote(value: &str) -> Result<String, Error> {
     if value.bytes().any(|b| b < 32 || b == 127) {
         return Err(Error::Unsupported);
     }
-    let mut result = String::with_capacity(value.len() + 2);
+    let escapes = value.bytes().filter(|b| matches!(b, b'"' | b'\\')).count();
+    let mut result = String::with_capacity(value.len() + escapes + 2);
     result.push('"');
     for character in value.chars() {
         if matches!(character, '"' | '\\') {
