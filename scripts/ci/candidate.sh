@@ -35,8 +35,7 @@ process_command=(cargo test --locked
 	--test search_process --test discovery_process
 	--test read_contention_process --test draft_process)
 native_command=(cargo test --locked --test native_credentials -- --ignored --test-threads=1)
-reading_installer_command=(python3 tests/installer.py --artifacts "$MAILCTL_CANDIDATE_DIR" --install-only)
-drafts_installer_command=(python3 tests/installer.py --artifacts "$MAILCTL_CANDIDATE_DIR" --install-only)
+component_command=(python3 tests/installer.py --artifacts "$MAILCTL_CANDIDATE_DIR" --install-only --reuse)
 
 select_reading_components() {
 	components=$1
@@ -65,7 +64,7 @@ select_draft_components() {
 		;;
 	cli | mcp)
 		label=$components
-		installed="$MAILCTL_PACKAGED_BIN_DIR-drafts-$components"
+		installed="$MAILCTL_PACKAGED_BIN_DIR-$components"
 		drafts_command+=("${components}_")
 		;;
 	esac
@@ -103,9 +102,7 @@ reading)
 		select_reading_components "$components"
 		log="$MAILCTL_CANDIDATE_DIR/installed-reading-$label-acceptance.log"
 		{
-			if [ "$components" != cli,mcp ]; then
-				"${reading_installer_command[@]}" --components "$components" --install-to "$installed"
-			fi
+			"${component_command[@]}" --components "$components" --install-to "$installed"
 			MAILCTL_PACKAGED_BIN_DIR="$installed" "${reading_command[@]}"
 		} 2>&1 | tee "$log"
 		if ! grep -Eq '^test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' "$log"; then
@@ -120,9 +117,7 @@ drafts)
 		select_draft_components "$components"
 		log="$MAILCTL_CANDIDATE_DIR/installed-drafts-$label-acceptance.log"
 		{
-			if [ "$components" != cli,mcp ]; then
-				"${drafts_installer_command[@]}" --components "$components" --install-to "$installed"
-			fi
+			"${component_command[@]}" --components "$components" --install-to "$installed"
 			MAILCTL_PACKAGED_BIN_DIR="$installed" "${drafts_command[@]}"
 		} 2>&1 | tee "$log"
 		if ! grep -Eq '^test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' "$log"; then
@@ -147,20 +142,16 @@ record)
 		printf 'reading_credential_source=disposable-command-helper\nreading_tls_source=fixture-ca-via-SSL_CERT_FILE\n'
 		for components in cli mcp cli,mcp; do
 			select_reading_components "$components"
-			if [ "$components" != cli,mcp ]; then
-				record_command "reading_installer_command_$components" \
-					"${reading_installer_command[@]}" --components "$components" --install-to "$installed"
-			fi
+			record_command "reading_components_command_$components" \
+				"${component_command[@]}" --components "$components" --install-to "$installed"
 			record_command "reading_command_$components" env \
 				"MAILCTL_PACKAGED_BIN_DIR=$installed" "${reading_command[@]}"
 		done
 		printf 'drafts_credential_source=disposable-command-helper\ndrafts_tls_source=fixture-ca-via-SSL_CERT_FILE\n'
 		for components in cli mcp cli,mcp; do
 			select_draft_components "$components"
-			if [ "$components" != cli,mcp ]; then
-				record_command "drafts_installer_command_$components" \
-					"${drafts_installer_command[@]}" --components "$components" --install-to "$installed"
-			fi
+			record_command "drafts_components_command_$components" \
+				"${component_command[@]}" --components "$components" --install-to "$installed"
 			record_command "drafts_command_$components" env \
 				"MAILCTL_PACKAGED_BIN_DIR=$installed" "${drafts_command[@]}"
 		done
