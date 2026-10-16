@@ -4,7 +4,7 @@ use crate::{
     config::Limits,
     domain::{
         DraftContent, DraftIdentity, DraftOperationDetails, DraftReceipt, DraftState,
-        DraftStatusInput, Error, ErrorCode, SaveDraftInput,
+        DraftStatusInput, Error, ErrorCode, ErrorReason, SaveDraftInput,
     },
     draft_journal::{
         DraftJournalError, DraftOperationState, DraftReconstruction, PersistedDraftOperation,
@@ -268,7 +268,10 @@ impl Service {
         .await
         .unwrap_or_else(|_| {
             Err(if let Some(operation) = dispatched {
-                Error::draft_outcome(ErrorCode::OutcomeUnknown, operation)
+                let mut error = Error::draft_outcome(ErrorCode::OutcomeUnknown, operation);
+                error.message =
+                    "Draft creation deadline exceeded; acceptance remains uncertain".into();
+                error
             } else {
                 Error::new(ErrorCode::Timeout)
             })
@@ -640,6 +643,7 @@ impl Service {
                 .await
         }
         .await;
+        let failure_reason = evidence.as_ref().err().and_then(|error| error.reason);
         use crate::draft::DraftEvidence;
         let uid = match evidence {
             Ok(DraftEvidence::Verified(uid)) => Ok(uid),
@@ -666,7 +670,11 @@ impl Service {
                 Err("The original draft target could not be verified; acceptance remains uncertain")
             }
         }
-        .map_err(|reason| uncertain(operation, reason))?;
+        .map_err(|message| {
+            let mut error = uncertain(operation, message);
+            error.reason = failure_reason;
+            error
+        })?;
         if uid.uid == 0
             || Some(uid.uid_validity) != operation.reconstruction.as_ref().map(|r| r.uid_validity)
         {
@@ -836,6 +844,13 @@ impl<'a> Dispatch<'a> {
         outcome: Result<crate::imap::AppendOutcome, Error>,
     ) -> Result<PersistedDraftOperation, Error> {
         let identity = &self.operation.identity;
+        let failure_reason = outcome.as_ref().err().and_then(|error| error.reason);
+        let failure = || {
+            let mut error =
+                Error::draft_outcome(ErrorCode::OutcomeUnknown, operation_details(self.operation));
+            error.reason = failure_reason;
+            error
+        };
         let recorded = self
             .journal
             .access(|journal| match outcome {
@@ -845,10 +860,11 @@ impl<'a> Dispatch<'a> {
                 Ok(crate::imap::AppendOutcome::Rejected) => journal.record_rejected(identity),
                 _ => journal.record_outcome_unknown(identity),
             })
-            .map_err(|_| {
-                Error::draft_outcome(ErrorCode::OutcomeUnknown, operation_details(self.operation))
-            })?;
+            .map_err(|_| failure())?;
         self.finished = true;
+        if failure_reason.is_some() {
+            return Err(failure());
+        }
         Ok(recorded)
     }
 }
@@ -904,7 +920,10 @@ fn admit_draft_response(
     let maximum = context.response_limit().saturating_sub(512);
     crate::encoding::serialized_size(&crate::domain::OperationResult::Draft(receipt), maximum)?;
     crate::encoding::serialized_size(
-        &Error::draft_outcome(ErrorCode::OutcomeUnknown, operation_details(operation)),
+        // Reserve the longest reviewed reason; the immediate response can report
+        // a safe dispatch cause without dropping the original draft identity.
+        &Error::draft_outcome(ErrorCode::OutcomeUnknown, operation_details(operation))
+            .with_reason(ErrorReason::ResultSerializationFailed),
         maximum,
     )?;
     Ok(())

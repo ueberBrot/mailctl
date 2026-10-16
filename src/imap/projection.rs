@@ -1,32 +1,20 @@
 //! The envelope FETCH contract: requested fields, validation, and normalization.
 use super::Error;
 use crate::domain::dot_atom;
-use io_imap::types::{
-    core::NString,
-    datetime::DateTime,
-    envelope::Envelope as WireEnvelope,
-    fetch::{MessageDataItem, MessageDataItemName},
-    flag::FlagFetch,
-};
-use std::num::NonZeroU32;
+use imap_proto::{AttributeValue, Envelope as WireEnvelope};
+use std::{borrow::Cow, num::NonZeroU32};
 
 pub(super) struct Projection<'a, 'b> {
     uid: NonZeroU32,
     envelope: &'a WireEnvelope<'b>,
-    flags: &'a [FlagFetch<'b>],
-    internal_date: &'a DateTime,
+    flags: &'a [Cow<'b, str>],
+    internal_date: chrono::DateTime<chrono::FixedOffset>,
     size: u32,
 }
 impl<'a, 'b> Projection<'a, 'b> {
-    pub const FIELDS: [MessageDataItemName<'static>; 5] = [
-        MessageDataItemName::Uid,
-        MessageDataItemName::Envelope,
-        MessageDataItemName::Flags,
-        MessageDataItemName::InternalDate,
-        MessageDataItemName::Rfc822Size,
-    ];
+    pub const FIELDS: &'static str = "UID ENVELOPE FLAGS INTERNALDATE RFC822.SIZE";
     /// Rejects unknown, duplicate, and missing fields before the backend can merge rows.
-    pub fn parse(items: &'a [MessageDataItem<'b>]) -> Result<Self, Error> {
+    pub fn parse(items: &'a [AttributeValue<'b>]) -> Result<Self, Error> {
         let mut uid = None;
         let mut envelope = None;
         let mut flags = None;
@@ -34,11 +22,11 @@ impl<'a, 'b> Projection<'a, 'b> {
         let mut size = None;
         for item in items {
             let duplicate = match item {
-                MessageDataItem::Uid(value) => uid.replace(*value).is_some(),
-                MessageDataItem::Envelope(value) => envelope.replace(value).is_some(),
-                MessageDataItem::Flags(value) => flags.replace(value.as_slice()).is_some(),
-                MessageDataItem::InternalDate(value) => internal_date.replace(value).is_some(),
-                MessageDataItem::Rfc822Size(value) => size.replace(*value).is_some(),
+                AttributeValue::Uid(value) => uid.replace(*value).is_some(),
+                AttributeValue::Envelope(value) => envelope.replace(value).is_some(),
+                AttributeValue::Flags(value) => flags.replace(value.as_slice()).is_some(),
+                AttributeValue::InternalDate(value) => internal_date.replace(value).is_some(),
+                AttributeValue::Rfc822Size(value) => size.replace(*value).is_some(),
                 _ => return Err(Error::Unsupported),
             };
             if duplicate {
@@ -46,18 +34,22 @@ impl<'a, 'b> Projection<'a, 'b> {
             }
         }
         Ok(Self {
-            uid: uid.ok_or(Error::Protocol)?,
+            uid: NonZeroU32::new(uid.ok_or(Error::Protocol)?).ok_or(Error::Protocol)?,
             envelope: envelope.ok_or(Error::Protocol)?,
             flags: flags.ok_or(Error::Protocol)?,
-            internal_date: internal_date.ok_or(Error::Protocol)?,
+            internal_date: chrono::DateTime::parse_from_str(
+                internal_date.ok_or(Error::Protocol)?,
+                "%d-%b-%Y %H:%M:%S %z",
+            )
+            .map_err(|_| Error::Protocol)?,
             size: size.ok_or(Error::Protocol)?,
         })
     }
     /// Bound source field octets before malformed/encoded metadata can shrink or grow.
     pub(super) fn check_header_bytes(&self, maximum: usize) -> Result<(), Error> {
         let mut remaining = maximum;
-        let mut count = |value: &NString<'_>| {
-            let length = value.0.as_ref().map_or(0, |value| value.as_ref().len());
+        let mut count = |value: &Option<Cow<'_, [u8]>>| {
+            let length = value.as_ref().map_or(0, |value| value.as_ref().len());
             remaining = remaining.checked_sub(length).ok_or(Error::Limit)?;
             Ok::<_, Error>(())
         };
@@ -77,7 +69,7 @@ impl<'a, 'b> Projection<'a, 'b> {
             &self.envelope.cc,
             &self.envelope.bcc,
         ] {
-            for address in addresses {
+            for address in addresses.iter().flatten() {
                 for value in [&address.name, &address.adl, &address.mailbox, &address.host] {
                     count(value)?;
                 }
@@ -86,13 +78,26 @@ impl<'a, 'b> Projection<'a, 'b> {
         Ok(())
     }
     pub(super) fn message(self) -> crate::search::LocatedMessage {
-        use crate::domain::MessageMetadata;
+        use crate::domain::{MessageMetadata, StandardFlag};
+        let standard_flags = [
+            StandardFlag::Answered,
+            StandardFlag::Deleted,
+            StandardFlag::Draft,
+            StandardFlag::Flagged,
+            StandardFlag::Recent,
+            StandardFlag::Seen,
+        ]
+        .map(StandardFlag::imap_name);
         let mut flags = self
             .flags
             .iter()
-            .map(|flag| match flag {
-                FlagFetch::Flag(flag) => flag.to_string(),
-                FlagFetch::Recent => "\\Recent".into(),
+            .map(|flag| {
+                standard_flags
+                    .iter()
+                    .copied()
+                    .find(|name| name.eq_ignore_ascii_case(flag))
+                    .unwrap_or(flag)
+                    .to_owned()
             })
             .collect::<Vec<_>>();
         flags.sort_unstable();
@@ -104,7 +109,7 @@ impl<'a, 'b> Projection<'a, 'b> {
                 from: parsed_addresses(&self.envelope.from),
                 to: parsed_addresses(&self.envelope.to),
                 cc: parsed_addresses(&self.envelope.cc),
-                received_date: self.internal_date.as_ref().to_rfc3339(),
+                received_date: self.internal_date.to_rfc3339(),
                 sent_date: metadata(&self.envelope.date, |bytes| {
                     let value = std::str::from_utf8(bytes).ok()?;
                     let date = mail_parser::DateTime::parse_rfc822(value)?;
@@ -124,11 +129,11 @@ impl<'a, 'b> Projection<'a, 'b> {
 }
 
 fn metadata<T>(
-    value: &NString<'_>,
+    value: &Option<Cow<'_, [u8]>>,
     parse: impl FnOnce(&[u8]) -> Option<T>,
 ) -> crate::domain::Metadata<T> {
     use crate::domain::Metadata;
-    match &value.0 {
+    match value {
         None => Metadata::Missing,
         Some(value) => parse(value.as_ref()).map_or(Metadata::Malformed, Metadata::Present),
     }
@@ -200,16 +205,17 @@ fn encoded_word_work_is_bounded(bytes: &[u8]) -> bool {
 }
 
 fn parsed_addresses(
-    values: &[io_imap::types::envelope::Address<'_>],
+    values: &Option<Vec<imap_proto::Address<'_>>>,
 ) -> crate::domain::Metadata<Vec<crate::domain::MessageAddress>> {
     use crate::domain::{MessageAddress, Metadata};
+    let values = values.as_deref().unwrap_or_default();
     if values.is_empty() {
         return Metadata::Missing;
     }
     let mut addresses = Vec::new();
     let mut group = false;
     for value in values {
-        match (&value.mailbox.0, &value.host.0) {
+        match (&value.mailbox, &value.host) {
             (Some(name), None) if !group => {
                 if std::str::from_utf8(name.as_ref())
                     .ok()
@@ -330,37 +336,74 @@ fn skip_comments(mut value: &str) -> Option<&str> {
 mod tests {
     use super::*;
     use crate::domain::{MessageAddress, Metadata};
-    use io_imap::types::envelope::Address;
+    use imap_proto::Address;
 
-    fn fields(local: &str) -> Vec<MessageDataItem<'_>> {
+    fn fields(local: &str) -> Vec<AttributeValue<'_>> {
         vec![
-            MessageDataItem::Uid(NonZeroU32::MIN),
-            MessageDataItem::Envelope(WireEnvelope {
-                date: NString::NIL,
-                subject: NString::NIL,
-                from: vec![Address {
-                    name: NString::NIL,
-                    adl: NString::NIL,
-                    mailbox: NString(Some(local.try_into().unwrap())),
-                    host: NString(Some("example.test".try_into().unwrap())),
-                }],
-                sender: vec![],
-                reply_to: vec![],
-                to: vec![],
-                cc: vec![],
-                bcc: vec![],
-                in_reply_to: NString::NIL,
-                message_id: NString::NIL,
-            }),
-            MessageDataItem::Flags(vec![]),
-            MessageDataItem::InternalDate(
-                chrono::DateTime::parse_from_rfc3339("2024-03-01T00:30:00+14:00")
-                    .unwrap()
-                    .try_into()
-                    .unwrap(),
-            ),
-            MessageDataItem::Rfc822Size(100),
+            AttributeValue::Uid(1),
+            AttributeValue::Envelope(Box::new(WireEnvelope {
+                date: None,
+                subject: None,
+                from: Some(vec![Address {
+                    name: None,
+                    adl: None,
+                    mailbox: Some(Cow::Borrowed(local.as_bytes())),
+                    host: Some(Cow::Borrowed(b"example.test")),
+                }]),
+                sender: None,
+                reply_to: None,
+                to: None,
+                cc: None,
+                bcc: None,
+                in_reply_to: None,
+                message_id: None,
+            })),
+            AttributeValue::Flags(vec![]),
+            AttributeValue::InternalDate(Cow::Borrowed("01-Mar-2024 00:30:00 +1400")),
+            AttributeValue::Rfc822Size(100),
         ]
+    }
+
+    #[test]
+    fn projection_rejects_zero_duplicate_and_missing_uids() {
+        let mut zero = fields("sender");
+        zero[0] = AttributeValue::Uid(0);
+        assert!(matches!(Projection::parse(&zero), Err(Error::Protocol)));
+        let mut duplicate = fields("sender");
+        duplicate.push(AttributeValue::Uid(1));
+        assert!(matches!(
+            Projection::parse(&duplicate),
+            Err(Error::Protocol)
+        ));
+        let mut missing = fields("sender");
+        missing.remove(0);
+        assert!(matches!(Projection::parse(&missing), Err(Error::Protocol)));
+    }
+
+    #[test]
+    fn internal_dates_validate_calendar_values_before_projection() {
+        for raw in [
+            "31-Feb-2024 12:00:00 +0000",
+            "01-Mar-2024 24:00:00 +0000",
+            "invalid",
+        ] {
+            let mut fields = fields("sender");
+            fields[3] = AttributeValue::InternalDate(raw.into());
+            assert!(
+                matches!(Projection::parse(&fields), Err(Error::Protocol)),
+                "{raw}"
+            );
+        }
+        let mut fields = fields("sender");
+        fields[3] = AttributeValue::InternalDate(" 1-Mar-2024 00:30:00 +1400".into());
+        assert_eq!(
+            Projection::parse(&fields)
+                .unwrap()
+                .message()
+                .metadata
+                .received_date,
+            "2024-03-01T00:30:00+14:00"
+        );
     }
 
     #[test]
@@ -405,10 +448,10 @@ mod tests {
             ("30 Apr 2024 12:00:00 +0000", Some("2024-04-30T12:00:00Z")),
         ] {
             let mut fields = fields("sender");
-            let MessageDataItem::Envelope(envelope) = &mut fields[1] else {
+            let AttributeValue::Envelope(envelope) = &mut fields[1] else {
                 unreachable!();
             };
-            envelope.date = NString(Some(raw.try_into().unwrap()));
+            envelope.date = Some(Cow::Borrowed(raw.as_bytes()));
             let message = Projection::parse(&fields).unwrap().message();
             assert_eq!(
                 message.metadata.sent_date,
@@ -426,11 +469,11 @@ mod tests {
         ] {
             let source = format!("\t  {expected} \t");
             let mut fields = fields("sender");
-            let MessageDataItem::Envelope(envelope) = &mut fields[1] else {
+            let AttributeValue::Envelope(envelope) = &mut fields[1] else {
                 unreachable!();
             };
-            envelope.subject = NString(Some(source.as_str().try_into().unwrap()));
-            envelope.from[0].name = NString(Some(source.as_str().try_into().unwrap()));
+            envelope.subject = Some(Cow::Borrowed(source.as_bytes()));
+            envelope.from.as_mut().unwrap()[0].name = Some(Cow::Borrowed(source.as_bytes()));
             let measured = allocation_counter::measure(|| {
                 let projection = Projection::parse(&fields).unwrap();
                 projection.check_header_bytes(256 * 1024).unwrap();
@@ -478,11 +521,11 @@ mod tests {
             (b"Invalid\xff".as_slice(), None),
         ] {
             let mut fields = fields("sender");
-            let MessageDataItem::Envelope(envelope) = &mut fields[1] else {
+            let AttributeValue::Envelope(envelope) = &mut fields[1] else {
                 unreachable!();
             };
-            envelope.subject = NString(Some(raw.try_into().unwrap()));
-            envelope.from[0].name = NString(Some(raw.try_into().unwrap()));
+            envelope.subject = Some(Cow::Borrowed(raw));
+            envelope.from.as_mut().unwrap()[0].name = Some(Cow::Borrowed(raw));
             let message = Projection::parse(&fields).unwrap().message();
             match expected {
                 Some(expected) => {

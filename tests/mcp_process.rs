@@ -133,7 +133,7 @@ async fn mcp_discovery_is_compact_and_output_schemas_validate_wire_results() {
     let tools = client.list_all_tools().await.unwrap();
     assert_eq!(tools.len(), 9, "discovery retains every authorized tool");
     let bytes = serde_json::to_vec(&tools).unwrap().len();
-    assert!(bytes <= 48 * 1024, "tool discovery uses {bytes} bytes");
+    assert!(bytes <= 52 * 1024, "tool discovery uses {bytes} bytes");
     for tool in &tools {
         let schema = serde_json::to_value(tool.output_schema.as_ref().unwrap()).unwrap();
         assert_eq!(schema["type"], "object", "{}", tool.name);
@@ -631,33 +631,86 @@ async fn mcp_hides_administration_tools_and_releases_setup_after_eof() {
     assert_success(&ready);
 }
 
-#[test]
-fn malformed_stdio_frames_are_not_parsed_or_kept_alive() {
+#[tokio::test]
+async fn malformed_stdio_frames_are_not_parsed_or_kept_alive() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
     let installation = Installation::two_accounts();
+    let mut config: toml::Value =
+        toml::from_str(&std::fs::read_to_string(installation.config()).unwrap()).unwrap();
+    config.as_table_mut().unwrap().insert(
+        "limits".into(),
+        toml::Value::Table(toml::map::Map::from_iter([(
+            "envelope_bytes".into(),
+            (64 * 1024).into(),
+        )])),
+    );
+    std::fs::write(installation.config(), toml::to_string(&config).unwrap()).unwrap();
     setup(&installation);
-    for frame in [
-        vec![0xff, b'\n'],
-        format!("[{}]\n", vec!["0"; 4097].join(",")).into_bytes(),
-        format!("{}0{}\n", "[".repeat(65), "]".repeat(65)).into_bytes(),
-        vec![b'x'; 65 * 1024],
-    ] {
-        let mut command = installation.mcp();
-        command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = command.spawn().expect("start MCP component");
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(&frame)
-            .expect("write malformed frame");
-        let output = wait_for_exit(child);
-        assert!(
-            output.stdout.is_empty(),
-            "malformed input must not be reflected to stdout"
-        );
+    for initialized in [false, true] {
+        for frame in [
+            [b"fixture-private-frame".as_slice(), &[0xff, b'\n']].concat(),
+            format!("[{}]\n", vec!["0"; 4097].join(",")).into_bytes(),
+            format!("{}0{}\n", "[".repeat(65), "]".repeat(65)).into_bytes(),
+            vec![b'x'; 65 * 1024],
+        ] {
+            let mut command = tokio::process::Command::from(installation.mcp());
+            command
+                .kill_on_drop(true)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let mut child = command.spawn().expect("start MCP component");
+            let mut input = child.stdin.take().unwrap();
+            if initialized {
+                input.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"ingress-test\",\"version\":\"1\"}}}\n").await.unwrap();
+                let mut output = BufReader::new(child.stdout.take().unwrap());
+                let mut line = String::new();
+                tokio::time::timeout(Duration::from_secs(5), output.read_line(&mut line))
+                    .await
+                    .expect("bounded MCP initialization")
+                    .unwrap();
+                let response: Value = serde_json::from_str(&line).unwrap();
+                assert!(response.get("result").is_some());
+                child.stdout = Some(output.into_inner());
+                input
+                    .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+                    .await
+                    .unwrap();
+            }
+            input
+                .write_all(&frame)
+                .await
+                .expect("write malformed frame");
+            drop(input);
+            let output = tokio::time::timeout(Duration::from_secs(10), child.wait_with_output())
+                .await
+                .expect("malformed input closes MCP")
+                .unwrap();
+            assert!(
+                output.stdout.is_empty(),
+                "malformed input must not be reflected to stdout"
+            );
+            assert!(
+                !output.status.success(),
+                "invalid input must fail the session"
+            );
+            let diagnostics = String::from_utf8(output.stderr).unwrap();
+            assert!(!diagnostics.contains("fixture-private-frame"));
+            let events: Vec<Value> = diagnostics
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("safe JSON diagnostic"))
+                .collect();
+            assert!(
+                events.iter().any(|event| {
+                    event["event"] == "operation_failed"
+                        && event["code"] == "invalid_request"
+                        && event["reason"] == "mcp_invalid_frame"
+                }),
+                "invalid input must retain a safe failure reason (initialized={initialized}, bytes={}): {events:?}",
+                frame.len()
+            );
+        }
     }
 }
 

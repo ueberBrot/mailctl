@@ -371,14 +371,14 @@ impl super::DraftAppend for ImapDraft<'_> {
                     let mut bounds = crate::imap::Limits::body(limits);
                     bounds.max_operation_bytes =
                         limits.draft_mime_bytes.saturating_add(1024 * 1024);
-                    connection
-                        .append_draft(
-                            self.mailbox,
-                            draft,
-                            &bounds,
-                            &mut crate::imap::Metrics::default(),
-                        )
-                        .await
+                    let mut metrics = crate::imap::Metrics::default();
+                    let outcome = connection
+                        .append_draft(self.mailbox, draft, &bounds, &mut metrics)
+                        .await?;
+                    match (outcome, metrics.append_error) {
+                        (crate::imap::AppendOutcome::Unknown, Some(error)) => Err(error),
+                        _ => Ok(outcome),
+                    }
                 })
                 .await
                 .map_err(Into::into)

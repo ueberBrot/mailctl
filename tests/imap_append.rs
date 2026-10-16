@@ -173,6 +173,7 @@ async fn tagged_acknowledgement_survives_missing_uid_and_connection_close() {
             .unwrap();
         assert_eq!(result, AppendOutcome::Created { uid });
         assert_eq!(fixture.probe.append_outcome(), Some(result));
+        assert_eq!(fixture.probe.metrics().append_error, None);
         assert!(fixture.probe.metrics().append_wire_bytes > draft.bytes().len());
         fixture.task.await.unwrap();
     }
@@ -268,6 +269,7 @@ async fn tagged_no_and_bad_are_rejections_before_or_after_literal() {
                 .await
                 .unwrap();
             assert_eq!(result, AppendOutcome::Rejected);
+            assert_eq!(fixture.probe.metrics().append_error, None);
             fixture.task.await.unwrap();
         }
     }
@@ -301,8 +303,37 @@ async fn lost_or_invalid_acknowledgement_is_unknown() {
             .await
             .unwrap();
         assert_eq!(result, AppendOutcome::Unknown);
+        assert!(fixture.probe.metrics().append_error.is_some());
         fixture.task.await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn parser_failure_reports_its_reason_and_retains_uncertain_append_progress() {
+    let draft = draft();
+    let bytes = draft.bytes().to_vec();
+    let mut fixture = fixture(TlsMode::Implicit, Limits::default(), move |mut wire| {
+        Box::pin(async move {
+            authenticate(&mut wire).await;
+            receive(&mut wire, "Drafts", &bytes).await;
+            write(&mut wire, "* 1 FETCH (UNKNOWN ((x) INTERNALDATE NIL))\r\n").await;
+            dropped(&mut wire).await;
+        })
+    })
+    .await;
+    assert_eq!(
+        fixture
+            .probe
+            .append_draft("fixture", "disposable-password", "Drafts", &draft)
+            .await,
+        Ok(AppendOutcome::Unknown)
+    );
+    assert_eq!(fixture.probe.append_outcome(), Some(AppendOutcome::Unknown));
+    assert_eq!(
+        fixture.probe.metrics().append_error,
+        Some(Error::ParserPanic)
+    );
+    fixture.task.await.unwrap();
 }
 
 #[tokio::test]
@@ -329,6 +360,7 @@ async fn timeout_disposes_uncertain_transport() {
             .unwrap(),
         AppendOutcome::Unknown
     );
+    assert_eq!(fixture.probe.metrics().append_error, Some(Error::Timeout));
     fixture.task.await.unwrap();
 }
 

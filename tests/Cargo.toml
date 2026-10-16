@@ -28,7 +28,6 @@ tokio = { version = "=1.53.2", features = ["rt-multi-thread", "macros", "net", "
 rmcp = { version = "=3.5.1", default-features = false, features = ["client", "transport-child-process"] }
 serde_json = "1.0.151"
 rcgen = { version = "=0.14.10", default-features = false, features = ["ring", "pem"] }
-io-imap = { version = "=0.7.1", default-features = false }
 rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled"] }
 
 [target.'cfg(unix)'.dev-dependencies]

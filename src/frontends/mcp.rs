@@ -263,12 +263,11 @@ impl ServerHandler for EmailTools {
             self.shutdown.cancel();
         }
         let mut envelope = diagnostic_request.envelope(result);
-        let envelope_bytes = match crate::encoding::serialized_size(&envelope, self.envelope_limit)
-        {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                let code =
-                    envelope
+        let envelope_bytes =
+            match crate::encoding::serialized_size(&envelope, self.envelope_limit) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    let code = envelope
                         .error()
                         .map_or(ErrorCode::ResponseTooLarge, |error| match error.code {
                             ErrorCode::OutcomeUnknown | ErrorCode::OperationInProgress => {
@@ -276,12 +275,26 @@ impl ServerHandler for EmailTools {
                             }
                             _ => ErrorCode::ResponseTooLarge,
                         });
-                envelope =
-                    Envelope::from_result(envelope.request_id().to_owned(), Err(Error::new(code)));
-                crate::encoding::serialized_size(&envelope, self.envelope_limit)
-                    .map_err(|_| McpError::internal_error("Result unavailable", None))?
-            }
-        };
+                    let reason = envelope.error().and_then(|error| error.reason);
+                    envelope = Envelope::from_result(
+                        envelope.request_id().to_owned(),
+                        Err(Error {
+                            reason,
+                            ..Error::new(code)
+                        }),
+                    );
+                    if reason.is_some()
+                        && crate::encoding::serialized_size(&envelope, self.envelope_limit).is_err()
+                    {
+                        envelope = Envelope::from_result(
+                            envelope.request_id().to_owned(),
+                            Err(Error::new(code)),
+                        );
+                    }
+                    crate::encoding::serialized_size(&envelope, self.envelope_limit)
+                        .map_err(|_| McpError::internal_error("Result unavailable", None))?
+                }
+            };
         super::diagnostics::result(envelope.request_id(), envelope.error());
         let success = envelope.is_success();
         let value = serde_json::to_value(envelope)
@@ -371,18 +384,27 @@ pub(super) async fn run(application: Application) -> Result<(), Error> {
         application: application.with_response_limit(bounds.envelope),
         shutdown: shutdown.clone(),
     };
-    let service = tokio::time::timeout_at(
-        initialization_expires,
-        handler.serve_with_ct(BoundedStdio::new(bounds, shutdown.clone()), shutdown),
-    )
-    .await
-    .map_err(|_| Error::new(ErrorCode::Timeout))?
-    .map_err(|_| Error::new(ErrorCode::ProtocolMismatch))?;
-    tokio::time::timeout_at(expires, service.waiting())
+    let transport = BoundedStdio::new(bounds, shutdown.clone());
+    let failure = transport.failure();
+    let result = async {
+        let service = tokio::time::timeout_at(
+            initialization_expires,
+            handler.serve_with_ct(transport, shutdown),
+        )
         .await
         .map_err(|_| Error::new(ErrorCode::Timeout))?
-        .map_err(|_| Error::new(ErrorCode::InternalError))
-        .map(|_| ())
+        .map_err(|_| Error::new(ErrorCode::ProtocolMismatch))?;
+        tokio::time::timeout_at(expires, service.waiting())
+            .await
+            .map_err(|_| Error::new(ErrorCode::Timeout))?
+            .map_err(|_| Error::new(ErrorCode::InternalError))
+            .map(|_| ())
+    }
+    .await;
+    match failure.get() {
+        Some(error) => Err(error.clone()),
+        None => result,
+    }
 }
 
 #[cfg(test)]

@@ -63,6 +63,9 @@ async fn snapshots_preserve_all_outcomes_and_suspend_missing_history(executable:
         }
         if state != "outcome_unknown" {
             assert_eq!(outcome["result"]["state"], state, "{outcome}");
+        } else {
+            assert_eq!(outcome["error"]["reason"], "imap_connection_closed");
+            outcome["error"].as_object_mut().unwrap().remove("reason");
         }
         retained.push((fixture.input.clone(), outcome));
     }
@@ -298,6 +301,9 @@ async fn historical_operations_keep_original_targets_and_permissions(executable:
         if state == "duplicate" {
             fixture.server.expect_reconciliation();
             original = fixture.status(executable, true).await;
+        } else if state == "outcome_unknown" {
+            assert_eq!(original["error"]["reason"], "imap_connection_closed");
+            original["error"].as_object_mut().unwrap().remove("reason");
         }
         let original_rows = rows(&fixture);
         let frozen = reconstruction(&fixture);

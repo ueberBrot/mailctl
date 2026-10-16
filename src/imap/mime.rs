@@ -1,15 +1,13 @@
 //! MIME structure limits and part identity shared by message readers.
 use super::{Error, Limits};
-use io_imap::types::{
-    body::{BodyStructure, Disposition, SpecificFields},
-    core::IString,
-    fetch::Part,
+use imap_proto::{
+    BodyContentCommon, BodyContentSinglePart, BodyStructure, ContentDisposition, ContentEncoding,
 };
-use std::fmt::Write;
+use std::{fmt::Write, num::NonZeroU32};
 
-/// Count the complete server-provided structure before selection cuts off attached-message and
-/// attachment subtrees. Those subtrees are ineligible for rendering, but still consume the MIME
-/// structure budget.
+pub(super) type Part = Vec<NonZeroU32>;
+
+/// Count every server-provided node, including ineligible attached-message subtrees.
 pub(super) fn validate_structure(
     structure: &BodyStructure<'_>,
     limits: &Limits,
@@ -25,37 +23,57 @@ pub(super) fn validate_structure(
             return Err(Error::Limit);
         }
         match structure {
-            BodyStructure::Single { body, .. } => {
-                if let SpecificFields::Message { body_structure, .. } = &body.specific {
-                    visit(body_structure, limits, parts, depth + 1)?;
-                }
-            }
-            BodyStructure::Multi { bodies, .. } => {
-                for body in bodies.as_ref() {
+            BodyStructure::Message { body, .. } => visit(body, limits, parts, depth + 1)?,
+            BodyStructure::Multipart { bodies, .. } => {
+                for body in bodies {
                     visit(body, limits, parts, depth + 1)?;
                 }
             }
+            _ => {}
         }
         Ok(())
     }
-
-    let mut parts = 0;
-    visit(structure, limits, &mut parts, 1)
+    visit(structure, limits, &mut 0, 1)
 }
 
-pub(super) fn attachment(disposition: Option<&Disposition<'_>>) -> bool {
-    disposition
-        .and_then(|disposition| disposition.disposition.as_ref())
-        .is_some_and(|(kind, _)| kind.as_ref().eq_ignore_ascii_case(b"attachment"))
+pub(super) fn common<'a, 'b>(structure: &'a BodyStructure<'b>) -> &'a BodyContentCommon<'b> {
+    match structure {
+        BodyStructure::Basic { common, .. }
+        | BodyStructure::Text { common, .. }
+        | BodyStructure::Message { common, .. }
+        | BodyStructure::Multipart { common, .. } => common,
+    }
 }
 
-pub(super) fn imap_text<'a>(value: &'a IString<'_>) -> Result<&'a str, Error> {
-    std::str::from_utf8(value.as_ref()).map_err(|_| Error::Protocol)
+pub(super) fn single<'a, 'b>(
+    structure: &'a BodyStructure<'b>,
+) -> Option<&'a BodyContentSinglePart<'b>> {
+    match structure {
+        BodyStructure::Basic { other, .. }
+        | BodyStructure::Text { other, .. }
+        | BodyStructure::Message { other, .. } => Some(other),
+        BodyStructure::Multipart { .. } => None,
+    }
 }
 
-pub(super) fn part_name(part: &Part) -> String {
+pub(super) fn attachment(disposition: Option<&ContentDisposition<'_>>) -> bool {
+    disposition.is_some_and(|disposition| disposition.ty.eq_ignore_ascii_case("attachment"))
+}
+
+pub(super) fn encoding_name<'a>(encoding: &'a ContentEncoding<'_>) -> &'a str {
+    match encoding {
+        ContentEncoding::SevenBit => "7bit",
+        ContentEncoding::EightBit => "8bit",
+        ContentEncoding::Binary => "binary",
+        ContentEncoding::Base64 => "base64",
+        ContentEncoding::QuotedPrintable => "quoted-printable",
+        ContentEncoding::Other(value) => value,
+    }
+}
+
+pub(super) fn part_name(part: &[NonZeroU32]) -> String {
     let mut name = String::new();
-    for (index, number) in part.0.as_ref().iter().enumerate() {
+    for (index, number) in part.iter().enumerate() {
         if index != 0 {
             name.push('.');
         }

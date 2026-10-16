@@ -4,11 +4,7 @@ mod imap_support;
 use fuzz_support::{Campaign, MAX_INPUT_BYTES};
 use imap_support::{
     CountedWire, Wire, authenticate, dedicated_fixture, examine, expect, observe_command,
-};
-use io_imap::types::{
-    command::CommandBody,
-    fetch::{MacroOrMessageDataItemNames, MessageDataItemName, Section},
-    sequence::{SeqOrUid, Sequence},
+    protocol_stack,
 };
 use mailctl::imap::{
     AttachmentData, AttachmentDecoder, BodyPage, BodyRequest, Error, Limits, Metrics, TlsMode,
@@ -131,9 +127,13 @@ const CORPUS: &[Case] = &[
         },
     },
     Case {
-        // RFC 3501 section 9 excludes NUL from ordinary IMAP literals.
+        // The published parser permits arbitrary literal payload bytes. Preserve
+        // NUL exactly, under the same admission and integrity bounds as other bytes.
         input: include_bytes!("fuzz_corpus/mime/attachment-raw-nul.seed"),
-        expected: Expected::AttachmentProtocol,
+        expected: Expected::Attachment {
+            bytes: b"\0",
+            digest: "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+        },
     },
 ];
 
@@ -205,45 +205,20 @@ async fn serve(mut wire: Wire, kind: u8, input: Vec<u8>) {
         let Some(command) = observe_command(&mut wire, Duration::from_secs(3)).await else {
             return;
         };
-        let tag = command.tag.as_ref();
-        if matches!(command.body, CommandBody::Logout) {
+        let tag = &command.tag;
+        if command.is("LOGOUT") {
             let _ = wire
                 .write_all(format!("* BYE closing\r\n{tag} OK logout\r\n").as_bytes())
                 .await;
             return;
         }
-        let CommandBody::Fetch {
-            sequence_set,
-            macro_or_item_names: MacroOrMessageDataItemNames::MessageDataItemNames(names),
-            uid: true,
-            modifiers,
-        } = &command.body
-        else {
-            panic!("only read-only synthetic FETCH is allowed");
-        };
-        assert!(modifiers.is_empty(), "synthetic FETCH modifiers");
-        assert!(
-            matches!(sequence_set.0.as_ref(), [Sequence::Single(SeqOrUid::Value(uid))] if uid.get() == 4)
-        );
-        let [
-            MessageDataItemName::Uid,
-            MessageDataItemName::BodyExt {
-                section: Some(section),
-                partial: Some((offset, count)),
-                peek: true,
-            },
-        ] = names.as_slice()
-        else {
-            panic!("only bounded synthetic PEEK is allowed");
-        };
-        let offset = *offset as usize;
-        let count = count.get() as usize;
+        let (section, offset, count) = command.bounded_peek(4);
         assert!(
             (1..=WIRE_SLICE).contains(&count),
             "synthetic wire slice ceiling"
         );
-        let (section_name, bytes) = match section {
-            Section::Header(None) if !attachment => {
+        let (section_name, bytes) = match section.as_str() {
+            "HEADER" if !attachment => {
                 assert_eq!(offset, header_offset, "synthetic header offset");
                 let value = if kind == b'H' {
                     input.as_slice()
@@ -255,25 +230,14 @@ async fn serve(mut wire: Wire, kind: u8, input: Vec<u8>) {
                 header_offset = end;
                 ("HEADER".to_owned(), &value[offset..end])
             }
-            Section::Mime(part) if !attachment && kind == b'S' => {
+            section if section.ends_with(".MIME") && !attachment && kind == b'S' => {
                 assert_eq!(offset, 0, "synthetic related header offset");
-                let part = part
-                    .0
-                    .as_ref()
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(".");
-                (format!("{part}.MIME"), ROOT_HEADERS)
+                (section.to_owned(), ROOT_HEADERS)
             }
-            Section::Part(part) => {
-                let part = part
-                    .0
-                    .as_ref()
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(".");
+            part if part.split('.').all(|component| {
+                !component.is_empty() && component.bytes().all(|byte| byte.is_ascii_digit())
+            }) =>
+            {
                 if attachment {
                     assert_eq!(part, "2", "synthetic attachment part");
                 }
@@ -281,7 +245,7 @@ async fn serve(mut wire: Wire, kind: u8, input: Vec<u8>) {
                 let end = offset.saturating_add(count).min(body.len());
                 assert!(offset <= end, "synthetic body progress");
                 body_offset = end;
-                (part, &body[offset..end])
+                (part.to_owned(), &body[offset..end])
             }
             _ => panic!("unexpected synthetic PEEK section"),
         };
@@ -493,44 +457,49 @@ fn run(input: &[u8], case: usize) -> Outcome {
 
 #[test]
 fn retained_mime_inputs_replay_through_bounded_public_reads() {
-    for (case, fixture) in CORPUS.iter().enumerate() {
-        match (&fixture.expected, run(fixture.input, case)) {
-            (Expected::BodyText(text), Outcome::Body(Ok(page))) => assert_eq!(page.text, *text),
-            (Expected::BodyProtocol, Outcome::Body(Err(Error::Protocol)))
-            | (Expected::BodyLimit, Outcome::Body(Err(Error::Limit)))
-            | (Expected::IncompleteStructure, Outcome::Body(Err(Error::Protocol | Error::Eof)))
-            | (Expected::AttachmentProtocol, Outcome::Attachment(Err(Error::Protocol))) => {}
-            (Expected::Replacements, Outcome::Body(Ok(page))) => {
-                assert!(page.replacements);
-                assert!(page.text.contains('\u{fffd}'));
+    protocol_stack(|| {
+        for (case, fixture) in CORPUS.iter().enumerate() {
+            match (&fixture.expected, run(fixture.input, case)) {
+                (Expected::BodyText(text), Outcome::Body(Ok(page))) => assert_eq!(page.text, *text),
+                (Expected::BodyProtocol, Outcome::Body(Err(Error::Protocol)))
+                | (Expected::BodyLimit, Outcome::Body(Err(Error::Limit)))
+                | (
+                    Expected::IncompleteStructure,
+                    Outcome::Body(Err(Error::Protocol | Error::Eof)),
+                )
+                | (Expected::AttachmentProtocol, Outcome::Attachment(Err(Error::Protocol))) => {}
+                (Expected::Replacements, Outcome::Body(Ok(page))) => {
+                    assert!(page.replacements);
+                    assert!(page.text.contains('\u{fffd}'));
+                }
+                (Expected::SanitizedHtml, Outcome::Body(Ok(page))) => {
+                    assert!(page.converted);
+                    assert!(page.text.contains("Visible synthetic text"));
+                    assert!(page.text.contains("Quoted synthetic text"));
+                    assert!(!page.text.contains("synthetic-active-marker"));
+                    assert!(!page.text.contains("synthetic-style-marker"));
+                }
+                (Expected::HtmlText(text), Outcome::Body(Ok(page))) => {
+                    assert!(page.converted);
+                    assert!(page.text.contains(*text));
+                }
+                (Expected::ReplacedText(text), Outcome::Body(Ok(page))) => {
+                    assert_eq!(page.text, *text);
+                    assert!(page.replacements);
+                }
+                (Expected::Attachment { bytes, digest }, Outcome::Attachment(Ok(chunk))) => {
+                    assert_integrity(chunk, bytes, digest);
+                }
+                (_, Outcome::Body(Err(error))) => {
+                    panic!("mime retained case {case}: unexpected body error {error}")
+                }
+                (_, Outcome::Attachment(Err(error))) => {
+                    panic!("mime retained case {case}: unexpected attachment error {error}")
+                }
+                _ => panic!("mime retained case {case}: unexpected result"),
             }
-            (Expected::SanitizedHtml, Outcome::Body(Ok(page))) => {
-                assert!(page.converted);
-                assert!(page.text.contains("Visible synthetic text"));
-                assert!(page.text.contains("Quoted synthetic text"));
-                assert!(!page.text.contains("synthetic-active-marker"));
-                assert!(!page.text.contains("synthetic-style-marker"));
-            }
-            (Expected::HtmlText(text), Outcome::Body(Ok(page))) => {
-                assert!(page.converted);
-                assert!(page.text.contains(*text));
-            }
-            (Expected::ReplacedText(text), Outcome::Body(Ok(page))) => {
-                assert_eq!(page.text, *text);
-                assert!(page.replacements);
-            }
-            (Expected::Attachment { bytes, digest }, Outcome::Attachment(Ok(chunk))) => {
-                assert_integrity(chunk, bytes, digest);
-            }
-            (_, Outcome::Body(Err(error))) => {
-                panic!("mime retained case {case}: unexpected body error {error}")
-            }
-            (_, Outcome::Attachment(Err(error))) => {
-                panic!("mime retained case {case}: unexpected attachment error {error}")
-            }
-            _ => panic!("mime retained case {case}: unexpected result"),
         }
-    }
+    });
 }
 
 fn assert_integrity(chunk: AttachmentData, expected_bytes: &[u8], expected_digest: &str) {
@@ -547,10 +516,12 @@ fn assert_integrity(chunk: AttachmentData, expected_bytes: &[u8], expected_diges
 #[test]
 #[ignore = "explicit bounded synthetic MIME mutation campaign"]
 fn fuzz_mime() {
-    let campaign = Campaign::from_env("mime");
-    let seeds: Vec<_> = CORPUS.iter().map(|case| case.input).collect();
-    for (case, input) in campaign.cases(&seeds) {
-        run(&input, case);
-    }
-    campaign.finish();
+    protocol_stack(|| {
+        let campaign = Campaign::from_env("mime");
+        let seeds: Vec<_> = CORPUS.iter().map(|case| case.input).collect();
+        for (case, input) in campaign.cases(&seeds) {
+            run(&input, case);
+        }
+        campaign.finish();
+    });
 }

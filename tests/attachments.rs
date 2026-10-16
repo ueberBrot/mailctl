@@ -1041,6 +1041,52 @@ async fn narrowed_attachment_byte_limits_fail_without_retaining_a_transfer() {
 
 mod attachment_support;
 #[tokio::test]
+async fn narrowed_wire_budgets_preserve_small_imap_attachments() {
+    use imap_support::*;
+    let mut session = 0;
+    let fixture = repeating_fixture(Default::default(), 2, move |mut wire| {
+        let read_payload = session == 1;
+        session += 1;
+        Box::pin(async move {
+            authenticate(&mut wire).await;
+            examine(&mut wire).await;
+            attachment_support::metadata(&mut wire, &attachment_support::structure("BASE64", 8))
+                .await;
+            if read_payload {
+                literal_bytes(&mut wire, "2", 0, 16384, b"YWJjZGVm").await;
+            }
+            logout(&mut wire).await;
+        })
+    })
+    .await;
+    let mut configuration = config();
+    configuration.grants[0].limits.wire_fetch_bytes = 32 * 1024;
+    let (service, message) = live(&fixture, configuration).await;
+    let context = service.context("reader", &Default::default()).unwrap();
+    let reference = attachment_reference(&service, &context, &message).await;
+    let OperationResult::Attachment(chunk) = service
+        .execute(
+            &context,
+            operation("get_attachment", json!({"attachment": reference})),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(chunk.bytes_base64, "YWJjZGVm");
+    assert_eq!(chunk.decoded_offset, 0);
+    assert!(matches!(
+        chunk.progress,
+        mailctl::domain::AttachmentProgress::Complete {
+            total_decoded_bytes: 6,
+            ..
+        }
+    ));
+    fixture.task.await.unwrap();
+}
+
+#[tokio::test]
 async fn imap_continuations_reconnect_and_check_identity_before_returning_buffered_bytes() {
     use imap_support::*;
     for stale in [false, true] {

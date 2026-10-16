@@ -415,7 +415,7 @@ grant and routing recovery; callers keep their original operation records.
 const ERRORS: &str = r###"# Handle an unsuccessful operation
 
 CLI JSON and MCP structured results use `ok: false` with an `error`. Read its
-`code`, `message`, `retryable`, and any `credential_failure`, `conflict_kind`, or
+`code`, `message`, `retryable`, and any `reason`, `credential_failure`, `conflict_kind`, or
 `draft_operation` details. Retain `request_id` for diagnostics. CLI failure also
 returns a nonzero exit code; ordinary stderr diagnostics are not result JSON.
 

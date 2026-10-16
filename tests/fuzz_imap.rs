@@ -3,10 +3,6 @@ mod imap_support;
 
 use fuzz_support::{Campaign, MAX_INPUT_BYTES};
 use imap_support::*;
-use io_imap::{
-    codec::{CommandCodec, decode::Decoder},
-    types::command::CommandBody,
-};
 use mailctl::{
     config,
     draft::{DraftEvidence, DraftVerification},
@@ -154,38 +150,32 @@ async fn observe_cleanup(wire: &mut Wire, route: Route, commands: &AtomicUsize) 
     let mut verified = false;
     while let Some(command) = observe_command(wire, Duration::from_secs(3)).await {
         commands.fetch_add(1, Ordering::Relaxed);
-        match command.body {
-            CommandBody::Logout if route != Route::Reconcile => {
-                let tag = command.tag.as_ref();
-                let reply = format!("* BYE closing\r\n{tag} OK logout\r\n");
-                if wire.write_all(reply.as_bytes()).await.is_ok() {
-                    let _ = wire.flush().await;
-                }
-            }
-            body if route == Route::Reconcile && !verified => {
-                let codec = CommandCodec::new();
-                let (_, expected) = codec
-                    .decode(b"expected UID FETCH 4 (UID BODY.PEEK[]<0.1025>)\r\n")
-                    .unwrap();
-                assert!(
-                    body == expected.body,
-                    "unexpected command or mailbox mutation"
-                );
-                verified = true;
-                let tag = command.tag.as_ref();
-                let prefix = format!("* 1 FETCH (UID 4 BODY[]<0> {{{}}}\r\n", DRAFT.len());
-                if wire.write_all(prefix.as_bytes()).await.is_err()
-                    || wire.write_all(DRAFT).await.is_err()
-                    || wire
-                        .write_all(format!(")\r\n{tag} OK fetched\r\n").as_bytes())
-                        .await
-                        .is_err()
-                {
-                    return;
-                }
+        if command.is("LOGOUT") && route != Route::Reconcile {
+            let tag = &command.tag;
+            let reply = format!("* BYE closing\r\n{tag} OK logout\r\n");
+            if wire.write_all(reply.as_bytes()).await.is_ok() {
                 let _ = wire.flush().await;
             }
-            _ => panic!("unexpected command or mailbox mutation"),
+        } else if route == Route::Reconcile && !verified {
+            assert!(
+                command.is("UID FETCH 4 (UID BODY.PEEK[]<0.1025>)"),
+                "unexpected command or mailbox mutation"
+            );
+            verified = true;
+            let tag = &command.tag;
+            let prefix = format!("* 1 FETCH (UID 4 BODY[]<0> {{{}}}\r\n", DRAFT.len());
+            if wire.write_all(prefix.as_bytes()).await.is_err()
+                || wire.write_all(DRAFT).await.is_err()
+                || wire
+                    .write_all(format!(")\r\n{tag} OK fetched\r\n").as_bytes())
+                    .await
+                    .is_err()
+            {
+                return;
+            }
+            let _ = wire.flush().await;
+        } else {
+            panic!("unexpected command or mailbox mutation");
         }
     }
 }

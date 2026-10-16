@@ -26,11 +26,6 @@ dist = true
 inherits = "release"
 lto = "thin"
 
-[patch.crates-io]
-# Preserve bounded MIME depth across multipart and embedded-message parsing.
-# This revision is the exact alpha.9 source plus the focused recursion fix.
-imap-codec = { git = "https://github.com/ueberBrot/imap-codec", rev = "d69e4bd1b26b812518a0e47a2cf636ed7671ba66" }
-
 [dependencies]
 clap = { version = "4.6.7", default-features = false, features = ["std", "help", "usage", "error-context", "derive"] }
 serde = { version = "1.0.229", features = ["derive"] }
@@ -40,15 +35,14 @@ toml = "1.1.8"
 uuid = { version = "1.27.0", features = ["v4", "serde"] }
 schemars = { version = "1.2.2", features = ["uuid1"] }
 tokio = { version = "=1.53.2", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "sync", "time", "signal"] }
-io-imap = { version = "=0.7.1", default-features = false }
-# imap-codec needs nom's allocating parsers; abnf-core no longer enables them transitively.
-nom = { version = "7.1.3", default-features = false, features = ["alloc"] }
+async-imap = { version = "=0.12.0", default-features = false, features = ["runtime-tokio"] }
+imap-proto = "=0.17.0"
 tokio-rustls = { version = "=0.26.6", default-features = false, features = ["ring", "tls12"] }
 zeroize = "=1.9.1"
 rustls-native-certs = "=0.8.4"
 rmcp = { version = "=3.5.1", optional = true, default-features = false, features = ["server", "transport-io"] }
 tokio-util = { version = "0.7.20", optional = true, features = ["codec", "rt"] }
-futures-util = { version = "0.3.34", optional = true, default-features = false, features = ["std"] }
+futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["std", "registry", "fmt", "json", "ansi"] }
 anstream = "1.0.0"
@@ -92,7 +86,7 @@ toml = "1.1.8"
 [features]
 default = ["cli", "mcp"]
 cli = []
-mcp = ["dep:rmcp", "dep:tokio-util", "dep:futures-util"]
+mcp = ["dep:rmcp", "dep:tokio-util"]
 isolated = []
 docker-tests = ["greenmail-support/docker"]
 

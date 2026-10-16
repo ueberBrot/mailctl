@@ -540,7 +540,7 @@ fn hostile_failures(installation: &Installation, server: &server::ImapServer) {
     for level in ["error", "warn", "info", "debug", "trace"] {
         for (malformed, exit, code) in [
             (false, 4, "authentication_failed"),
-            (true, 5, "provider_unavailable"),
+            (true, 8, "unsupported_capability"),
         ] {
             server.reject_authentication(malformed);
             let mut command = installation.cli();

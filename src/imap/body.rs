@@ -1,11 +1,9 @@
 //! A bounded body read owns selection, byte retrieval, representation, and continuation.
 mod representation;
 
+use super::fetch::Section;
 use super::{Error, Limits, Metrics, fetch::Fetch, mailbox, mime::part_name, wire::Connection};
-use io_imap::{
-    rfc3501::logout::ImapLogout,
-    types::{body::BodyStructure, fetch::Section},
-};
+use imap_proto::BodyStructure;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
@@ -102,6 +100,9 @@ impl Limits {
             max_mime_parts: limits.mime_parts,
             max_text_bytes: limits.text_page_bytes,
             max_operation_bytes: 16 * 1024 * 1024,
+            // Admission, normalization, decoding and ownership each charge wire
+            // bytes. Leave room for framing and headers at the body ceiling.
+            max_parser_steps: (limits.wire_fetch_bytes * 5).max(Self::default().max_parser_steps),
             max_response_bytes: 256 * 1024,
             max_literal_bytes: 64 * 1024,
             ..Self::default()
@@ -127,7 +128,7 @@ async fn read_selected(
     }
     let metadata = Fetch::Metadata { uid: request.uid };
     let fields = metadata.execute(conn).await?;
-    let (size, structure) = Fetch::metadata(&fields)?;
+    let (size, structure) = Fetch::metadata(Fetch::items(&fields)?)?;
     // Validate every MIME node, including excluded attachment subtrees.
     let mut related_ids = HashMap::new();
     let needed_headers = representation::related_multipart_headers(structure, limits)?;
@@ -135,7 +136,7 @@ async fn read_selected(
     let root_headers = headers(
         conn,
         request.uid,
-        Section::Header(None),
+        Section::Header,
         limits,
         &mut header_bytes,
     )
@@ -151,7 +152,7 @@ async fn read_selected(
         )
         .await?;
         if let Some(id) = representation::validate_headers(&raw, None, limits)? {
-            related_ids.insert(path.0.into_inner(), id);
+            related_ids.insert(path, id);
         }
     }
     let selected = representation::select(structure, limits, &related_ids)?;
@@ -159,7 +160,7 @@ async fn read_selected(
         if selected.wire_size > limits.max_body_wire_bytes {
             return Err(Error::Limit);
         }
-        let single = matches!(structure, BodyStructure::Single { .. });
+        let single = !matches!(structure, BodyStructure::Multipart { .. });
         if single {
             representation::validate_headers(&root_headers, Some(selected), limits)?;
         }
@@ -200,7 +201,7 @@ async fn read_selected(
     } else {
         None
     };
-    conn.drive(ImapLogout::new()).await?;
+    conn.logout().await?;
     let mut metrics = conn.metrics();
     let (text, converted, replacements) = if let Some(rendered) = rendered {
         metrics.decode_steps = rendered.work;
@@ -244,7 +245,7 @@ async fn read_selected(
 async fn headers(
     conn: &mut Connection<'_>,
     uid: u32,
-    section: Section<'static>,
+    section: Section,
     limits: &Limits,
     used: &mut usize,
 ) -> Result<Vec<u8>, Error> {
@@ -273,7 +274,7 @@ async fn headers(
 async fn bytes(
     conn: &mut Connection<'_>,
     uid: u32,
-    section: Option<Section<'static>>,
+    section: Option<Section>,
     expected: Option<usize>,
     budget: usize,
     limits: &Limits,
@@ -293,7 +294,7 @@ async fn bytes(
             count: count as u32,
         };
         let items = fetch.execute(conn).await?;
-        let value = fetch.data(&items)?;
+        let value = fetch.data(Fetch::items(&items)?)?;
         if value.len() > budget.saturating_sub(result.len()) {
             return Err(Error::Limit);
         }

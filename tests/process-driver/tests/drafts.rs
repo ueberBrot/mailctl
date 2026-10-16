@@ -414,7 +414,11 @@ async fn lost_acknowledgement_and_rejection_replay_across_processes() {
         let mut f = DraftFixture::new();
         f.server.expect_append(reply);
         let first = run_bounded(f.save());
-        let expected = envelope(&first);
+        let mut expected = envelope(&first);
+        if expected["error"]["code"] == "outcome_unknown" {
+            assert_eq!(expected["error"]["reason"], "imap_connection_closed");
+            expected["error"].as_object_mut().unwrap().remove("reason");
+        }
         let client = f.mcp().await;
         let replay = call(&client, "email_save_draft", f.input.clone()).await;
         assert_eq!(expected["result"], replay["result"]);
@@ -602,7 +606,11 @@ async fn historical_cli_and_mcp_recover_lost_responses_without_provider_access()
         f.server.expect_append(reply);
         // The caller retained the original tuple and input, but loses the first result.
         let output = run_bounded(f.save());
-        let expected = envelope(&output);
+        let mut expected = envelope(&output);
+        if expected["error"]["code"] == "outcome_unknown" {
+            assert_eq!(expected["error"]["reason"], "imap_connection_closed");
+            expected["error"].as_object_mut().unwrap().remove("reason");
+        }
         let mut config = f.configuration();
         f.repoint(&mut config);
         f.configure(&config);

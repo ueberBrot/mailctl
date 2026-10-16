@@ -3,8 +3,7 @@
     reason = "integration-test crates use different subsets of these shared fixture helpers"
 )]
 
-use crate::imap_support::{Wire, write};
-use io_imap::codec::{CommandCodec, decode::Decoder};
+use crate::imap_support::{Wire, parse_command, write};
 use mailctl::draft::{DraftInput, PreparedDraft};
 use tokio::io::AsyncReadExt;
 
@@ -38,20 +37,15 @@ pub async fn header(wire: &mut Wire, target: &str, len: usize) -> String {
         .expect("synchronizing literal with exact byte count");
     let mut command = prefix.to_vec();
     command.extend_from_slice(b"{0}\r\n\r\n");
-    let codec = CommandCodec::new();
-    let (rest, actual) = codec.decode(&command).unwrap();
-    assert!(rest.is_empty());
+    let actual = parse_command(&command).unwrap();
     let escaped = target.replace('\\', "\\\\").replace('"', "\\\"");
     let expected = format!("expected APPEND \"{escaped}\" (\\Draft) {{0}}\r\n\r\n");
-    let (_, mut expected) = codec.decode(expected.as_bytes()).unwrap();
-    if let io_imap::types::command::CommandBody::Append { mailbox, .. } = &mut expected.body {
-        *mailbox = target.try_into().unwrap();
-    }
+    let expected = parse_command(expected.as_bytes()).unwrap();
     assert_eq!(
         actual.body, expected.body,
         "only exact-target APPEND with initial Draft is allowed"
     );
-    actual.tag.as_ref().to_owned()
+    actual.tag
 }
 pub async fn receive(wire: &mut Wire, target: &str, expected: &[u8]) -> String {
     let tag = header(wire, target, expected.len()).await;

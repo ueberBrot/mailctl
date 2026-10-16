@@ -30,7 +30,8 @@ switch ($Suite) {
                 Name = 'mime_depth'
                 Source = 'tests/process-driver/tests/mime_depth.rs'
                 Tests = @($mimeTests)
-                Filter = @()
+                # Shared fixture unit tests are covered by the workspace run.
+                Filter = @('_decodes_deep_mime_from_a_one_mib_lifecycle_caller')
             },
             @{
                 Name = 'imap_allocations'

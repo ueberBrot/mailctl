@@ -1,8 +1,9 @@
 //! Bounded IMAP operations shared by the application and protocol fixtures.
 //!
-//! Typed decoding uses bounded recursive parsers. Embedded runtimes should
+//! Typed decoding follows bounded frame admission. Embedded runtimes should
 //! reserve 8 MiB per decoding thread, as the shipped frontends do.
 use crate::domain::mailbox_identity;
+mod admission;
 mod append;
 mod attachment;
 mod body;
@@ -27,13 +28,7 @@ use base64::{
     alphabet::IMAP_MUTF7,
     engine::general_purpose::{GeneralPurpose, NO_PAD},
 };
-use io_imap::{
-    rfc3501::{
-        capability::ImapCapabilityGet, greeting::ImapGreetingGet, list::ImapMailboxList,
-        login::ImapLogin, logout::ImapLogout,
-    },
-    types::{flag::FlagNameAttribute, mailbox::Mailbox as WireMailbox, response::Capability},
-};
+use imap_proto::{Capability, MailboxDatum, NameAttribute, Response};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, fmt, sync::Arc, time::Duration};
 use tokio_rustls::rustls::{self, RootCertStore};
@@ -78,7 +73,7 @@ impl AuthenticatedConnection {
         let mut connection = self.session.resume(metrics);
         connection.limit_body(limits);
         let result = connection.discover_all(limits.max_mailboxes).await?;
-        connection.drive(ImapLogout::new()).await?;
+        connection.logout().await?;
         Ok(result)
     }
     pub async fn discover(
@@ -112,13 +107,13 @@ impl AuthenticatedConnection {
                 .discover_names(names, limits.max_mailboxes)
                 .await?
         };
-        connection.drive(ImapLogout::new()).await?;
+        connection.logout().await?;
         Ok(result)
     }
     pub(crate) async fn disconnect(self) -> Result<(), Error> {
         let mut metrics = Metrics::default();
         let mut connection = self.session.resume(&mut metrics);
-        connection.drive(ImapLogout::new()).await
+        connection.logout().await
     }
 }
 
@@ -131,6 +126,7 @@ pub enum Error {
     Timeout,
     Eof,
     Protocol,
+    ParserPanic,
     Limit,
     Authentication,
     UnsafeSelection,
@@ -149,6 +145,7 @@ impl fmt::Display for Error {
             Self::Timeout => "IMAP operation timed out",
             Self::Eof => "IMAP connection closed",
             Self::Protocol => "invalid IMAP response",
+            Self::ParserPanic => "IMAP response parser panicked; report this problem with the request ID and application version",
             Self::Limit => "IMAP resource limit exceeded",
             Self::Authentication => "IMAP authentication failed",
             Self::UnsafeSelection => "IMAP read-only selection was not established",
@@ -197,7 +194,7 @@ impl Default for Limits {
             max_operation_bytes: 4 * 1024 * 1024,
             max_literal_bytes: 64 * 1024,
             max_responses: 4096,
-            max_parser_steps: 8 * 1024 * 1024,
+            max_parser_steps: 16 * 1024 * 1024,
             max_nesting: defaults.mime_depth,
             max_mailboxes: defaults.mailbox_inventory,
             max_header_bytes: defaults.header_bytes,
@@ -226,7 +223,7 @@ impl Limits {
             || self.max_responses == 0
             || self.max_responses > 16384
             || self.max_parser_steps == 0
-            || self.max_parser_steps > 32 * 1024 * 1024
+            || self.max_parser_steps > 64 * 1024 * 1024
             || !(1..=maximum.mime_depth).contains(&self.max_nesting)
             || !(1..=maximum.mailbox_inventory).contains(&self.max_mailboxes)
             || !(1..=maximum.header_bytes).contains(&self.max_header_bytes)
@@ -255,6 +252,8 @@ impl Limits {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Metrics {
     pub append_outcome: Option<AppendOutcome>,
+    /// Safe failure cause retained independently of uncertain APPEND acceptance.
+    pub append_error: Option<Error>,
     pub append_wire_bytes: usize,
     pub mime_bytes: usize,
     pub wire_bytes: usize,
@@ -369,27 +368,29 @@ impl ImapEndpoint {
         )
         .await
         .map_err(|_| Error::Timeout)??;
-        conn.drive(ImapGreetingGet::new(Default::default())).await?;
-        let mut caps = conn.drive(ImapCapabilityGet::new()).await?;
+        conn.greeting().await?;
+        let mut caps = conn.capabilities().await?;
         if matches!(self.mode, TlsMode::StartTls) {
-            if !caps.contains(&Capability::StartTls) {
+            if !has_capability(&caps, "STARTTLS") {
                 return Err(Error::Unsupported);
             }
             conn = conn.upgrade(&self.host, self.tls.clone()).await?;
-            caps = conn.drive(ImapCapabilityGet::new()).await?;
+            caps = conn.capabilities().await?;
         }
-        if !caps.contains(&Capability::Imap4Rev1) || caps.contains(&Capability::LoginDisabled) {
+        if !caps.contains(&Capability::Imap4rev1) || has_capability(&caps, "LOGINDISABLED") {
             return Err(Error::Unsupported);
         }
-        let login =
-            ImapLogin::new(user, password, Default::default()).map_err(|_| Error::InvalidInput)?;
-        conn.drive(login).await?;
-        let caps = conn.drive(ImapCapabilityGet::new()).await?;
-        if !caps.contains(&Capability::Imap4Rev1) {
+        conn.login(user, password).await?;
+        let caps = conn.capabilities().await?;
+        if !caps.contains(&Capability::Imap4rev1) {
             return Err(Error::Unsupported);
         }
         Ok(conn)
     }
+}
+fn has_capability(caps: &[Capability<'_>], name: &str) -> bool {
+    caps.iter()
+        .any(|cap| matches!(cap, Capability::Atom(value) if value.eq_ignore_ascii_case(name)))
 }
 fn credentials(user: &str, password: &str) -> Result<(), Error> {
     if user.is_empty() || user.len() > 4096 || password.is_empty() || password.len() > 64 * 1024 {
@@ -414,7 +415,7 @@ pub(crate) fn mailbox(name: &str) -> Result<(), Error> {
     Ok(())
 }
 
-// io-imap encodes mailbox arguments but leaves LIST patterns in wire form.
+// Mailbox arguments and LIST patterns use canonical modified UTF-7 wire encoding.
 const MODIFIED_UTF7: GeneralPurpose = GeneralPurpose::new(&IMAP_MUTF7, NO_PAD);
 
 fn mailbox_pattern(name: &str) -> String {
@@ -444,12 +445,8 @@ fn mailbox_pattern(name: &str) -> String {
     encoded
 }
 
-// Validate before io-imap's lossy decoding can replace a provider mailbox identity.
-fn validate_wire_mailbox_name(mailbox: &WireMailbox<'_>) -> Result<(), Error> {
-    let WireMailbox::Other(name) = mailbox else {
-        return Ok(());
-    };
-    let wire = std::str::from_utf8(name.inner().as_ref()).map_err(|_| Error::Protocol)?;
+// Reject lossy and noncanonical wire names before they can replace an identity.
+fn decode_wire_mailbox_name(wire: &str) -> Result<String, Error> {
     if wire.len() > 4096 || wire.bytes().any(|byte| !(32..=126).contains(&byte)) {
         return Err(Error::Protocol);
     }
@@ -498,21 +495,36 @@ fn validate_wire_mailbox_name(mailbox: &WireMailbox<'_>) -> Result<(), Error> {
     if decoded.chars().any(char::is_control) || mailbox_pattern(&decoded) != wire {
         return Err(Error::Protocol);
     }
-    Ok(())
+    Ok(decoded)
 }
 
 impl Connection<'_> {
     fn decode_mailbox(
-        returned: &WireMailbox<'_>,
-        attrs: &[FlagNameAttribute<'_>],
+        returned: &str,
+        attrs: &[NameAttribute<'_>],
     ) -> Result<Option<Mailbox>, Error> {
-        let returned = match returned {
-            WireMailbox::Inbox => "INBOX",
-            WireMailbox::Other(name) => {
-                std::str::from_utf8(name.inner().as_ref()).map_err(|_| Error::Protocol)?
-            }
-        };
-        let mut attributes: Vec<_> = attrs.iter().map(ToString::to_string).collect();
+        let returned = decode_wire_mailbox_name(returned)?;
+        let mut attributes = attrs
+            .iter()
+            .map(|attribute| {
+                Ok(match attribute {
+                    NameAttribute::NoInferiors => "\\Noinferiors",
+                    NameAttribute::NoSelect => "\\Noselect",
+                    NameAttribute::Marked => "\\Marked",
+                    NameAttribute::Unmarked => "\\Unmarked",
+                    NameAttribute::All => "\\All",
+                    NameAttribute::Archive => "\\Archive",
+                    NameAttribute::Drafts => "\\Drafts",
+                    NameAttribute::Flagged => "\\Flagged",
+                    NameAttribute::Junk => "\\Junk",
+                    NameAttribute::Sent => "\\Sent",
+                    NameAttribute::Trash => "\\Trash",
+                    NameAttribute::Extension(value) => value.as_ref(),
+                    _ => return Err(Error::Unsupported),
+                }
+                .to_owned())
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
         attributes.sort_unstable();
         attributes.dedup();
         let selectable = !attributes
@@ -525,24 +537,22 @@ impl Connection<'_> {
             return Err(Error::Protocol);
         }
         Ok(Some(Mailbox {
-            name: mailbox_identity(returned).into(),
+            name: mailbox_identity(&returned).into(),
             selectable,
             attributes,
         }))
     }
     async fn discover_all(&mut self, maximum: usize) -> Result<Vec<Mailbox>, Error> {
-        let rows = self
-            .drive(ImapMailboxList::new(
-                "".try_into().map_err(|_| Error::InvalidInput)?,
-                "*".try_into().map_err(|_| Error::InvalidInput)?,
-            ))
-            .await?;
+        let rows = self.request("LIST \"\" \"*\"", wire::Kind::List).await?;
         if rows.len() > maximum {
             return Err(Error::Limit);
         }
         let mut mailboxes = Vec::with_capacity(rows.len());
-        for (returned, _, attrs) in rows {
-            let Some(mailbox) = Self::decode_mailbox(&returned, &attrs)? else {
+        for row in rows {
+            let Response::MailboxData(MailboxDatum::List(data)) = &row else {
+                return Err(Error::Protocol);
+            };
+            let Some(mailbox) = Self::decode_mailbox(&data.name, &data.name_attributes)? else {
                 continue;
             };
             mailboxes.push(mailbox);
@@ -565,23 +575,21 @@ impl Connection<'_> {
         let mut mailboxes = Vec::with_capacity(names.len());
         let mut row_count = 0usize;
         for (expected, name) in names {
-            // The coroutine decodes response names; its LIST pattern needs wire encoding.
-            let pattern = mailbox_pattern(name)
-                .try_into()
-                .map_err(|_| Error::InvalidInput)?;
+            let pattern = wire::quote(&mailbox_pattern(name))?;
             let rows = self
-                .drive(ImapMailboxList::new(
-                    "".try_into().map_err(|_| Error::InvalidInput)?,
-                    pattern,
-                ))
+                .request(&format!("LIST \"\" {pattern}"), wire::Kind::List)
                 .await?;
             row_count = row_count.saturating_add(rows.len());
             if row_count > maximum {
                 return Err(Error::Limit);
             }
             let mut found = None;
-            for (returned, _, attrs) in rows {
-                let mailbox = Self::decode_mailbox(&returned, &attrs)?.ok_or(Error::Protocol)?;
+            for row in rows {
+                let Response::MailboxData(MailboxDatum::List(data)) = &row else {
+                    return Err(Error::Protocol);
+                };
+                let mailbox = Self::decode_mailbox(&data.name, &data.name_attributes)?
+                    .ok_or(Error::Protocol)?;
                 if mailbox.name != expected {
                     return Err(Error::Protocol);
                 }
@@ -600,19 +608,46 @@ impl Connection<'_> {
 
 impl From<Error> for crate::domain::Error {
     fn from(error: Error) -> Self {
-        use crate::domain::ErrorCode;
-        Self::new(match error {
-            Error::Authentication => ErrorCode::AuthenticationFailed,
-            Error::Tls => ErrorCode::TlsFailed,
-            Error::Timeout => ErrorCode::Timeout,
-            Error::Unsupported => ErrorCode::UnsupportedCapability,
-            Error::Limit => ErrorCode::ResponseTooLarge,
-            Error::InvalidInput => ErrorCode::InvalidRequest,
-            Error::StaleReference => ErrorCode::StaleReference,
-            Error::StaleCursor => ErrorCode::StaleCursor,
-            Error::TransferExpired => ErrorCode::TransferExpired,
-            Error::MessageNotFound => ErrorCode::MessageNotFound,
-            _ => ErrorCode::ProviderUnavailable,
-        })
+        use crate::domain::{ErrorCode, ErrorReason};
+        let (code, reason) = match error {
+            Error::ParserPanic => (ErrorCode::InternalError, ErrorReason::ImapParserPanic),
+            Error::Authentication => (
+                ErrorCode::AuthenticationFailed,
+                ErrorReason::ImapAuthentication,
+            ),
+            Error::Tls => (ErrorCode::TlsFailed, ErrorReason::ImapTls),
+            Error::Timeout => (ErrorCode::Timeout, ErrorReason::ImapTimeout),
+            Error::Unsupported => (
+                ErrorCode::UnsupportedCapability,
+                ErrorReason::ImapUnsupported,
+            ),
+            Error::Limit => (ErrorCode::ResponseTooLarge, ErrorReason::ImapResourceLimit),
+            Error::InvalidInput => (ErrorCode::InvalidRequest, ErrorReason::ImapInvalidInput),
+            Error::StaleReference => (ErrorCode::StaleReference, ErrorReason::ImapStaleReference),
+            Error::StaleCursor => (ErrorCode::StaleCursor, ErrorReason::ImapStaleCursor),
+            Error::TransferExpired => {
+                (ErrorCode::TransferExpired, ErrorReason::ImapTransferExpired)
+            }
+            Error::MessageNotFound => {
+                (ErrorCode::MessageNotFound, ErrorReason::ImapMessageNotFound)
+            }
+            Error::Transport => (ErrorCode::ProviderUnavailable, ErrorReason::ImapTransport),
+            Error::Eof => (
+                ErrorCode::ProviderUnavailable,
+                ErrorReason::ImapConnectionClosed,
+            ),
+            Error::Protocol => (
+                ErrorCode::ProviderUnavailable,
+                ErrorReason::ImapInvalidResponse,
+            ),
+            Error::UnsafeSelection => (
+                ErrorCode::ProviderUnavailable,
+                ErrorReason::ImapUnsafeSelection,
+            ),
+        };
+        Self {
+            message: error.to_string(),
+            ..Self::new(code).with_reason(reason)
+        }
     }
 }

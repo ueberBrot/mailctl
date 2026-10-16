@@ -72,6 +72,7 @@ pub enum DraftReply {
     ObservedCreated(tokio::sync::oneshot::Sender<()>),
     Rejected,
     Disconnect,
+    ParserPanic,
     Hold(Arc<AtomicUsize>),
 }
 
@@ -135,6 +136,7 @@ pub enum BodyCase {
     PartsAtLimit,
     PartsOverLimit,
     MalformedStructure,
+    ParserPanic,
     ExcessiveNesting,
     Base64Tail,
     QuotedPrintableTail,
@@ -807,6 +809,9 @@ async fn body_case(wire: &mut imap_support::Wire, mailbox: &str, case: BodyCase)
             // Body types must be strings, so this unquoted atom cannot decode.
             body = "(INVALID)".into();
         }
+        ParserPanic => {
+            body = "(UNKNOWN ((fixture-private-parser-input) INTERNALDATE NIL))".into();
+        }
         ExcessiveNesting => {
             // Exceed the independent protocol nesting guard even when the codec
             // admits structures within the configured MIME depth range.
@@ -817,7 +822,10 @@ async fn body_case(wire: &mut imap_support::Wire, mailbox: &str, case: BodyCase)
         _ => {}
     }
     let header_case = matches!(case, HeadersAtLimit | HeadersOverLimit);
-    let metadata_rejected = matches!(case, PartsOverLimit | MalformedStructure | ExcessiveNesting);
+    let metadata_rejected = matches!(
+        case,
+        PartsOverLimit | MalformedStructure | ParserPanic | ExcessiveNesting
+    );
     if header_case || metadata_rejected {
         body_metadata(wire, mailbox, &body, payload.len()).await;
     } else {
@@ -956,7 +964,7 @@ async fn attachment_case(
         _ => ("7BIT", b"".as_slice()),
     };
     let size = match case {
-        WireAtLimit | DecodedAtLimit => 16384,
+        WireAtLimit | DecodedAtLimit | BinaryEncoding => 16384,
         WireOverLimit | DecodedOverLimit => 16385,
         Base64Truncated | Base64BadPadding | QuotedPrintableTruncated => payload.len(),
         _ => 40000,
@@ -973,7 +981,7 @@ async fn attachment_case(
         return;
     }
     match case {
-        BinaryEncoding | UnknownEncoding => {
+        UnknownEncoding => {
             // Refuse the unavailable encoding before any payload request.
         }
         WrongUid | WrongSection | WrongOrigin | NilPayload | OversizedLiteral => {
@@ -990,7 +998,7 @@ async fn attachment_case(
             };
             imap_support::write(wire, frame).await;
         }
-        WireAtLimit | WireOverLimit | DecodedAtLimit | DecodedOverLimit => {
+        WireAtLimit | WireOverLimit | DecodedAtLimit | DecodedOverLimit | BinaryEncoding => {
             body_literal(wire, "2", 0, 16384, &[b'x'; 16384]).await;
             let count = if matches!(case, WireAtLimit | WireOverLimit) {
                 1
@@ -1005,7 +1013,7 @@ async fn attachment_case(
             // A full first literal cannot prove EOF. The wire ceiling narrows
             // the next request to one byte; decoded limits are tested separately.
             body_literal(wire, "2", 16384, count, tail).await;
-            if matches!(case, WireAtLimit | DecodedAtLimit) {
+            if matches!(case, WireAtLimit | DecodedAtLimit | BinaryEncoding) {
                 imap_support::logout(wire).await;
                 return;
             }
@@ -1035,8 +1043,6 @@ async fn append_draft(
     observed: &AtomicUsize,
     captured: &Mutex<Vec<Vec<u8>>>,
 ) {
-    use io_imap::codec::{CommandCodec, decode::Decoder};
-    use io_imap::types::{command::CommandBody, mailbox::Mailbox};
     use tokio::io::AsyncReadExt;
     let mut header = Vec::new();
     while !header.ends_with(b"\r\n") {
@@ -1048,25 +1054,14 @@ async fn append_draft(
     let length: usize = length.strip_suffix("}\r\n").unwrap().parse().unwrap();
     assert!(length < 1024 * 1024);
     let command = format!("{prefix}{{0}}\r\n\r\n");
-    let codec = CommandCodec::new();
-    let (_, mut actual) = codec.decode(command.as_bytes()).unwrap();
+    let actual = imap_support::parse_command(command.as_bytes()).unwrap();
     let expected = format!(
         "expected APPEND {} (\\Draft) {{0}}\r\n\r\n",
         mailbox_argument(mailbox)
     );
-    let (_, mut expected) = codec.decode(expected.as_bytes()).unwrap();
-    // Atom/quoted/literal spelling does not change the exact mailbox identity.
-    let normalize = |body: &mut CommandBody<'_>| {
-        if let CommandBody::Append { mailbox, .. } = body
-            && let Mailbox::Other(name) = mailbox
-        {
-            *mailbox = name.as_ref().to_vec().try_into().unwrap();
-        }
-    };
-    normalize(&mut actual.body);
-    normalize(&mut expected.body);
+    let expected = imap_support::parse_command(expected.as_bytes()).unwrap();
     assert_eq!(actual.body, expected.body);
-    let tag = actual.tag.as_ref().to_owned();
+    let tag = actual.tag;
     imap_support::write(wire, "+ continue\r\n").await;
     let mut literal = vec![0; length];
     wire.read_exact(&mut literal).await.unwrap();
@@ -1098,6 +1093,13 @@ async fn append_draft(
             imap_support::write(wire, &format!("{tag} NO synthetic rejection\r\n")).await
         }
         DraftReply::Disconnect => return,
+        DraftReply::ParserPanic => {
+            imap_support::write(
+                wire,
+                "* 1 FETCH (UNKNOWN ((fixture-private-parser-input) INTERNALDATE NIL))\r\n",
+            )
+            .await;
+        }
         DraftReply::Hold(release) => {
             let mut byte = [0];
             loop {

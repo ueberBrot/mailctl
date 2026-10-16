@@ -3,8 +3,8 @@ mod support;
 use mailctl::{
     config::{Config, Limits, MailboxScope},
     domain::{
-        DraftContent, DraftState, DraftStatusInput, Error, ErrorCode, Operation, OperationResult,
-        SaveDraftInput,
+        DraftContent, DraftState, DraftStatusInput, Error, ErrorCode, ErrorReason, Operation,
+        OperationResult, SaveDraftInput,
     },
     draft::{DraftEvidence, DraftMessageIdentity, DraftVerification, PreparedDraft},
     draft_journal::{DraftJournal, DraftOperationState},
@@ -16,13 +16,14 @@ use std::{
     pin::Pin,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
 struct Backend {
     appends: AtomicUsize,
     uid: Option<DraftMessageIdentity>,
+    parser_failure: AtomicBool,
 }
 impl DraftBackend for Backend {
     fn prepare<'a>(
@@ -58,6 +59,11 @@ impl DraftAppend for Append<'_> {
     {
         Box::pin(async move {
             self.0.appends.fetch_add(1, Ordering::SeqCst);
+            if self.0.parser_failure.load(Ordering::SeqCst) {
+                return Err(
+                    Error::new(ErrorCode::InternalError).with_reason(ErrorReason::ImapParserPanic)
+                );
+            }
             Ok(AppendOutcome::Created { uid: self.0.uid })
         })
     }
@@ -89,6 +95,7 @@ impl Fixture {
         let backend = Arc::new(Backend {
             appends: AtomicUsize::new(0),
             uid,
+            parser_failure: AtomicBool::new(false),
         });
         let service = Service::open(config.clone())
             .unwrap()
@@ -129,6 +136,49 @@ impl Fixture {
             .execute(&context, Operation::SaveDraft(self.input.clone()))
             .await
     }
+}
+
+#[tokio::test]
+async fn draft_admission_reserves_safe_failure_reasons_before_dispatch() {
+    let fixture = Fixture::new("a".repeat(256), None).await;
+    fixture.backend.parser_failure.store(true, Ordering::SeqCst);
+    let mut details = fixture.input.operation_details();
+    details.uid_validity = Some(77);
+    let mut reservation = Error::draft_outcome(ErrorCode::OutcomeUnknown, details);
+    reservation.reason = Some(ErrorReason::ResultSerializationFailed);
+    let required = serde_json::to_vec(&reservation).unwrap().len();
+    // Enumerate the published schema so a newly added, longer reason must also
+    // fit the pre-dispatch reservation.
+    let schema = schemars::schema_for!(ErrorReason);
+    for value in schema.as_value()["enum"].as_array().unwrap() {
+        reservation.reason = Some(serde_json::from_value(value.clone()).unwrap());
+        assert!(serde_json::to_vec(&reservation).unwrap().len() <= required);
+    }
+    assert_eq!(
+        fixture.save(required + 512 - 1).await.unwrap_err().code,
+        ErrorCode::ResponseTooLarge
+    );
+    assert_eq!(fixture.backend.appends.load(Ordering::SeqCst), 0);
+    let error = fixture.save(required + 512).await.unwrap_err();
+    assert_eq!(error.code, ErrorCode::OutcomeUnknown);
+    assert_eq!(error.reason, Some(ErrorReason::ImapParserPanic));
+    assert!(!error.retryable);
+    assert!(serde_json::to_vec(&error).unwrap().len() <= required);
+    assert_eq!(
+        error.draft_operation.unwrap().identity,
+        fixture.input.identity()
+    );
+    assert_eq!(fixture.backend.appends.load(Ordering::SeqCst), 1);
+    let history =
+        DraftJournal::open_existing_nowait(fixture.config.state_dir.join("drafts.sqlite")).unwrap();
+    assert_eq!(
+        history
+            .inspect(&fixture.input.identity())
+            .unwrap()
+            .unwrap()
+            .state,
+        DraftOperationState::OutcomeUnknown
+    );
 }
 
 #[tokio::test]

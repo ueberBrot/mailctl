@@ -4,8 +4,6 @@
 )]
 
 use crate::imap_support::*;
-use io_imap::codec::{CommandCodec, decode::Decoder};
-use io_imap::types::command::CommandBody;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -47,17 +45,15 @@ pub async fn payload_session(
             );
             assert!(raw.len() < 1024);
         }
-        let codec = CommandCodec::new();
-        let (remaining, command) = codec.decode(&raw).unwrap();
-        assert!(remaining.is_empty());
-        let tag = command.tag.as_ref();
-        if matches!(command.body, CommandBody::Logout) {
+        let command = parse_command(&raw).unwrap();
+        let tag = &command.tag;
+        if command.is("LOGOUT") {
             write(wire, &format!("* BYE closing\r\n{tag} OK logout\r\n")).await;
             return;
         }
         let offset = position.load(Ordering::Relaxed);
         let expected = format!("expected UID FETCH 4 (UID BODY.PEEK[2]<{offset}.{count}>)\r\n");
-        let (_, expected) = codec.decode(expected.as_bytes()).unwrap();
+        let expected = parse_command(expected.as_bytes()).unwrap();
         assert_eq!(
             command.body, expected.body,
             "only sequential bounded PEEK is allowed"
