@@ -152,6 +152,11 @@ A new operation UUID after an uncertain save risks a duplicate.
 `mailctl schema <operation>` for exact JSON inputs. `mailctl-mcp` exposes the same
 guides and schemas as offline commands. Each command also has `--help`.
 
+See [Operations](docs/operations.md) for permission profiles, credential rotation,
+degraded behavior, and consuming application responsibilities. The
+[acceptance routes](docs/acceptance/routes.md) record platform scope, dependency
+pins, and the limits of the current evidence.
+
 Access grants constrain operations through mailctl. They do not restrict an
 agent's separate shell or filesystem access under the same OS identity.
 Optional macOS isolation uses a separate service identity and requires explicit
