@@ -111,9 +111,26 @@ The entire two-message INBOX remained unchanged. The operator subsequently
 reported deleting the test drafts; their historical receipts and observations
 remain valid, and cleanup does not authorize recreating them.
 
-Genuine uncertain-draft fault cases remain unqualified and require an approved
-disposable account, which is unavailable. Ordinary-account authorization does
-not cover induced faults. The October 16 Codex CLI 0.163.0 archive-recovery run
+The operator explicitly approved a [single existing-account recovery check](https://github.com/ueberBrot/mailctl/issues/24#issuecomment-6212252957)
+using one new labelled unsent draft and a local outcome-persistence failure in a
+fresh private installation. [The preregistered check passed](https://github.com/ueberBrot/mailctl/issues/24#issuecomment-6212484189)
+on these exact packaged bytes. Actual journal history progressed from
+`in_flight` to `outcome_unknown`, then to `duplicate` through explicit MCP
+reconciliation. The independent observer verified the original draft before
+retry, its exact MIME hash/content/initial Draft flag, and the same sole UID
+after CLI/MCP retries and reconciliation. Both preexisting INBOX messages kept
+their content and flags; Entwürfe changed from empty to that one draft. Original
+configuration/history fingerprints remained unchanged, and the owned trigger
+was removed. Two independent audits verified the retained evidence.
+
+This qualifies genuine uncertain local history and real IONOS reconciliation
+after local outcome persistence failed. No tagged provider acknowledgement,
+live acknowledgement loss or wire-level command count was independently
+observed; broader fault coverage remains in synthetic packaged fixtures. The
+single test draft remains for operator cleanup. No additional draft or live
+check is needed for this unchanged scoped result. Publication remains excluded.
+
+The October 16 Codex CLI 0.163.0 archive-recovery run
 passed both mechanical profiles against these MCP and README bytes. Its complete
 private archive is retained. Both fresh answers still omit part of the required
 capacity explanation; those historical grades remain incomplete.
@@ -126,8 +143,8 @@ discovery remained sequential. Qualification establishes prompted application
 of public guidance. The result retains unexplained nonfatal pre-turn client
 diagnostics and the limits of payload-free evidence; it does not erase earlier
 grades or establish spontaneous mention of every capacity layer. The single
-attempt is consumed. Genuine live IONOS uncertainty and publication remain
-unqualified; none of these checks authorizes publication.
+attempt is consumed. None of these checks authorizes publication; #24 retains
+the explicit operator publication gate and final commit/artifact checks.
 
 ## Release-note review
 

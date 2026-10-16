@@ -236,5 +236,5 @@ detailed body/attachment checks rely on the reviewed runner's recorded results.
 The complete private archive and checksum index are retained. This completes
 criterion 7 for the named candidate under this protocol, preserving earlier
 incomplete grades and all stated interpretation limits. The single attempt is
-consumed; no further run is permitted. Live IONOS uncertainty and publication
-remain separately unqualified.
+consumed; no further run is permitted. Publication remains separately gated;
+[#24 records the subsequent scoped IONOS recovery result](https://github.com/ueberBrot/mailctl/issues/24#issuecomment-6212484189).
