@@ -10,37 +10,36 @@ Model Context Protocol (MCP). Install both or use either on its own.
 ## Install
 
 The standalone installer supports macOS on Apple Silicon. It does not require Rust.
-
-Set `VERSION` to the release that you want.
-Download the installer into your current folder as `mailctl-install.sh`:
+Install the latest stable release:
 
 ```sh
-VERSION=0.1.0
 curl --fail --location --proto '=https' --proto-redir '=https' \
-  --output mailctl-install.sh \
-  "https://github.com/ueberBrot/mailctl/releases/download/v${VERSION}/install-v${VERSION}.sh"
+  https://github.com/ueberBrot/mailctl/releases/latest/download/install.sh | sh
 ```
 
-Choose one installation. For both CLI and MCP:
+On first installation, both components install by default. For CLI only:
 
 ```sh
-sh ./mailctl-install.sh --version "$VERSION"
-```
-
-For CLI only:
-
-```sh
-sh ./mailctl-install.sh --version "$VERSION" --components cli
+curl --fail --location --proto '=https' --proto-redir '=https' \
+  https://github.com/ueberBrot/mailctl/releases/latest/download/install.sh | sh -s -- --components cli
 ```
 
 For MCP only:
 
 ```sh
-sh ./mailctl-install.sh --version "$VERSION" --components mcp
+curl --fail --location --proto '=https' --proto-redir '=https' \
+  https://github.com/ueberBrot/mailctl/releases/latest/download/install.sh | sh -s -- --components mcp
 ```
 
 Executables go into `~/.cargo/bin`, or `$CARGO_HOME/bin` when `CARGO_HOME` is nonempty.
 Add that directory to your `PATH`. Use `--install-dir /absolute/path/to/bin` for a different destination.
+
+To install an exact release, set `VERSION` and use its installer:
+
+```sh
+VERSION=0.1.0
+curl --fail --location --proto '=https' --proto-redir '=https' "https://github.com/ueberBrot/mailctl/releases/download/v${VERSION}/install.sh" | sh -s -- --version "$VERSION"
+```
 
 ## Connect your account
 
@@ -188,7 +187,10 @@ Inspect permissions with `mailctl capability show --json` or MCP `email_capabili
 Agents with separate shell or filesystem access retain their OS permissions.
 Optional [macOS isolation](deployment/macos-isolated/install.sh) uses a separate service identity.
 
-Draft history persists across restarts to prevent duplicate creation on retries.
+Draft access creates `drafts.sqlite` in the configured state directory (`state_dir`).
+SQLite is bundled with the executables and needs no database server.
+The database records draft operations to prevent duplicate creation on retries.
+Updates and removal preserve it.
 Keep each draft's original input and operation UUID, a unique operation identifier.
 After an interrupted save, inspect the same operation with `draft status` before retrying.
 Use `mailctl guide drafts` for status and reconciliation.
@@ -196,24 +198,25 @@ Use `mailctl guide drafts` for status and reconciliation.
 ## Update or remove
 
 Before updating, stop the CLI commands and MCP servers that use the installation.
-Set `VERSION` to the new release and repeat the installation steps above.
-Update both components together when both are installed. For a custom configuration,
-pass `--config /absolute/path/to/config.toml`.
-Use the same destination as the original installation.
+Repeat the install command to update to the latest stable release.
+Without `--components`, the installer keeps your installed component selection.
+If both components are installed, it updates both together.
+Use `--components cli,mcp` to add a missing component.
+Use the original `--install-dir` for a custom destination.
+For a custom configuration, pass `--config /absolute/path/to/config.toml` so the installer can inspect its state.
+When a configuration is available, the installer checks state compatibility before replacing binaries.
+If that check fails, the installed binaries stay in place.
 
-To remove both installer-owned executables, download the installer and run it:
+To remove the installed components:
 
 ```sh
-VERSION=0.1.0
-curl --fail --location --proto '=https' --proto-redir '=https' \
-  --output mailctl-install.sh \
-  "https://github.com/ueberBrot/mailctl/releases/download/v${VERSION}/install-v${VERSION}.sh"
-sh ./mailctl-install.sh --uninstall
+curl --fail --location --proto '=https' --proto-redir '=https' https://github.com/ueberBrot/mailctl/releases/latest/download/install.sh | sh -s -- --uninstall
 ```
 
 Add `--components cli` or `--components mcp` to remove only one.
 For a custom destination, add the original `--install-dir /absolute/path/to/bin`.
-Uninstalling preserves account configuration, credentials, and draft history.
+Updates and removal preserve account configuration, credentials, and draft history.
+If the installer requires recovery, wait for its previous process to exit and rerun it with `--recover`.
 Use `mailctl state --help` for backups and recovery, or `mailctl-mcp state --help` for MCP-only installations.
 
 ## Build from source

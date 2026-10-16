@@ -1,6 +1,6 @@
 # Install CLI and MCP as selectable components
 
-Install both `mailctl` and `mailctl-mcp` by default so the standard installation provides both interfaces. Offer CLI-only and MCP-only installation as explicit selections; each component remains independently usable. Default source builds follow the same selection.
+Install both `mailctl` and `mailctl-mcp` by default on first installation so the standard installation provides both interfaces. Offer CLI-only and MCP-only installation as explicit selections. Each component remains independently usable. On later installer runs, preserve the installed selection when no component selection is supplied, including during removal. Default source builds include both components.
 
 The standalone installer downloads verified binaries and installs selected components side by side in Cargo's binary directory, matching rustup: `CARGO_HOME/bin` when configured, otherwise `~/.cargo/bin` on Unix or `%USERPROFILE%\.cargo\bin` on Windows. An explicit destination override is supported. Rust and rustup are not runtime prerequisites.
 

@@ -200,8 +200,8 @@ def zip_files(path):
 
 def candidate_files(version):
     return LOGS | {"SHA256SUMS", "acceptance-evidence.txt", "build-evidence.txt", "dist-manifest.json",
-                   f"install-v{version}.sh", ARCHIVE, ARCHIVE + ".sha256",
-                   f"manifest-v{version}-{TARGET}.txt"} | {
+                   "install.sh", ARCHIVE, ARCHIVE + ".sha256",
+                   f"manifest-{TARGET}.txt"} | {
                        f"{binary}-v{version}-{TARGET}" for binary in COMPONENTS.values()}
 
 
@@ -225,7 +225,7 @@ def validate_candidate(files, source, commit):
     require(sums == {name: sha(data) for name, data in files.items() if name != "SHA256SUMS"},
             "SHA256SUMS must cover all 19 other files with matching hashes")
     common = dict(version=version, target=TARGET, commit=commit, compatibility="1")
-    receipt = fields(files[f"manifest-v{version}-{TARGET}.txt"])
+    receipt = fields(files[f"manifest-{TARGET}.txt"])
     require(set(receipt) == {"format", "version", "target", "commit", "compatibility"} | {
         component + "_" + key for component in COMPONENTS for key in ("file", "size", "sha256", "signing")},
         "Unexpected component manifest fields")
@@ -258,7 +258,7 @@ def validate_candidate(files, source, commit):
                                     for result in results), "Missing passing tests: " + name)
         else:
             require(re.search(rb"^OK\s*$", files[name], re.MULTILINE), "Missing passing installer tests")
-    require(files[f"install-v{version}.sh"] == source["install.sh"], "Installer differs from fixed source commit")
+    require(files["install.sh"] == source["install.sh"], "Installer differs from fixed source commit")
     require(b"compatibility=1" in source["install.sh"], "Source installer compatibility changed")
     manifest = parse_json(files["dist-manifest.json"])
     matches(manifest, {"dist_version": "0.33.0"}, "dist manifest")
