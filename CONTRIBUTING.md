@@ -148,6 +148,3 @@ preserves a merged changelog entry until that version is tagged. When the
 candidate is ready, merge it and publish the qualified commit through the
 separate release process. Run preparation again after the first published tag
 if more changes need a release candidate.
-
-For candidate preservation, exact approval, publication, and recovery, read
-[the release procedure](docs/releasing.md).
