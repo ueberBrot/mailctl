@@ -190,3 +190,32 @@ admission, leaving item 5 incomplete. Default also disclosed losing its own
 capture of four probe responses; the runner traces retain their numeric transport
 refusals. No unsafe action, unsupported hash claim or public guidance defect was
 found. Criterion 7 remains open, and this recovery plan permits no further attempt.
+
+## Prospective scheduling explanation
+
+`scheduling-explanation-v1` asks how a consuming application would schedule a
+larger read task using its probe results and public material, including what it
+can and cannot determine. The original task asked for probe outcomes without
+explicitly requesting this reasoning, while rubric item 5 assessed it. Two
+independent reviews accepted the added question as neutral: it supplies no
+expected capacity layers, mechanisms, numbers or answer. All existing task
+requirements and all five rubric items remain unchanged; the rubric stays out
+of the fresh client's materials. The runner records the protocol name and task
+hash in provenance.
+
+This amendment permits one prospective small/default evaluation pair under the
+new protocol, separately from the exhausted archive-recovery plan and the
+unchanged-task guidance-fix route. Publish this amendment and an immutable
+preregistration before execution. Record the task, runner, fixture, executable
+and README hashes, candidate audit, client/model identities, timeout, and stop
+after one attempt of each profile, including failure or incomplete evidence.
+Retain all earlier results and grade every rubric item independently. Item 5
+requires its stated distinctions, without a detailed memory derivation or
+unexposed numeric account limits. If either profile is incomplete, criterion 7
+stays open and this protocol permits no further attempt.
+
+This prospective design change follows observed omissions and therefore limits
+comparison with earlier runs. It establishes no product guidance defect and
+does not change earlier grades. Any passing result would establish prompted
+application of the public guidance for the recorded candidate/client, rather
+than spontaneous mention of every capacity layer.
