@@ -219,3 +219,22 @@ comparison with earlier runs. It establishes no product guidance defect and
 does not change earlier grades. Any passing result would establish prompted
 application of the public guidance for the recorded candidate/client, rather
 than spontaneous mention of every capacity layer.
+
+The single [preregistered evaluation](https://github.com/ueberBrot/mailctl/issues/18#issuecomment-6211339872)
+completed on October 16 with Codex CLI 0.163.0 and `gpt-6.1-sol` against the
+same audited MCP/README bytes. [Retained results](https://github.com/ueberBrot/mailctl/issues/18#issuecomment-6211505047)
+passed both mechanical profiles and all five original rubric items in two
+independent semantic reviews. Initialization overlapped; tools/list discovery
+remained sequential. Both answers distinguished process ceilings, transport
+admission and per-account connection and waiting limits, with application
+hash checks and hypothetical draft recovery correctly labelled as proposed.
+
+Each profile emitted one pre-turn client error item whose text was intentionally
+not retained; its cause remains unknown. No failed required operation was
+associated with those events. Payload-free traces establish metadata facts;
+detailed body/attachment checks rely on the reviewed runner's recorded results.
+The complete private archive and checksum index are retained. This completes
+criterion 7 for the named candidate under this protocol, preserving earlier
+incomplete grades and all stated interpretation limits. The single attempt is
+consumed; no further run is permitted. Live IONOS uncertainty and publication
+remain separately unqualified.

@@ -70,6 +70,14 @@ the build/acceptance records, installer manifest, binaries and checksummed logs:
 [artifact 11991697237](https://github.com/ueberBrot/mailctl/actions/runs/38770249651/artifacts/11991697237).
 Later candidate bytes still need their own matching evidence.
 
+The later [candidate audit](https://github.com/ueberBrot/mailctl/issues/18#issuecomment-6210340300)
+identifies build `bdce9b795b6034afafabb2a00c978e96463e213e`, artifact `12030484034`,
+associated with main `7d16a87a30fcb3aa6bf78ae9dbcc86992b28b7ec`. Its CLI/MCP and
+README bytes match the earlier candidate. The prospective Codex evaluation below
+selects those exact packaged bytes; its runner commit `5c449dd` changes only the
+evaluation task/procedure. This does not establish full-tree equality with the
+newer main or qualify newly built artifacts automatically.
+
 | Installed selection | Packaged reading checks passed | Packaged draft checks passed |
 | --- | --- | --- |
 | CLI-only | 13 | 18 |
@@ -108,9 +116,18 @@ disposable account, which is unavailable. Ordinary-account authorization does
 not cover induced faults. The October 16 Codex CLI 0.163.0 archive-recovery run
 passed both mechanical profiles against these MCP and README bytes. Its complete
 private archive is retained. Both fresh answers still omit part of the required
-capacity explanation, so actual-client/fresh-agent criterion 7 remains incomplete
-under the [Codex procedure](codex-mcp.md). None of this evidence authorizes
-publication or completes those remaining gates.
+capacity explanation; those historical grades remain incomplete.
+
+The subsequent single [preregistered scheduling evaluation](https://github.com/ueberBrot/mailctl/issues/18#issuecomment-6211505047)
+passed both mechanical profiles and all five original comprehension items under
+the [Codex procedure](codex-mcp.md). This completes actual-client/fresh-agent
+criterion 7 for the named candidate. Initialization overlapped and tools/list
+discovery remained sequential. Qualification establishes prompted application
+of public guidance. The result retains unexplained nonfatal pre-turn client
+diagnostics and the limits of payload-free evidence; it does not erase earlier
+grades or establish spontaneous mention of every capacity layer. The single
+attempt is consumed. Genuine live IONOS uncertainty and publication remain
+unqualified; none of these checks authorizes publication.
 
 ## Release-note review
 
