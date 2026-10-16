@@ -8,7 +8,7 @@ operator authorization. Ordinary PR CI must not run it.
 ## Prerequisites and invocation
 
 Use Python 3.9 or newer, OpenSSL, and an authenticated Codex CLI. The runner was
-checked with Codex CLI 0.162.1. Its installed `exec --help` must support
+checked with Codex CLI 0.162.1 and 0.163.0. Its installed `exec --help` must support
 `--strict-config`, `--ignore-user-config`, `--ignore-rules`, `--ephemeral`,
 `--json`, `--sandbox`, `--skip-git-repo-check`, and inline TOML `-c` settings.
 It also uses the installed
@@ -27,14 +27,17 @@ python3 scripts/acceptance/codex_mcp.py --run \
 ```
 
 For a final packaged rerun, select the independently verified, installed
-candidate directory and its matching README:
+candidate directory and its matching README. Create a private persistent parent
+directory, then select a new evidence directory for this run:
 
 ```sh
+mkdir -m 700 -p "$HOME/.mailctl-qualification"
 python3 scripts/acceptance/codex_mcp.py --run \
   --bin-dir /absolute/verified/candidate/bin --codex /opt/homebrew/bin/codex \
   --model gpt-6.1-sol --provenance packaged \
   --candidate-commit '<full qualified candidate commit>' \
-  --readme /absolute/candidate/source/README.md --profile both --timeout 600
+  --readme /absolute/candidate/source/README.md --profile both --timeout 600 \
+  --output "$HOME/.mailctl-qualification/codex-candidate-001"
 ```
 
 `--provenance packaged` records the operator's selection; it does not verify an
@@ -82,7 +85,11 @@ timeout or interruption.
 ## Evidence and evaluation
 
 The runner prints its private evidence directory. `--output` can select a new
-directory instead. It retains hashes/platform/client identity, the public task,
+directory instead. Final qualification must use a persistent directory outside
+the operating system's temporary directories. Keep its executable snapshot,
+provenance, workflow, invocation, answers, summaries and traces together, and
+record a checksum index after the run. Fixture cleanup is separate from evidence
+retention. It retains hashes/platform/client identity, the public task,
 invocation, payload-free client event metadata, per-server STDIO traces, synthetic
 agent answers and a mechanical summary. Raw Codex diagnostics and raw MCP
 payloads are not retained. STDIO trace records contain only monotonic timestamps,
@@ -141,6 +148,16 @@ criterion complete:
 Document any failure using the public task, actual call/result metadata and
 answer excerpt. Fix a concrete public guidance/schema defect before repeating
 the same fresh task. Do not teach the expected answer through a revised task.
+
+Archive loss requires a separately recorded evidence-recovery run. Before that
+run, record the missing files, surviving results, selected executable/README and
+client/model identities, and a stop after one complete small/default run. Keep
+the task and rubric unchanged. Retain and assess the earlier incomplete results
+alongside the new evidence; a recovery run does not erase them or establish a
+guidance fix. Review every rubric item independently. If the new run is
+incomplete, keep the gate open rather than repeating until it passes. Label this
+as archive recovery, not as following the guidance-fix repeat procedure above.
+
 Source results are provisional. Repeat against the final candidate after byte
 changes; earlier 7113046 binaries cannot qualify representation-version metadata
 added later. This procedure does not qualify live-provider refresh, draft fault
@@ -152,3 +169,24 @@ initialization in both profiles. `tools/list` discovery overlapped only in
 it computed an attachment hash, but no observable hashing action substantiates
 that claim. Only the runner's independent digest calculation is verified.
 Final packaged qualification remains pending.
+
+The [October 15 packaged run](https://github.com/ueberBrot/mailctl/issues/24#issuecomment-6209304368)
+used the executable and README bytes associated with the PR73 candidate. Both
+mechanical profiles passed. Independent review passed all five comprehension
+items for small; default omitted per-account connection/waiting limits in item 5.
+Its answer made no contrary claim, and the overview already explains those
+limits. The original temporary archive is unavailable; recovered chat excerpts
+include the default answer and selected summaries, but not the complete traces
+or small answer. These retained observations do not complete the gate.
+
+One preregistered archive-recovery run on October 16 used Codex CLI 0.163.0,
+`gpt-6.1-sol`, the same packaged MCP/README bytes, and the unchanged task/rubric.
+Both mechanical profiles passed; both initialized concurrently, while tools/list
+discovery remained sequential. Full workflows, invocations, answers, summaries
+and payload-free traces are retained in private persistent storage with checksums.
+Independent review passed items 1–4 for each profile. Both answers omitted
+per-account connection/waiting limits and did not explain transport memory
+admission, leaving item 5 incomplete. Default also disclosed losing its own
+capture of four probe responses; the runner traces retain their numeric transport
+refusals. No unsafe action, unsupported hash claim or public guidance defect was
+found. Criterion 7 remains open, and this recovery plan permits no further attempt.
