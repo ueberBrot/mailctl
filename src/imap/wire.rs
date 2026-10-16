@@ -215,7 +215,7 @@ impl<'a> Connection<'a> {
             Ok(response) => response,
             Err(_) => {
                 self.session.client.take();
-                return Err(Error::Protocol);
+                return Err(Error::ParserPanic);
             }
         };
         let mut response = response

@@ -12,7 +12,7 @@ mod mcp_transport;
 mod presentation;
 
 use crate::{
-    domain::{Error, ErrorCode, OperationResult},
+    domain::{Error, ErrorCode, ErrorReason, OperationResult},
     policy::Narrowing,
 };
 use application::Application;
@@ -580,26 +580,53 @@ async fn report<O: Send + 'static>(
         }),
         _ => None,
     });
-    diagnostics::result(envelope.request_id(), error);
-    let code = error.map_or(0, Error::exit_code);
-    let human_error = !json && envelope.error().is_some();
+    if error.is_some() {
+        // Retain the operation's cause even if delivering its error later fails.
+        diagnostics::result(envelope.request_id(), error);
+    }
     let output = if json {
         // Keep one complete buffer so serializer failures leave stdout untouched.
         let mut output = ReportBuffer(Vec::with_capacity(1024));
-        serde_json::to_writer(&mut output, &envelope)
-            .ok()
-            .map(|()| ReportOutput::Json(output.0))
+        serde_json::to_writer(&mut output, &envelope).map(|()| ReportOutput::Json(output.0))
     } else {
         match envelope.result() {
             Some(result) => presentation::human(result),
-            None => presentation::human_error(envelope.error().expect("failure contains an error")),
+            None => presentation::human_error(
+                envelope.error().expect("failure contains an error"),
+                request.id(),
+            ),
         }
-        .ok()
         .map(ReportOutput::Human)
     };
-    let Some(output) = output else {
-        return 8;
-    };
+    let rendering_error = output.as_ref().err().map(|_| {
+        output_failure(
+            &envelope,
+            ErrorCode::InternalError,
+            ErrorReason::ResultSerializationFailed,
+        )
+    });
+    if let Some(error) = &rendering_error {
+        diagnostics::result(envelope.request_id(), Some(error));
+    }
+    let output = output.unwrap_or_else(|_| {
+        let error = rendering_error.as_ref().expect("rendering failed");
+        if json {
+            // Domain errors contain no fallible filesystem or provider values.
+            ReportOutput::Json(
+                serde_json::to_vec(&request.envelope::<()>(Err(error.clone())))
+                    .expect("safe error envelope serializes"),
+            )
+        } else {
+            ReportOutput::Human(
+                presentation::human_error(error, request.id())
+                    .expect("safe human error serializes"),
+            )
+        }
+    });
+    let error = rendering_error.as_ref().or(error);
+    let code = error.map_or(0, Error::exit_code);
+    let human_error = !json && (envelope.error().is_some() || rendering_error.is_some());
+    let request_id = envelope.request_id();
     let write = tokio::task::spawn_blocking(move || {
         let _owner = owner;
         // Terminal filtering strips valid JSON string data such as DELETE.
@@ -617,11 +644,51 @@ async fn report<O: Send + 'static>(
         let heading = anstyle::Style::new().bold();
         writeln!(color.human_stdout(), "{heading}Result{heading:#}\n{text}")
     });
-    match tokio::time::timeout(Duration::from_secs(seconds as u64), write).await {
-        Ok(Ok(Ok(()))) => code,
-        Err(_) => 5,
-        _ => 8,
-    }
+    let failure = match tokio::time::timeout(Duration::from_secs(seconds as u64), write).await {
+        Ok(Ok(Ok(()))) => {
+            if error.is_none() {
+                diagnostics::result(request_id, None);
+            }
+            return code;
+        }
+        Err(_) => output_failure(&envelope, ErrorCode::Timeout, ErrorReason::OutputTimedOut),
+        _ => output_failure(
+            &envelope,
+            ErrorCode::InternalError,
+            ErrorReason::OutputWriteFailed,
+        ),
+    };
+    diagnostics::result(request_id, Some(&failure));
+    failure.exit_code()
+}
+
+fn output_failure(
+    envelope: &crate::domain::Envelope,
+    code: ErrorCode,
+    reason: ErrorReason,
+) -> Error {
+    let error = if let Some(error) = envelope.error() {
+        error.clone()
+    } else if let Some(OperationResult::Draft(receipt)) = envelope.result()
+        && receipt.dispatched
+    {
+        // Losing a dispatched draft receipt must never invite another creation.
+        Error::draft_outcome(
+            ErrorCode::OutcomeUnknown,
+            crate::domain::DraftOperationDetails {
+                identity: crate::domain::DraftIdentity {
+                    account_id: receipt.account_id,
+                    account_generation: receipt.account_generation,
+                    operation_id: receipt.operation_id,
+                },
+                mailbox: receipt.mailbox.clone(),
+                uid_validity: Some(receipt.uid_validity),
+            },
+        )
+    } else {
+        Error::new(code)
+    };
+    error.with_reason(reason)
 }
 
 async fn report_guidance(
@@ -631,18 +698,23 @@ async fn report_guidance(
     result: serde_json::Value,
 ) -> Result<u8, Error> {
     let text = if json {
-        serde_json::to_string(&request.envelope(Ok(result)))
-            .map_err(|_| Error::new(ErrorCode::InternalError))?
+        serde_json::to_string(&request.envelope(Ok(result))).map_err(|_| {
+            Error::new(ErrorCode::InternalError).with_reason(ErrorReason::ResultSerializationFailed)
+        })?
     } else {
         text
     };
-    diagnostics::result(request.id(), None);
     let write = tokio::task::spawn_blocking(move || writeln!(std::io::stdout().lock(), "{text}"));
     tokio::time::timeout(Duration::from_secs(30), write)
         .await
-        .map_err(|_| Error::new(ErrorCode::Timeout))?
-        .map_err(|_| Error::new(ErrorCode::InternalError))?
-        .map_err(|_| Error::new(ErrorCode::InternalError))?;
+        .map_err(|_| Error::new(ErrorCode::Timeout).with_reason(ErrorReason::OutputTimedOut))?
+        .map_err(|_| {
+            Error::new(ErrorCode::InternalError).with_reason(ErrorReason::OutputWriteFailed)
+        })?
+        .map_err(|_| {
+            Error::new(ErrorCode::InternalError).with_reason(ErrorReason::OutputWriteFailed)
+        })?;
+    diagnostics::result(request.id(), None);
     Ok(0)
 }
 
@@ -650,6 +722,62 @@ async fn report_guidance(
 mod tests {
     use super::*;
     use crate::domain::{BodyText, MessageBody};
+
+    #[test]
+    fn output_failures_keep_draft_identity_and_prohibit_blind_retries() {
+        use crate::domain::{DraftIdentity, DraftOperationDetails, DraftReceipt, DraftState};
+        let operation = DraftOperationDetails {
+            identity: DraftIdentity {
+                account_id: uuid::Uuid::new_v4(),
+                account_generation: 3,
+                operation_id: uuid::Uuid::new_v4(),
+            },
+            mailbox: "Drafts".into(),
+            uid_validity: Some(7),
+        };
+        let request = Request::new();
+        for code in [ErrorCode::OutcomeUnknown, ErrorCode::OperationInProgress] {
+            let envelope = request.envelope(Err(Error::draft_outcome(code, operation.clone())));
+            let error = output_failure(&envelope, ErrorCode::Timeout, ErrorReason::OutputTimedOut);
+            assert_eq!(error.code, code);
+            assert!(!error.retryable);
+            assert_eq!(error.exit_code(), 7);
+            assert_eq!(error.draft_operation.as_deref(), Some(&operation));
+            assert_eq!(error.reason, Some(ErrorReason::OutputTimedOut));
+        }
+        let envelope = request.envelope(Ok(OperationResult::Draft(DraftReceipt {
+            account_id: operation.identity.account_id,
+            account_generation: operation.identity.account_generation,
+            operation_id: operation.identity.operation_id,
+            mailbox: operation.mailbox.clone(),
+            uid_validity: 7,
+            state: DraftState::Created,
+            dispatched: true,
+            message_reference: Some("fixture-message".into()),
+            content_sha256: "0".repeat(64),
+        })));
+        let error = output_failure(
+            &envelope,
+            ErrorCode::InternalError,
+            ErrorReason::OutputWriteFailed,
+        );
+        assert_eq!(error.code, ErrorCode::OutcomeUnknown);
+        assert!(!error.retryable);
+        assert_eq!(error.exit_code(), 7);
+        assert_eq!(error.draft_operation.as_deref(), Some(&operation));
+
+        let OperationResult::Draft(mut receipt) = envelope.into_result().unwrap() else {
+            unreachable!();
+        };
+        receipt.state = DraftState::Prepared;
+        receipt.dispatched = false;
+        receipt.message_reference = None;
+        let prepared = request.envelope(Ok(OperationResult::Draft(receipt)));
+        let error = output_failure(&prepared, ErrorCode::Timeout, ErrorReason::OutputTimedOut);
+        assert_eq!(error.code, ErrorCode::Timeout);
+        assert_eq!(error.exit_code(), 5);
+        assert!(error.retryable, "the prepared draft was never dispatched");
+    }
 
     #[test]
     fn cli_json_buffers_keep_escaped_pages_with_geometric_growth() {
@@ -668,7 +796,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn cli_json_serializer_failures_leave_stdout_empty() {
+    fn cli_json_serializer_failures_return_a_complete_safe_error() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "frontends::tests::non_utf8_export_report_fixture",
@@ -683,15 +811,33 @@ mod tests {
             "serializer failure fixture failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        let diagnostics = String::from_utf8(output.stderr).unwrap();
         let output = String::from_utf8(output.stdout).unwrap();
         assert!(
             output.contains("1 passed; 0 failed"),
             "fixture did not run: {output}"
         );
-        assert!(
-            !output.contains("\"request_id\""),
-            "failed serialization must not emit a partial JSON envelope: {output}"
-        );
+        let envelopes: Vec<serde_json::Value> = output
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        assert_eq!(envelopes.len(), 1, "one complete error envelope: {output}");
+        let envelope = &envelopes[0];
+        assert_eq!(envelope["ok"], false);
+        assert!(envelope.get("result").is_none());
+        assert_eq!(envelope["error"]["code"], "internal_error");
+        assert_eq!(envelope["error"]["reason"], "result_serialization_failed");
+        assert_eq!(envelope["error"]["retryable"], false);
+        assert!(uuid::Uuid::parse_str(envelope["request_id"].as_str().unwrap()).is_ok());
+        assert!(!output.contains("/fixture") && !diagnostics.contains("/fixture"));
+        assert!(!diagnostics.contains("operation_completed"));
+        let failure: serde_json::Value = diagnostics
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|event| event["event"] == "operation_failed")
+            .expect("serialization failure is diagnosed");
+        assert_eq!(failure["request_id"], envelope["request_id"]);
+        assert_eq!(failure["reason"], envelope["error"]["reason"]);
     }
 
     #[cfg(unix)]
@@ -699,6 +845,13 @@ mod tests {
     #[ignore = "child fixture for the serializer failure stdout regression"]
     fn non_utf8_export_report_fixture() {
         use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+        Options {
+            log_format: LogFormat::Json,
+            log_level: diagnostics::LogLevel::Info,
+            color: Color::Never,
+        }
+        .initialize(true)
+        .unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()

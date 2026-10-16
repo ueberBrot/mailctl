@@ -1,20 +1,21 @@
 //! Apply admission limits around the SDK's STDIO transport.
 use crate::{
     config::Limits,
-    domain::{Error, ErrorCode},
+    domain::{DraftReceipt, Envelope, Error, ErrorCode, ErrorReason, OperationResult},
 };
 use futures_util::StreamExt;
 use rmcp::{
     RoleServer,
-    model::{ClientNotification, ClientRequest, GetExtensions, JsonRpcMessage},
+    model::{ClientNotification, ClientRequest, GetExtensions, JsonRpcMessage, ServerResult},
     service::{RxJsonRpcMessage, TxJsonRpcMessage},
     transport::{Transport, async_rw::AsyncRwTransport},
 };
+use serde::Deserialize;
 use std::{
     collections::{HashMap, hash_map::Entry},
     io,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 use tokio::{
@@ -41,6 +42,69 @@ struct DeferredRequest {
 struct RejectedRequest {
     send: Pin<Box<dyn Future<Output = io::Result<()>> + Send>>,
     _control: OwnedSemaphorePermit,
+}
+
+#[derive(Default)]
+struct OutputContext {
+    request_id: String,
+    envelope: Option<Envelope>,
+}
+
+impl OutputContext {
+    fn new(item: &TxJsonRpcMessage<RoleServer>) -> Self {
+        let JsonRpcMessage::Response(response) = item else {
+            return Self::default();
+        };
+        let ServerResult::CallToolResult(result) = &response.result else {
+            return Self::default();
+        };
+        let Some(content) = &result.structured_content else {
+            return Self::default();
+        };
+        let request_id = content
+            .get("request_id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|id| uuid::Uuid::parse_str(id).ok())
+            .map(|id| id.to_string())
+            .unwrap_or_default();
+        // Retain only failure/draft metadata, never another copy of email content.
+        let outcome = if let Some(error) = content.get("error") {
+            Error::deserialize(error).ok().map(Err)
+        } else {
+            content
+                .get("result")
+                .filter(|result| {
+                    result
+                        .get("dispatched")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+                })
+                .and_then(|result| DraftReceipt::deserialize(result).ok())
+                .map(|receipt| Ok(OperationResult::Draft(receipt)))
+        };
+        Self {
+            envelope: outcome.map(|result| Envelope::from_result(request_id.clone(), result)),
+            request_id,
+        }
+    }
+
+    fn failure(&self, code: ErrorCode, reason: ErrorReason) -> Error {
+        self.envelope.as_ref().map_or_else(
+            || Error::new(code).with_reason(reason),
+            |envelope| super::output_failure(envelope, code, reason),
+        )
+    }
+}
+
+fn record_output_failure(
+    failure: &OnceLock<Error>,
+    shutdown: &CancellationToken,
+    request_id: &str,
+    error: Error,
+) {
+    super::diagnostics::result(request_id, Some(&error));
+    let _ = failure.set(error);
+    shutdown.cancel();
 }
 
 #[derive(Clone)]
@@ -199,6 +263,8 @@ fn largest_fitting(mut lower: usize, mut upper: usize, fits: impl Fn(usize) -> b
 pub(super) struct BoundedStdio<W: AsyncWrite = tokio::io::Stdout> {
     sdk: AsyncRwTransport<RoleServer, tokio::io::DuplexStream, W>,
     ingress: JoinHandle<()>,
+    failure: Arc<OnceLock<Error>>,
+    shutdown: CancellationToken,
     slots: Arc<Semaphore>,
     pending: Pending,
     control: Arc<Semaphore>,
@@ -269,22 +335,31 @@ impl<W: AsyncWrite + Unpin + Send + 'static> BoundedStdio<W> {
         output: W,
     ) -> Self {
         let (reader, mut writer) = tokio::io::duplex(8192);
+        let failure = Arc::new(OnceLock::new());
+        let ingress_failure = failure.clone();
+        let ingress_shutdown = shutdown.clone();
         // Validate complete, bounded lines before the SDK can buffer or parse them.
         let ingress = tokio::spawn(async move {
             // The SDK may drain requests after EOF; cancel active work as soon as input closes.
-            let _cancel_on_exit = shutdown.drop_guard();
-            let _ = forward_bounded_input(
+            let _cancel_on_exit = ingress_shutdown.drop_guard();
+            if let Err(code) = forward_bounded_input(
                 input,
                 &mut writer,
                 bounds.input,
                 bounds.nesting,
                 bounds.deadline,
             )
-            .await;
+            .await
+            {
+                let _ =
+                    ingress_failure.set(Error::new(code).with_reason(ErrorReason::McpInvalidFrame));
+            }
         });
         Self {
             sdk: AsyncRwTransport::new_server(reader, output),
             ingress,
+            failure,
+            shutdown,
             slots: Arc::new(Semaphore::new(bounds.requests)),
             pending: Default::default(),
             control: Arc::new(Semaphore::new(1)),
@@ -296,6 +371,10 @@ impl<W: AsyncWrite + Unpin + Send + 'static> BoundedStdio<W> {
             deferred: None,
             rejected: None,
         }
+    }
+
+    pub(super) fn failure(&self) -> Arc<OnceLock<Error>> {
+        self.failure.clone()
     }
 
     fn receive_deadline(&self) -> Instant {
@@ -354,7 +433,10 @@ impl<W: AsyncWrite + Unpin + Send + 'static> Transport<RoleServer> for BoundedSt
             })
         });
         let valid = cancelled || crate::encoding::serialized_size(&item, self.output_limit).is_ok();
+        let output_context = OutputContext::new(&item);
         let pending = self.pending.clone();
+        let failure = self.failure.clone();
+        let shutdown = self.shutdown.clone();
         let send = if cancelled {
             // Release the reservation only after the handler's retained output
             // has been dropped, preserving cancellation's no-response behavior.
@@ -365,20 +447,42 @@ impl<W: AsyncWrite + Unpin + Send + 'static> Transport<RoleServer> for BoundedSt
         };
         let deadline = self.deadline;
         async move {
-            if !valid {
-                return Err(io::ErrorKind::InvalidData.into());
+            let result = async {
+                if !valid {
+                    return Err(io::ErrorKind::InvalidData.into());
+                }
+                let result = match send {
+                    Some(send) => timeout(deadline, send)
+                        .await
+                        .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?,
+                    None => Ok(()),
+                };
+                if let Some(id) = id {
+                    pending
+                        .lock()
+                        .map_err(|_| io::ErrorKind::Other)?
+                        .remove(&id);
+                }
+                result
             }
-            let result = match send {
-                Some(send) => timeout(deadline, send)
-                    .await
-                    .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?,
-                None => Ok(()),
-            };
-            if let Some(id) = id {
-                pending
-                    .lock()
-                    .map_err(|_| io::ErrorKind::Other)?
-                    .remove(&id);
+            .await;
+            if let Err(error) = &result {
+                let (code, reason) = if !valid {
+                    (
+                        ErrorCode::ResponseTooLarge,
+                        ErrorReason::OutputLimitExceeded,
+                    )
+                } else if error.kind() == io::ErrorKind::TimedOut {
+                    (ErrorCode::Timeout, ErrorReason::OutputTimedOut)
+                } else {
+                    (ErrorCode::InternalError, ErrorReason::OutputWriteFailed)
+                };
+                record_output_failure(
+                    &failure,
+                    &shutdown,
+                    &output_context.request_id,
+                    output_context.failure(code, reason),
+                );
             }
             result
         }
@@ -389,7 +493,21 @@ impl<W: AsyncWrite + Unpin + Send + 'static> Transport<RoleServer> for BoundedSt
             if let Some(rejected) = &mut self.rejected {
                 // SDK select can interrupt receive while output is partially
                 // written. Retain this single control response until completion.
-                timeout_at(expires, &mut rejected.send).await.ok()?.ok()?;
+                let result = timeout_at(expires, &mut rejected.send).await;
+                let error = match result {
+                    Ok(Ok(())) => None,
+                    Err(_) => Some(
+                        Error::new(ErrorCode::Timeout).with_reason(ErrorReason::OutputTimedOut),
+                    ),
+                    Ok(Err(_)) => Some(
+                        Error::new(ErrorCode::InternalError)
+                            .with_reason(ErrorReason::OutputWriteFailed),
+                    ),
+                };
+                if let Some(error) = error {
+                    record_output_failure(&self.failure, &self.shutdown, "", error);
+                    return None;
+                }
                 self.rejected = None;
             }
             if self
@@ -617,6 +735,70 @@ mod tests {
             requests: 1,
             nesting: 32,
             deadline: Duration::from_secs(2),
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_output_preserves_draft_uncertainty_and_terminates_the_session() {
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let receipt = DraftReceipt {
+            account_id: uuid::Uuid::new_v4(),
+            account_generation: 1,
+            operation_id: uuid::Uuid::new_v4(),
+            mailbox: "Drafts".into(),
+            uid_validity: 23,
+            state: crate::domain::DraftState::Created,
+            dispatched: true,
+            message_reference: None,
+            content_sha256: "0".repeat(64),
+        };
+        for reason in [
+            ErrorReason::OutputWriteFailed,
+            ErrorReason::OutputTimedOut,
+            ErrorReason::OutputLimitExceeded,
+        ] {
+            let (output, reader) = tokio::io::duplex(1);
+            let _reader = (reason != ErrorReason::OutputWriteFailed).then_some(reader);
+            let (input, _input_writer) = tokio::io::duplex(8192);
+            let shutdown = CancellationToken::new();
+            let mut bounds = one_request_bounds();
+            bounds.deadline = Duration::from_millis(20);
+            if reason == ErrorReason::OutputLimitExceeded {
+                bounds.output = 1;
+            }
+            let mut transport = BoundedStdio::with_io(bounds, shutdown.clone(), input, output);
+            let envelope = Envelope::from_result(
+                request_id.clone(),
+                Ok(OperationResult::Draft(receipt.clone())),
+            );
+            let mut result = CallToolResult::success(Vec::new());
+            result.structured_content = Some(serde_json::to_value(envelope).unwrap());
+            let message = TxJsonRpcMessage::<RoleServer>::response(
+                ServerResult::CallToolResult(result),
+                RequestId::Number(1),
+            );
+            assert_eq!(OutputContext::new(&message).request_id, request_id);
+            assert!(transport.send(message).await.is_err());
+            let failure = transport.failure();
+            let error = failure
+                .get()
+                .expect("output failure must remain observable");
+            assert_eq!(error.reason, Some(reason));
+            assert_eq!(error.code, ErrorCode::OutcomeUnknown);
+            assert!(!error.retryable);
+            assert_eq!(
+                error
+                    .draft_operation
+                    .as_ref()
+                    .unwrap()
+                    .identity
+                    .operation_id,
+                receipt.operation_id,
+            );
+            assert!(
+                shutdown.is_cancelled(),
+                "broken output must close the session"
+            );
         }
     }
 

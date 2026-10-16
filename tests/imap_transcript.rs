@@ -399,7 +399,7 @@ async fn invalid_envelope_projections_dispose_the_connection() {
     // value and panics. The shared protocol module must reject it and close.
     cases.push((
         "UNKNOWN ((x) INTERNALDATE NIL)".to_owned(),
-        mailctl::imap::Error::Protocol,
+        mailctl::imap::Error::ParserPanic,
     ));
     for (items, expected) in cases {
         let mut fixture = fixture(TlsMode::Implicit, Limits::default(), move |mut wire| {
@@ -424,6 +424,7 @@ async fn invalid_envelope_projections_dispose_the_connection() {
             .await
             .unwrap_err();
         assert_eq!(error.code, mailctl::domain::Error::from(expected).code);
+        assert_eq!(error.reason, mailctl::domain::Error::from(expected).reason);
         fixture.task.await.unwrap();
     }
 }

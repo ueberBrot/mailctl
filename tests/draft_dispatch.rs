@@ -2,7 +2,7 @@ mod fuzz_support;
 mod support;
 use mailctl::{
     config::{Config, Limits},
-    domain::{Error, ErrorCode, Operation, OperationResult, SaveDraftInput},
+    domain::{Error, ErrorCode, ErrorReason, Operation, OperationResult, SaveDraftInput},
     draft::{DraftMessageIdentity, PreparedDraft},
     draft_journal::{DraftJournal, DraftOperationState},
     imap::AppendOutcome,
@@ -14,7 +14,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc,
-        atomic::{AtomicU32, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
     },
 };
 use tokio::sync::Notify;
@@ -195,6 +195,7 @@ struct Backend {
     fail_outcome: bool,
     stall: bool,
     entered: Notify,
+    parser_failure: AtomicBool,
 }
 impl DraftBackend for Backend {
     fn reconcile<'a>(
@@ -205,7 +206,13 @@ impl DraftBackend for Backend {
         _: &'a Limits,
     ) -> Pin<Box<dyn Future<Output = Result<mailctl::draft::DraftEvidence, Error>> + Send + 'a>>
     {
-        Box::pin(async { Err(Error::new(ErrorCode::UnsupportedCapability)) })
+        Box::pin(async move {
+            Err(if self.parser_failure.load(Ordering::SeqCst) {
+                Error::new(ErrorCode::InternalError).with_reason(ErrorReason::ImapParserPanic)
+            } else {
+                Error::new(ErrorCode::UnsupportedCapability)
+            })
+        })
     }
     fn prepare<'a>(
         &'a self,
@@ -243,6 +250,11 @@ impl DraftAppend for Prepared<'_> {
             if self.0.stall {
                 std::future::pending::<()>().await;
             }
+            if self.0.parser_failure.load(Ordering::SeqCst) {
+                return Err(
+                    Error::new(ErrorCode::InternalError).with_reason(ErrorReason::ImapParserPanic)
+                );
+            }
             Ok(self.0.outcome)
         })
     }
@@ -275,6 +287,7 @@ impl Fixture {
             fail_outcome,
             stall,
             entered: Notify::new(),
+            parser_failure: AtomicBool::new(false),
         });
         let service = Arc::new(
             Service::open(config.clone())
@@ -410,6 +423,50 @@ async fn uncertain_acceptance_and_failed_outcome_commit_never_redispatch() {
         assert_eq!(f.backend.appends.load(Ordering::SeqCst), 1);
     }
 }
+
+#[tokio::test]
+async fn uncertain_dispatch_and_reconciliation_preserve_safe_failure_reasons() {
+    for fail_commit in [false, true] {
+        let f = Fixture::new(AppendOutcome::Unknown, fail_commit, false).await;
+        f.backend.parser_failure.store(true, Ordering::SeqCst);
+        let error = f.save().await.unwrap_err();
+        assert_eq!(error.reason, Some(ErrorReason::ImapParserPanic));
+        uncertain(error, &f.input);
+        if fail_commit {
+            assert_eq!(f.state(), DraftOperationState::InFlight);
+            rusqlite::Connection::open(&f.backend.path)
+                .unwrap()
+                .execute_batch("DROP TRIGGER fail_outcome")
+                .unwrap();
+        }
+        let replay = f.save().await.unwrap_err();
+        assert!(
+            replay.reason.is_none(),
+            "dispatch diagnostics are not persisted"
+        );
+        uncertain(replay, &f.input);
+        assert_eq!(f.state(), DraftOperationState::OutcomeUnknown);
+        let context = f.service.context("writer", &Default::default()).unwrap();
+        let error = f
+            .service
+            .execute(
+                &context,
+                Operation::DraftStatus(mailctl::domain::DraftStatusInput {
+                    account_id: f.input.account_id,
+                    account_generation: f.input.account_generation,
+                    operation_id: f.input.operation_id,
+                    mailbox: f.input.mailbox.clone(),
+                    reconcile: true,
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.reason, Some(ErrorReason::ImapParserPanic));
+        uncertain(error, &f.input);
+        assert_eq!(f.state(), DraftOperationState::OutcomeUnknown);
+        assert_eq!(f.backend.appends.load(Ordering::SeqCst), 1);
+    }
+}
 #[tokio::test]
 async fn failed_prepare_and_in_flight_commits_prevent_network_dispatch() {
     for transition in ["INSERT", "UPDATE"] {
@@ -458,7 +515,9 @@ async fn live_owner_is_pending_and_cancellation_records_uncertainty_before_unloc
 #[tokio::test]
 async fn dispatched_deadline_returns_uncertainty_instead_of_retryable_timeout() {
     let f = Fixture::new(AppendOutcome::Created { uid: None }, false, true).await;
-    uncertain(f.save().await.unwrap_err(), &f.input);
+    let error = f.save().await.unwrap_err();
+    assert!(error.message.contains("deadline exceeded"));
+    uncertain(error, &f.input);
     assert_eq!(f.state(), DraftOperationState::OutcomeUnknown);
     uncertain(f.save().await.unwrap_err(), &f.input);
     assert_eq!(f.backend.appends.load(Ordering::SeqCst), 1);

@@ -599,6 +599,39 @@ fn assert_uncertain(response: &Value, fixture: &Fixture) {
     );
 }
 
+async fn immediate_append_failures(executable: &str) {
+    for (reply, reason) in [
+        (server::DraftReply::Disconnect, "imap_connection_closed"),
+        (server::DraftReply::ParserPanic, "imap_parser_panic"),
+    ] {
+        let mut fixture = Fixture::new(executable);
+        fixture.server.expect_append(reply);
+        let response = fixture.save(executable).await;
+        assert_uncertain(&response, &fixture);
+        assert_eq!(response["error"]["reason"], reason);
+        assert!(
+            !response
+                .to_string()
+                .contains("fixture-private-parser-input")
+        );
+        for retained in [
+            fixture.save(executable).await,
+            fixture.status(executable, false).await,
+        ] {
+            assert_uncertain(&retained, &fixture);
+            assert!(retained["error"].get("reason").is_none());
+        }
+        assert_eq!(fixture.server.drafts().len(), 1);
+        assert_eq!(fixture.server.accepted(), 1);
+        fixture.server.finish();
+    }
+}
+component_tests!(
+    immediate_append_failures,
+    cli_uncertain_append_reports_safe_failure_reason_without_redispatch,
+    mcp_uncertain_append_reports_safe_failure_reason_without_redispatch
+);
+
 async fn reconciliation_evidence(executable: &str) {
     use server::ReconciliationCase::*;
     for case in [

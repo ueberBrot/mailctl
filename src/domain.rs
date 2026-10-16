@@ -54,12 +54,40 @@ pub enum ConflictKind {
     DraftInput,
 }
 
+/// Reviewed failure reasons that are safe to include in responses and bug reports.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorReason {
+    ImapInvalidInput,
+    ImapUnsupported,
+    ImapTransport,
+    ImapTls,
+    ImapTimeout,
+    ImapConnectionClosed,
+    ImapInvalidResponse,
+    ImapUnsafeSelection,
+    ImapParserPanic,
+    ImapResourceLimit,
+    ImapAuthentication,
+    ImapStaleReference,
+    ImapMessageNotFound,
+    ImapStaleCursor,
+    ImapTransferExpired,
+    ResultSerializationFailed,
+    OutputWriteFailed,
+    OutputTimedOut,
+    OutputLimitExceeded,
+    McpInvalidFrame,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Error {
     pub code: ErrorCode,
     pub message: String,
     pub retryable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<ErrorReason>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_failure: Option<CredentialFailure>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -68,6 +96,10 @@ pub struct Error {
     pub draft_operation: Option<Box<DraftOperationDetails>>,
 }
 impl Error {
+    pub fn with_reason(mut self, reason: ErrorReason) -> Self {
+        self.reason = Some(reason);
+        self
+    }
     /// Repair guidance from trusted field names and constraints, never caller values.
     pub(crate) fn invalid_input(message: &'static str) -> Self {
         Self::with_message(ErrorCode::InvalidRequest, message)
@@ -165,6 +197,7 @@ impl Error {
                     | ErrorCode::RateLimited
                     | ErrorCode::Timeout
             ),
+            reason: None,
             draft_operation: None,
             credential_failure: None,
             conflict_kind: (code == ErrorCode::OperationConflict)

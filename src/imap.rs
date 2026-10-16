@@ -126,6 +126,7 @@ pub enum Error {
     Timeout,
     Eof,
     Protocol,
+    ParserPanic,
     Limit,
     Authentication,
     UnsafeSelection,
@@ -144,6 +145,7 @@ impl fmt::Display for Error {
             Self::Timeout => "IMAP operation timed out",
             Self::Eof => "IMAP connection closed",
             Self::Protocol => "invalid IMAP response",
+            Self::ParserPanic => "IMAP response parser panicked; report this problem with the request ID and application version",
             Self::Limit => "IMAP resource limit exceeded",
             Self::Authentication => "IMAP authentication failed",
             Self::UnsafeSelection => "IMAP read-only selection was not established",
@@ -250,6 +252,8 @@ impl Limits {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Metrics {
     pub append_outcome: Option<AppendOutcome>,
+    /// Safe failure cause retained independently of uncertain APPEND acceptance.
+    pub append_error: Option<Error>,
     pub append_wire_bytes: usize,
     pub mime_bytes: usize,
     pub wire_bytes: usize,
@@ -604,19 +608,46 @@ impl Connection<'_> {
 
 impl From<Error> for crate::domain::Error {
     fn from(error: Error) -> Self {
-        use crate::domain::ErrorCode;
-        Self::new(match error {
-            Error::Authentication => ErrorCode::AuthenticationFailed,
-            Error::Tls => ErrorCode::TlsFailed,
-            Error::Timeout => ErrorCode::Timeout,
-            Error::Unsupported => ErrorCode::UnsupportedCapability,
-            Error::Limit => ErrorCode::ResponseTooLarge,
-            Error::InvalidInput => ErrorCode::InvalidRequest,
-            Error::StaleReference => ErrorCode::StaleReference,
-            Error::StaleCursor => ErrorCode::StaleCursor,
-            Error::TransferExpired => ErrorCode::TransferExpired,
-            Error::MessageNotFound => ErrorCode::MessageNotFound,
-            _ => ErrorCode::ProviderUnavailable,
-        })
+        use crate::domain::{ErrorCode, ErrorReason};
+        let (code, reason) = match error {
+            Error::ParserPanic => (ErrorCode::InternalError, ErrorReason::ImapParserPanic),
+            Error::Authentication => (
+                ErrorCode::AuthenticationFailed,
+                ErrorReason::ImapAuthentication,
+            ),
+            Error::Tls => (ErrorCode::TlsFailed, ErrorReason::ImapTls),
+            Error::Timeout => (ErrorCode::Timeout, ErrorReason::ImapTimeout),
+            Error::Unsupported => (
+                ErrorCode::UnsupportedCapability,
+                ErrorReason::ImapUnsupported,
+            ),
+            Error::Limit => (ErrorCode::ResponseTooLarge, ErrorReason::ImapResourceLimit),
+            Error::InvalidInput => (ErrorCode::InvalidRequest, ErrorReason::ImapInvalidInput),
+            Error::StaleReference => (ErrorCode::StaleReference, ErrorReason::ImapStaleReference),
+            Error::StaleCursor => (ErrorCode::StaleCursor, ErrorReason::ImapStaleCursor),
+            Error::TransferExpired => {
+                (ErrorCode::TransferExpired, ErrorReason::ImapTransferExpired)
+            }
+            Error::MessageNotFound => {
+                (ErrorCode::MessageNotFound, ErrorReason::ImapMessageNotFound)
+            }
+            Error::Transport => (ErrorCode::ProviderUnavailable, ErrorReason::ImapTransport),
+            Error::Eof => (
+                ErrorCode::ProviderUnavailable,
+                ErrorReason::ImapConnectionClosed,
+            ),
+            Error::Protocol => (
+                ErrorCode::ProviderUnavailable,
+                ErrorReason::ImapInvalidResponse,
+            ),
+            Error::UnsafeSelection => (
+                ErrorCode::ProviderUnavailable,
+                ErrorReason::ImapUnsafeSelection,
+            ),
+        };
+        Self {
+            message: error.to_string(),
+            ..Self::new(code).with_reason(reason)
+        }
     }
 }

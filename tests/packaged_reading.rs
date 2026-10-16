@@ -550,6 +550,7 @@ async fn read_adversarial_mime(executable: &str) {
             (BodyCase::PartsAtLimit, Ok(("ok", false))),
             (BodyCase::PartsOverLimit, Err("response_too_large")),
             (BodyCase::MalformedStructure, Err("provider_unavailable")),
+            (BodyCase::ParserPanic, Err("internal_error")),
             (BodyCase::ExcessiveNesting, Err("response_too_large")),
             (BodyCase::Base64Tail, Ok(("�Hello", true))),
             (BodyCase::QuotedPrintableTail, Ok(("�hello", true))),
@@ -580,6 +581,19 @@ async fn read_adversarial_mime(executable: &str) {
                 Err(code) => {
                     assert_eq!(response["error"]["code"], code, "{case:?}");
                     assert!(response.get("result").is_none());
+                    if matches!(case, BodyCase::ParserPanic) {
+                        assert_eq!(response["ok"], false);
+                        assert_eq!(response["error"]["reason"], "imap_parser_panic");
+                        assert_eq!(response["error"]["retryable"], false);
+                        assert!(
+                            uuid::Uuid::parse_str(response["request_id"].as_str().unwrap()).is_ok()
+                        );
+                        assert!(
+                            !response
+                                .to_string()
+                                .contains("fixture-private-parser-input")
+                        );
+                    }
                 }
             }
         }

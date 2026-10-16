@@ -47,6 +47,34 @@ fn machine_modes_reject_compact_diagnostics_before_initialization() {
     let _: Value = serde_json::from_slice(&output.stdout).unwrap();
 }
 
+#[cfg(unix)]
+#[test]
+fn failed_output_keeps_the_operation_error_and_reports_delivery_failure() {
+    let (reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    drop(reader);
+    let output = Command::new(MAILCTL)
+        .arg("--config")
+        .arg(missing_config())
+        .args(["--json", "--log-format", "json", "account", "list"])
+        .stdout(std::os::fd::OwnedFd::from(writer))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let events: Vec<Value> = String::from_utf8(output.stderr)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0]["event"], "operation_failed");
+    assert_eq!(events[0]["code"], "invalid_request");
+    assert_eq!(events[1]["event"], "operation_failed");
+    assert_eq!(events[1]["reason"], "output_write_failed");
+    assert_eq!(events[0]["request_id"], events[1]["request_id"]);
+    assert!(uuid::Uuid::parse_str(events[0]["request_id"].as_str().unwrap()).is_ok());
+}
+
 #[test]
 fn every_log_level_keeps_request_content_and_dependency_filters_out_of_diagnostics() {
     let secret = "fixture-secret\u{1b}]52;c;payload\u{7}\u{202e}";

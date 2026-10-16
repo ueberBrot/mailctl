@@ -72,6 +72,7 @@ pub enum DraftReply {
     ObservedCreated(tokio::sync::oneshot::Sender<()>),
     Rejected,
     Disconnect,
+    ParserPanic,
     Hold(Arc<AtomicUsize>),
 }
 
@@ -135,6 +136,7 @@ pub enum BodyCase {
     PartsAtLimit,
     PartsOverLimit,
     MalformedStructure,
+    ParserPanic,
     ExcessiveNesting,
     Base64Tail,
     QuotedPrintableTail,
@@ -807,6 +809,9 @@ async fn body_case(wire: &mut imap_support::Wire, mailbox: &str, case: BodyCase)
             // Body types must be strings, so this unquoted atom cannot decode.
             body = "(INVALID)".into();
         }
+        ParserPanic => {
+            body = "(UNKNOWN ((fixture-private-parser-input) INTERNALDATE NIL))".into();
+        }
         ExcessiveNesting => {
             // Exceed the independent protocol nesting guard even when the codec
             // admits structures within the configured MIME depth range.
@@ -817,7 +822,10 @@ async fn body_case(wire: &mut imap_support::Wire, mailbox: &str, case: BodyCase)
         _ => {}
     }
     let header_case = matches!(case, HeadersAtLimit | HeadersOverLimit);
-    let metadata_rejected = matches!(case, PartsOverLimit | MalformedStructure | ExcessiveNesting);
+    let metadata_rejected = matches!(
+        case,
+        PartsOverLimit | MalformedStructure | ParserPanic | ExcessiveNesting
+    );
     if header_case || metadata_rejected {
         body_metadata(wire, mailbox, &body, payload.len()).await;
     } else {
@@ -1085,6 +1093,13 @@ async fn append_draft(
             imap_support::write(wire, &format!("{tag} NO synthetic rejection\r\n")).await
         }
         DraftReply::Disconnect => return,
+        DraftReply::ParserPanic => {
+            imap_support::write(
+                wire,
+                "* 1 FETCH (UNKNOWN ((fixture-private-parser-input) INTERNALDATE NIL))\r\n",
+            )
+            .await;
+        }
         DraftReply::Hold(release) => {
             let mut byte = [0];
             loop {

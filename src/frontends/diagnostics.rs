@@ -155,6 +155,9 @@ pub(super) fn result(request_id: &str, error: Option<&Error>) {
         .unwrap_or_default();
     if let Some(error) = error {
         let code = serde_json::to_value(error.code).expect("error code serializes");
+        let reason = error
+            .reason
+            .map(|reason| serde_json::to_value(reason).expect("error reason serializes"));
         // Public errors can carry caller-controlled text. Only emit reviewed messages.
         let message = [
             Error::setup_required,
@@ -168,7 +171,7 @@ pub(super) fn result(request_id: &str, error: Option<&Error>) {
         .find(|known| known == error)
         .unwrap_or_else(|| Error::new(error.code))
         .message;
-        tracing::error!(target: TARGET, event = "operation_failed", request_id = request_id.as_str(), code = code.as_str().expect("error code is a string"), message = message.as_str());
+        tracing::error!(target: TARGET, event = "operation_failed", request_id = request_id.as_str(), code = code.as_str().expect("error code is a string"), reason = reason.as_ref().and_then(serde_json::Value::as_str), message = message.as_str());
     } else {
         tracing::info!(target: TARGET, event = "operation_completed", request_id = request_id.as_str());
     }
@@ -207,6 +210,7 @@ mod tests {
             tracing::debug!(target: "parser", payload = ?Private);
             tracing::trace!(target: "transport", payload = ?Private);
             let mut error = Error::new(ErrorCode::ProviderUnavailable);
+            error.reason = Some(crate::domain::ErrorReason::ImapInvalidResponse);
             error.message = "fixture-private-secret\u{1b}]52;c;private\u{7}".repeat(4096);
             result("untrusted-request-secret", Some(&error));
             let _ = std::panic::catch_unwind(|| panic!("fixture-private-panic\u{202e}"));
@@ -235,6 +239,7 @@ mod tests {
                 .collect();
             assert_eq!(events.len(), 2);
             assert_eq!(events[0]["code"], "provider_unavailable");
+            assert_eq!(events[0]["reason"], "imap_invalid_response");
             assert_eq!(events[1]["event"], "panic");
             assert!(uuid::Uuid::parse_str(events[1]["event_id"].as_str().unwrap()).is_ok());
         }

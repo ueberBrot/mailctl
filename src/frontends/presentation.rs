@@ -209,13 +209,22 @@ fn continuation(output: &mut String, complete: bool, cursor: Option<&str>) {
     }
 }
 
-pub(super) fn human_error(error: &Error) -> Result<String, serde_json::Error> {
+pub(super) fn human_error(error: &Error, request_id: &str) -> Result<String, serde_json::Error> {
     let code = serde_json::to_value(error.code)?;
     let mut output = format!(
         "Error ({}): {}",
         code.as_str().expect("error code"),
         label(&error.message)
     );
+    if let Some(reason) = error.reason {
+        let reason = serde_json::to_value(reason)?;
+        let _ = write!(
+            output,
+            "\nReason: {}",
+            reason.as_str().expect("error reason")
+        );
+    }
+    let _ = write!(output, "\nRequest ID: {}", label(request_id));
     if let Some(operation) = &error.draft_operation {
         let _ = write!(
             output,
@@ -341,6 +350,17 @@ fn skip_string(characters: &mut std::iter::Peekable<std::str::Chars<'_>>, osc: b
 mod tests {
     use super::*;
     use crate::domain::{BodyText, MessageBody};
+
+    #[test]
+    fn human_errors_include_safe_bug_report_identifiers() {
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let error = Error::new(crate::domain::ErrorCode::InternalError)
+            .with_reason(crate::domain::ErrorReason::ResultSerializationFailed);
+        let rendered = human_error(&error, &request_id).unwrap();
+        assert!(rendered.contains("Error (internal_error):"));
+        assert!(rendered.contains("Reason: result_serialization_failed"));
+        assert!(rendered.contains(&format!("Request ID: {request_id}")));
+    }
 
     fn message(text: &str) -> OperationResult {
         OperationResult::Message(MessageBody {
