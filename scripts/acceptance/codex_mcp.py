@@ -156,6 +156,8 @@ def transport_summary(path):
             "unanswered_requests": len(pending), "responses": intervals}
 
 
+WORKFLOW_PROTOCOL = "scheduling-explanation-v1"
+
 WORKFLOW = """You are a fresh consuming application evaluating public mailctl documentation.
 Only use the connected mail_a and mail_b tools/resources and the public material below.
 All connected accounts/data are synthetic, locally provisioned by the operator. Do not
@@ -169,6 +171,9 @@ for the discovered synthetic-blue account concurrently in one parallel tool batc
 using distinct limit values 1, 2, 3, 4, 5, 6 for the six calls.
 Repeat this probe on mail_b. Do not intentionally serialize or stagger a probe.
 Report all outcomes, then continue the workflow even if some probes were refused.
+Using the probe results and public material, explain how you would schedule
+independent reads for a larger task. State which concurrency limits you can
+determine, which you cannot, and how you would respond to refusals.
 
 Find the INBOX synthetic message in synthetic-blue. Read its entire selected text
 through mail_a using a 32-byte page budget. Record its exact assembled text and the
@@ -551,6 +556,8 @@ def main():
     if digest(binary) != digest(selected_binary):
         raise RuntimeError("selected executable changed while taking the acceptance snapshot")
     provenance = {"qualification": args.provenance, "candidate_commit": args.candidate_commit,
+                  "workflow_protocol": WORKFLOW_PROTOCOL,
+                  "workflow_sha256": hashlib.sha256(WORKFLOW.encode()).hexdigest(),
                   "mcp_sha256": digest(binary), "codex_sha256": digest(args.codex),
                   "selected_mcp_path": str(selected_binary),
                   "readme_sha256": digest(readme),
