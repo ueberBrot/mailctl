@@ -596,6 +596,18 @@ fn normalize(
                         depth = depth.checked_sub(1).ok_or(Error::Protocol)?;
                     }
                     TokenKind::Atom if depth == 1 => {
+                        if token.data.eq_ignore_ascii_case(b"INTERNALDATE") {
+                            let date = scanner.next()?.ok_or(Error::Protocol)?;
+                            // imap-proto accepts nstring here and unwraps NIL.
+                            // RFC 3501 requires a quoted date-time instead.
+                            if !matches!(date.kind, TokenKind::Quoted { escaped: false })
+                                || !date.data.is_ascii()
+                            {
+                                return Err(Error::Protocol);
+                            }
+                            attr = b"INTERNALDATE";
+                            continue;
+                        }
                         if token.data.eq_ignore_ascii_case(b"BODY")
                             && frame.get(token.end) == Some(&b'[')
                         {
@@ -656,11 +668,6 @@ fn normalize(
                             attr = b"BODY[]";
                         } else {
                             attr = token.data;
-                        }
-                    }
-                    TokenKind::Quoted { escaped } if attr.eq_ignore_ascii_case(b"INTERNALDATE") => {
-                        if escaped {
-                            return Err(Error::Protocol);
                         }
                     }
                     TokenKind::Quoted { .. } | TokenKind::Literal => {
@@ -1061,6 +1068,20 @@ mod tests {
             list(b"* LIST () \"/\" \"bad\\q\"\r\n").await,
             Err(Error::Protocol)
         );
+    }
+    #[tokio::test]
+    async fn internal_date_requires_a_quoted_value_before_client_decoding() {
+        for input in [
+            b"* 1 FETCH (UID 4 INTERNALDATE NIL)\r\n".as_slice(),
+            b"* 1 FETCH (UID 4 INTERNALDATE NILjunk)\r\n",
+            b"* 1 FETCH (UID 4 INTERNALDATE {3}\r\nNIL)\r\n",
+            b"* 1 FETCH (UID 4 INTERNALDATE \"bad\\\\date\")\r\n",
+        ] {
+            assert_eq!(
+                rejected(input, Limits::default(), FrameContract::Metadata).await,
+                Error::Protocol
+            );
+        }
     }
     async fn rejected(input: &[u8], limits: Limits, contract: FrameContract) -> Error {
         let (wire, control) =
