@@ -68,7 +68,8 @@ Use `--components cli` or `--components mcp` for a requested partial removal.
 Pass the original `--install-dir` for a custom destination.
 Updates and removal preserve account configuration, credentials, and draft history.
 Draft history uses `drafts.sqlite` in the configured state directory.
-The installer preserves this SQLite database; no separate database server is installed.
+The installer preserves this SQLite database.
+The executables need no separate database server.
 Report the removed components and any remaining components.
 
 ## Guide requested account setup
