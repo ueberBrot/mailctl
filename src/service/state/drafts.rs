@@ -106,10 +106,11 @@ impl Recovery {
 }
 
 /// Installation-aware journal access owns the durable response to corrupt history.
-/// Callers retain their account-writer or exclusive maintenance lease throughout.
 pub(in crate::service) struct DraftHistory {
     directory: PathBuf,
+    // Field order closes SQLite before releasing either lease, including on unwind.
     journal: DraftJournal,
+    _writer: Option<File>,
     _lease: Option<std::sync::Arc<Lease>>,
 }
 impl DraftHistory {
@@ -141,8 +142,13 @@ impl DraftHistory {
         Ok(Self {
             directory: directory.to_owned(),
             journal,
+            _writer: None,
             _lease: None,
         })
+    }
+    pub(in crate::service) fn with_writer(mut self, writer: Option<File>) -> Self {
+        self._writer = writer;
+        self
     }
     pub(in crate::service) fn access<T>(
         &mut self,
