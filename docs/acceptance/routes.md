@@ -2,8 +2,8 @@
 
 This record supports [#18](https://github.com/ueberBrot/mailctl/issues/18) and
 [#24](https://github.com/ueberBrot/mailctl/issues/24). It describes the routes and
-test oracles in main `6732bd066fa067656e0ed88a9a240d257a54d1c8`, source tree
-`f62048a4804455b44cb40201d7e84d0a64ad20e8`. It does not qualify a release by itself.
+test oracles audited in main `744ad89386610465b487686533d1d1c5b32c061d`, source tree
+`c9a09e015a4beca1ff5b2c368a2af5a4c0913017`. It does not qualify a release by itself.
 See [Operations](../operations.md) for the operator procedures and profile matrix.
 
 ## Platform and components
@@ -63,10 +63,11 @@ instrumented parser counter, not CPU instructions. KiB/MiB use powers of 1024.
 
 ## Retained packaged evidence
 
-The [PR #72 candidate audit](https://github.com/ueberBrot/mailctl/pull/72) records build
-commit `703bf93eb6384e7c1c6d4170f3a329c0d19908bf`, with the same source tree as
+The [PR #73 candidate audit](https://github.com/ueberBrot/mailctl/issues/24#issuecomment-6209304368)
+records build commit `52189ca06c1a5085a9d6ad1d41d85fc154c1b096`, with the same source tree as
 the main commit above. Its `mailctl-candidate-aarch64-apple-darwin` artifact retains
-the build/acceptance records, installer manifest, binaries and checksummed logs.
+the build/acceptance records, installer manifest, binaries and checksummed logs:
+[artifact 11991697237](https://github.com/ueberBrot/mailctl/actions/runs/38770249651/artifacts/11991697237).
 Later candidate bytes still need their own matching evidence.
 
 | Installed selection | Packaged reading checks passed | Packaged draft checks passed |
@@ -81,32 +82,42 @@ disposable Apple Keychain entry. They do not establish live-provider behavior.
 Retained SHA-256 values identify the exact candidate and suite logs:
 
 ```text
-44b2362e41e35129fb55c15bf1f5b44a9785d0583066654bc5ecf7a5f3b3108f  mailctl-aarch64-apple-darwin.tar.gz
+8d8ae93b6f15a28ded68225e8e2c5e9958ec7a04cf1f41c70071b1291f1ba736  mailctl-aarch64-apple-darwin.tar.gz
 e6dd52553692ee67a252ffa251ce2f1d172cf756bf42876cb97a04fd03538b1f  mailctl
 87cfdb6af2cd8b92208c825ffe4835e7f1b371d78b778184efcc69660c258c52  mailctl-mcp
-e6a7118ed55e07d1be2c6e745e9062d23bfbbf8e9ab2f5d32be3755f79757558  installed-reading-cli-acceptance.log
-f46fa493d191212b27045edc6f35d73ff453a1545540f3b43fe3bed95d2af5cd  installed-reading-mcp-acceptance.log
-c1b286c593c64283c742effa05b36e16c955a173931fbf7adde2ddb91926bd96  installed-reading-cli-mcp-acceptance.log
-c3dfb9a5fd1c2563bba582e492504aa285d5c244136feee5d3e7fbabaf57ab49  installed-drafts-cli-acceptance.log
-cfb238db4288fc89fa2b0389df6a85327acb8ef80739cecc1fd03da3f568524b  installed-drafts-mcp-acceptance.log
-3639ab9b9385ae1c5bc4f65ab374a0c157c8f3d0c2db619f3e9c3c28af6b641b  installed-drafts-cli-mcp-acceptance.log
+54eafe2c76bed0189f9de215add54c67faaaa97771b3bd6649a807727e10d71a  installed-reading-cli-acceptance.log
+dae4943b98f40c5e9607e8f5bfa97159145d63f1c5e9e14c380b539a98621318  installed-reading-mcp-acceptance.log
+62a01958c50e30af4df92c4e77ef6da3f0cb3a8bf3bc60e2823fd43dd0438f3d  installed-reading-cli-mcp-acceptance.log
+508654654cfe2f36be8a448f80f94fd4876d6874984d1798ec978f892de99353  installed-drafts-cli-acceptance.log
+8e67cad0dd7fea037841b2e493e9a233c99547108ab37fe167c68244b2cd7bbf  installed-drafts-mcp-acceptance.log
+32d494edff12522bc7b77c261fe419c1cdba06fa1e600113fc21c8adbd34e9b4  installed-drafts-cli-mcp-acceptance.log
 ```
 
 The accepted IONOS baseline in [#43](https://github.com/ueberBrot/mailctl/issues/43)
 and [#50](https://github.com/ueberBrot/mailctl/issues/50) remains completed. The
-final affected packaged IONOS refresh remains pending within the existing approved
-scope. Genuine uncertain-draft fault cases require an approved disposable account;
-ordinary-account authorization does not cover induced faults. Final packaged
-actual-client and fresh-agent acceptance also remains pending under the
-[Codex procedure](codex-mcp.md), after the candidate
-README is final. None of this evidence authorizes publication or completes those
-remaining gates.
+affected ordinary packaged IONOS refresh passed on October 16 within the approved
+scope. The current audit records matching CLI/MCP body continuation/version and
+attachment/export bytes, two new acknowledged unsent drafts, retries/status/
+conflict/permission checks, and independent content/flag/exactly-one observations.
+The entire two-message INBOX remained unchanged. The operator subsequently
+reported deleting the test drafts; their historical receipts and observations
+remain valid, and cleanup does not authorize recreating them.
+
+Genuine uncertain-draft fault cases remain unqualified and require an approved
+disposable account, which is unavailable. Ordinary-account authorization does
+not cover induced faults. The October 16 Codex CLI 0.163.0 archive-recovery run
+passed both mechanical profiles against these MCP and README bytes. Its complete
+private archive is retained. Both fresh answers still omit part of the required
+capacity explanation, so actual-client/fresh-agent criterion 7 remains incomplete
+under the [Codex procedure](codex-mcp.md). None of this evidence authorizes
+publication or completes those remaining gates.
 
 ## Release-note review
 
-The first release remains unreleased. Review the regenerated release-plz candidate
-for compatibility and migration text, including the required
-`body.representation_version` field and strict response-schema regeneration.
+The first release remains unreleased. [Preparation PR #54](https://github.com/ueberBrot/mailctl/pull/54),
+head `47dc66b42919efe4ff06bc99a05859673de3c613`, was reviewed for version 0.1.0,
+the qualified platform scope and compatibility/migration text, including the
+required `body.representation_version` field and strict response-schema regeneration.
 [release-plz.toml](../../release-plz.toml) retains that migration in its curated
 initial-release template. Keep the preparation PR open while the candidate changes;
 version changes, merging the release PR, tags, and publication are separate work.
