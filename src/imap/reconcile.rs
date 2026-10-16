@@ -41,8 +41,8 @@ impl AuthenticatedConnection {
                     let uids = connection
                         .search(
                             vec![
-                                SearchTerm::Atom(format!("UID {first}:{last}")),
-                                SearchTerm::Text("HEADER Message-ID", expected.message_id.clone()),
+                                SearchTerm::Atom(format!("UID {first}:{last}").into()),
+                                SearchTerm::Text("HEADER Message-ID", &expected.message_id),
                             ],
                             false,
                         )

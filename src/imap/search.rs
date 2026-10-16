@@ -8,6 +8,7 @@ use crate::{
     domain::{Error, ErrorCode, SearchCriteria},
     search::{LocatedMessage, SearchBatch, SearchRequest, SelectedMailbox, page},
 };
+use std::fmt::Write;
 
 impl AuthenticatedConnection {
     pub async fn search(
@@ -59,13 +60,12 @@ impl SelectedMailbox for Selection<'_, '_> {
         last: u32,
         criteria: &SearchCriteria,
     ) -> Result<Vec<u32>, Error> {
-        let mut keys = vec![SearchTerm::Atom(format!("UID {first}:{last}"))];
+        let mut keys = vec![SearchTerm::Atom(format!("UID {first}:{last}").into())];
         let mut utf8 = false;
         for predicate in criteria.predicates() {
             keys.push(search_key(predicate, &mut utf8));
         }
-        let uids = self.connection.search(keys, utf8).await?;
-        Ok(uids)
+        Ok(self.connection.search(keys, utf8).await?)
     }
     async fn fetch(&mut self, uids: &[u32]) -> Result<Vec<LocatedMessage>, Error> {
         if uids.is_empty() || uids.contains(&0) {
@@ -74,11 +74,13 @@ impl SelectedMailbox for Selection<'_, '_> {
         let mut uids = uids.to_vec();
         uids.sort_unstable();
         uids.dedup();
-        let set = uids
-            .iter()
-            .map(u32::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
+        let mut set = String::with_capacity(uids.len() * 11);
+        for uid in &uids {
+            if !set.is_empty() {
+                set.push(',');
+            }
+            write!(set, "{uid}").expect("writing a UID to a String");
+        }
         let rows = self
             .connection
             .request(
@@ -100,14 +102,17 @@ impl SelectedMailbox for Selection<'_, '_> {
     }
 }
 
-fn search_key(predicate: &crate::domain::SearchPredicate, utf8: &mut bool) -> SearchTerm {
+fn search_key<'a>(
+    predicate: &'a crate::domain::SearchPredicate,
+    utf8: &mut bool,
+) -> SearchTerm<'a> {
     use crate::domain::{SearchPredicate::*, StandardFlag};
     let date = |keyword: &str, value: &crate::domain::SearchDate| {
-        SearchTerm::Atom(format!("{keyword} {}", value.date().format("%d-%b-%Y")))
+        SearchTerm::Atom(format!("{keyword} {}", value.date().format("%d-%b-%Y")).into())
     };
-    let mut text = |keyword, value: &String| {
+    let mut text = |keyword, value: &'a str| {
         *utf8 |= !value.is_ascii();
-        SearchTerm::Text(keyword, value.clone())
+        SearchTerm::Text(keyword, value)
     };
     match predicate {
         ReceivedAfter { date: value } => date("SINCE", value),

@@ -6,7 +6,7 @@ use super::{
     projection::Projection,
 };
 use imap_proto::{Capability, MailboxDatum, Outcome, Response, ResponseCode, Status};
-use std::{collections::BTreeSet, fmt, io, sync::Arc};
+use std::{borrow::Cow, collections::BTreeSet, fmt, io, sync::Arc};
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
@@ -120,9 +120,9 @@ impl Kind {
         }
     }
 }
-pub(super) enum SearchTerm {
-    Atom(String),
-    Text(&'static str, String),
+pub(super) enum SearchTerm<'a> {
+    Atom(Cow<'a, str>),
+    Text(&'static str, &'a str),
 }
 impl<'a> Connection<'a> {
     pub(super) fn into_session(self) -> Session {
@@ -495,7 +495,7 @@ impl<'a> Connection<'a> {
     }
     pub(super) async fn search(
         &mut self,
-        terms: Vec<SearchTerm>,
+        terms: Vec<SearchTerm<'_>>,
         utf8: bool,
     ) -> Result<Vec<u32>, Error> {
         self.prepare(FrameContract::Other);
@@ -513,7 +513,7 @@ impl<'a> Connection<'a> {
                     pending.push_str(key);
                     pending.push(' ');
                     if value.bytes().all(|byte| (32..=126).contains(&byte)) {
-                        pending.push_str(&quote(&value)?);
+                        pending.push_str(&quote(value)?);
                     } else {
                         pending.push_str(&format!("{{{}}}\r\n", value.len()));
                         command_bytes = command_bytes
