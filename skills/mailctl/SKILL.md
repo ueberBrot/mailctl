@@ -67,7 +67,8 @@ The installed guides and schemas are the authority for inputs and recovery:
 - For failures, read `mailctl guide errors` or `mailctl://guide/errors`.
   Retry transient reads only within a bounded attempt count and delay, according to `retryable`.
   If access or credentials prevent the task, report the blocker for operator action.
-  Draft uncertainty follows the draft reference, including after a timeout or interrupted call.
+  For uncertain draft saves, follow [Draft creation and recovery](references/drafts.md).
+  Use that procedure after a timeout or interrupted call.
 
 Use `mailctl schema <operation>` and command `--help` for exact inputs, such as `schema search_messages`.
 With MCP, inspect the tool's `inputSchema`.

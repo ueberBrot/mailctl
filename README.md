@@ -62,6 +62,24 @@ The executables share application state for all component selections.
 For an MCP-only installation, use `mailctl-mcp` for the setup, credential, and doctor
 commands below.
 
+## Install the agent skill
+
+The [mailctl skill](skills/mailctl/SKILL.md) guides agents through CLI and MCP usage.
+Install and configure mailctl before using the skill. From your agent's project,
+install it with [skills.sh](https://skills.sh/docs):
+
+```sh
+npx skills add ueberBrot/mailctl --skill mailctl
+```
+
+Select your agent when prompted. To select Codex or Claude Code directly, add
+`--agent codex` or `--agent claude-code`. The command installs into the current
+project. Add `--global` to make the skill available across projects.
+
+For other compatible skill loaders, use the complete `skills/mailctl` directory.
+It contains standard `SKILL.md` frontmatter and a relative reference for draft
+recovery. Keep the `references` directory beside `SKILL.md`.
+
 ## Set up an account on macOS
 
 Run setup and credential commands in an operator terminal before the agent starts.
