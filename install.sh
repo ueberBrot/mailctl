@@ -67,7 +67,7 @@ Darwin:arm64 | Darwin:aarch64) target=aarch64-apple-darwin ;;
 *) fail 'This installer currently supports macOS Apple Silicon only.' ;;
 esac
 if [ "$mode" = install ]; then
-	printf '%s\n' "$version" | awk '/^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/ {ok=1} END {exit !ok}' || fail 'Specify --version with a stable release version.'
+	printf '%s\n' "$version" | awk '/^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/ {ok=1} END {exit !(NR == 1 && ok)}' || fail 'Specify --version with a stable release version.'
 	[ -n "$base_url" ] || base_url="https://github.com/ueberBrot/mailctl/releases/download/v$version"
 	# HTTP is restricted to local fixture servers, including redirects.
 	case "$base_url" in
@@ -80,7 +80,7 @@ if [ "$mode" = install ]; then
 		;;
 	*) fail 'Downloads require HTTPS (or HTTP on 127.0.0.1 for local tests).' ;;
 	esac
-	printf '%s\n' "$base_url" | awk '/^[[:graph:]]+$/ && !/@/ {ok=1} END {exit !ok}' || fail 'Invalid download URL.'
+	printf '%s\n' "$base_url" | awk '/^[[:graph:]]+$/ && !/@/ {ok=1} END {exit !(NR == 1 && ok)}' || fail 'Invalid download URL.'
 fi
 if [ -z "$install_dir" ]; then
 	if [ -n "${CARGO_HOME:-}" ]; then
@@ -209,6 +209,12 @@ for c in cli mcp; do
 done
 printf 'format=1\ntarget=%s\ncompatibility=1\n' "$target" >"$lock/after"
 if [ "$mode" = install ]; then
+	if [ -z "$config" ] && [ -n "${HOME:-}" ]; then config="$HOME/Library/Preferences/org.ueberbrot.mailctl/config.toml"; fi
+	# Reject invalid paths before downloads; recheck before state verification.
+	if [ "$explicit_config" -eq 1 ] || { [ -n "$config" ] && [ -e "$config" ]; }; then
+		case "$config" in /*) ;; *) fail '--config must be absolute.' ;; esac
+		regular "$config" || fail 'Configuration is missing or not a regular file.'
+	fi
 	download() {
 		curl --fail --silent --show-error --location --max-redirs 5 \
 			--connect-timeout 10 --max-time 180 --proto "$protocol" --proto-redir '=https' \
@@ -233,6 +239,11 @@ if [ "$mode" = install ]; then
 	[ "$(value "$manifest" version)" = "$version" ] && [ "$(value "$manifest" target)" = "$target" ] || fail 'Candidate version or target does not match the request.'
 	commit=$(value "$manifest" commit)
 	for c in cli mcp; do
+		if ! selected "$c" && [ -n "$(value "$lock/before" "${c}_version")" ]; then
+			[ "$(value "$lock/before" "${c}_version")" = "$version" ] && [ "$(value "$lock/before" "${c}_commit")" = "$commit" ] || fail 'Component versions or source commits differ; update both components together.'
+		fi
+	done
+	for c in cli mcp; do
 		binary=$(name "$c")
 		if selected "$c"; then
 			filename="$binary-v$version-$target"
@@ -246,11 +257,9 @@ if [ "$mode" = install ]; then
 			[ "$("./$staged" --version)" = "$binary $version" ] || fail "Candidate $binary reports a different version."
 			printf '%s_version=%s\n%s_commit=%s\n%s_sha256=%s\n%s_origin=%s\n' "$c" "$version" "$c" "$commit" "$c" "$checksum" "$c" "$base_url" >>"$lock/after"
 		elif [ -n "$(value "$lock/before" "${c}_version")" ]; then
-			[ "$(value "$lock/before" "${c}_version")" = "$version" ] && [ "$(value "$lock/before" "${c}_commit")" = "$commit" ] || fail 'Component versions or source commits differ; update both components together.'
 			awk -v prefix="${c}_" 'index($0,prefix)==1' "$lock/before" >>"$lock/after"
 		fi
 	done
-	if [ -z "$config" ] && [ -n "${HOME:-}" ]; then config="$HOME/Library/Preferences/org.ueberbrot.mailctl/config.toml"; fi
 	if [ "$explicit_config" -eq 1 ] || { [ -n "$config" ] && [ -e "$config" ]; }; then
 		case "$config" in /*) ;; *) fail '--config must be absolute.' ;; esac
 		regular "$config" || fail 'Configuration is missing or not a regular file.'

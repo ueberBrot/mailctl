@@ -87,7 +87,8 @@ class DownloadServer:
         self.http = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.http.daemon_threads = True
         self.url = f"http://127.0.0.1:{self.http.server_port}"
-        self.thread = threading.Thread(target=self.http.serve_forever, daemon=True)
+        self.thread = threading.Thread(target=self.http.serve_forever,
+                                       kwargs={"poll_interval": 0.05}, daemon=True)
         self.thread.start()
 
     def close(self):
@@ -288,6 +289,26 @@ class InstallerTest(unittest.TestCase):
         self.assertFalse((self.bin / "mailctl-mcp").exists())
         self.assertEqual(sentinel.read_bytes(), b"opaque installation history\n")
 
+    def test_invalid_configuration_paths_are_rejected_before_download(self):
+        self.successful(self.command())
+        before = tree_bytes(self.bin)
+        configuration = self.directory / "operator configuration"
+        configuration.mkdir()
+        regular = configuration / "config.toml"
+        regular.write_text("fixture configuration\n")
+        linked = configuration / "linked.toml"
+        linked.symlink_to(regular)
+        dangling = configuration / "dangling.toml"
+        dangling.symlink_to(configuration / "missing.toml")
+        for path in (configuration / "missing.toml", Path("relative-config.toml"),
+                     configuration, linked, dangling):
+            with self.subTest(config=path):
+                self.server.requests.clear()
+                result = self.command("--config", path)
+                self.failed(result)
+                self.assertEqual(tree_bytes(self.bin), before)
+                self.assertEqual(self.server.requests, [])
+
     def test_checksum_size_missing_download_and_manifest_failures_are_atomic(self):
         self.successful(self.command())
         before = tree_bytes(self.bin)
@@ -316,12 +337,17 @@ class InstallerTest(unittest.TestCase):
     def test_partial_upgrade_rejects_mixed_versions_or_commits(self):
         self.successful(self.command())
         before = tree_bytes(self.bin)
-        self.publish_fixture("0.2.0", commit="b" * 40)
-        self.failed(self.command("--components", "cli", version="0.2.0"))
-        self.assertEqual(tree_bytes(self.bin), before)
-        self.publish_fixture("0.1.0", commit="b" * 40)
-        self.failed(self.command("--components", "mcp"))
-        self.assertEqual(tree_bytes(self.bin), before)
+        for version in ("0.2.0", "0.1.0"):
+            self.publish_fixture(version, commit="b" * 40)
+            for selected in ("cli", "mcp"):
+                with self.subTest(version=version, components=selected):
+                    self.server.requests.clear()
+                    result = self.command("--components", selected, version=version)
+                    self.failed(result)
+                    self.assertIn("Component versions or source commits differ", result.stderr)
+                    self.assertEqual(tree_bytes(self.bin), before)
+                    self.assertEqual(self.server.requests,
+                                     [f"/manifest-v{version}-{TARGET}.txt"])
         self.successful(self.command(version="0.2.0"))
         self.version = "0.2.0"
         self.installed({"cli", "mcp"})
@@ -422,7 +448,18 @@ class InstallerTest(unittest.TestCase):
                           ("--version", "../../0.1.0")):
             with self.subTest(arguments=arguments):
                 self.failed(self.command(*arguments))
-                self.assertFalse((self.bin / "mailctl").exists())
+                self.assertFalse(self.bin.exists())
+                self.assertEqual(self.server.requests, [])
+        for option, value, error in (
+                ("--version", self.version, "Specify --version with a stable release version."),
+                ("--base-url", self.server.url + "/releases", "Invalid download URL.")):
+            for suffix in ("\ninvalid", "\n"):
+                with self.subTest(option=option, suffix=suffix):
+                    result = self.command(option, value + suffix)
+                    self.failed(result)
+                    self.assertIn(error, result.stderr)
+                    self.assertFalse(self.bin.exists())
+                    self.assertEqual(self.server.requests, [])
 
     def test_unsupported_platform_is_rejected_before_download_or_install(self):
         (self.tools / "uname").write_text("#!/bin/sh\necho unsupported\n")
