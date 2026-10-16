@@ -10,35 +10,36 @@ Model Context Protocol (MCP). Install both or use either on its own.
 ## Install
 
 The standalone installer supports macOS on Apple Silicon. It does not require Rust.
-Version 0.1.0 is not published yet. Until it is available, [build from source](#build-from-source).
 
-Download the installer:
+Set `VERSION` to the release that you want.
+Download the installer into your current folder as `mailctl-install.sh`:
 
 ```sh
+VERSION=0.1.0
 curl --fail --location --proto '=https' --proto-redir '=https' \
-  --output install-v0.1.0.sh \
-  https://github.com/ueberBrot/mailctl/releases/download/v0.1.0/install-v0.1.0.sh
+  --output mailctl-install.sh \
+  "https://github.com/ueberBrot/mailctl/releases/download/v${VERSION}/install-v${VERSION}.sh"
 ```
 
 Choose one installation. For both CLI and MCP:
 
 ```sh
-sh install-v0.1.0.sh --version 0.1.0
+sh ./mailctl-install.sh --version "$VERSION"
 ```
 
 For CLI only:
 
 ```sh
-sh install-v0.1.0.sh --version 0.1.0 --components cli
+sh ./mailctl-install.sh --version "$VERSION" --components cli
 ```
 
 For MCP only:
 
 ```sh
-sh install-v0.1.0.sh --version 0.1.0 --components mcp
+sh ./mailctl-install.sh --version "$VERSION" --components mcp
 ```
 
-Executables go into `~/.cargo/bin`, or `CARGO_HOME/bin` when `CARGO_HOME` is nonempty.
+Executables go into `~/.cargo/bin`, or `$CARGO_HOME/bin` when `CARGO_HOME` is nonempty.
 Add that directory to your `PATH`. Use `--install-dir /absolute/path/to/bin` for a different destination.
 
 ## Connect your account
@@ -93,15 +94,59 @@ mailctl guide drafts
 
 ## Use MCP with your agent
 
-Add a STDIO server to your agent's MCP configuration.
-Use the installed executable's absolute path:
+Merge the example into your agent's global or project MCP configuration.
+Replace `/absolute/path/to/mailctl-mcp` with the path from `command -v mailctl-mcp`.
+Project paths are relative to your project folder.
+
+<details>
+<summary>Claude Code</summary>
+
+Global: `~/.claude.json`. Project: `.mcp.json`. [Docs](https://code.claude.com/docs/en/mcp#mcp-installation-scopes).
 
 ```json
 {
-  "command": "/absolute/path/to/mailctl-mcp",
-  "args": ["--account", "work"]
+  "mcpServers": {
+    "mailctl": {
+      "type": "stdio",
+      "command": "/absolute/path/to/mailctl-mcp",
+      "args": ["--account", "work"]
+    }
+  }
 }
 ```
+
+</details>
+
+<details>
+<summary>Codex</summary>
+
+Global: `~/.codex/config.toml`. Project: `.codex/config.toml`. [Docs](https://developers.openai.com/codex/mcp#configure-with-configtoml).
+
+```toml
+[mcp_servers.mailctl]
+command = "/absolute/path/to/mailctl-mcp"
+args = ["--account", "work"]
+```
+
+</details>
+
+<details>
+<summary>Pi 1.0+</summary>
+
+Global: `~/.pi/agent/mcp.json`. Project: `.pi/mcp.json`. [Docs](https://pi.dev/docs/latest/mcp#configure-servers).
+
+```json
+{
+  "mcpServers": {
+    "mailctl": {
+      "command": "/absolute/path/to/mailctl-mcp",
+      "args": ["--account", "work"]
+    }
+  }
+}
+```
+
+</details>
 
 Set up credentials before starting the server. MCP never prompts for passwords.
 Start with `email_capabilities` and `email_list_accounts`. The server provides
@@ -151,18 +196,23 @@ Use `mailctl guide drafts` for status and reconciliation.
 ## Update or remove
 
 Before updating, stop the CLI commands and MCP servers that use the installation.
-Download the new version's installer and repeat the matching installation command.
+Set `VERSION` to the new release and repeat the installation steps above.
 Update both components together when both are installed. For a custom configuration,
 pass `--config /absolute/path/to/config.toml`.
 Use the same destination as the original installation.
 
-To remove both installer-owned executables:
+To remove both installer-owned executables, download the installer and run it:
 
 ```sh
-sh install-v0.1.0.sh --uninstall
+VERSION=0.1.0
+curl --fail --location --proto '=https' --proto-redir '=https' \
+  --output mailctl-install.sh \
+  "https://github.com/ueberBrot/mailctl/releases/download/v${VERSION}/install-v${VERSION}.sh"
+sh ./mailctl-install.sh --uninstall
 ```
 
 Add `--components cli` or `--components mcp` to remove only one.
+For a custom destination, add the original `--install-dir /absolute/path/to/bin`.
 Uninstalling preserves account configuration, credentials, and draft history.
 Use `mailctl state --help` for backups and recovery, or `mailctl-mcp state --help` for MCP-only installations.
 
