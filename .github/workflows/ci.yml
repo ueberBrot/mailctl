@@ -34,6 +34,8 @@ jobs:
         run: python3 tests/installer.py --suite fixtures
       - name: Check offline Codex acceptance fixtures
         run: python3 scripts/acceptance/test_codex_mcp.py
+      - name: Check offline release preparation and publication fixtures
+        run: python3 tests/release.py
 
   components:
     strategy:

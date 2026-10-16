@@ -106,6 +106,7 @@ Publication repeats all local and remote checks before its first mutation.
 It refuses existing tags, existing releases, and an earlier publication journal.
 It creates `refs/tags/vVERSION` through the GitHub API with the approved commit SHA.
 It creates a draft release with `gh release create --draft --verify-tag` and an explicit list of all 20 assets.
+It uploads known asset basenames from the candidate directory, so special characters in the plan path remain literal.
 It compares the remote asset names, sizes, upload states, and API SHA256 digests with the plan.
 Only after those comparisons pass does it run `gh release edit --draft=false`.
 

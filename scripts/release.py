@@ -96,10 +96,10 @@ def timestamp(value):
 class GitHub:
     """Keep all external commands at one auditable boundary."""
 
-    def call(self, args, *, data=None, output=None, absent_ok=False):
+    def call(self, args, *, data=None, output=None, absent_ok=False, cwd=None):
         env = dict(os.environ, GH_HOST="github.com", GH_PROMPT_DISABLED="1")
         result = subprocess.run(["gh", *args], input=data, stdout=output or subprocess.PIPE,
-                                stderr=subprocess.PIPE, env=env, check=False)
+                                stderr=subprocess.PIPE, env=env, cwd=cwd, check=False)
         if result.returncode:
             if absent_ok and b"(HTTP 404)" in result.stderr:
                 return None
@@ -414,7 +414,7 @@ def publish(gh, directory, approved):
     matches(remote_tag["object"], {"type": "commit", "sha": plan["commit"]}, "created tag")
     gh.call(["release", "create", tag, "--draft", "--verify-tag", "--repo", REPO,
              "--title", tag, "--notes-file", str(directory / "release-notes.md"),
-             *[str(directory / "candidate" / name) for name in sorted(plan["assets"])]])
+             *sorted(plan["assets"])], cwd=directory / "candidate")
     releases = [release for release in gh.pages("releases", None) if release["tag_name"] == tag]
     require(len(releases) == 1, "Expected exactly one draft release")
     release = releases[0]

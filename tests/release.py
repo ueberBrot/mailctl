@@ -216,10 +216,10 @@ class FakeGitHub(release.GitHub):
     def mutations(self):
         return [call for call in self.calls if call["args"][0] != "api" or call["args"][4] != "GET"]
 
-    def call(self, args, *, data=None, output=None, absent_ok=False):
-        self.calls.append(dict(args=list(args), data=data, output=output is not None, absent_ok=absent_ok))
+    def call(self, args, *, data=None, output=None, absent_ok=False, cwd=None):
+        self.calls.append(dict(args=list(args), data=data, output=output is not None, absent_ok=absent_ok, cwd=cwd))
         if args[0] == "release":
-            return self.release_command(args)
+            return self.release_command(args, cwd=cwd)
         if args[:4] != ["api", "--hostname", "github.com", "--method"]:
             raise AssertionError("Unexpected gh command: " + repr(args))
         method, endpoint = args[4:6]
@@ -283,7 +283,7 @@ class FakeGitHub(release.GitHub):
             raise AssertionError("Unexpected GET endpoint: " + endpoint)
         return release.canonical(value)
 
-    def release_command(self, args):
+    def release_command(self, args, *, cwd=None):
         if args[:2] == ["release", "create"]:
             prefix = ["release", "create", "v" + VERSION, "--draft", "--verify-tag", "--repo",
                       release.REPO, "--title", "v" + VERSION, "--notes-file"]
@@ -292,7 +292,10 @@ class FakeGitHub(release.GitHub):
             notes = Path(args[10])
             if notes.name != "release-notes.md" or not notes.is_file():
                 raise AssertionError("Missing explicit release notes")
-            assets = [Path(value) for value in args[11:]]
+            # gh treats '#' inside an asset argument as its label delimiter.
+            assets = [Path(value.split("#", 1)[0]) for value in args[11:]]
+            if cwd is not None:
+                assets = [Path(cwd) / path for path in assets]
             if {path.name for path in assets} != EXPECTED_CANDIDATE or len(assets) != 20:
                 raise AssertionError("Draft creation must name all 20 assets")
             self.draft = dict(id=RELEASE_ID, tag_name="v" + VERSION, draft=True,
@@ -634,10 +637,23 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(tag["args"], ["api", "--hostname", "github.com", "--method", "POST",
                                       release.BASE + "git/refs", "--input", "-"])
         self.assertEqual(json.loads(tag["data"]), {"ref": "refs/tags/v" + VERSION, "sha": COMMIT})
-        self.assertEqual(draft["args"][11:], [str(directory / "candidate" / name) for name in sorted(gh.candidate.files)])
+        self.assertEqual(draft["args"][11:], sorted(gh.candidate.files))
+        self.assertEqual(draft["cwd"], directory / "candidate")
         self.assertEqual(publish["args"], ["release", "edit", "v" + VERSION, "--draft=false", "--repo", release.REPO])
         self.assertFalse(gh.draft["draft"])
         self.assertTrue((directory / "publication-started.json").is_file())
+
+    def test_plan_directory_is_literal_when_gh_uploads_assets(self):
+        gh, original, digest = self.prepare()
+        directory = original.with_name("candidate [review]#approved")
+        original.rename(directory)
+        release.publish(gh, directory, digest)
+        uploaded = gh.mutations[1]
+        self.assertEqual(uploaded["cwd"], directory / "candidate")
+        self.assertEqual(uploaded["args"][11:], sorted(EXPECTED_CANDIDATE))
+        self.assertEqual(uploaded["args"][10], str(directory / "release-notes.md"))
+        self.assertEqual({asset["name"] for asset in gh.remote_assets}, EXPECTED_CANDIDATE)
+        self.assertFalse(gh.draft["draft"])
 
     def test_upload_failure_keeps_partial_draft_and_blocks_retry(self):
         gh, directory, digest = self.prepare()
