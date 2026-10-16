@@ -3,6 +3,7 @@
 Search and read email, retrieve attachments, and save unsent drafts from your
 terminal or AI agent. mailctl connects to IMAP accounts over TLS. It does not
 send email or edit existing drafts.
+Choose which accounts, mailboxes, and operations your agent can use.
 
 Use `mailctl` for the command-line interface (CLI) or `mailctl-mcp` for the
 Model Context Protocol (MCP). Install both or use either on its own.
@@ -52,44 +53,11 @@ mailctl --account work credential set
 mailctl --account work doctor --check-account --json
 ```
 
-Enter your password or app password at the credential prompt. macOS Keychain
-stores it. Account configuration contains a credential reference, not the password.
+Enter your password or app password at the credential prompt.
 The doctor command tests authentication. New accounts use TLS on port 993.
 
 For MCP-only installations, use `mailctl-mcp` for account, credential, and guide commands.
 Use `--config /absolute/path/to/config.toml` to select a custom configuration.
-
-## Read email with the CLI
-
-List the account's mailboxes:
-
-```sh
-mailctl --account work mailbox list --json
-```
-
-Copy a mailbox's `reference` from the result and search it:
-
-```sh
-mailctl message search --mailbox '<mailbox reference>' \
-  --criteria '[{"field":"subject","value":"invoice"}]' --limit 10 --json
-```
-
-Copy a message's `reference` from the search result and read its text:
-
-```sh
-mailctl message get --message '<message reference>' --max-bytes 8192 --json
-```
-
-Message text is in `result.body.text`. Results can span several pages.
-Use `mailctl guide reading` for continuation and completion rules.
-Scripts must inspect `ok` before using `result`. Failures return an `error` and a nonzero exit code.
-
-The built-in guides cover attachment downloads, exports, and draft creation:
-
-```sh
-mailctl guide attachments
-mailctl guide drafts
-```
 
 ## Use MCP with your agent
 
@@ -147,11 +115,9 @@ Global: `~/.pi/agent/mcp.json`. Project: `.pi/mcp.json`. [Docs](https://pi.dev/d
 
 </details>
 
-Set up credentials before starting the server. MCP never prompts for passwords.
-Start with `email_capabilities` and `email_list_accounts`. The server provides
-tools for mailbox discovery, search, message text, attachments, and unsent drafts.
-Guides are available at `mailctl://guide/overview`, with separate `reading`,
-`attachments`, `drafts`, and `errors` resources.
+Restart your agent after saving its configuration.
+Ask it to find invoices, summarize a thread, download an attachment, or prepare an unsent reply.
+The server includes tools and guides for reading email, attachments, and drafts.
 
 MCP is read-only by default. For drafts, configure a grant with draft permissions
 and add `--grant writer --use-configured-grant` to the server arguments.
@@ -171,13 +137,47 @@ Choose your agent when prompted, or add `--agent codex` or `--agent claude-code`
 Add `--global` to make the skill available across projects.
 Other compatible skill loaders can use the complete `skills/mailctl` directory.
 
-For example, ask your agent to find invoices, summarize a thread, download an
-attachment, or prepare an unsent reply. Enter account credentials in your terminal.
+The skill uses mailctl's CLI commands or MCP tools for the requested task.
+Enter account credentials in your own terminal.
+
+## Read email with the CLI
+
+List the account's mailboxes:
+
+```sh
+mailctl --account work mailbox list --json
+```
+
+Copy a mailbox's `reference` from the result and search it:
+
+```sh
+mailctl message search --mailbox '<mailbox reference>' \
+  --criteria '[{"field":"subject","value":"invoice"}]' --limit 10 --json
+```
+
+Copy a message's `reference` from the search result and read its text:
+
+```sh
+mailctl message get --message '<message reference>' --max-bytes 8192 --json
+```
+
+Message text is in `result.body.text`. Results can span several pages.
+Use `mailctl guide reading` for continuation and completion rules.
+Scripts must inspect `ok` before using `result`. Failures return an `error` and a nonzero exit code.
+
+The built-in guides cover attachment downloads, exports, and draft creation:
+
+```sh
+mailctl guide attachments
+mailctl guide drafts
+```
 
 ## Credentials and permissions
 
-Keep passwords outside prompts, command arguments, and account configuration.
-The standard setup stores them in macOS Keychain.
+The standard setup stores account passwords in macOS Keychain.
+Account configuration contains a reference to the saved credential.
+Keep passwords out of agent chat, command arguments, and account configuration.
+The MCP server never prompts for passwords or returns saved account passwords.
 For external command credential sources, their owner controls the storage and protection.
 
 An access grant defines the permitted accounts, mailboxes, and operations.
@@ -187,14 +187,6 @@ Inspect permissions with `mailctl capability show --json` or MCP `email_capabili
 Agents with separate shell or filesystem access retain their OS permissions.
 Optional [macOS isolation](deployment/macos-isolated/install.sh) uses a separate service identity.
 
-Draft access creates `drafts.sqlite` in the configured state directory (`state_dir`).
-SQLite is bundled with the executables and needs no database server.
-The database records draft operations to prevent duplicate creation on retries.
-Updates and removal preserve it.
-Keep each draft's original input and operation UUID, a unique operation identifier.
-After an interrupted save, inspect the same operation with `draft status` before retrying.
-Use `mailctl guide drafts` for status and reconciliation.
-
 ## Update or remove
 
 Before updating, stop the CLI commands and MCP servers that use the installation.
@@ -203,9 +195,7 @@ Without `--components`, the installer keeps your installed component selection.
 If both components are installed, it updates both together.
 Use `--components cli,mcp` to add a missing component.
 Use the original `--install-dir` for a custom destination.
-For a custom configuration, pass `--config /absolute/path/to/config.toml` so the installer can inspect its state.
-When a configuration is available, the installer checks state compatibility before replacing binaries.
-If that check fails, the installed binaries stay in place.
+For a custom configuration, also pass `--config /absolute/path/to/config.toml`.
 
 To remove the installed components:
 
@@ -216,8 +206,6 @@ curl --fail --location --proto '=https' --proto-redir '=https' https://github.co
 Add `--components cli` or `--components mcp` to remove only one.
 For a custom destination, add the original `--install-dir /absolute/path/to/bin`.
 Updates and removal preserve account configuration, credentials, and draft history.
-If the installer requires recovery, wait for its previous process to exit and rerun it with `--recover`.
-Use `mailctl state --help` for backups and recovery, or `mailctl-mcp state --help` for MCP-only installations.
 
 ## Build from source
 
@@ -232,4 +220,4 @@ For CLI only, add `--no-default-features --features cli` to the build command.
 For MCP only, use `--no-default-features --features mcp`.
 
 Use `mailctl --help`, `mailctl guide`, or `mailctl guide errors` for more help.
-See [CONTRIBUTING.md](CONTRIBUTING.md) for development and [LICENSE](LICENSE) for the ISC license.
+Released under the [ISC license](LICENSE).
