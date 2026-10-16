@@ -233,7 +233,11 @@ impl Drop for Installation {
     }
 }
 
-pub(crate) fn run_bounded(mut command: Command) -> Output {
+pub(crate) fn run_bounded(command: Command) -> Output {
+    run_bounded_with_timeout(command, Duration::from_secs(10))
+}
+
+pub(crate) fn run_bounded_with_timeout(mut command: Command, timeout: Duration) -> Output {
     let spawn_guard = COPY_OR_SPAWN.lock().expect("copy/spawn fixture lock");
     let mut child = command
         .stdin(Stdio::null())
@@ -247,7 +251,7 @@ pub(crate) fn run_bounded(mut command: Command) -> Output {
     let stdout = thread::spawn(move || read_pipe(stdout));
     let stderr = thread::spawn(move || read_pipe(stderr));
     let started = Instant::now();
-    let deadline = started + Duration::from_secs(10);
+    let deadline = started + timeout;
     let status = loop {
         if let Some(status) = child.try_wait().expect("inspect process")
             && stdout.is_finished()
