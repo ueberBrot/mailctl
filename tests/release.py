@@ -42,7 +42,7 @@ LOG_NAMES = {
 }
 EXPECTED_CANDIDATE = LOG_NAMES | {
     "SHA256SUMS", "acceptance-evidence.txt", "build-evidence.txt", "dist-manifest.json",
-    "install-v0.1.0.sh", "manifest-v0.1.0-aarch64-apple-darwin.txt",
+    "install.sh", "manifest-aarch64-apple-darwin.txt",
     "mailctl-aarch64-apple-darwin.tar.gz", "mailctl-aarch64-apple-darwin.tar.gz.sha256",
     "mailctl-v0.1.0-aarch64-apple-darwin", "mailctl-mcp-v0.1.0-aarch64-apple-darwin",
 }
@@ -86,8 +86,8 @@ class Candidate:
                             component + "_sha256": release.sha(self.binaries[binary]),
                             component + "_size": str(len(self.binaries[binary])),
                             component + "_signing": "ad-hoc"})
-        self.files[f"manifest-v{VERSION}-{release.TARGET}.txt"] = evidence(receipt)
-        self.files[f"install-v{VERSION}.sh"] = self.source["install.sh"]
+        self.files[f"manifest-{release.TARGET}.txt"] = evidence(receipt)
+        self.files["install.sh"] = self.source["install.sh"]
         build = dict(status="prepared", source="clean", commit=COMMIT,
                      version=VERSION, target=release.TARGET, compatibility="1",
                      dist_version="0.33.0", rustc="rustc 1.98.1 (fixture)",
@@ -468,6 +468,19 @@ class ReleaseTests(unittest.TestCase):
                     candidate.files["SHA256SUMS"] += candidate.files["SHA256SUMS"].splitlines(keepends=True)[0]
                 self.rejected(FakeGitHub(candidate))
 
+    def test_versioned_installer_and_manifest_aliases_are_rejected(self):
+        for stable, versioned in (("install.sh", f"install-v{VERSION}.sh"),
+                                  (f"manifest-{release.TARGET}.txt",
+                                   f"manifest-v{VERSION}-{release.TARGET}.txt")):
+            for replace in (False, True):
+                with self.subTest(asset=versioned, replace=replace):
+                    candidate = Candidate()
+                    candidate.files[versioned] = candidate.files[stable]
+                    if replace:
+                        del candidate.files[stable]
+                    candidate.sums()
+                    self.rejected(FakeGitHub(candidate), "exact 20 expected files")
+
     def test_dirty_mismatched_or_missing_build_evidence(self):
         for field, value in (("source", "dirty"), ("commit", "b" * 40), ("version", "0.2.0"),
                              ("target", "x86_64-apple-darwin"), ("compatibility", "2"),
@@ -485,7 +498,7 @@ class ReleaseTests(unittest.TestCase):
         self.rejected(FakeGitHub(candidate))
 
     def test_component_metadata_and_acceptance_evidence(self):
-        manifest_name = f"manifest-v{VERSION}-{release.TARGET}.txt"
+        manifest_name = f"manifest-{release.TARGET}.txt"
         for field, value in (("commit", "b" * 40), ("version", "0.2.0"), ("compatibility", "2"),
                              ("cli_size", "999"), ("cli_sha256", "0" * 64),
                              ("cli_file", "../mailctl"), ("mcp_signing", "signed")):
@@ -536,7 +549,7 @@ class ReleaseTests(unittest.TestCase):
             candidate.source["Cargo.toml"] = f'[workspace.package]\nversion = "{version}"\n'.encode()
             self.rejected(FakeGitHub(candidate))
         candidate = Candidate()
-        candidate.files[f"install-v{VERSION}.sh"] += b"# changed\n"
+        candidate.files["install.sh"] += b"# changed\n"
         candidate.sums()
         self.rejected(FakeGitHub(candidate))
         for changelog in (b"# No version entry\n", b"## [0.1.0]\n", b"## [0.1.0]\nOne\n## [0.1.0]\nTwo\n"):

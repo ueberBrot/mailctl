@@ -9,12 +9,13 @@ fail() {
 }
 usage() {
 	cat <<'EOF'
-Usage: sh install.sh --version VERSION [options]
+Usage: sh install.sh [options]
        sh install.sh --uninstall [options]
        sh install.sh --recover [options]
 
-  --version VERSION       Install an explicit release (for example, 0.1.0).
-  --components SELECTION  cli, mcp, or cli,mcp (default: cli,mcp).
+  --version VERSION       Select a release (default: latest stable).
+  --components SELECTION  cli, mcp, or cli,mcp (default: installed selection,
+                          or cli,mcp for a new installation).
   --install-dir DIRECTORY Override CARGO_HOME/bin or ~/.cargo/bin.
   --base-url URL          Candidate download directory; HTTPS or loopback HTTP.
   --config FILE           Verify this existing installation before replacement.
@@ -26,13 +27,13 @@ Rust is not required. Configuration, credentials, and draft history are preserve
 Stop mailctl/MCP runtimes before updating an existing configured installation.
 EOF
 }
-version='' components='cli mcp' install_dir='' base_url='' config='' explicit_config=0 mode=install
+requested_version='' components='' install_dir='' base_url='' config='' explicit_config=0 mode=install
 while [ "$#" -gt 0 ]; do
 	case "$1" in
 	--version | --components | --install-dir | --base-url | --config)
 		[ "$#" -ge 2 ] && [ -n "$2" ] || fail "Missing value for $1."
 		case "$1" in
-		--version) version=${2#v} ;;
+		--version) requested_version=$2 ;;
 		--components)
 			case "$2" in
 			cli) components=cli ;; mcp) components=mcp ;;
@@ -62,13 +63,24 @@ while [ "$#" -gt 0 ]; do
 	esac
 done
 export LC_ALL=C
+stable_version() {
+	printf '%s\n' "$1" | awk '/^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/ {ok=1} END {exit !(NR == 1 && ok)}'
+}
 case "$(uname -s):$(uname -m)" in
 Darwin:arm64 | Darwin:aarch64) target=aarch64-apple-darwin ;;
 *) fail 'This installer currently supports macOS Apple Silicon only.' ;;
 esac
 if [ "$mode" = install ]; then
-	printf '%s\n' "$version" | awk '/^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/ {ok=1} END {exit !(NR == 1 && ok)}' || fail 'Specify --version with a stable release version.'
-	[ -n "$base_url" ] || base_url="https://github.com/ueberBrot/mailctl/releases/download/v$version"
+	version=${requested_version#v}
+	if [ -n "$requested_version" ]; then
+		stable_version "$version" || fail 'Specify --version with a stable release version.'
+	fi
+	github_release=0
+	if [ -z "$base_url" ]; then
+		github_release=1
+		base_url=https://github.com/ueberBrot/mailctl/releases/latest/download
+		if [ -n "$version" ]; then base_url="https://github.com/ueberBrot/mailctl/releases/download/v$version"; fi
+	fi
 	# HTTP is restricted to local fixture servers, including redirects.
 	case "$base_url" in
 	https://*) protocol='=https' ;;
@@ -207,6 +219,12 @@ for c in cli mcp; do
 		cp "$binary" "$lock/backup/$binary"
 	elif [ -n "$owned" ]; then fail "Owned $binary is missing; preserve the component manifest for inspection."; fi
 done
+if [ -z "$components" ]; then
+	for c in cli mcp; do
+		if [ -n "$(value "$lock/before" "${c}_version")" ]; then components="${components:+$components }$c"; fi
+	done
+	if [ -z "$components" ] && [ "$mode" = install ]; then components='cli mcp'; fi
+fi
 printf 'format=1\ntarget=%s\ncompatibility=1\n' "$target" >"$lock/after"
 if [ "$mode" = install ]; then
 	if [ -z "$config" ] && [ -n "${HOME:-}" ]; then config="$HOME/Library/Preferences/org.ueberbrot.mailctl/config.toml"; fi
@@ -222,7 +240,7 @@ if [ "$mode" = install ]; then
 		[ "$(wc -c <"$2")" -le "$3" ] || fail 'Candidate download exceeded its size limit.'
 	}
 	manifest="$lock/download/manifest"
-	download "manifest-v$version-$target.txt" "$manifest" 16384
+	download "manifest-$target.txt" "$manifest" 16384
 	awk -F= '
         NF != 2 || seen[$1]++ {exit 1}
         $1 == "format" || $1 == "compatibility" {if ($2 != "1") exit 1; next}
@@ -236,9 +254,16 @@ if [ "$mode" = install ]; then
         {exit 1}
         END {if (length(seen) != 13) exit 1}
     ' "$manifest" || fail 'Unsupported or malformed candidate manifest.'
-	[ "$(value "$manifest" version)" = "$version" ] && [ "$(value "$manifest" target)" = "$target" ] || fail 'Candidate version or target does not match the request.'
+	resolved_version=$(value "$manifest" version)
+	stable_version "$resolved_version" || fail 'Release manifest has an invalid stable version.'
+	[ -z "$requested_version" ] || [ "$resolved_version" = "$version" ] || fail 'Candidate version or target does not match the request.'
+	[ "$(value "$manifest" target)" = "$target" ] || fail 'Candidate version or target does not match the request.'
+	version=$resolved_version
+	# Resolve latest once, then use the immutable release directory for every binary.
+	if [ "$github_release" -eq 1 ]; then base_url="https://github.com/ueberBrot/mailctl/releases/download/v$version"; fi
 	commit=$(value "$manifest" commit)
 	for c in cli mcp; do
+		[ "$(value "$manifest" "${c}_file")" = "$(name "$c")-v$version-$target" ] || fail 'Unexpected candidate filename.'
 		if ! selected "$c" && [ -n "$(value "$lock/before" "${c}_version")" ]; then
 			[ "$(value "$lock/before" "${c}_version")" = "$version" ] && [ "$(value "$lock/before" "${c}_commit")" = "$commit" ] || fail 'Component versions or source commits differ; update both components together.'
 		fi
@@ -247,7 +272,6 @@ if [ "$mode" = install ]; then
 		binary=$(name "$c")
 		if selected "$c"; then
 			filename="$binary-v$version-$target"
-			[ "$(value "$manifest" "${c}_file")" = "$filename" ] || fail 'Unexpected candidate filename.'
 			size=$(value "$manifest" "${c}_size")
 			staged="$lock/download/$binary"
 			download "$filename" "$staged" "$size"
@@ -292,6 +316,7 @@ mv -f "$lock/new-receipt" "$receipt"
 : >"$lock/committed"
 printf '%s completed in %s. Configuration, credentials, and draft history are preserved.\n' "$mode" "$install_dir"
 if [ "$mode" = install ]; then
+	printf '  Version: %s\n' "$version"
 	for c in $components; do printf '  %s/%s\n' "$install_dir" "$(name "$c")"; done
 	case ":${PATH:-}:" in *":$install_dir:"*) ;; *) printf 'Add this directory to PATH: %s\n' "$install_dir" ;; esac
 fi

@@ -1,14 +1,14 @@
 ---
 name: mailctl
 description: >-
-  Install, configure, or use mailctl through CLI or MCP for authorized email
-  discovery, search, message and attachment reads, and unsent draft creation.
-  Excludes mailctl development.
+  Install, update, remove, configure, or use mailctl through CLI or MCP for
+  authorized email discovery, search, message and attachment reads, and unsent
+  draft creation. Excludes mailctl development.
 ---
 
 # mailctl
 
-For installation, component updates, or account setup, read [Installation and setup](references/installation.md).
+For installation, updates, removal, or account setup, read [Installation and setup](references/installation.md).
 That reference also covers credential provisioning in the operator's terminal.
 Installing components does not authorize account changes or email access.
 
