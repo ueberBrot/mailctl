@@ -96,10 +96,6 @@ async fn concurrent_draft_replay(preparation_delay: std::time::Duration) {
     // Both calls have finished, so replay only the waiting caller with the same
     // identity. A second provider connection or any other error still fails.
     if !cli.status.success() {
-        eprintln!(
-            "[DEBUG-mailctl-journal] cli_stderr={}",
-            String::from_utf8_lossy(&cli.stderr)
-        );
         assert_writer_wait_expired(&envelope(&cli));
         cli = run_bounded(f.save());
     }

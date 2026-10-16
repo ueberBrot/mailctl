@@ -875,11 +875,6 @@ fn sqlite_generation(generation: u64) -> Result<i64, DraftJournalError> {
 }
 
 fn unavailable(error: rusqlite::Error) -> DraftJournalError {
-    #[cfg(windows)]
-    diagnostic(
-        "sqlite",
-        error.sqlite_error().map(|error| error.extended_code),
-    );
     match error {
         rusqlite::Error::SqliteFailure(error, _)
             if matches!(
@@ -902,12 +897,5 @@ fn unavailable(error: rusqlite::Error) -> DraftJournalError {
             DraftJournalError::InvalidDatabase
         }
         _ => DraftJournalError::Unavailable,
-    }
-}
-
-#[cfg(windows)]
-pub(crate) fn diagnostic(stage: &'static str, code: Option<i32>) {
-    if std::env::var_os("MAILCTL_TEST_JOURNAL_DIAGNOSTICS").is_some() {
-        eprintln!("[DEBUG-mailctl-journal] stage={stage} code={code:?}");
     }
 }

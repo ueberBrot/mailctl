@@ -44,11 +44,7 @@ pub(super) fn private_files(directory: &Path) -> Result<(), Error> {
         match crate::file_storage::inspect(&directory.join(name)) {
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_error) => {
-                #[cfg(windows)]
-                crate::draft_journal::diagnostic(name, _error.raw_os_error());
-                return Err(unavailable());
-            }
+            Err(_) => return Err(unavailable()),
         }
     }
     Ok(())
@@ -134,15 +130,6 @@ impl DraftHistory {
         }
         let journal =
             DraftJournal::open_existing_nowait(directory.join(JOURNAL)).map_err(|error| {
-                #[cfg(windows)]
-                crate::draft_journal::diagnostic(
-                    "history_open",
-                    Some(match error {
-                        DraftJournalError::Busy => 1,
-                        DraftJournalError::InvalidDatabase => 2,
-                        _ => 3,
-                    }),
-                );
                 if error == DraftJournalError::Busy {
                     return Error::new(ErrorCode::RateLimited);
                 }
@@ -224,13 +211,8 @@ impl AccountRegistry {
         seconds: usize,
     ) -> Result<File, Error> {
         let directory = &self.lease.as_ref().ok_or_else(unavailable)?.directory;
-        let file =
-            storage::open_lock(directory, &format!("draft-{account}.lock")).map_err(|error| {
-                #[cfg(windows)]
-                crate::draft_journal::diagnostic("writer_open", None);
-                let _ = error;
-                unavailable()
-            })?;
+        let file = storage::open_lock(directory, &format!("draft-{account}.lock"))
+            .map_err(|_| unavailable())?;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(seconds as u64);
         loop {
             match file.try_lock() {
@@ -244,11 +226,7 @@ impl AccountRegistry {
                     )
                     .await;
                 }
-                Err(std::fs::TryLockError::Error(_error)) => {
-                    #[cfg(windows)]
-                    crate::draft_journal::diagnostic("writer_lock", _error.raw_os_error());
-                    return Err(unavailable());
-                }
+                Err(_) => return Err(unavailable()),
             }
         }
     }
