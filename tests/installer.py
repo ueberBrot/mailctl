@@ -6,6 +6,7 @@ to qualify real packaged binaries on macOS Apple Silicon. ``--install-to DIR``
 leaves a fresh installation for the packaged Rust acceptance suites, combined by
 default or selected with ``--components``. ``--install-only`` skips the suite
 when preparing additional component selections from an already checked candidate.
+Add ``--reuse`` to verify and reuse an existing exact component selection.
 Only Python's standard library and the installer's documented system tools are
 used; every download is served from a temporary loopback HTTP server.
 """
@@ -41,11 +42,58 @@ def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def require(condition, message):
+    if not condition:
+        raise SystemExit(message)
+
+
+def read_fields(path):
+    require(path.is_file() and not path.is_symlink(), f"Expected a regular manifest: {path}")
+    entries = [line.split("=", 1) for line in path.read_text().splitlines()]
+    require(all(len(entry) == 2 for entry in entries), f"Malformed manifest: {path}")
+    result = dict(entries)
+    require(len(result) == len(entries), f"Duplicate manifest fields: {path}")
+    return result
+
+
 def read_manifest(directory):
     manifests = list(directory.glob(f"manifest-v*-{TARGET}.txt"))
     if len(manifests) != 1:
         raise AssertionError("artifact directory must contain one candidate manifest")
-    return dict(line.split("=", 1) for line in manifests[0].read_text().splitlines())
+    return read_fields(manifests[0])
+
+
+def verify_installed_candidate(manifest, directory, components):
+    require(directory.is_dir() and not directory.is_symlink(), f"Expected an installed directory: {directory}")
+    lock = directory / ".mailctl-installer.lock"
+    require(not lock.exists() and not lock.is_symlink(), "Installer update is active or requires recovery")
+    receipt = read_fields(directory / ".mailctl-components")
+    expected_fields = {"format", "target", "compatibility"}
+    expected_entries = {".mailctl-components"}
+    for field in expected_fields:
+        require(receipt.get(field) == manifest[field], f"Installed {field} differs from the candidate")
+    selected = set(components.split(","))
+    for component, name in COMPONENTS.items():
+        binary = directory / name
+        if component not in selected:
+            require(not binary.exists() and not binary.is_symlink(), f"Unselected component exists: {binary}")
+            continue
+        expected_entries.add(name)
+        require(binary.is_file() and not binary.is_symlink() and os.access(binary, os.X_OK),
+                f"Expected an executable candidate component: {binary}")
+        require(binary.stat().st_size == int(manifest[f"{component}_size"]) and
+                digest(binary) == manifest[f"{component}_sha256"],
+                f"Installed component differs from the candidate: {binary}")
+        for field in ("version", "commit", "sha256"):
+            key = f"{component}_{field}"
+            expected_fields.add(key)
+            expected = manifest[key] if field == "sha256" else manifest[field]
+            require(receipt.get(key) == expected, f"Installed receipt differs from the candidate: {key}")
+        expected_fields.add(f"{component}_origin")
+    require(set(receipt) == expected_fields, "Installed receipt has a different component selection")
+    require({entry.name for entry in directory.iterdir()} == expected_entries,
+            "Installed directory has unexpected entries")
+    print(f"Verified installed candidate components {components} in {directory}")
 
 
 def tree_bytes(directory):
@@ -778,10 +826,13 @@ class PackagedInstallerTest(InstallerTest):
         self.assertEqual(tree_bytes(self.config.parent), state_before)
 
 
-def leave_installed_candidate(artifacts, destination, components):
+def leave_installed_candidate(artifacts, destination, components, reuse=False):
+    manifest = read_manifest(artifacts)
+    if reuse and (destination.exists() or destination.is_symlink()):
+        verify_installed_candidate(manifest, destination, components)
+        return
     if destination.exists() and (not destination.is_dir() or any(destination.iterdir())):
         raise SystemExit("--install-to must be a missing or empty dedicated directory")
-    manifest = read_manifest(artifacts)
     with tempfile.TemporaryDirectory(prefix="mailctl-candidate-install-") as temporary:
         home = Path(temporary) / "home"
         home.mkdir(mode=0o700)
@@ -793,14 +844,7 @@ def leave_installed_candidate(artifacts, destination, components):
                 str(destination), "--components", components], env=env, check=True, timeout=60)
         finally:
             server.close()
-    selected = set(components.split(","))
-    for selection, component in COMPONENTS.items():
-        binary = destination / component
-        if selection in selected:
-            if not binary.is_file() or digest(binary) != manifest[f"{selection}_sha256"]:
-                raise SystemExit(f"installed {component} does not match the candidate")
-        elif binary.exists():
-            raise SystemExit(f"unselected component {component} was installed")
+    verify_installed_candidate(manifest, destination, components)
 
 
 def main():
@@ -810,8 +854,12 @@ def main():
     parser.add_argument("--install-to", type=Path)
     parser.add_argument("--components", choices=("cli", "mcp", "cli,mcp"))
     parser.add_argument("--install-only", action="store_true")
+    parser.add_argument("--reuse", action="store_true",
+                        help="verify and reuse an existing candidate with --install-only")
     parser.add_argument("--suite", choices=("all", "fixtures", "packaged"), default="all")
     options, unittest_args = parser.parse_known_args()
+    if options.reuse and not options.install_only:
+        parser.error("--reuse requires --install-only")
     if options.artifacts:
         ARTIFACTS = options.artifacts.resolve(strict=True)
     if options.install_to and ARTIFACTS is None:
@@ -821,8 +869,9 @@ def main():
     if options.suite == "packaged" and ARTIFACTS is None:
         parser.error("--suite packaged requires --artifacts")
     if options.install_only:
-        leave_installed_candidate(ARTIFACTS, options.install_to.resolve(),
-                                  options.components or "cli,mcp")
+        destination = options.install_to.absolute() if options.reuse else options.install_to.resolve()
+        leave_installed_candidate(ARTIFACTS, destination,
+                                  options.components or "cli,mcp", reuse=options.reuse)
         return
     # Packaged checks complement the fixture suite. Avoid inheriting all fixture
     # cases into the packaged class, whose downloads are immutable candidates.

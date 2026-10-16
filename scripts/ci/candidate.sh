@@ -19,9 +19,9 @@ prepare)
 		"$MAILCTL_CANDIDATE_DIR" "$MAILCTL_PACKAGED_BIN_DIR" >>"$GITHUB_ENV"
 	exit
 	;;
-installer | state | process | native | reading | drafts | record | components) ;;
+installer | state | process | native | reading | drafts | record) ;;
 *)
-	printf 'Usage: %s {build|prepare|installer|state|process|native|reading|drafts|record|components SELECTION DIRECTORY}\n' "$0" >&2
+	printf 'Usage: %s {build|prepare|installer|state|process|native|reading|drafts|record}\n' "$0" >&2
 	exit 2
 	;;
 esac
@@ -35,8 +35,7 @@ process_command=(cargo test --locked
 	--test search_process --test discovery_process
 	--test read_contention_process --test draft_process)
 native_command=(cargo test --locked --test native_credentials -- --ignored --test-threads=1)
-component_command=(bash scripts/ci/candidate.sh components)
-component_installer_command=(python3 tests/installer.py --artifacts "$MAILCTL_CANDIDATE_DIR" --install-only)
+component_command=(python3 tests/installer.py --artifacts "$MAILCTL_CANDIDATE_DIR" --install-only --reuse)
 
 select_reading_components() {
 	components=$1
@@ -86,68 +85,6 @@ run_acceptance() {
 }
 
 case "$1" in
-components)
-	[ "$#" -eq 3 ] || exit 2
-	case "$2" in cli | mcp | cli,mcp) ;; *) exit 2 ;; esac
-	# Reading and draft fixtures own separate application state. Share only the
-	# installer-qualified bytes, and reject stale or changed component selections.
-	if [ ! -e "$3" ] && [ ! -L "$3" ]; then
-		"${component_installer_command[@]}" --components "$2" --install-to "$3"
-	fi
-	python3 - "$MAILCTL_CANDIDATE_DIR" "$2" "$3" <<'PY'
-import hashlib
-import os
-from pathlib import Path
-import sys
-
-artifacts, selection, directory = Path(sys.argv[1]), sys.argv[2], Path(sys.argv[3])
-
-def require(condition, message):
-    if not condition:
-        raise SystemExit(message)
-
-def fields(path):
-    require(path.is_file() and not path.is_symlink(), f"Expected a regular manifest: {path}")
-    entries = [line.split("=", 1) for line in path.read_text().splitlines()]
-    require(all(len(entry) == 2 for entry in entries), f"Malformed manifest: {path}")
-    result = dict(entries)
-    require(len(result) == len(entries), f"Duplicate manifest fields: {path}")
-    return result
-
-manifests = list(artifacts.glob("manifest-v*-aarch64-apple-darwin.txt"))
-require(len(manifests) == 1, "Expected one candidate manifest")
-manifest = fields(manifests[0])
-require(directory.is_dir() and not directory.is_symlink(), f"Expected an installed directory: {directory}")
-lock = directory / ".mailctl-installer.lock"
-require(not lock.exists() and not lock.is_symlink(), "Installer update is active or requires recovery")
-receipt = fields(directory / ".mailctl-components")
-expected_fields = {"format", "target", "compatibility"}
-expected_entries = {".mailctl-components"}
-for field in expected_fields:
-    require(receipt.get(field) == manifest[field], f"Installed {field} differs from the candidate")
-for component, name in (("cli", "mailctl"), ("mcp", "mailctl-mcp")):
-    binary = directory / name
-    if component not in selection.split(","):
-        require(not binary.exists() and not binary.is_symlink(), f"Unselected component exists: {binary}")
-        continue
-    expected_entries.add(name)
-    require(binary.is_file() and not binary.is_symlink() and os.access(binary, os.X_OK),
-            f"Expected an executable candidate component: {binary}")
-    require(binary.stat().st_size == int(manifest[f"{component}_size"]) and
-            hashlib.sha256(binary.read_bytes()).hexdigest() == manifest[f"{component}_sha256"],
-            f"Installed component differs from the candidate: {binary}")
-    for field in ("version", "commit", "sha256"):
-        key = f"{component}_{field}"
-        expected_fields.add(key)
-        expected = manifest[key] if field == "sha256" else manifest[field]
-        require(receipt.get(key) == expected, f"Installed receipt differs from the candidate: {key}")
-    expected_fields.add(f"{component}_origin")
-require(set(receipt) == expected_fields, "Installed receipt has a different component selection")
-require({entry.name for entry in directory.iterdir()} == expected_entries,
-        "Installed directory has unexpected entries")
-print(f"Verified installed candidate components {selection} in {directory}")
-PY
-	;;
 installer)
 	run_acceptance installer-acceptance.log "${installer_command[@]}"
 	;;
@@ -165,7 +102,7 @@ reading)
 		select_reading_components "$components"
 		log="$MAILCTL_CANDIDATE_DIR/installed-reading-$label-acceptance.log"
 		{
-			"${component_command[@]}" "$components" "$installed"
+			"${component_command[@]}" --components "$components" --install-to "$installed"
 			MAILCTL_PACKAGED_BIN_DIR="$installed" "${reading_command[@]}"
 		} 2>&1 | tee "$log"
 		if ! grep -Eq '^test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' "$log"; then
@@ -180,7 +117,7 @@ drafts)
 		select_draft_components "$components"
 		log="$MAILCTL_CANDIDATE_DIR/installed-drafts-$label-acceptance.log"
 		{
-			"${component_command[@]}" "$components" "$installed"
+			"${component_command[@]}" --components "$components" --install-to "$installed"
 			MAILCTL_PACKAGED_BIN_DIR="$installed" "${drafts_command[@]}"
 		} 2>&1 | tee "$log"
 		if ! grep -Eq '^test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' "$log"; then
@@ -206,7 +143,7 @@ record)
 		for components in cli mcp cli,mcp; do
 			select_reading_components "$components"
 			record_command "reading_components_command_$components" \
-				"${component_command[@]}" "$components" "$installed"
+				"${component_command[@]}" --components "$components" --install-to "$installed"
 			record_command "reading_command_$components" env \
 				"MAILCTL_PACKAGED_BIN_DIR=$installed" "${reading_command[@]}"
 		done
@@ -214,7 +151,7 @@ record)
 		for components in cli mcp cli,mcp; do
 			select_draft_components "$components"
 			record_command "drafts_components_command_$components" \
-				"${component_command[@]}" "$components" "$installed"
+				"${component_command[@]}" --components "$components" --install-to "$installed"
 			record_command "drafts_command_$components" env \
 				"MAILCTL_PACKAGED_BIN_DIR=$installed" "${drafts_command[@]}"
 		done
