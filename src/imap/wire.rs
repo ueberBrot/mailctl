@@ -98,8 +98,7 @@ impl Session {
         }
     }
 }
-#[derive(Clone)]
-pub(super) enum Kind {
+pub(super) enum Kind<'a> {
     Capability,
     Login,
     StartTls,
@@ -107,10 +106,10 @@ pub(super) enum Kind {
     Examine,
     Search,
     Projection,
-    Body(Fetch),
+    Body(&'a Fetch),
     Logout,
 }
-impl Kind {
+impl Kind<'_> {
     fn contract(&self) -> FrameContract {
         match self {
             Self::List => FrameContract::List,
@@ -274,15 +273,24 @@ impl<'a> Connection<'a> {
     pub(super) async fn request(
         &mut self,
         command: &str,
-        kind: Kind,
+        kind: Kind<'_>,
     ) -> Result<Vec<Response<'static>>, Error> {
         self.prepare(kind.contract());
         let tag = self.tag()?;
-        let bytes = Zeroizing::new(format!("{tag} {command}\r\n"));
-        self.write(bytes.as_bytes()).await?;
+        // Allocate before copying a command that may contain credentials.
+        let mut bytes = Zeroizing::new(Vec::with_capacity(tag.len() + command.len() + 3));
+        bytes.extend_from_slice(tag.as_bytes());
+        bytes.push(b' ');
+        bytes.extend_from_slice(command.as_bytes());
+        bytes.extend_from_slice(b"\r\n");
+        self.write(&bytes).await?;
         self.collect(&tag, kind).await
     }
-    async fn collect(&mut self, tag: &str, kind: Kind) -> Result<Vec<Response<'static>>, Error> {
+    async fn collect(
+        &mut self,
+        tag: &str,
+        kind: Kind<'_>,
+    ) -> Result<Vec<Response<'static>>, Error> {
         let mut rows = Vec::new();
         let mut sequences = BTreeSet::new();
         let mut uids = BTreeSet::new();

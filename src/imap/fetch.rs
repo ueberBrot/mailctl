@@ -47,7 +47,7 @@ impl Section {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(super) enum Fetch {
     Metadata {
         uid: u32,
@@ -193,7 +193,7 @@ impl Fetch {
         let mut rows = connection
             .request(
                 &format!("UID FETCH {} ({query})", self.uid()),
-                Kind::Body(self.clone()),
+                Kind::Body(self),
             )
             .await?;
         if rows.len() != 1 {
