@@ -208,8 +208,9 @@ function Invoke-Component([string] $Path, [string[]] $Arguments) {
     } finally { $process.Dispose() }
 }
 function Move-Replacement([string] $Source, [string] $Destination) {
-    if (Test-Path -LiteralPath $Destination) { [IO.File]::Replace($Source, $Destination, $null) }
-    else { [IO.File]::Move($Source, $Destination) }
+    if (Test-Path -LiteralPath $Destination) {
+        [IO.File]::Replace($Source, $Destination, [System.Management.Automation.Language.NullString]::Value)
+    } else { [IO.File]::Move($Source, $Destination) }
 }
 function Assert-LockTree {
     $null = Assert-Path $lock

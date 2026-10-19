@@ -73,7 +73,7 @@ function Invoke-Installer([string[]] $Arguments, [switch] $Fails) {
         $stdout = $running.Out.GetAwaiter().GetResult()
         $stderr = $running.Err.GetAwaiter().GetResult()
         if ($Fails) { Assert ($process.ExitCode -ne 0) "Installer unexpectedly succeeded: $stdout" }
-        else { Assert ($process.ExitCode -eq 0) "Installer failed: $stdout $stderr" }
+        else { Assert ($process.ExitCode -eq 0) "Installer failed ($($Arguments -join ' ')): $stdout $stderr" }
     } finally { $process.Dispose() }
 }
 function Install([string] $Directory, [string[]] $Extra = @(), [switch] $Fails) {
@@ -202,8 +202,10 @@ try {
             $setup = Invoke-Json (Join-Path $directory $first) @('--config', $config, '--json', 'setup', '--alias', 'work', '--server', 'imap.example.test', '--username', 'work@example.test')
             $state = Snapshot ([IO.Path]::GetDirectoryName($config))
             $identity = $setup.installation_id
+            $installed = Snapshot $directory
             Install $directory @('-Config', $config)
             Verify $directory $selection $manifest
+            Assert ((Snapshot $directory) -ceq $installed) 'Repeated installation changed installed bytes or left replacement files.'
             Assert ((Snapshot ([IO.Path]::GetDirectoryName($config))) -ceq $state) 'Update changed application state.'
             $again = Invoke-Json (Join-Path $directory $first) @('--config', $config, '--json', 'setup')
             Assert ($again.installation_id -eq $identity) 'Update changed installation identity.'
