@@ -5,10 +5,13 @@ use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 #[path = "export/macos.rs"]
 mod native;
+#[cfg(target_os = "linux")]
+#[path = "export/linux.rs"]
+mod native;
 #[cfg(windows)]
 #[path = "export/windows.rs"]
 mod native;
-#[cfg(not(any(target_os = "macos", windows)))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 #[path = "export/unsupported.rs"]
 mod native;
 use native::NativeFile;
@@ -55,7 +58,7 @@ impl ExportWriter {
         if !safe_name(name) || maximum == 0 || base64::encoded_len(maximum, true).is_none() {
             return Err(Error::new(ErrorCode::InvalidRequest));
         }
-        if !cfg!(any(target_os = "macos", windows)) {
+        if !cfg!(any(target_os = "macos", target_os = "linux", windows)) {
             return Err(Error::new(ErrorCode::UnsupportedCapability));
         }
         Ok(())
@@ -156,7 +159,7 @@ fn safe_name(name: &str) -> bool {
 fn failed() -> Error {
     Error::new(ErrorCode::ExportFailed)
 }
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn cleanup_failed() -> Error {
     Error::new(ErrorCode::ExportCleanupFailed)
 }

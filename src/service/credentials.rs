@@ -74,6 +74,12 @@ impl Service {
             Topology::WindowsHostedWsl => result.prerequisites.push(
                 "Windows-hosted WSL requires Windows executables and the Windows execution identity's credential store".into()),
         }
+        #[cfg(target_os = "linux")]
+        if !self.config.export_roots.is_empty() {
+            result
+                .prerequisites
+                .push("Linux attachment export requires mounted procfs at /proc/self/fd".into());
+        }
         // Reserve a fixed upper bound for each safe status before source work.
         if accounts.len().saturating_mul(1024).saturating_add(1024) > context.response_limit() {
             return Err(Error::new(ErrorCode::ResponseTooLarge));

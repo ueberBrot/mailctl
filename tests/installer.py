@@ -2,7 +2,7 @@
 """Exercise the standalone installer using disposable downloads and state.
 
 Run fixture checks with ``python3 tests/installer.py``. Add ``--artifacts DIR``
-to qualify real packaged binaries on macOS Apple Silicon. ``--install-to DIR``
+to qualify native macOS Apple Silicon or GNU/Linux x86_64 packaged binaries. ``--install-to DIR``
 leaves a fresh installation for the packaged Rust acceptance suites, combined by
 default or selected with ``--components``. ``--install-only`` skips the suite
 when preparing additional component selections from an already checked candidate.
@@ -34,7 +34,8 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-TARGET = "aarch64-apple-darwin"
+TARGETS = ("aarch64-apple-darwin", "x86_64-unknown-linux-gnu")
+PACKAGED_TARGET = None
 COMPONENTS = {"cli": "mailctl", "mcp": "mailctl-mcp"}
 ARTIFACTS = None
 
@@ -57,8 +58,17 @@ def read_fields(path):
     return result
 
 
+def native_target():
+    host = platform.system(), platform.machine()
+    if host == ("Darwin", "arm64"):
+        return TARGETS[0]
+    if host == ("Linux", "x86_64"):
+        return TARGETS[1]
+    raise SystemExit("Packaged candidate acceptance requires native macOS Apple Silicon or GNU/Linux x86_64")
+
+
 def read_manifest(directory):
-    return read_fields(directory / f"manifest-{TARGET}.txt")
+    return read_fields(directory / f"manifest-{PACKAGED_TARGET or native_target()}.txt")
 
 
 def verify_installed_candidate(manifest, directory, components):
@@ -145,6 +155,8 @@ class DownloadServer:
 
 
 class InstallerTest(unittest.TestCase):
+    target = TARGETS[0]
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="mailctl-installer-")
         self.directory = Path(self.temporary.name).resolve()
@@ -157,7 +169,12 @@ class InstallerTest(unittest.TestCase):
         # Fixture scenarios exercise installation semantics independently of the
         # development host. Real artifact checks use the actual native platform.
         uname = self.tools / "uname"
-        uname.write_text('#!/bin/sh\ncase "$1" in -s) echo Darwin;; -m) echo arm64;; *) exit 1;; esac\n')
+        system, machine = (("Darwin", "arm64") if self.target == TARGETS[0]
+                           else ("Linux", "x86_64"))
+        uname.write_text(f'#!/bin/sh\ncase "$1" in -s) echo {system};; -m) echo {machine};; *) exit 1;; esac\n')
+        getconf = self.tools / "getconf"
+        getconf.write_text('#!/bin/sh\n[ "$1" = GNU_LIBC_VERSION ] || exit 1\necho "glibc 2.39"\n')
+        getconf.chmod(0o755)
         uname.chmod(0o755)
         self.env = {
             "HOME": str(self.home),
@@ -179,12 +196,12 @@ class InstallerTest(unittest.TestCase):
         manifest = {
             "format": "1",
             "version": version,
-            "target": TARGET,
+            "target": self.target,
             "commit": commit,
             "compatibility": compatibility,
         }
         for selection, component in COMPONENTS.items():
-            name = f"{component}-v{version}-{TARGET}"
+            name = f"{component}-v{version}-{self.target}"
             path = self.downloads / name
             path.write_text(
                 f"#!/bin/sh\n"
@@ -201,7 +218,7 @@ class InstallerTest(unittest.TestCase):
         return manifest
 
     def write_manifest(self, manifest):
-        path = self.downloads / f"manifest-{TARGET}.txt"
+        path = self.downloads / f"manifest-{self.target}.txt"
         path.write_text("".join(f"{key}={value}\n" for key, value in manifest.items()))
         return path
 
@@ -231,7 +248,7 @@ class InstallerTest(unittest.TestCase):
             if selection in components:
                 self.assertTrue(os.access(path, os.X_OK), str(path))
                 self.assertEqual(path.read_bytes(), (self.downloads /
-                    f"{component}-v{self.version}-{TARGET}").read_bytes())
+                    f"{component}-v{self.version}-{self.target}").read_bytes())
 
     def test_default_install_is_combined_and_needs_no_rust(self):
         self.assertIsNone(shutil.which("cargo", path=self.env["PATH"]))
@@ -250,7 +267,7 @@ class InstallerTest(unittest.TestCase):
         latest = self.downloads / "releases" / "latest" / "download"
         latest.mkdir(parents=True)
         # Latest exposes metadata only. Binary requests must use the resolved tag.
-        shutil.copy2(release / f"manifest-{TARGET}.txt", latest)
+        shutil.copy2(release / f"manifest-{self.target}.txt", latest)
         curl = self.tools / "curl"
         curl.write_text(
             f"#!{sys.executable}\n"
@@ -271,8 +288,8 @@ class InstallerTest(unittest.TestCase):
         self.successful(result)
         self.installed({"cli", "mcp"})
         self.assertEqual(self.server.requests, [
-            f"/releases/latest/download/manifest-{TARGET}.txt",
-            *[f"/releases/download/v{self.version}/{binary}-v{self.version}-{TARGET}"
+            f"/releases/latest/download/manifest-{self.target}.txt",
+            *[f"/releases/download/v{self.version}/{binary}-v{self.version}-{self.target}"
               for binary in COMPONENTS.values()],
         ])
         receipt = read_fields(self.bin / ".mailctl-components")
@@ -286,8 +303,8 @@ class InstallerTest(unittest.TestCase):
         ], env=self.env, capture_output=True, text=True, timeout=30))
         self.installed({"cli"})
         self.assertEqual(self.server.requests, [
-            f"/releases/download/v{self.version}/manifest-{TARGET}.txt",
-            f"/releases/download/v{self.version}/mailctl-v{self.version}-{TARGET}",
+            f"/releases/download/v{self.version}/manifest-{self.target}.txt",
+            f"/releases/download/v{self.version}/mailctl-v{self.version}-{self.target}",
         ])
 
     def test_latest_metadata_failures_and_explicit_version_mismatch_preserve_installation(self):
@@ -301,7 +318,7 @@ class InstallerTest(unittest.TestCase):
                 self.server.requests.clear()
                 self.failed(self.command(version=""))
                 self.assertEqual(tree_bytes(self.bin), before)
-                self.assertEqual(self.server.requests, [f"/manifest-{TARGET}.txt"])
+                self.assertEqual(self.server.requests, [f"/manifest-{self.target}.txt"])
         manifest = self.publish_fixture(self.version)
         self.failed(self.command(version="0.2.0"))
         self.assertEqual(tree_bytes(self.bin), before)
@@ -467,7 +484,7 @@ class InstallerTest(unittest.TestCase):
                     self.assertIn("Component versions or source commits differ", result.stderr)
                     self.assertEqual(tree_bytes(self.bin), before)
                     self.assertEqual(self.server.requests,
-                                     [f"/manifest-{TARGET}.txt"])
+                                     [f"/manifest-{self.target}.txt"])
         self.publish_fixture("0.2.0", commit="b" * 40)
         self.successful(self.command(version="0.2.0"))
         self.version = "0.2.0"
@@ -593,14 +610,85 @@ class InstallerTest(unittest.TestCase):
         self.assertEqual(self.server.requests, [])
 
 
+class LinuxInstallerTest(InstallerTest):
+    target = TARGETS[1]
+
+    def test_gnu_checksum_tool_works_without_perl_shasum(self):
+        sha256sum = self.tools / "sha256sum"
+        sha256sum.write_text(f"#!{sys.executable}\nimport hashlib, pathlib, sys\n"
+                            "print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())\n")
+        sha256sum.chmod(0o755)
+        shasum = self.tools / "shasum"
+        shasum.write_text("#!/bin/sh\nexit 79\n")
+        shasum.chmod(0o755)
+        self.successful(self.command())
+        self.installed({"cli", "mcp"})
+        self.successful(self.command("--uninstall"))
+
+    def test_musl_and_other_architectures_are_rejected_before_install(self):
+        getconf = self.tools / "getconf"
+        getconf.write_text("#!/bin/sh\nexit 1\n")
+        self.failed(self.command())
+        self.assertFalse(self.bin.exists())
+        self.assertEqual(self.server.requests, [])
+        getconf.write_text('#!/bin/sh\necho "glibc 2.39"\n')
+        uname = self.tools / "uname"
+        uname.write_text('#!/bin/sh\ncase "$1" in -s) echo Linux;; -m) echo aarch64;; esac\n')
+        self.failed(self.command())
+        self.assertFalse(self.bin.exists())
+        self.assertEqual(self.server.requests, [])
+
+    def test_native_and_xdg_default_configuration_are_verified_before_replacement(self):
+        self.successful(self.command())
+        before = tree_bytes(self.bin)
+        # A fixture component fails state verification, so an existing default
+        # configuration must prevent replacement rather than being overlooked.
+        fixture = self.downloads / f"mailctl-v{self.version}-{self.target}"
+        fixture.write_text(f'#!/bin/sh\n[ "$1" = --version ] || exit 83\necho "mailctl {self.version}"\n')
+        manifest = read_fields(self.downloads / f"manifest-{self.target}.txt")
+        manifest.update(cli_sha256=digest(fixture), cli_size=str(fixture.stat().st_size))
+        self.write_manifest(manifest)
+        for xdg in (None, "relative-config", str(self.directory / "custom config root")):
+            with self.subTest(xdg=xdg):
+                root = Path(xdg) if xdg and Path(xdg).is_absolute() else self.home / ".config"
+                config = root / "mailctl" / "config.toml"
+                config.parent.mkdir(parents=True, exist_ok=True)
+                config.write_text("fixture configuration\n")
+                env = self.env if xdg is None else dict(self.env, XDG_CONFIG_HOME=xdg)
+                result = self.command(env=env)
+                self.failed(result)
+                self.assertIn("Installation history", result.stderr)
+                self.assertEqual(tree_bytes(self.bin), before)
+                self.assertEqual(config.read_text(), "fixture configuration\n")
+                config.unlink()
+
+    def test_foreign_target_manifest_and_receipt_are_rejected(self):
+        self.successful(self.command())
+        before = tree_bytes(self.bin)
+        manifest = self.publish_fixture(self.version)
+        manifest["target"] = TARGETS[0]
+        self.write_manifest(manifest)
+        self.failed(self.command())
+        self.assertEqual(tree_bytes(self.bin), before)
+        manifest["target"] = self.target
+        self.write_manifest(manifest)
+        receipt = self.bin / ".mailctl-components"
+        receipt.write_text(receipt.read_text().replace(self.target, TARGETS[0]))
+        before = tree_bytes(self.bin)
+        self.server.requests.clear()
+        self.failed(self.command("--uninstall"))
+        self.assertEqual(tree_bytes(self.bin), before)
+        self.assertEqual(self.server.requests, [])
+
+
 class PackagedInstallerTest(InstallerTest):
     """Acceptance at the public installed executable boundary."""
 
     def setUp(self):
         if ARTIFACTS is None:
             self.skipTest("supply --artifacts DIR to qualify packaged binaries")
-        if platform.system() != "Darwin" or platform.machine() != "arm64":
-            self.fail("packaged candidate acceptance requires macOS Apple Silicon")
+        self.target = PACKAGED_TARGET or native_target()
+        self.assertEqual(self.target, native_target(), "packaged candidate must match the native host")
         super().setUp()
         shutil.rmtree(self.downloads)
         shutil.copytree(ARTIFACTS, self.downloads)
@@ -611,7 +699,7 @@ class PackagedInstallerTest(InstallerTest):
         self.config = self.directory / "operator configuration" / "config.toml"
 
     def test_packaged_dist_archive_matches_installed_bytes(self):
-        archive_path = self.downloads / f"mailctl-{TARGET}.tar.gz"
+        archive_path = self.downloads / f"mailctl-{self.target}.tar.gz"
         build = json.loads((self.downloads / "dist-manifest.json").read_text())
         artifact = build["artifacts"][archive_path.name]
         self.assertEqual(digest(archive_path), artifact["checksums"]["sha256"])
@@ -633,7 +721,7 @@ class PackagedInstallerTest(InstallerTest):
         for artifact in build["artifacts"].values():
             artifact["path"] = str(self.downloads / artifact["name"])
         manifest_path.write_text(json.dumps(build))
-        archive_path = self.downloads / f"mailctl-{TARGET}.tar.gz"
+        archive_path = self.downloads / f"mailctl-{self.target}.tar.gz"
         with archive_path.open("ab") as archive:
             archive.write(b"corruption")
         output = self.directory / "rejected-candidate"
@@ -840,8 +928,8 @@ class PackagedInstallerTest(InstallerTest):
 
     def test_packaged_default_configuration_is_detected_before_replacement(self):
         self.successful(self.command())
-        self.config = self.home / "Library" / "Preferences" / \
-            "org.ueberbrot.mailctl" / "config.toml"
+        self.config = (self.home / "Library" / "Preferences" / "org.ueberbrot.mailctl" / "config.toml"
+                       if self.target == TARGETS[0] else self.home / ".config" / "mailctl" / "config.toml")
         # Invoke setup without a path override so this proves the application's
         # native default path agrees with the installer's default preflight.
         for alias in ("work", "personal"):
@@ -922,9 +1010,10 @@ def leave_installed_candidate(artifacts, destination, components, reuse=False):
 
 
 def main():
-    global ARTIFACTS
+    global ARTIFACTS, PACKAGED_TARGET
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--artifacts", type=Path)
+    parser.add_argument("--target", choices=TARGETS)
     parser.add_argument("--install-to", type=Path)
     parser.add_argument("--components", choices=("cli", "mcp", "cli,mcp"))
     parser.add_argument("--install-only", action="store_true")
@@ -936,6 +1025,10 @@ def main():
         parser.error("--reuse requires --install-only")
     if options.artifacts:
         ARTIFACTS = options.artifacts.resolve(strict=True)
+        PACKAGED_TARGET = options.target or native_target()
+        require(PACKAGED_TARGET == native_target(), "Packaged candidate must match the native host")
+    elif options.target:
+        parser.error("--target requires --artifacts")
     if options.install_to and ARTIFACTS is None:
         parser.error("--install-to requires --artifacts")
     if (options.components or options.install_only) and not options.install_to:
@@ -951,13 +1044,13 @@ def main():
     # cases into the packaged class, whose downloads are immutable candidates.
     suite = unittest.TestSuite()
     loader = unittest.TestLoader()
-    for test_class in (InstallerTest, PackagedInstallerTest):
+    for test_class in (InstallerTest, LinuxInstallerTest, PackagedInstallerTest):
         if options.suite == "fixtures" and test_class is PackagedInstallerTest:
             continue
-        if options.suite == "packaged" and test_class is InstallerTest:
+        if options.suite == "packaged" and test_class is not PackagedInstallerTest:
             continue
         names = [name for name in loader.getTestCaseNames(test_class)
-                 if test_class is InstallerTest or name.startswith("test_packaged_")]
+                 if test_class is not PackagedInstallerTest or name.startswith("test_packaged_")]
         if unittest_args:
             names = [name for name in names if any(pattern in name for pattern in unittest_args)]
         suite.addTests(test_class(name) for name in names)

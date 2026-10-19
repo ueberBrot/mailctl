@@ -32,6 +32,8 @@ jobs:
         run: cargo deny --locked --all-features check
       - name: Check installer failure and recovery fixtures
         run: python3 tests/installer.py --suite fixtures
+      - name: Check native candidate preparation fixtures
+        run: python3 tests/prepare_installer.py
       - name: Check offline Codex acceptance fixtures
         run: python3 scripts/acceptance/test_codex_mcp.py
       - name: Check offline release preparation and publication fixtures
@@ -175,6 +177,50 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: mailctl-candidate-aarch64-apple-darwin
+          path: ${{ env.MAILCTL_CANDIDATE_DIR }}/
+          if-no-files-found: error
+          retention-days: 14
+
+  linux-candidate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      MAILCTL_TARGET: x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f  # v2.0.0
+      - name: Install dist 0.33.0 from its official release
+        shell: bash
+        env:
+          DIST_BIN_DIR: ${{ runner.temp }}/dist-bin
+        run: bash scripts/ci/install-dist.sh
+      - name: Build native Ubuntu x86_64 archives with dist
+        run: bash scripts/ci/candidate.sh build
+      - name: Prepare Linux components and build evidence
+        env:
+          MAILCTL_CANDIDATE_DIR: ${{ runner.temp }}/mailctl-linux-candidate
+          MAILCTL_PACKAGED_BIN_DIR: ${{ runner.temp }}/mailctl-linux-installed
+        run: bash scripts/ci/candidate.sh prepare
+      - name: Qualify Linux installation, upgrades and removal
+        run: bash scripts/ci/candidate.sh installer
+      - name: Qualify packaged Linux setup, history, backup and restore
+        run: bash scripts/ci/candidate.sh state
+      - name: Qualify independent packaged Linux processes
+        run: bash scripts/ci/candidate.sh process
+      - name: Qualify headless credential sources and permissions
+        run: bash scripts/ci/candidate.sh native
+      - name: Qualify packaged Linux reading under command and systemd sources
+        run: bash scripts/ci/candidate.sh reading
+      - name: Qualify packaged Linux draft faults under command and systemd sources
+        run: bash scripts/ci/candidate.sh drafts
+      - name: Record passing Linux candidate acceptance
+        run: bash scripts/ci/candidate.sh record
+      - name: Keep Linux candidate and acceptance evidence
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: mailctl-candidate-x86_64-unknown-linux-gnu
           path: ${{ env.MAILCTL_CANDIDATE_DIR }}/
           if-no-files-found: error
           retention-days: 14
