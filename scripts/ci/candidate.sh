@@ -157,6 +157,7 @@ record)
 			cat /etc/os-release
 			systemctl --version
 			cat "$MAILCTL_CANDIDATE_DIR/linux-source-evidence.txt"
+			cat "$MAILCTL_CANDIDATE_DIR/desktop-source-evidence.txt"
 		else
 			printf 'credential_source=disposable-apple-keychain\n'
 			sw_vers
@@ -175,7 +176,7 @@ record)
 	} >"$MAILCTL_CANDIDATE_DIR/acceptance-evidence.txt"
 	if [[ $target == x86_64-unknown-linux-gnu ]]; then
 		(cd "$MAILCTL_CANDIDATE_DIR" && "${hash_command[@]}" \
-			acceptance-evidence.txt linux-source-evidence.txt ./*.log >>SHA256SUMS)
+			acceptance-evidence.txt linux-source-evidence.txt desktop-source-evidence.txt ./*.log >>SHA256SUMS)
 	else
 		(cd "$MAILCTL_CANDIDATE_DIR" && "${hash_command[@]}" acceptance-evidence.txt installer-acceptance.log \
 			installed-state-acceptance.log installed-process-acceptance.log \

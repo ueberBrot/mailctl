@@ -99,6 +99,7 @@ mailboxes = ["INBOX"]
         let mut setup = fixture.command(executable);
         setup.args(["--json", "setup"]);
         assert_success(&run_bounded(setup));
+        fixture.installation.provision_packaged_native(PASSWORD);
         fixture
     }
 
