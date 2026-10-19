@@ -158,12 +158,20 @@ async fn public_composition_boundaries(executable: &str) {
 
 #[cfg(feature = "cli")]
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an explicitly disposable Windows identity and native credentials"
+)]
 async fn cli_composition_rejection_and_recipient_mime_ceilings_precede_dispatch() {
     public_composition_boundaries(support::MAILCTL).await;
 }
 
 #[cfg(feature = "mcp")]
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an explicitly disposable Windows identity and native credentials"
+)]
 async fn mcp_composition_rejection_and_recipient_mime_ceilings_precede_dispatch() {
     public_composition_boundaries(support::MAILCTL_MCP).await;
 }

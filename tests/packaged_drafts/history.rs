@@ -629,96 +629,160 @@ async fn corrupt_rows_suspend_creation_after_repair(executable: &str) {
 
 #[cfg(feature = "cli")]
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an explicitly disposable Windows identity and native credentials"
+)]
 async fn cli_corrupt_rows_keep_creation_suspended_after_repair() {
     corrupt_rows_suspend_creation_after_repair(support::MAILCTL).await;
 }
 
 #[cfg(feature = "mcp")]
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an explicitly disposable Windows identity and native credentials"
+)]
 async fn mcp_corrupt_rows_keep_creation_suspended_after_repair() {
     corrupt_rows_suspend_creation_after_repair(support::MAILCTL_MCP).await;
 }
 
 #[cfg(feature = "cli")]
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an explicitly disposable Windows identity and native credentials"
+)]
 async fn cli_snapshots_preserve_all_draft_outcomes_and_fence_post_backup_history() {
     snapshots_preserve_all_outcomes_and_suspend_missing_history(support::MAILCTL).await;
 }
 
 #[cfg(feature = "mcp")]
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an explicitly disposable Windows identity and native credentials"
+)]
 async fn mcp_snapshots_preserve_all_draft_outcomes_and_fence_post_backup_history() {
     snapshots_preserve_all_outcomes_and_suspend_missing_history(support::MAILCTL_MCP).await;
 }
 
 #[cfg(feature = "cli")]
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an explicitly disposable Windows identity and native credentials"
+)]
 async fn cli_journal_loss_stays_suspended_after_file_replacement() {
     journal_loss_stays_suspended_after_file_replacement(support::MAILCTL).await;
 }
 
 #[cfg(feature = "mcp")]
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an explicitly disposable Windows identity and native credentials"
+)]
 async fn mcp_journal_loss_stays_suspended_after_file_replacement() {
     journal_loss_stays_suspended_after_file_replacement(support::MAILCTL_MCP).await;
 }
 
 #[cfg(feature = "cli")]
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an explicitly disposable Windows identity and native credentials"
+)]
 async fn cli_unusable_writer_preserves_status_and_provider_reads() {
     unusable_writer_preserves_status_and_provider_reads(support::MAILCTL).await;
 }
 
 #[cfg(feature = "mcp")]
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an explicitly disposable Windows identity and native credentials"
+)]
 async fn mcp_unusable_writer_preserves_status_and_provider_reads() {
     unusable_writer_preserves_status_and_provider_reads(support::MAILCTL_MCP).await;
 }
 
 #[cfg(feature = "cli")]
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an explicitly disposable Windows identity and native credentials"
+)]
 async fn cli_upgrade_verification_refuses_unknown_history_without_dispatch() {
     upgrade_verification_refuses_unknown_history_without_dispatch(support::MAILCTL).await;
 }
 
 #[cfg(feature = "mcp")]
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an explicitly disposable Windows identity and native credentials"
+)]
 async fn mcp_upgrade_verification_refuses_unknown_history_without_dispatch() {
     upgrade_verification_refuses_unknown_history_without_dispatch(support::MAILCTL_MCP).await;
 }
 
 #[cfg(feature = "cli")]
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an explicitly disposable Windows identity and native credentials"
+)]
 async fn cli_previous_encoder_prepared_retry_preserves_frozen_facts() {
     previous_encoder_prepared_retry_preserves_frozen_facts(support::MAILCTL).await;
 }
 
 #[cfg(feature = "mcp")]
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an explicitly disposable Windows identity and native credentials"
+)]
 async fn mcp_previous_encoder_prepared_retry_preserves_frozen_facts() {
     previous_encoder_prepared_retry_preserves_frozen_facts(support::MAILCTL_MCP).await;
 }
 
 #[cfg(feature = "cli")]
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an explicitly disposable Windows identity and native credentials"
+)]
 async fn cli_historical_operations_keep_original_targets_and_permissions() {
     historical_operations_keep_original_targets_and_permissions(support::MAILCTL).await;
 }
 
 #[cfg(feature = "mcp")]
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an explicitly disposable Windows identity and native credentials"
+)]
 async fn mcp_historical_operations_keep_original_targets_and_permissions() {
     historical_operations_keep_original_targets_and_permissions(support::MAILCTL_MCP).await;
 }
 
 #[cfg(feature = "cli")]
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an explicitly disposable Windows identity and native credentials"
+)]
 async fn cli_revoked_from_and_unretained_routes_preserve_history_without_dispatch() {
     revoked_from_and_unretained_routes_preserve_history_without_dispatch(support::MAILCTL).await;
 }
 
 #[cfg(feature = "mcp")]
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an explicitly disposable Windows identity and native credentials"
+)]
 async fn mcp_revoked_from_and_unretained_routes_preserve_history_without_dispatch() {
     revoked_from_and_unretained_routes_preserve_history_without_dispatch(support::MAILCTL_MCP)
         .await;

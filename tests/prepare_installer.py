@@ -13,6 +13,7 @@ import tarfile
 import tempfile
 import unittest
 from unittest.mock import patch
+import zipfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -22,6 +23,7 @@ prepare = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(prepare)
 LINUX = "x86_64-unknown-linux-gnu"
 MACOS = "aarch64-apple-darwin"
+WINDOWS = "x86_64-pc-windows-msvc"
 
 
 def fields(path):
@@ -36,22 +38,35 @@ def elf(machine=62, loader=b"/lib64/ld-linux-x86-64.so.2\0"):
     return header + interpreter + loader
 
 
+def pe(machine=0x8664, magic=0x20b, characteristics=0x22):
+    dos = b"MZ" + b"\0" * 58 + struct.pack("<I", 64)
+    header = struct.pack("<4sHHIIIHH", b"PE\0\0", machine, 1, 0, 0, 0, 112, characteristics)
+    return dos + header + struct.pack("<H", magic) + b"\0" * (110 + 40)
+
+
 class CandidatePreparationTest(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="mailctl-prepare-test-")
         self.addCleanup(self.temporary.cleanup)
         self.directory = Path(self.temporary.name)
         self.destination = self.directory / "candidate"
+        self.signing = "NotSigned"
 
     def manifest(self, target, contents=None):
-        archive = self.directory / f"mailctl-{target}.tar.gz"
-        with tarfile.open(archive, "w:gz") as output:
-            for binary in prepare.COMPONENTS.values():
-                data = (contents or {}).get(binary, elf())
-                member = tarfile.TarInfo(f"mailctl-{target}/{binary}")
-                member.size = len(data)
-                member.mode = 0o755
-                output.addfile(member, io.BytesIO(data))
+        windows = target == WINDOWS
+        archive = self.directory / (f"mailctl-{target}" + (".zip" if windows else ".tar.gz"))
+        if windows:
+            with zipfile.ZipFile(archive, "w") as output:
+                for binary in prepare.COMPONENTS.values():
+                    output.writestr(binary + ".exe", (contents or {}).get(binary, pe()))
+        else:
+            with tarfile.open(archive, "w:gz") as output:
+                for binary in prepare.COMPONENTS.values():
+                    data = (contents or {}).get(binary, elf())
+                    member = tarfile.TarInfo(f"mailctl-{target}/{binary}")
+                    member.size = len(data)
+                    member.mode = 0o755
+                    output.addfile(member, io.BytesIO(data))
         checksum = self.directory / (archive.name + ".sha256")
         digest = prepare.digest(archive)
         checksum.write_text(f"{digest}  {archive.name}\n")
@@ -83,6 +98,10 @@ class CandidatePreparationTest(unittest.TestCase):
             return "arm64"
         if arguments[:3] == ("/usr/bin/codesign", "--verify", "--strict"):
             return ""
+        if arguments[:3] == ("pwsh", "-NoProfile", "-File"):
+            self.assertEqual(arguments[4:7], ("-Phase", "inspect", "-Binary"))
+            return json.dumps(dict(authenticode_status=self.signing, powershell_version="7.4.13",
+                                   windows_caption="Microsoft Windows Server 2025 Datacenter"))
         if len(arguments) == 2 and arguments[1] == "--version":
             binary = "mailctl-mcp" if Path(arguments[0]).name.startswith("mailctl-mcp-") else "mailctl"
             return binary + " 0.1.0"
@@ -90,10 +109,13 @@ class CandidatePreparationTest(unittest.TestCase):
 
     def qualify(self, target, contents=None):
         manifest = self.manifest(target, contents)
-        system, machine = ("Linux", "x86_64") if target == LINUX else ("Darwin", "arm64")
+        system, machine = {LINUX: ("Linux", "x86_64"), MACOS: ("Darwin", "arm64"),
+                           WINDOWS: ("Windows", "AMD64")}[target]
         with patch.object(prepare.platform, "system", return_value=system), \
                 patch.object(prepare.platform, "machine", return_value=machine), \
-                patch.object(prepare.platform, "release", return_value="6.8.0-test"), \
+                patch.object(prepare.platform, "release", return_value=(
+                    "2025Server" if target == WINDOWS else "6.8.0-test")), \
+                patch.object(prepare.platform, "win32_ver", return_value=("10", "10.0.26100", "", "")), \
                 patch.object(prepare.platform, "freedesktop_os_release", create=True,
                              return_value={"ID": "ubuntu", "VERSION_ID": "24.04"}), \
                 patch.object(prepare.os, "confstr", return_value="glibc 2.39"), \
@@ -145,9 +167,50 @@ class CandidatePreparationTest(unittest.TestCase):
         with patch.object(prepare.platform, "system", return_value="Linux"), \
                 patch.object(prepare.platform, "machine", return_value="x86_64"), \
                 patch.object(prepare.os, "confstr", return_value=None):
-            with self.assertRaisesRegex(ValueError, "native macOS Apple Silicon or GNU/Linux x86_64"):
+            with self.assertRaisesRegex(ValueError, "native macOS Apple Silicon, GNU/Linux x86_64"):
+                prepare.native_target()
+        with patch.object(prepare.platform, "system", return_value="Windows"), \
+                patch.object(prepare.platform, "machine", return_value="AMD64"):
+            self.assertEqual(prepare.native_target(), WINDOWS)
+        with patch.object(prepare.platform, "system", return_value="Windows"), \
+                patch.object(prepare.platform, "machine", return_value="ARM64"):
+            with self.assertRaises(ValueError):
                 prepare.native_target()
         self.assertFalse(self.destination.exists())
+
+    def test_windows_receipt_uses_native_zip_bytes_and_observed_signing(self):
+        evidence = self.qualify(WINDOWS)
+        for key, expected in dict(target=WINDOWS, architecture="AMD64", os_release="Windows",
+                                  os_version="10.0.26100", pe_machine="x86_64", pe_format="PE32+",
+                                  authenticode_status="NotSigned", powershell_version="7.4.13",
+                                  windows_caption="Microsoft Windows Server 2025 Datacenter",
+                                  publication="not-performed").items():
+            self.assertEqual(evidence[key], expected)
+        receipt = fields(self.destination / f"manifest-{WINDOWS}.txt")
+        self.assertEqual(len(receipt), 13)
+        for component, binary in prepare.COMPONENTS.items():
+            name = f"{binary}-v0.1.0-{WINDOWS}.exe"
+            self.assertEqual(receipt[f"{component}_file"], name)
+            self.assertEqual(receipt[f"{component}_signing"], "unsigned")
+            self.assertEqual((self.destination / name).read_bytes(), pe())
+        self.assertEqual((self.destination / "install.ps1").read_bytes(), (ROOT / "install.ps1").read_bytes())
+        self.assertFalse((self.destination / "install.sh").exists())
+
+    def test_invalid_windows_images_cannot_publish_a_candidate(self):
+        for invalid in (b"#!/bin/sh\n", elf(), pe(machine=0xaa64), pe(magic=0x10b),
+                        pe(characteristics=0x20), pe(characteristics=0x2022), pe()[:100]):
+            with self.subTest(binary=invalid):
+                with self.assertRaises(ValueError):
+                    self.qualify(WINDOWS, {"mailctl-mcp": invalid})
+                self.assertFalse(self.destination.exists())
+
+    def test_windows_signing_evidence_must_not_claim_unqualified_signing(self):
+        for signing in ("Valid", "HashMismatch", "NotTrusted", "UnknownError"):
+            self.signing = signing
+            with self.subTest(signing=signing):
+                with self.assertRaisesRegex(ValueError, "unqualified Authenticode"):
+                    self.qualify(WINDOWS)
+                self.assertFalse(self.destination.exists())
 
     def test_invalid_linux_executables_never_publish_a_partial_candidate(self):
         for invalid in (b"#!/bin/sh\n", elf(machine=183), elf()[:80],

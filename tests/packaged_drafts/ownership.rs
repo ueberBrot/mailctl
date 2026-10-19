@@ -12,6 +12,8 @@ async fn start_request(
     #[cfg(feature = "cli")]
     if executable == support::MAILCTL {
         let mut command = tokio::process::Command::from(fixture.cli_command(tool, &input, grant));
+        #[cfg(windows)]
+        command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NEW_CONSOLE);
         return command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -63,6 +65,18 @@ async fn start_request(
         .await
         .unwrap();
     child
+}
+
+#[cfg(feature = "cli")]
+fn cancel_cli(child: &tokio::process::Child) {
+    #[cfg(unix)]
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(child.id().unwrap() as i32).unwrap(),
+        rustix::process::Signal::TERM,
+    )
+    .unwrap();
+    #[cfg(windows)]
+    native_support::cancel(child.id().unwrap());
 }
 
 #[cfg(feature = "mcp")]
@@ -192,12 +206,20 @@ async fn unread_creation_response(executable: &str) {
 
 #[cfg(feature = "cli")]
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an explicitly disposable Windows identity and native credentials"
+)]
 async fn cli_unread_first_creation_response_replays_committed_receipt() {
     unread_creation_response(support::MAILCTL).await;
 }
 
 #[cfg(feature = "mcp")]
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an explicitly disposable Windows identity and native credentials"
+)]
 async fn mcp_unread_first_creation_response_replays_committed_receipt() {
     unread_creation_response(support::MAILCTL_MCP).await;
 }
@@ -230,11 +252,7 @@ async fn interrupted_creation(executable: &str) {
         } else {
             #[cfg(feature = "cli")]
             if executable == support::MAILCTL {
-                rustix::process::kill_process(
-                    rustix::process::Pid::from_raw(owner.id().unwrap() as i32).unwrap(),
-                    rustix::process::Signal::TERM,
-                )
-                .unwrap();
+                cancel_cli(&owner);
             }
             // MCP EOF must release ownership and preserve possible dispatch.
             drop(owner.stdin.take());
@@ -257,12 +275,20 @@ async fn interrupted_creation(executable: &str) {
 
 #[cfg(feature = "cli")]
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an explicitly disposable Windows identity and native credentials"
+)]
 async fn cli_crash_and_cancellation_release_real_append_ownership() {
     interrupted_creation(support::MAILCTL).await;
 }
 
 #[cfg(feature = "mcp")]
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an explicitly disposable Windows identity and native credentials"
+)]
 async fn mcp_crash_and_eof_release_real_append_ownership() {
     interrupted_creation(support::MAILCTL_MCP).await;
 }
@@ -299,11 +325,7 @@ async fn interrupted_reconciliation(executable: &str) {
             .expect("reconciliation reaches provider search");
             #[cfg(feature = "cli")]
             if executable == support::MAILCTL {
-                rustix::process::kill_process(
-                    rustix::process::Pid::from_raw(owner.id().unwrap() as i32).unwrap(),
-                    rustix::process::Signal::TERM,
-                )
-                .unwrap();
+                cancel_cli(&owner);
             }
             drop(owner.stdin.take());
             let output = tokio::time::timeout(Duration::from_secs(5), owner.wait_with_output())
@@ -335,18 +357,30 @@ async fn interrupted_reconciliation(executable: &str) {
 
 #[cfg(feature = "cli")]
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an explicitly disposable Windows identity and native credentials"
+)]
 async fn cli_reconciliation_deadline_retains_original_uncertainty() {
     interrupted_reconciliation(support::MAILCTL).await;
 }
 
 #[cfg(feature = "mcp")]
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an explicitly disposable Windows identity and native credentials"
+)]
 async fn mcp_reconciliation_deadline_retains_original_uncertainty() {
     interrupted_reconciliation(support::MAILCTL_MCP).await;
 }
 
 #[cfg(feature = "mcp")]
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an explicitly disposable Windows identity and native credentials"
+)]
 async fn mcp_request_cancellation_releases_append_and_reconciliation_without_ending_session() {
     use tokio::io::{AsyncWriteExt, BufReader};
 
@@ -456,6 +490,10 @@ async fn mcp_request_cancellation_releases_append_and_reconciliation_without_end
 
 #[cfg(all(feature = "cli", feature = "mcp"))]
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an explicitly disposable Windows identity and native credentials"
+)]
 async fn cross_same_id_and_conflicting_inputs_share_one_append_across_grants() {
     use std::sync::{
         Arc,
@@ -567,6 +605,10 @@ async fn cross_same_id_and_conflicting_inputs_share_one_append_across_grants() {
 
 #[cfg(all(feature = "cli", feature = "mcp"))]
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an explicitly disposable Windows identity and native credentials"
+)]
 async fn cross_crashed_owner_and_concurrent_reconciliation_never_append_again() {
     let mut fixture = Fixture::new(support::MAILCTL);
     fixture

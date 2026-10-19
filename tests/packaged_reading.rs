@@ -2,27 +2,32 @@
 //! MAILCTL_PACKAGED_BIN_DIR selects installed candidate bytes; cli_ and mcp_
 //! test filters exercise installations that do not contain the other component.
 #![cfg(all(
-    any(target_os = "macos", target_os = "linux"),
+    any(target_os = "macos", target_os = "linux", windows),
     any(feature = "cli", feature = "mcp")
 ))]
 
 mod imap_support;
+#[cfg(windows)]
+#[path = "native_support/windows_export.rs"]
+mod native_support;
 #[path = "imap_support/process.rs"]
 mod server;
 mod support;
 
 #[path = "packaged_reading/body_routes.rs"]
 mod body_routes;
-#[cfg(feature = "cli")]
+#[cfg(all(feature = "cli", unix))]
 #[path = "packaged_reading/export_faults.rs"]
 mod export_faults;
 #[path = "packaged_reading/transfer_lifecycle.rs"]
 mod transfer_lifecycle;
 
 use serde_json::{Value, json};
-#[cfg(feature = "cli")]
+#[cfg(all(feature = "cli", unix))]
 use std::os::unix::fs::MetadataExt;
-use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, process::Command};
+#[cfg(all(feature = "cli", unix))]
+use std::os::unix::fs::PermissionsExt;
+use std::{fs, path::PathBuf, process::Command};
 #[cfg(feature = "cli")]
 use support::envelope;
 use support::{Installation, assert_success, run_bounded};
@@ -50,7 +55,7 @@ impl Fixture {
         let server = server::ImapServer::new(directory);
         let root = directory.join("exports");
         fs::create_dir(&root).unwrap();
-        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        support::protect(&root, true);
         let empty_path = directory.join("empty-path");
         fs::create_dir(&empty_path).unwrap();
         let credential = support::packaged_credential(directory, PASSWORD);
@@ -88,7 +93,7 @@ mailboxes = ["INBOX"]
             ),
         )
         .unwrap();
-        fs::set_permissions(installation.config(), fs::Permissions::from_mode(0o600)).unwrap();
+        support::protect(installation.config(), false);
         let fixture = Self {
             installation,
             server,
@@ -99,7 +104,7 @@ mailboxes = ["INBOX"]
         let mut setup = fixture.command(executable);
         setup.args(["--json", "setup"]);
         assert_success(&run_bounded(setup));
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows))]
         fixture.installation.provision_packaged_native(PASSWORD);
         fixture
     }
@@ -350,12 +355,20 @@ async fn read_and_continue_selected_bodies(executable: &str) {
 
 #[cfg(feature = "cli")]
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an explicitly disposable Windows identity and native credentials"
+)]
 async fn cli_reads_selected_bodies_at_utf8_boundaries_without_attachment_downloads() {
     read_and_continue_selected_bodies(support::MAILCTL).await;
 }
 
 #[cfg(feature = "mcp")]
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an explicitly disposable Windows identity and native credentials"
+)]
 async fn mcp_reads_selected_bodies_at_utf8_boundaries_without_attachment_downloads() {
     read_and_continue_selected_bodies(support::MAILCTL_MCP).await;
 }
@@ -431,12 +444,20 @@ async fn read_selected_body_wire_bounds(executable: &str) {
 
 #[cfg(feature = "cli")]
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an explicitly disposable Windows identity and native credentials"
+)]
 async fn cli_enforces_selected_body_wire_bounds_without_attachment_downloads() {
     read_selected_body_wire_bounds(support::MAILCTL).await;
 }
 
 #[cfg(feature = "mcp")]
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an explicitly disposable Windows identity and native credentials"
+)]
 async fn mcp_enforces_selected_body_wire_bounds_without_attachment_downloads() {
     read_selected_body_wire_bounds(support::MAILCTL_MCP).await;
 }
@@ -520,12 +541,20 @@ async fn reject_body_cursor_after_content_changes(executable: &str) {
 
 #[cfg(feature = "cli")]
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an explicitly disposable Windows identity and native credentials"
+)]
 async fn cli_rejects_body_cursor_after_selected_content_changes() {
     reject_body_cursor_after_content_changes(support::MAILCTL).await;
 }
 
 #[cfg(feature = "mcp")]
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an explicitly disposable Windows identity and native credentials"
+)]
 async fn mcp_rejects_body_cursor_after_selected_content_changes() {
     reject_body_cursor_after_content_changes(support::MAILCTL_MCP).await;
 }
@@ -601,18 +630,30 @@ async fn read_adversarial_mime(executable: &str) {
 
 #[cfg(feature = "cli")]
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an explicitly disposable Windows identity and native credentials"
+)]
 async fn cli_bounds_mime_and_marks_malformed_transfer_replacements() {
     read_adversarial_mime(support::MAILCTL).await;
 }
 
 #[cfg(feature = "mcp")]
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an explicitly disposable Windows identity and native credentials"
+)]
 async fn mcp_bounds_mime_and_marks_malformed_transfer_replacements() {
     read_adversarial_mime(support::MAILCTL_MCP).await;
 }
 
 #[cfg(feature = "cli")]
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an explicitly disposable Windows identity and native credentials"
+)]
 async fn cli_exports_privately_without_overwrite_and_cleans_up_failed_transfers() {
     use server::AttachmentPhase;
     let mut fixture = Fixture::new(support::MAILCTL);
@@ -661,14 +702,19 @@ async fn cli_exports_privately_without_overwrite_and_cleans_up_failed_transfers(
             .starts_with(&format!("{}:", std::env::consts::OS))
     );
     assert_eq!(fs::read(&destination).unwrap(), b"abcdef");
-    assert_eq!(
-        fs::metadata(&destination).unwrap().uid(),
-        rustix::process::geteuid().as_raw()
-    );
-    assert_eq!(
-        fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
-        0o600
-    );
+    #[cfg(unix)]
+    {
+        assert_eq!(
+            fs::metadata(&destination).unwrap().uid(),
+            rustix::process::geteuid().as_raw()
+        );
+        assert_eq!(
+            fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    #[cfg(windows)]
+    native_support::assert_private(&destination);
     assert_eq!(fs::read(&sentinel).unwrap(), b"existing operator file");
     assert_eq!(fs::read_dir(&fixture.root).unwrap().count(), 2);
     for name in ["../escape.bin", "NUL.txt"] {
@@ -721,6 +767,10 @@ async fn cli_exports_privately_without_overwrite_and_cleans_up_failed_transfers(
 
 #[cfg(feature = "mcp")]
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an explicitly disposable Windows identity and native credentials"
+)]
 async fn mcp_binds_attachment_tokens_to_the_issuing_session_and_consumes_them_once() {
     use server::AttachmentPhase;
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
@@ -901,12 +951,20 @@ async fn reject_attachment_continuation_after_mailbox_recreation(executable: &st
 
 #[cfg(feature = "cli")]
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an explicitly disposable Windows identity and native credentials"
+)]
 async fn cli_rejects_buffered_attachment_bytes_after_mailbox_recreation() {
     reject_attachment_continuation_after_mailbox_recreation(support::MAILCTL).await;
 }
 
 #[cfg(feature = "mcp")]
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an explicitly disposable Windows identity and native credentials"
+)]
 async fn mcp_rejects_buffered_attachment_bytes_after_mailbox_recreation() {
     reject_attachment_continuation_after_mailbox_recreation(support::MAILCTL_MCP).await;
 }
@@ -1029,12 +1087,20 @@ async fn validate_attachment_payloads_and_bounds(executable: &str) {
 
 #[cfg(feature = "cli")]
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an explicitly disposable Windows identity and native credentials"
+)]
 async fn cli_validates_attachment_payloads_and_enforces_transfer_bounds() {
     validate_attachment_payloads_and_bounds(support::MAILCTL).await;
 }
 
 #[cfg(feature = "mcp")]
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an explicitly disposable Windows identity and native credentials"
+)]
 async fn mcp_validates_attachment_payloads_and_enforces_transfer_bounds() {
     validate_attachment_payloads_and_bounds(support::MAILCTL_MCP).await;
 }

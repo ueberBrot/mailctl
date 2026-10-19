@@ -274,7 +274,8 @@ fn mcp_discovery(installation: &Installation, server: &server::ImapServer) {
         .build()
         .unwrap()
         .block_on(async {
-            let mut command = tokio::process::Command::new(support::MAILCTL_MCP);
+            let mut command =
+                tokio::process::Command::new(support::selected_executable(support::MAILCTL_MCP));
             command
                 .arg("--config")
                 .arg(installation.config())

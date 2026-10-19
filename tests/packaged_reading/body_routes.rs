@@ -145,12 +145,20 @@ async fn read_body_selection_and_representation_routes(executable: &str) {
 
 #[cfg(feature = "cli")]
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an explicitly disposable Windows identity and native credentials"
+)]
 async fn cli_selects_and_decodes_body_routes_without_unrelated_payloads() {
     read_body_selection_and_representation_routes(support::MAILCTL).await;
 }
 
 #[cfg(feature = "mcp")]
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an explicitly disposable Windows identity and native credentials"
+)]
 async fn mcp_selects_and_decodes_body_routes_without_unrelated_payloads() {
     read_body_selection_and_representation_routes(support::MAILCTL_MCP).await;
 }
@@ -201,12 +209,20 @@ async fn enforce_semantic_mime_depth(executable: &str) {
 
 #[cfg(feature = "cli")]
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an explicitly disposable Windows identity and native credentials"
+)]
 async fn cli_mime_depth_counts_nodes_instead_of_protocol_parentheses() {
     enforce_semantic_mime_depth(support::MAILCTL).await;
 }
 
 #[cfg(feature = "mcp")]
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an explicitly disposable Windows identity and native credentials"
+)]
 async fn mcp_mime_depth_counts_nodes_instead_of_protocol_parentheses() {
     enforce_semantic_mime_depth(support::MAILCTL_MCP).await;
 }

@@ -24,7 +24,10 @@ fn console_command(
     let mut command = Command::new(std::env::current_exe().unwrap());
     command
         .args(["--exact", "console_provision", "--ignored", "--nocapture"])
-        .env("MAILCTL_TEST_BINARY", binary)
+        .env(
+            "MAILCTL_TEST_BINARY",
+            crate::support::selected_executable(binary),
+        )
         .env("MAILCTL_TEST_CONFIG", installation.config())
         .env("MAILCTL_TEST_ALIAS", alias)
         .env("MAILCTL_TEST_SECRET", secret)

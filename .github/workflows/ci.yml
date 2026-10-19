@@ -233,6 +233,63 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  windows-candidate:
+    runs-on: windows-2025
+    timeout-minutes: 90
+    env:
+      MAILCTL_TARGET: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f  # v2.0.0
+      - name: Install dist 0.33.0 from its official release
+        shell: pwsh
+        env:
+          DIST_BIN_DIR: ${{ runner.temp }}/dist-bin
+        run: ./scripts/ci/install-dist.ps1
+      - name: Build native Windows x86_64 archives with dist
+        shell: pwsh
+        run: ./scripts/ci/windows-candidate.ps1 build
+      - name: Prepare Windows components and build evidence
+        shell: pwsh
+        env:
+          MAILCTL_CANDIDATE_DIR: ${{ runner.temp }}/mailctl-windows-candidate
+          MAILCTL_PACKAGED_BIN_DIR: ${{ runner.temp }}/mailctl-windows-installed
+        run: ./scripts/ci/windows-candidate.ps1 prepare
+      - name: Qualify installation, upgrades and removal with PowerShell 5.1 and 7
+        shell: pwsh
+        run: ./scripts/ci/windows-candidate.ps1 installer
+      - name: Build reusable Windows acceptance harnesses
+        shell: pwsh
+        run: ./scripts/ci/windows-packaged-acceptance.ps1 prepare
+      - name: Qualify installed setup, shared account state, backup and restore
+        shell: pwsh
+        run: ./scripts/ci/windows-packaged-acceptance.ps1 state
+      - name: Qualify installed interfaces, export and process recovery
+        shell: pwsh
+        run: ./scripts/ci/windows-packaged-acceptance.ps1 process
+      - name: Qualify installed Credential Manager lifecycle under a disposable identity
+        shell: pwsh
+        run: ./scripts/ci/windows-packaged-acceptance.ps1 native
+      - name: Qualify installed reading through native Windows credentials
+        shell: pwsh
+        run: ./scripts/ci/windows-packaged-acceptance.ps1 reading
+      - name: Qualify installed draft faults and recovery
+        shell: pwsh
+        run: ./scripts/ci/windows-packaged-acceptance.ps1 drafts
+      - name: Record passing Windows candidate acceptance
+        shell: pwsh
+        run: ./scripts/ci/windows-candidate.ps1 record
+      - name: Keep Windows candidate and acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: mailctl-candidate-x86_64-pc-windows-msvc
+          path: ${{ env.MAILCTL_CANDIDATE_DIR }}/
+          if-no-files-found: error
+          retention-days: 14
+
   native-isolation:
     runs-on: macos-latest
     timeout-minutes: 25

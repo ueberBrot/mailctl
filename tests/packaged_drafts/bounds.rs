@@ -47,18 +47,30 @@ async fn authentication_and_sqlite_contention(executable: &str) {
 
 #[cfg(feature = "cli")]
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an explicitly disposable Windows identity and native credentials"
+)]
 async fn cli_authentication_and_sqlite_lock_failures_precede_dispatch() {
     authentication_and_sqlite_contention(support::MAILCTL).await;
 }
 
 #[cfg(feature = "mcp")]
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an explicitly disposable Windows identity and native credentials"
+)]
 async fn mcp_authentication_and_sqlite_lock_failures_precede_dispatch() {
     authentication_and_sqlite_contention(support::MAILCTL_MCP).await;
 }
 
 #[cfg(feature = "cli")]
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an explicitly disposable Windows identity and native credentials"
+)]
 async fn cli_response_budget_admission_and_replay_preserve_side_effects() {
     let mut fixture = Fixture::new(support::MAILCTL);
     let mailbox = "x".repeat(400);
@@ -123,6 +135,10 @@ async fn cli_response_budget_admission_and_replay_preserve_side_effects() {
 
 #[cfg(feature = "mcp")]
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an explicitly disposable Windows identity and native credentials"
+)]
 async fn mcp_inadmissible_response_budget_refuses_startup_before_drafts() {
     let mut fixture = Fixture::new(support::MAILCTL_MCP);
     let mut config = fixture.configuration();

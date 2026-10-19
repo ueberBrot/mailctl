@@ -64,7 +64,7 @@ pub(crate) const MAILCTL_MCP: &str = match option_env!("CARGO_BIN_EXE_mailctl-mc
 /// Test drivers and already copied fixture executables retain their own paths.
 /// Validate each requested component once so a combined harness can also run
 /// against an installation containing only one component.
-fn selected_executable(executable: &str) -> PathBuf {
+pub(crate) fn selected_executable(executable: &str) -> PathBuf {
     let Some((_, name, packaged)) = PRODUCT_COMPONENTS
         .iter()
         .find(|(compiled, _, _)| *compiled == Some(executable))
@@ -115,7 +115,7 @@ fn selected_executable(executable: &str) -> PathBuf {
 pub(crate) struct Installation {
     directory: PathBuf,
     config: PathBuf,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     native_credentials: Mutex<Vec<Uuid>>,
 }
 
@@ -130,7 +130,7 @@ impl Installation {
         Self {
             directory,
             config,
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", windows))]
             native_credentials: Mutex::new(Vec::new()),
         }
     }
@@ -145,7 +145,7 @@ impl Installation {
         &self.config
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     pub(crate) fn provision_packaged_native(&self, password: &str) {
         if std::env::var("MAILCTL_PACKAGED_CREDENTIAL_SOURCE").as_deref() != Ok("native") {
             return;
@@ -154,14 +154,14 @@ impl Installation {
             config::CredentialSource,
             credentials::{self, Secret},
         };
-        secret_service::assert_disposable();
+        assert_disposable_native();
         let registry: Value =
             serde_json::from_slice(&fs::read(self.directory.join("state/accounts.json")).unwrap())
                 .unwrap();
         let source = credentials::source_for(&CredentialSource::Native {});
         let store = source
             .mutable_store()
-            .expect("mutable native Linux credential source");
+            .expect("mutable native credential source");
         let secret = Secret::new(password.as_bytes().to_vec()).unwrap();
         for account in registry["accounts"].as_object().unwrap().values() {
             let id = Uuid::parse_str(account["account_id"].as_str().unwrap()).unwrap();
@@ -270,7 +270,7 @@ mailboxes = ["INBOX", "Drafts"]
 
 impl Drop for Installation {
     fn drop(&mut self) {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows))]
         if let Ok(accounts) = self.native_credentials.get_mut()
             && !accounts.is_empty()
         {
@@ -391,13 +391,17 @@ pub(crate) fn toml_string(path: &Path) -> String {
     toml::Value::String(path.to_string_lossy().into_owned()).to_string()
 }
 
-#[cfg(unix)]
 pub(crate) fn packaged_credential(
     directory: &Path,
     password: &str,
 ) -> mailctl::config::CredentialSource {
-    use mailctl::config::{CredentialCommand, CredentialSource};
+    #[cfg(unix)]
+    use mailctl::config::CredentialCommand;
+    use mailctl::config::CredentialSource;
+    #[cfg(windows)]
+    let _ = (directory, password);
     match std::env::var("MAILCTL_PACKAGED_CREDENTIAL_SOURCE").as_deref() {
+        #[cfg(unix)]
         Err(std::env::VarError::NotPresent) | Ok("command") => {
             let secret = directory.join("synthetic-credential");
             fs::write(&secret, password).expect("write synthetic credential");
@@ -409,6 +413,7 @@ pub(crate) fn packaged_credential(
                 protected_paths: vec![secret],
             })
         }
+        #[cfg(target_os = "linux")]
         Ok("systemd") => {
             assert_eq!(std::env::consts::OS, "linux");
             assert!(std::env::var_os("CREDENTIALS_DIRECTORY").is_some());
@@ -416,16 +421,15 @@ pub(crate) fn packaged_credential(
                 name: "password".into(),
             }
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows))]
         Ok("native") => {
-            secret_service::assert_disposable();
+            assert_disposable_native();
             CredentialSource::Native {}
         }
         source => panic!("unsupported packaged credential source: {source:?}"),
     }
 }
 
-#[cfg(unix)]
 pub(crate) fn packaged_environment(command: &mut Command, certificate: &Path, empty_path: &Path) {
     command
         .env_clear()
@@ -437,6 +441,19 @@ pub(crate) fn packaged_environment(command: &mut Command, certificate: &Path, em
             std::env::var_os("CREDENTIALS_DIRECTORY").unwrap(),
         );
     }
+    #[cfg(windows)]
+    for name in [
+        "SystemRoot",
+        "TEMP",
+        "TMP",
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
+    ] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
     #[cfg(target_os = "linux")]
     if std::env::var("MAILCTL_PACKAGED_CREDENTIAL_SOURCE").as_deref() == Ok("native") {
         secret_service::assert_disposable();
@@ -446,7 +463,19 @@ pub(crate) fn packaged_environment(command: &mut Command, certificate: &Path, em
     }
 }
 
-fn protect(path: &Path, directory: bool) {
+#[cfg(any(target_os = "linux", windows))]
+fn assert_disposable_native() {
+    #[cfg(target_os = "linux")]
+    secret_service::assert_disposable();
+    #[cfg(windows)]
+    assert_eq!(
+        std::env::var("MAILCTL_DISPOSABLE_WINDOWS").as_deref(),
+        Ok("1"),
+        "native acceptance requires an explicitly disposable Windows identity"
+    );
+}
+
+pub(crate) fn protect(path: &Path, directory: bool) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -456,6 +485,40 @@ fn protect(path: &Path, directory: bool) {
         )
         .expect("protect disposable fixture");
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        static SID: OnceLock<String> = OnceLock::new();
+        let sid = SID.get_or_init(|| {
+            let mut command = Command::new("whoami.exe");
+            command.args(["/user", "/fo", "csv", "/nh"]);
+            let output = run_bounded(command);
+            assert_success(&output);
+            let output = String::from_utf8_lossy(&output.stdout);
+            let sid = output
+                .trim()
+                .rsplit_once("\",\"")
+                .unwrap()
+                .1
+                .trim_end_matches('"');
+            assert!(
+                sid.starts_with("S-")
+                    && sid
+                        .bytes()
+                        .all(|byte| byte == b'S' || byte == b'-' || byte.is_ascii_digit())
+            );
+            sid.into()
+        });
+        let flags = if directory { "(OI)(CI)(F)" } else { "(F)" };
+        let mut command = Command::new("icacls.exe");
+        command.arg(path).args([
+            "/inheritance:r",
+            "/grant:r",
+            &format!("*{sid}:{flags}"),
+            &format!("*S-1-5-18:{flags}"),
+            &format!("*S-1-5-32-544:{flags}"),
+        ]);
+        assert_success(&run_bounded(command));
+    }
+    #[cfg(not(any(unix, windows)))]
     let _ = (path, directory);
 }
