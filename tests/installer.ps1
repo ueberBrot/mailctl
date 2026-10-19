@@ -215,15 +215,17 @@ try {
             Verify $directory '' $manifest
             Assert ((Snapshot ([IO.Path]::GetDirectoryName($config))) -ceq $state) 'Uninstall changed application state.'
         }
-        $default = Join-Path $env:CARGO_HOME 'bin'
+        $default = Join-Path $env:USERPROFILE '.local/bin'
+        $cargoBefore = Snapshot $env:CARGO_HOME
         Invoke-Installer @('-BaseUrl', $url)
         Verify $default 'cli,mcp' $manifest
+        Assert ((Snapshot $env:CARGO_HOME) -ceq $cargoBefore) 'Installer used CARGO_HOME instead of the standalone destination.'
         Invoke-Installer @('-Uninstall')
         Verify $default '' $manifest
         $cargoHome = $env:CARGO_HOME
         try {
             Remove-Item Env:CARGO_HOME
-            $fallback = Join-Path $env:USERPROFILE '.cargo/bin'
+            $fallback = Join-Path $env:USERPROFILE '.local/bin'
             Invoke-Installer @('-BaseUrl', $url, '-Components', 'cli')
             Verify $fallback 'cli' $manifest
             Invoke-Installer @('-Uninstall')

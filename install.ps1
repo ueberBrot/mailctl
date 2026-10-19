@@ -277,7 +277,7 @@ Usage: powershell -File install.ps1 [options]
   -Version VERSION       Stable release (default: latest stable).
   -Components SELECTION  cli, mcp, or cli,mcp (default: installed selection,
                          or cli,mcp for a new installation).
-  -InstallDir DIRECTORY  Override CARGO_HOME\bin or USERPROFILE\.cargo\bin.
+  -InstallDir DIRECTORY  Override USERPROFILE\.local\bin.
   -BaseUrl URL           Candidate directory; HTTPS or loopback HTTP.
   -Config FILE           Verify an existing installation before replacement.
   -Uninstall             Remove selected installer-owned components.
@@ -306,8 +306,7 @@ Stop mailctl/MCP runtimes before updating a configured installation.
         $null = Get-DownloadUri $BaseUrl
     }
     if (!$InstallDir) {
-        if ($env:CARGO_HOME) { $InstallDir = Join-Path $env:CARGO_HOME 'bin' }
-        elseif ($env:USERPROFILE) { $InstallDir = Join-Path $env:USERPROFILE '.cargo/bin' }
+        if ($env:USERPROFILE) { $InstallDir = Join-Path $env:USERPROFILE '.local/bin' }
         else { Fail 'Set USERPROFILE or -InstallDir.' }
     }
     $InstallDir = Assert-Path $InstallDir

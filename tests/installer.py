@@ -186,7 +186,7 @@ class InstallerTest(unittest.TestCase):
         self.installer = ROOT / "install.sh"
         self.publish_fixture(self.version)
         self.server = DownloadServer(self.downloads)
-        self.bin = self.home / ".cargo" / "bin"
+        self.bin = self.home / ".local" / "bin"
 
     def tearDown(self):
         self.server.close()
@@ -355,7 +355,7 @@ class InstallerTest(unittest.TestCase):
                                              "--install-dir", directory))
                 self.installed({sibling}, directory)
 
-    def test_cargo_home_and_explicit_paths_with_spaces_preserve_shared_tools(self):
+    def test_cargo_home_is_ignored_and_explicit_paths_preserve_shared_tools(self):
         cargo = self.directory / "custom cargo home"
         (cargo / "bin").mkdir(parents=True)
         sentinels = {
@@ -368,7 +368,9 @@ class InstallerTest(unittest.TestCase):
             path.write_bytes(content)
         env = dict(self.env, CARGO_HOME=str(cargo))
         self.successful(self.command(env=env))
-        self.installed({"cli", "mcp"}, cargo / "bin")
+        self.installed({"cli", "mcp"})
+        self.assertEqual(set((cargo / "bin").iterdir()),
+                         {cargo / "bin" / "rustup", cargo / "bin" / "cargo"})
         explicit = self.directory / "explicit application binaries"
         self.successful(self.command("--install-dir", explicit, env=env))
         self.installed({"cli", "mcp"}, explicit)
