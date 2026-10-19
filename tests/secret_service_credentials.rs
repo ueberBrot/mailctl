@@ -1,6 +1,8 @@
 #![cfg(all(target_os = "linux", any(feature = "cli", feature = "mcp")))]
 
 mod imap_support;
+#[path = "native_support/malformed_secret_service.rs"]
+mod malformed_secret_service;
 #[path = "native_support/process.rs"]
 mod process;
 #[path = "imap_support/process.rs"]
@@ -425,6 +427,18 @@ fn native_secret_service_recovers_after_service_restart() {
     assert_eq!(source.availability(account), Availability::Missing);
     assert_eq!(source.resolve(account).unwrap_err(), SourceError::Missing);
     fs::remove_file(marker).unwrap();
+}
+
+#[test]
+#[ignore = "requires the private session bus with its real Secret Service daemon stopped"]
+fn native_secret_service_rejects_malformed_secret_response() {
+    support::secret_service::assert_disposable();
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(malformed_secret_service::reject_malformed_secret());
 }
 
 fn private_state(path: &Path) {

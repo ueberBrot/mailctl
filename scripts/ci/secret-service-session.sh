@@ -83,6 +83,8 @@ credentials)
 	stop_keyring
 	start_keyring
 	run_exact_test native_secret_service_recovers_after_service_restart
+	stop_keyring
+	run_exact_test native_secret_service_rejects_malformed_secret_response
 	;;
 reading | drafts)
 	arguments=(--nocapture --test-threads=1)
