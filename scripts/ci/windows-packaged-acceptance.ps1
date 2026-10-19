@@ -1,7 +1,7 @@
 [CmdletBinding(DefaultParameterSetName = 'Phase')]
 param (
     [Parameter(Mandatory, ParameterSetName = 'Phase')]
-    [ValidateSet('prepare', 'state', 'process', 'native', 'reading', 'drafts')]
+    [ValidateSet('prepare', 'state', 'process', 'native', 'reading', 'drafts', 'wsl')]
     [string]$Phase,
     [Parameter(Mandatory, ParameterSetName = 'Session')]
     [string]$SessionFile
@@ -25,6 +25,9 @@ function Invoke-Harness {
         'windows_credentials' {
             $arguments += @('native_windows_credentials_cross_processes_and_rotate', '--exact', '--ignored')
         }
+        'windows_wsl' {
+            $arguments += @('windows_hosted_wsl2_reading_drafts_and_restart', '--exact', '--ignored')
+        }
         { $_ -in 'packaged_reading', 'packaged_drafts' } { $arguments += '--ignored' }
     }
     $listing = @(& $Harness.Executable @arguments --list)
@@ -34,6 +37,10 @@ function Invoke-Harness {
     if ($Harness.Name -eq 'windows_credentials' -and
         ($tests.Count -ne 1 -or $tests[0] -ne 'native_windows_credentials_cross_processes_and_rotate: test')) {
         throw 'The required native Credential Manager test is missing'
+    }
+    if ($Harness.Name -eq 'windows_wsl' -and
+        ($tests.Count -ne 1 -or $tests[0] -ne 'windows_hosted_wsl2_reading_drafts_and_restart: test')) {
+        throw 'The required Windows-hosted WSL 2 qualification test is missing'
     }
     "harness=$($Harness.Name) executable=$($Harness.Executable) arguments=$($arguments -join ' ')" |
         Tee-Object -FilePath $Log -Append
@@ -74,22 +81,33 @@ if ($PSCmdlet.ParameterSetName -eq 'Session') {
     New-Item -ItemType Directory -Path $env:TEMP -Force | Out-Null
     "phase=$($session.Phase) identity=$($identity.Name) sid=$($identity.User.Value) credential_source=windows-credential-manager" |
         Set-Content -LiteralPath (Join-Path $session.Root 'windows-source-evidence.txt') -Encoding utf8
-    foreach ($selection in $session.Selections) {
-        $label = $selection.Features.Replace(',', '-')
-        $installed = Join-Path $session.Root "installed-$label"
-        $log = Join-Path $session.Root "installed-$($session.Phase)-$label-acceptance.log"
-        $installer = Join-Path $repository 'tests/installer.ps1'
-        $engine = (Get-Process -Id $PID).Path
-        $installerArguments = @('-NoLogo', '-NoProfile', '-File', $installer,
-            '-Artifacts', $session.Artifacts, '-InstallTo', $installed,
-            '-Components', $selection.Features, '-InstallOnly', '-Reuse')
-        "installer=$engine arguments=$($installerArguments -join ' ')" | Set-Content -LiteralPath $log -Encoding utf8
-        & $engine @installerArguments 2>&1 | Tee-Object -FilePath $log -Append
-        if ($LASTEXITCODE -ne 0) { throw "Installing $label components failed" }
-        $env:MAILCTL_PACKAGED_BIN_DIR = $installed
-        foreach ($harness in $selection.Harnesses) { Invoke-Harness $harness $log }
-        "phase=$($session.Phase) components=$($selection.Features) installed=$installed log=$([System.IO.Path]::GetFileName($log))" |
-            Add-Content -LiteralPath (Join-Path $session.Root 'windows-source-evidence.txt') -Encoding utf8
+    if ($session.Phase -eq 'wsl') { . "$PSScriptRoot/windows-wsl.ps1" }
+    try {
+        if ($session.Phase -eq 'wsl') { Start-MailctlWsl $session.Root $session.Sid }
+        foreach ($selection in $session.Selections) {
+            $label = $selection.Features.Replace(',', '-')
+            $installed = Join-Path $session.Root "installed-$label"
+            $log = Join-Path $session.Root "installed-$($session.Phase)-$label-acceptance.log"
+            $installer = Join-Path $repository 'tests/installer.ps1'
+            $engine = (Get-Process -Id $PID).Path
+            $installerArguments = @('-NoLogo', '-NoProfile', '-File', $installer,
+                '-Artifacts', $session.Artifacts, '-InstallTo', $installed,
+                '-Components', $selection.Features, '-InstallOnly', '-Reuse')
+            "installer=$engine arguments=$($installerArguments -join ' ')" | Set-Content -LiteralPath $log -Encoding utf8
+            & $engine @installerArguments 2>&1 | Tee-Object -FilePath $log -Append
+            if ($LASTEXITCODE -ne 0) { throw "Installing $label components failed" }
+            $env:MAILCTL_PACKAGED_BIN_DIR = $installed
+            foreach ($harness in $selection.Harnesses) { Invoke-Harness $harness $log }
+            "phase=$($session.Phase) components=$($selection.Features) installed=$installed log=$([System.IO.Path]::GetFileName($log))" |
+                Add-Content -LiteralPath (Join-Path $session.Root 'windows-source-evidence.txt') -Encoding utf8
+        }
+        if ($session.Phase -eq 'wsl') {
+            $path = Join-Path $session.Root 'windows-wsl-evidence.txt'
+            $evidence = [IO.File]::ReadAllText($path).Replace('status=prepared', 'status=passed')
+            [IO.File]::WriteAllText($path, $evidence, [Text.UTF8Encoding]::new($false))
+        }
+    } finally {
+        if ($session.Phase -eq 'wsl') { Stop-MailctlWsl $session.Root $session.Sid }
     }
     exit 0
 }
@@ -108,6 +126,7 @@ $phaseTargets = @{
     native = @('windows_credentials')
     reading = @('packaged_reading')
     drafts = @('packaged_drafts')
+    wsl = @('windows_wsl')
 }
 
 if ($Phase -eq 'prepare') {
@@ -163,6 +182,17 @@ try {
     Copy-Item -LiteralPath (Join-Path $repository 'install.ps1') -Destination $stagedRepository
     Copy-Item -LiteralPath (Join-Path $repository 'tests/installer.ps1') -Destination (Join-Path $stagedRepository 'tests')
     Copy-Item -LiteralPath $PSCommandPath -Destination (Join-Path $stagedRepository 'scripts/ci')
+    if ($Phase -eq 'wsl') {
+        Copy-Item -LiteralPath (Join-Path $repository 'scripts/ci/windows-wsl.ps1') -Destination (Join-Path $stagedRepository 'scripts/ci')
+        $rootfs = Join-Path $root 'wsl-rootfs.tar.gz'
+        $rootfsUrl = 'https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/x86_64/alpine-minirootfs-3.22.6-x86_64.tar.gz'
+        "rootfs_url=$rootfsUrl" | Set-Content -LiteralPath (Join-Path $root 'windows-wsl.log') -Encoding utf8
+        Invoke-WebRequest -Uri $rootfsUrl -OutFile $rootfs -TimeoutSec 180
+        if ((Get-FileHash -LiteralPath $rootfs -Algorithm SHA256).Hash.ToLowerInvariant() -ne
+            '27694aaa55fd7a9e3ef596e0ad4eb66802308bb20172b17030cd5f4d8ae9bac2') {
+            throw 'The Alpine WSL qualification root filesystem checksum differs from the pinned release'
+        }
+    }
     Get-ChildItem -LiteralPath $candidate -File | Where-Object {
         $_.Name -eq 'install.ps1' -or $_.Name -match '^manifest-.*\.txt$' -or $_.Name -match '^mailctl.*\.exe$'
     } | Copy-Item -Destination (Join-Path $root 'artifacts')
@@ -199,6 +229,27 @@ try {
     if ($child -and !$child.HasExited) {
         & taskkill.exe /PID $child.Id /T /F | Out-Null
     }
+    $wslCleanupError = $null
+    try {
+        if ($Phase -eq 'wsl' -and $user -and (Test-Path -LiteralPath (Join-Path $root 'windows-wsl-owned.json'))) {
+            $cleanup = Join-Path $root 'repository/scripts/ci/windows-wsl.ps1'
+            $arguments = @('-NoLogo', '-NoProfile', '-File', "`"$cleanup`"", '-Action', 'cleanup',
+                '-Root', "`"$root`"", '-Sid', $sid)
+            $recovery = Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList $arguments `
+                -Credential ([PSCredential]::new("$env:COMPUTERNAME\$userName", $password)) -LoadUserProfile `
+                -WorkingDirectory $stagedRepository -PassThru `
+                -RedirectStandardOutput (Join-Path $root 'wsl-cleanup.stdout.log') `
+                -RedirectStandardError (Join-Path $root 'wsl-cleanup.stderr.log')
+            try {
+                if (!$recovery.WaitForExit(240000)) {
+                    & taskkill.exe /PID $recovery.Id /T /F | Out-Null
+                    throw 'WSL qualification cleanup exceeded four minutes'
+                }
+                $recovery.Refresh()
+                if ($recovery.ExitCode -ne 0) { throw 'Owned WSL qualification cleanup failed' }
+            } finally { $recovery.Dispose() }
+        }
+    } catch { $wslCleanupError = $_ }
     if (Test-Path -LiteralPath $root) {
         Get-ChildItem -LiteralPath $root -Filter '*.log' -File | ForEach-Object {
             $name = if ($_.Name -like 'session.*') { "$Phase-$($_.Name)" } else { $_.Name }
@@ -208,6 +259,10 @@ try {
         $evidence = Join-Path $root 'windows-source-evidence.txt'
         if (Test-Path -LiteralPath $evidence) {
             Get-Content -LiteralPath $evidence | Add-Content -LiteralPath (Join-Path $candidate 'windows-source-evidence.txt') -Encoding utf8
+        }
+        $wslEvidence = Join-Path $root 'windows-wsl-evidence.txt'
+        if (Test-Path -LiteralPath $wslEvidence) {
+            Copy-Item -LiteralPath $wslEvidence -Destination $candidate
         }
     }
     try {
@@ -221,4 +276,5 @@ try {
             if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
         } finally { [Array]::Clear($passwordBytes, 0, $passwordBytes.Length) }
     }
+    if ($wslCleanupError) { throw $wslCleanupError }
 }

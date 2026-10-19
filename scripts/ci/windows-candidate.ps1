@@ -103,7 +103,7 @@ foreach ($line in [IO.File]::ReadAllLines((Join-Path $candidate 'SHA256SUMS'))) 
 foreach ($hostName in 'powershell', 'pwsh') {
     Assert-PassingLog -Path (Join-Path $candidate "installer-acceptance-$hostName.log") -Installer
 }
-foreach ($suite in 'state', 'process', 'native', 'reading', 'drafts') {
+foreach ($suite in 'state', 'process', 'native', 'reading', 'drafts', 'wsl') {
     foreach ($selection in 'cli', 'mcp', 'cli-mcp') {
         Assert-PassingLog -Path (Join-Path $candidate "installed-$suite-$selection-acceptance.log")
     }
@@ -112,6 +112,27 @@ $sourceEvidence = Join-Path $candidate 'windows-source-evidence.txt'
 if (-not (Test-Path -LiteralPath $sourceEvidence -PathType Leaf) -or
     (Get-Item -LiteralPath $sourceEvidence).Length -eq 0) {
     throw 'Missing Windows native source evidence'
+}
+$wslMetadata = @{}
+foreach ($line in [IO.File]::ReadAllLines((Join-Path $candidate 'windows-wsl-evidence.txt'))) {
+    $pair = $line -split '=', 2
+    if ($pair.Count -ne 2 -or $wslMetadata.ContainsKey($pair[0])) {
+        throw 'Malformed Windows-hosted WSL evidence'
+    }
+    $wslMetadata[$pair[0]] = $pair[1]
+}
+if ($wslMetadata.status -cne 'passed' -or
+    $wslMetadata.distro -cnotmatch '^mailctl-wsl-[0-9a-f]{32}$' -or
+    $wslMetadata.rootfs_sha256 -cne '27694aaa55fd7a9e3ef596e0ad4eb66802308bb20172b17030cd5f4d8ae9bac2' -or
+    $wslMetadata.kernel -notmatch 'WSL2' -or
+    $wslMetadata.wsl_version -notmatch '^\d+\.\d+\.\d+' -or
+    $wslMetadata.linux_release -cne '3.22.6' -or
+    $wslMetadata.windows_identity_sid -notmatch '^S-1-5-21-\d+-\d+-\d+-\d+$') {
+    throw 'Windows-hosted WSL2 qualification evidence is incomplete'
+}
+$wslIdentity = [regex]::Escape($wslMetadata.windows_identity_sid)
+if ([IO.File]::ReadAllText($sourceEvidence) -notmatch "(?m)^phase=wsl .* sid=$wslIdentity credential_source=") {
+    throw 'WSL interoperability did not retain the disposable Windows identity'
 }
 $legacyVersion = & powershell.exe -NoProfile -File scripts/ci/windows-candidate.ps1 -Phase host
 if ($LASTEXITCODE -ne 0 -or $legacyVersion -notmatch '^5\.1\.') {
@@ -125,6 +146,8 @@ $evidence = @(
     'reading_tls_source=fixture-ca-via-SSL_CERT_FILE',
     'drafts_credential_source=disposable-windows-credential-manager',
     'drafts_tls_source=fixture-ca-via-SSL_CERT_FILE',
+    'windows_hosted_wsl=qualified',
+    'wsl_evidence=windows-wsl-evidence.txt',
     "target=$target",
     "powershell_version=$($PSVersionTable.PSVersion)",
     "windows_powershell_version=$legacyVersion",
