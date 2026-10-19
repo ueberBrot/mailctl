@@ -149,6 +149,7 @@ try {
         [IO.File]::WriteAllText($Ready, "http://127.0.0.1:$($listener.LocalEndpoint.Port)")
         try {
             while ($true) {
+                while (!$listener.Pending()) { Start-Sleep -Milliseconds 20 }
                 $client = $listener.AcceptTcpClient()
                 try {
                     $client.ReceiveTimeout = 10000
