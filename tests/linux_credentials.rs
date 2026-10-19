@@ -68,6 +68,9 @@ impl Fixture {
         let mut setup = fixture.command(executable);
         setup.args(["--json", "setup"]);
         assert_success(&run_bounded(setup));
+        if !session {
+            fixture.installation.provision_packaged_native(PASSWORD);
+        }
         fixture
     }
 

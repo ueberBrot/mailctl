@@ -63,6 +63,10 @@ rustix = { version = "1.1.5", features = ["event", "fs", "process", "termios"] }
 close_fds = "=0.3.2"
 libc = "=0.2.190"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+oo7 = { version = "=0.6.0", default-features = false, features = ["tokio", "native_crypto"] }
+zbus = { version = "=5.19.0", default-features = false, features = ["tokio", "blocking-api"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring-core = { version = "=1.0.0", default-features = false }
 apple-native-keyring-store = { version = "=1.0.2", default-features = false, features = ["keychain"] }

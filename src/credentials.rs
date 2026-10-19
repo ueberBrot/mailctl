@@ -17,7 +17,10 @@ mod native;
 #[cfg(windows)]
 #[path = "credentials/windows.rs"]
 mod native;
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(target_os = "linux")]
+#[path = "credentials/linux.rs"]
+mod native;
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub use native::NativeSource;
 
 pub const SERVICE_NAME: &str = "mailctl";
@@ -198,16 +201,16 @@ pub fn source_for(source: &CredentialSource) -> Arc<dyn SecretSource> {
     }
 }
 
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn native_source() -> Arc<dyn SecretSource> {
     NativeSource::shared()
 }
 
-#[cfg(not(any(target_os = "macos", windows)))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn native_source() -> Arc<dyn SecretSource> {
     Arc::new(DeferredSource {
         failure: SourceError::Unavailable,
-        prerequisite: "Native credential resolution in this build requires macOS or Windows",
+        prerequisite: "Native credential resolution in this build requires Linux, macOS or Windows",
     })
 }
 

@@ -2,6 +2,12 @@
 [advisories]
 unmaintained = "all"
 yanked = "deny"
+unused-ignored-advisory = "deny"
+ignore = [
+  { id = "RUSTSEC-2026-0370", reason = "zvariant merged into zbus 6; required by oo7's published zbus 5 backend. Review by 2026-11-18 in #93; remove after the backend migration." },
+  { id = "RUSTSEC-2026-0371", reason = "zbus_names merged into zbus 6; required by oo7's published zbus 5 backend. Review by 2026-11-18 in #93; remove after the backend migration." },
+  { id = "RUSTSEC-2026-0372", reason = "zvariant_derive merged into zbus 6; required by oo7's published zbus 5 backend. Review by 2026-11-18 in #93; remove after the backend migration." },
+]
 
 [licenses]
 confidence-threshold = 0.93

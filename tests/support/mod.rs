@@ -39,6 +39,10 @@ const PRODUCT_COMPONENTS: &[(Option<&str>, &str, &OnceLock<PathBuf>)] = &[
 ];
 static PACKAGED_DIRECTORY: OnceLock<Option<PathBuf>> = OnceLock::new();
 
+#[cfg(target_os = "linux")]
+#[path = "../native_support/linux_secret_service.rs"]
+pub(crate) mod secret_service;
+
 #[cfg(feature = "cli")]
 pub(crate) const MAILCTL: &str = match option_env!("CARGO_BIN_EXE_mailctl") {
     Some(path) => path,
@@ -111,6 +115,8 @@ fn selected_executable(executable: &str) -> PathBuf {
 pub(crate) struct Installation {
     directory: PathBuf,
     config: PathBuf,
+    #[cfg(target_os = "linux")]
+    native_credentials: Mutex<Vec<Uuid>>,
 }
 
 impl Installation {
@@ -121,7 +127,12 @@ impl Installation {
         fs::create_dir(&directory).expect("create temporary installation");
         protect(&directory, true);
         let config = directory.join("config.toml");
-        Self { directory, config }
+        Self {
+            directory,
+            config,
+            #[cfg(target_os = "linux")]
+            native_credentials: Mutex::new(Vec::new()),
+        }
     }
 
     pub(crate) fn two_accounts() -> Self {
@@ -132,6 +143,36 @@ impl Installation {
 
     pub(crate) fn config(&self) -> &Path {
         &self.config
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn provision_packaged_native(&self, password: &str) {
+        if std::env::var("MAILCTL_PACKAGED_CREDENTIAL_SOURCE").as_deref() != Ok("native") {
+            return;
+        }
+        use mailctl::{
+            config::CredentialSource,
+            credentials::{self, Secret},
+        };
+        secret_service::assert_disposable();
+        let registry: Value =
+            serde_json::from_slice(&fs::read(self.directory.join("state/accounts.json")).unwrap())
+                .unwrap();
+        let source = credentials::source_for(&CredentialSource::Native {});
+        let store = source
+            .mutable_store()
+            .expect("mutable native Linux credential source");
+        let secret = Secret::new(password.as_bytes().to_vec()).unwrap();
+        for account in registry["accounts"].as_object().unwrap().values() {
+            let id = Uuid::parse_str(account["account_id"].as_str().unwrap()).unwrap();
+            store
+                .set(id, &secret)
+                .expect("provision a disposable native credential");
+            let mut owned = self.native_credentials.lock().unwrap();
+            if !owned.contains(&id) {
+                owned.push(id);
+            }
+        }
     }
 
     pub(crate) fn write_configuration(&self, default_grant: &str) {
@@ -229,6 +270,18 @@ mailboxes = ["INBOX", "Drafts"]
 
 impl Drop for Installation {
     fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        if let Ok(accounts) = self.native_credentials.get_mut()
+            && !accounts.is_empty()
+        {
+            use mailctl::{config::CredentialSource, credentials};
+            let source = credentials::source_for(&CredentialSource::Native {});
+            if let Some(store) = source.mutable_store() {
+                for id in accounts {
+                    let _ = store.delete(*id);
+                }
+            }
+        }
         let _ = fs::remove_dir_all(&self.directory);
     }
 }
@@ -363,6 +416,11 @@ pub(crate) fn packaged_credential(
                 name: "password".into(),
             }
         }
+        #[cfg(target_os = "linux")]
+        Ok("native") => {
+            secret_service::assert_disposable();
+            CredentialSource::Native {}
+        }
         source => panic!("unsupported packaged credential source: {source:?}"),
     }
 }
@@ -378,6 +436,13 @@ pub(crate) fn packaged_environment(command: &mut Command, certificate: &Path, em
             "CREDENTIALS_DIRECTORY",
             std::env::var_os("CREDENTIALS_DIRECTORY").unwrap(),
         );
+    }
+    #[cfg(target_os = "linux")]
+    if std::env::var("MAILCTL_PACKAGED_CREDENTIAL_SOURCE").as_deref() == Ok("native") {
+        secret_service::assert_disposable();
+        for name in ["DBUS_SESSION_BUS_ADDRESS", "HOME", "XDG_RUNTIME_DIR"] {
+            command.env(name, std::env::var_os(name).unwrap());
+        }
     }
 }
 

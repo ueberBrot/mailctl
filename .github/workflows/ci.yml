@@ -215,6 +215,14 @@ jobs:
         run: bash scripts/ci/candidate.sh reading
       - name: Qualify packaged Linux draft faults under command and systemd sources
         run: bash scripts/ci/candidate.sh drafts
+      - name: Install native Secret Service test prerequisites
+        run: bash scripts/ci/desktop-acceptance.sh prerequisites
+      - name: Qualify native Secret Service lifecycle and locked-store behavior
+        run: bash scripts/ci/desktop-acceptance.sh credentials
+      - name: Qualify packaged reading with native Secret Service credentials
+        run: bash scripts/ci/desktop-acceptance.sh reading
+      - name: Qualify packaged draft recovery with native Secret Service credentials
+        run: bash scripts/ci/desktop-acceptance.sh drafts
       - name: Record passing Linux candidate acceptance
         run: bash scripts/ci/candidate.sh record
       - name: Keep Linux candidate and acceptance evidence

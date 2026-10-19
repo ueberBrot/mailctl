@@ -101,6 +101,10 @@ initialization_seconds = 1
         };
         let setup = fixture.admin(executable, &["setup"]);
         assert!(setup.get("error").is_none(), "{setup}");
+        #[cfg(target_os = "linux")]
+        fixture
+            .installation
+            .provision_packaged_native("disposable-password");
         let registry: Value =
             serde_json::from_slice(&fs::read(fixture.state().join("accounts.json")).unwrap())
                 .unwrap();
