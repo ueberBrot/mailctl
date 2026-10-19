@@ -48,10 +48,8 @@ if ($Phase -eq 'prepare') {
     if (-not $env:GITHUB_ENV) { throw 'GITHUB_ENV is required' }
     & python scripts/prepare-installer.py --target $target --output $candidate
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-    [IO.File]::AppendAllLines($env:GITHUB_ENV, @(
-        "MAILCTL_CANDIDATE_DIR=$candidate",
-        "MAILCTL_PACKAGED_BIN_DIR=$installed"
-    ), $utf8)
+    [IO.File]::AppendAllText($env:GITHUB_ENV,
+        "MAILCTL_CANDIDATE_DIR=$candidate`nMAILCTL_PACKAGED_BIN_DIR=$installed`n", $utf8)
     exit
 }
 
@@ -140,9 +138,9 @@ foreach ($hostName in 'powershell.exe', 'pwsh') {
     $command = @($hostName) + @(Get-InstallerArguments -HostName $hostName)
     $evidence += "installer_command_$label=" + (ConvertTo-Json -InputObject $command -Compress)
 }
-[IO.File]::WriteAllLines((Join-Path $candidate 'acceptance-evidence.txt'), $evidence, $utf8)
+[IO.File]::WriteAllText((Join-Path $candidate 'acceptance-evidence.txt'), ($evidence -join "`n") + "`n", $utf8)
 $checksums = @(Get-ChildItem -LiteralPath $candidate -File | Where-Object Name -ne 'SHA256SUMS' |
     Sort-Object Name | ForEach-Object {
         (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() + '  ' + $_.Name
     })
-[IO.File]::WriteAllLines((Join-Path $candidate 'SHA256SUMS'), $checksums, $utf8)
+[IO.File]::WriteAllText((Join-Path $candidate 'SHA256SUMS'), ($checksums -join "`n") + "`n", $utf8)

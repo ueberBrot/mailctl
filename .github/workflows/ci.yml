@@ -286,7 +286,7 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: mailctl-candidate-x86_64-pc-windows-msvc
-          path: ${{ env.MAILCTL_CANDIDATE_DIR }}/
+          path: ${{ runner.temp }}/mailctl-windows-candidate/
           if-no-files-found: error
           retention-days: 14
 
