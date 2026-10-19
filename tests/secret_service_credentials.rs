@@ -29,7 +29,8 @@ use uuid::Uuid;
 
 const FIRST: &str = "first-synthetic-account-password";
 const SECOND: &str = "second-distinct-synthetic-password";
-const ROTATED: &str = " replacement-utf8-é🦀-password ";
+const ROTATED: &str = " replacement-synthetic-password ";
+const UNICODE: &str = " native-utf8-é🦀-password ";
 const KEYRING_PASSWORD: &str = "mailctl-disposable-keyring-password";
 
 fn executables() -> Vec<&'static str> {
@@ -53,7 +54,7 @@ fn executables() -> Vec<&'static str> {
 }
 
 fn private_output(bytes: &[u8]) {
-    for value in [FIRST, SECOND, ROTATED, KEYRING_PASSWORD] {
+    for value in [FIRST, SECOND, ROTATED, UNICODE, KEYRING_PASSWORD] {
         assert!(
             !bytes
                 .windows(value.len())
@@ -209,6 +210,8 @@ fn native_secret_service_credentials_cross_components_rotate_and_clean_up() {
     assert_eq!(source.availability(vacant), Availability::Missing);
     mutation.close().unwrap();
 
+    provision(&installation, binaries[0], "work", UNICODE, 0);
+    assert_eq!(source.resolve(first).unwrap().len(), UNICODE.len());
     provision(&installation, binaries[0], "work", FIRST, 0);
     provision(
         &installation,
