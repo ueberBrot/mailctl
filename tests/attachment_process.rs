@@ -28,7 +28,10 @@ fn export_root_configuration_is_bounded_and_absolute() {
     }
 }
 
-#[cfg(all(feature = "cli", any(target_os = "macos", windows)))]
+#[cfg(all(
+    feature = "cli",
+    any(target_os = "macos", target_os = "linux", windows)
+))]
 #[test]
 fn export_denies_attachment_access_before_opening_the_approved_root() {
     let installation = support::Installation::two_accounts();
@@ -69,13 +72,16 @@ fn export_denies_attachment_access_before_opening_the_approved_root() {
     assert!(!root.exists());
 }
 
-#[cfg(all(feature = "cli", any(target_os = "macos", windows)))]
+#[cfg(all(
+    feature = "cli",
+    any(target_os = "macos", target_os = "linux", windows)
+))]
 #[test]
 fn export_cleans_partial_after_reference_rejection() {
     let installation = support::Installation::two_accounts();
     let root = installation.config().parent().unwrap().join("exports");
     std::fs::create_dir(&root).unwrap();
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();

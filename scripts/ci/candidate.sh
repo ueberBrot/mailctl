@@ -3,18 +3,36 @@ set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 
+case "${MAILCTL_TARGET:-}" in
+"")
+	case "$(uname -s):$(uname -m)" in
+	Darwin:arm64) target=aarch64-apple-darwin ;;
+	Linux:x86_64) target=x86_64-unknown-linux-gnu ;;
+	*)
+		printf 'Unsupported native candidate host.\n' >&2
+		exit 1
+		;;
+	esac
+	;;
+aarch64-apple-darwin | x86_64-unknown-linux-gnu) target=$MAILCTL_TARGET ;;
+*)
+	printf 'Unsupported candidate target.\n' >&2
+	exit 1
+	;;
+esac
+
 # Keep each qualification visible as a workflow step. Evidence below uses the
 # same argument arrays as execution, so changes cannot leave stale commands.
 case "${1:-}" in
 build)
 	mkdir -p target
-	dist build --artifacts=local --target aarch64-apple-darwin \
+	dist build --artifacts=local --target "$target" \
 		--output-format=json >target/dist-build.json
 	exit
 	;;
 prepare)
 	: "${MAILCTL_CANDIDATE_DIR:?}" "${MAILCTL_PACKAGED_BIN_DIR:?}" "${GITHUB_ENV:?}"
-	python3 scripts/prepare-installer.py --output "$MAILCTL_CANDIDATE_DIR"
+	python3 scripts/prepare-installer.py --target "$target" --output "$MAILCTL_CANDIDATE_DIR"
 	printf 'MAILCTL_CANDIDATE_DIR=%s\nMAILCTL_PACKAGED_BIN_DIR=%s\n' \
 		"$MAILCTL_CANDIDATE_DIR" "$MAILCTL_PACKAGED_BIN_DIR" >>"$GITHUB_ENV"
 	exit
@@ -27,6 +45,8 @@ installer | state | process | native | reading | drafts | record) ;;
 esac
 
 : "${MAILCTL_CANDIDATE_DIR:?}" "${MAILCTL_PACKAGED_BIN_DIR:?}"
+hash_command=(shasum -a 256)
+if command -v sha256sum >/dev/null; then hash_command=(sha256sum); fi
 installer_command=(python3 tests/installer.py --suite packaged
 	--artifacts "$MAILCTL_CANDIDATE_DIR" --install-to "$MAILCTL_PACKAGED_BIN_DIR")
 state_command=(cargo test --locked --test administration_process --test state_maintenance)
@@ -35,6 +55,9 @@ process_command=(cargo test --locked
 	--test search_process --test discovery_process
 	--test read_contention_process --test draft_process)
 native_command=(cargo test --locked --test native_credentials -- --ignored --test-threads=1)
+if [[ $target == x86_64-unknown-linux-gnu ]]; then
+	native_command=(bash scripts/ci/linux-acceptance.sh credentials)
+fi
 component_command=(python3 tests/installer.py --artifacts "$MAILCTL_CANDIDATE_DIR" --install-only --reuse)
 
 select_packaged_components() {
@@ -111,30 +134,53 @@ native)
 	run_acceptance installed-native-acceptance.log "${native_command[@]}"
 	;;
 reading)
-	run_packaged_acceptance reading reading
+	if [[ $target == x86_64-unknown-linux-gnu ]]; then
+		bash scripts/ci/linux-acceptance.sh reading
+	else
+		run_packaged_acceptance reading reading
+	fi
 	;;
 drafts)
-	run_packaged_acceptance drafts draft
+	if [[ $target == x86_64-unknown-linux-gnu ]]; then
+		bash scripts/ci/linux-acceptance.sh drafts
+	else
+		run_packaged_acceptance drafts draft
+	fi
 	;;
 record)
 	# Verify the original artifact hashes before adding passing acceptance.
-	(cd "$MAILCTL_CANDIDATE_DIR" && shasum -a 256 -c SHA256SUMS)
+	(cd "$MAILCTL_CANDIDATE_DIR" && "${hash_command[@]}" -c SHA256SUMS)
 	{
-		printf 'status=passed\ntopology=cooperative-embedded\ncredential_source=disposable-apple-keychain\n'
-		sw_vers
+		printf 'status=passed\ntopology=cooperative-embedded\n'
+		if [[ $target == x86_64-unknown-linux-gnu ]]; then
+			printf 'credential_source=command,systemd,interactive-session\n'
+			cat /etc/os-release
+			systemctl --version
+			cat "$MAILCTL_CANDIDATE_DIR/linux-source-evidence.txt"
+		else
+			printf 'credential_source=disposable-apple-keychain\n'
+			sw_vers
+		fi
 		uname -sm
 		printf 'packaged_bin_directory=%s\n' "$MAILCTL_PACKAGED_BIN_DIR"
 		record_command installer_command "${installer_command[@]}"
 		record_command state_command "${state_command[@]}"
 		record_command process_command "${process_command[@]}"
 		record_command native_command "${native_command[@]}"
-		record_packaged_acceptance reading
-		record_packaged_acceptance drafts
+		if [[ $target == aarch64-apple-darwin ]]; then
+			record_packaged_acceptance reading
+			record_packaged_acceptance drafts
+		fi
 		printf 'real_provider=not-qualified\nisolation=not-qualified\npublication=not-performed\n'
 	} >"$MAILCTL_CANDIDATE_DIR/acceptance-evidence.txt"
-	(cd "$MAILCTL_CANDIDATE_DIR" && shasum -a 256 acceptance-evidence.txt installer-acceptance.log \
-		installed-state-acceptance.log installed-process-acceptance.log \
-		installed-native-acceptance.log installed-reading-*-acceptance.log \
-		installed-drafts-*-acceptance.log >>SHA256SUMS)
+	if [[ $target == x86_64-unknown-linux-gnu ]]; then
+		(cd "$MAILCTL_CANDIDATE_DIR" && "${hash_command[@]}" \
+			acceptance-evidence.txt linux-source-evidence.txt ./*.log >>SHA256SUMS)
+	else
+		(cd "$MAILCTL_CANDIDATE_DIR" && "${hash_command[@]}" acceptance-evidence.txt installer-acceptance.log \
+			installed-state-acceptance.log installed-process-acceptance.log \
+			installed-native-acceptance.log installed-reading-*-acceptance.log \
+			installed-drafts-*-acceptance.log >>SHA256SUMS)
+	fi
 	;;
 esac

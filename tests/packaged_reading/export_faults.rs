@@ -344,7 +344,11 @@ async fn cli_concurrent_exports_preserve_collisions_and_publish_distinct_private
         assert_eq!(result["sha256"], SHA256);
         assert_eq!(
             result["filesystem"],
-            format!("macos:{}", fs::metadata(&fixture.root).unwrap().dev())
+            format!(
+                "{}:{}",
+                std::env::consts::OS,
+                fs::metadata(&fixture.root).unwrap().dev()
+            )
         );
         assert_eq!(fs::read(&path).unwrap(), b"abcdef");
         assert_private(&path);

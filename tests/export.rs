@@ -1,4 +1,4 @@
-#![cfg(all(feature = "cli", target_os = "macos"))]
+#![cfg(all(feature = "cli", any(target_os = "macos", target_os = "linux")))]
 mod support;
 use mailctl::{
     domain::{AttachmentChunk, AttachmentProgress, ErrorCode},
@@ -49,7 +49,11 @@ fn publishes_exact_bytes_privately_without_overwriting_collisions() {
     assert_eq!(fs::read(&receipt.path).unwrap(), b"abc");
     assert_eq!(
         receipt.filesystem,
-        format!("macos:{}", fs::metadata(&root).unwrap().dev())
+        format!(
+            "{}:{}",
+            std::env::consts::OS,
+            fs::metadata(&root).unwrap().dev()
+        )
     );
     assert_eq!(fs::read(root.join("report.txt")).unwrap(), b"keep");
     assert_eq!(fs::metadata(&receipt.path).unwrap().mode() & 0o777, 0o600);

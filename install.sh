@@ -68,8 +68,19 @@ stable_version() {
 }
 case "$(uname -s):$(uname -m)" in
 Darwin:arm64 | Darwin:aarch64) target=aarch64-apple-darwin ;;
-*) fail 'This installer currently supports macOS Apple Silicon only.' ;;
+Linux:x86_64)
+	target=x86_64-unknown-linux-gnu
+	getconf GNU_LIBC_VERSION >/dev/null 2>&1 || fail 'Linux installation requires GNU libc on x86_64.'
+	;;
+*) fail 'This installer supports macOS Apple Silicon and GNU/Linux x86_64.' ;;
 esac
+if command -v sha256sum >/dev/null 2>&1; then
+	checksum_tool=sha256sum
+elif command -v shasum >/dev/null 2>&1; then
+	checksum_tool=shasum
+else
+	fail 'Install sha256sum or shasum to verify downloaded and installed files.'
+fi
 if [ "$mode" = install ]; then
 	version=${requested_version#v}
 	if [ -n "$requested_version" ]; then
@@ -115,7 +126,12 @@ receipt=.mailctl-components
 lock=.mailctl-installer.lock
 
 regular() { [ -f "$1" ] && [ ! -L "$1" ]; }
-hash() { shasum -a 256 "$1" | awk '{print $1}'; }
+hash() {
+	case "$checksum_tool" in
+	sha256sum) sha256sum "$1" ;;
+	shasum) shasum -a 256 "$1" ;;
+	esac | awk '{print $1}'
+}
 value() { awk -F= -v key="$2" '$1 == key {print substr($0, length(key)+2)}' "$1"; }
 selected() { case " $components " in *" $1 "*) return 0 ;; *) return 1 ;; esac }
 name() { case "$1" in cli) printf mailctl ;; mcp) printf mailctl-mcp ;; esac }
@@ -123,10 +139,10 @@ name() { case "$1" in cli) printf mailctl ;; mcp) printf mailctl-mcp ;; esac }
 validate_receipt() {
 	regular "$1" || fail 'Component manifest must be a regular file.'
 	[ "$(wc -c <"$1")" -le 4096 ] || fail 'Component manifest is too large.'
-	awk -F= '
+	awk -F= -v target="$target" '
         NF != 2 || seen[$1]++ {exit 1}
         $1 == "format" {if ($2 != "1") exit 1; next}
-        $1 == "target" {if ($2 != "aarch64-apple-darwin") exit 1; next}
+        $1 == "target" {if ($2 != target) exit 1; next}
         $1 == "compatibility" {if ($2 != "1") exit 1; next}
         $1 ~ /^(cli|mcp)_version$/ {if ($2 !~ /^[0-9]+\.[0-9]+\.[0-9]+$/) exit 1; next}
         $1 ~ /^(cli|mcp)_commit$/ {if (length($2) != 40 || $2 !~ /^[0-9a-f]+$/) exit 1; next}
@@ -227,7 +243,17 @@ if [ -z "$components" ]; then
 fi
 printf 'format=1\ntarget=%s\ncompatibility=1\n' "$target" >"$lock/after"
 if [ "$mode" = install ]; then
-	if [ -z "$config" ] && [ -n "${HOME:-}" ]; then config="$HOME/Library/Preferences/org.ueberbrot.mailctl/config.toml"; fi
+	if [ -z "$config" ] && [ -n "${HOME:-}" ]; then
+		case "$target" in
+		aarch64-apple-darwin) config="$HOME/Library/Preferences/org.ueberbrot.mailctl/config.toml" ;;
+		x86_64-unknown-linux-gnu)
+			case "${XDG_CONFIG_HOME:-}" in
+			/*) config="$XDG_CONFIG_HOME/mailctl/config.toml" ;;
+			*) config="$HOME/.config/mailctl/config.toml" ;;
+			esac
+			;;
+		esac
+	fi
 	# Reject invalid paths before downloads; recheck before state verification.
 	if [ "$explicit_config" -eq 1 ] || { [ -n "$config" ] && [ -e "$config" ]; }; then
 		case "$config" in /*) ;; *) fail '--config must be absolute.' ;; esac
@@ -241,16 +267,16 @@ if [ "$mode" = install ]; then
 	}
 	manifest="$lock/download/manifest"
 	download "manifest-$target.txt" "$manifest" 16384
-	awk -F= '
+	awk -F= -v target="$target" '
         NF != 2 || seen[$1]++ {exit 1}
         $1 == "format" || $1 == "compatibility" {if ($2 != "1") exit 1; next}
         $1 == "version" {if ($2 !~ /^[0-9]+\.[0-9]+\.[0-9]+$/) exit 1; next}
-        $1 == "target" {if ($2 != "aarch64-apple-darwin") exit 1; next}
+        $1 == "target" {if ($2 != target) exit 1; next}
         $1 == "commit" {if (length($2) != 40 || $2 !~ /^[0-9a-f]+$/) exit 1; next}
-        $1 ~ /^(cli|mcp)_file$/ {if ($2 !~ /^[a-z0-9.-]+$/) exit 1; next}
+        $1 ~ /^(cli|mcp)_file$/ {if ($2 !~ /^[a-z0-9._-]+$/) exit 1; next}
         $1 ~ /^(cli|mcp)_sha256$/ {if (length($2) != 64 || $2 !~ /^[0-9a-f]+$/) exit 1; next}
         $1 ~ /^(cli|mcp)_size$/ {if ($2 !~ /^[1-9][0-9]*$/ || $2+0 > 104857600) exit 1; next}
-        $1 ~ /^(cli|mcp)_signing$/ {if ($2 != "unsigned" && $2 != "ad-hoc") exit 1; next}
+        $1 ~ /^(cli|mcp)_signing$/ {if ($2 != "unsigned" && ($2 != "ad-hoc" || target != "aarch64-apple-darwin")) exit 1; next}
         {exit 1}
         END {if (length(seen) != 13) exit 1}
     ' "$manifest" || fail 'Unsupported or malformed candidate manifest.'

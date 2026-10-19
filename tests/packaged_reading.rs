@@ -1,7 +1,10 @@
 //! Reading acceptance through production executables and credential/CA sources.
 //! MAILCTL_PACKAGED_BIN_DIR selects installed candidate bytes; cli_ and mcp_
 //! test filters exercise installations that do not contain the other component.
-#![cfg(all(target_os = "macos", any(feature = "cli", feature = "mcp")))]
+#![cfg(all(
+    any(target_os = "macos", target_os = "linux"),
+    any(feature = "cli", feature = "mcp")
+))]
 
 mod imap_support;
 #[path = "imap_support/process.rs"]
@@ -50,9 +53,7 @@ impl Fixture {
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
         let empty_path = directory.join("empty-path");
         fs::create_dir(&empty_path).unwrap();
-        let secret = directory.join("synthetic-credential");
-        fs::write(&secret, PASSWORD).unwrap();
-        fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+        let credential = support::packaged_credential(directory, PASSWORD);
         fs::write(
             installation.config(),
             format!(
@@ -72,11 +73,7 @@ username = "work@example.test"
 mailboxes = ["INBOX"]
 from_identities = ["work"]
 [accounts.credential]
-source = "command"
-executable = {helper}
-args = [{secret}]
-working_dir = {directory}
-protected_paths = [{secret}]
+{credential}
 
 [[grants]]
 name = "default"
@@ -87,9 +84,7 @@ mailboxes = ["INBOX"]
                 state = support::toml_string(&directory.join("state")),
                 root = support::toml_string(&root),
                 port = server.port,
-                helper = support::toml_string(&fs::canonicalize("/bin/cat").unwrap()),
-                secret = support::toml_string(&secret),
-                directory = support::toml_string(directory),
+                credential = toml::to_string(&credential).unwrap(),
             ),
         )
         .unwrap();
@@ -111,10 +106,7 @@ mailboxes = ["INBOX"]
         let mut command = self.installation.command(executable);
         // No other mailctl component, broker, fixture credential hook, or
         // operator environment is available to the production process.
-        command
-            .env_clear()
-            .env("PATH", &self.empty_path)
-            .env("SSL_CERT_FILE", &self.server.certificate);
+        support::packaged_environment(&mut command, &self.server.certificate, &self.empty_path);
         command
     }
 
@@ -664,7 +656,7 @@ async fn cli_exports_privately_without_overwrite_and_cleans_up_failed_transfers(
         receipt["filesystem"]
             .as_str()
             .unwrap()
-            .starts_with("macos:")
+            .starts_with(&format!("{}:", std::env::consts::OS))
     );
     assert_eq!(fs::read(&destination).unwrap(), b"abcdef");
     assert_eq!(

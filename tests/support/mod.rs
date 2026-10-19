@@ -338,6 +338,49 @@ pub(crate) fn toml_string(path: &Path) -> String {
     toml::Value::String(path.to_string_lossy().into_owned()).to_string()
 }
 
+#[cfg(unix)]
+pub(crate) fn packaged_credential(
+    directory: &Path,
+    password: &str,
+) -> mailctl::config::CredentialSource {
+    use mailctl::config::{CredentialCommand, CredentialSource};
+    match std::env::var("MAILCTL_PACKAGED_CREDENTIAL_SOURCE").as_deref() {
+        Err(std::env::VarError::NotPresent) | Ok("command") => {
+            let secret = directory.join("synthetic-credential");
+            fs::write(&secret, password).expect("write synthetic credential");
+            protect(&secret, false);
+            CredentialSource::Command(CredentialCommand {
+                executable: fs::canonicalize("/bin/cat").expect("canonical credential helper"),
+                args: vec![secret.to_str().unwrap().into()],
+                working_dir: directory.into(),
+                protected_paths: vec![secret],
+            })
+        }
+        Ok("systemd") => {
+            assert_eq!(std::env::consts::OS, "linux");
+            assert!(std::env::var_os("CREDENTIALS_DIRECTORY").is_some());
+            CredentialSource::Systemd {
+                name: "password".into(),
+            }
+        }
+        source => panic!("unsupported packaged credential source: {source:?}"),
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn packaged_environment(command: &mut Command, certificate: &Path, empty_path: &Path) {
+    command
+        .env_clear()
+        .env("PATH", empty_path)
+        .env("SSL_CERT_FILE", certificate);
+    if std::env::var("MAILCTL_PACKAGED_CREDENTIAL_SOURCE").as_deref() == Ok("systemd") {
+        command.env(
+            "CREDENTIALS_DIRECTORY",
+            std::env::var_os("CREDENTIALS_DIRECTORY").unwrap(),
+        );
+    }
+}
+
 fn protect(path: &Path, directory: bool) {
     #[cfg(unix)]
     {

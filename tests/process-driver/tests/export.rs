@@ -1,4 +1,7 @@
-#![cfg(all(feature = "cli", any(target_os = "macos", windows)))]
+#![cfg(all(
+    feature = "cli",
+    any(target_os = "macos", target_os = "linux", windows)
+))]
 #[path = "../../imap_support/mod.rs"]
 mod imap_support;
 #[cfg(windows)]
@@ -8,7 +11,7 @@ mod native_support;
 mod server;
 #[path = "../../support/mod.rs"]
 mod support;
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use support::{Installation, assert_success, envelope, run_bounded};
 
@@ -17,7 +20,7 @@ fn cli_streams_attachment_to_approved_root_with_native_receipt() {
     let installation = Installation::two_accounts();
     let root = installation.config().parent().unwrap().join("exports");
     std::fs::create_dir(&root).unwrap();
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
     #[cfg(windows)]
     native_support::protect_root(&root);
@@ -133,7 +136,7 @@ fn cli_streams_attachment_to_approved_root_with_native_receipt() {
     assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
     let unapproved = root.with_file_name("unapproved");
     std::fs::create_dir(&unapproved).unwrap();
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     std::fs::set_permissions(&unapproved, std::fs::Permissions::from_mode(0o700)).unwrap();
     #[cfg(windows)]
     native_support::protect_root(&unapproved);
@@ -276,7 +279,7 @@ fn cli_streams_attachment_to_approved_root_with_native_receipt() {
             });
         assert_eq!(partial.is_some(), after_first_chunk);
         if cleanup_fails {
-            #[cfg(target_os = "macos")]
+            #[cfg(unix)]
             std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o500)).unwrap();
             #[cfg(windows)]
             {
@@ -288,7 +291,7 @@ fn cli_streams_attachment_to_approved_root_with_native_receipt() {
                 std::fs::set_permissions(partial, permissions).unwrap();
             }
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(unix)]
         assert!(
             std::process::Command::new("/bin/kill")
                 .args(["-TERM", &child.id().to_string()])
@@ -315,7 +318,7 @@ fn cli_streams_attachment_to_approved_root_with_native_receipt() {
                 "cancelled"
             }
         );
-        #[cfg(target_os = "macos")]
+        #[cfg(unix)]
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
         if cleanup_fails {
             let partial = partial.expect("first authorized chunk created a partial");

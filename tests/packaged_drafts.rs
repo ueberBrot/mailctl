@@ -1,7 +1,10 @@
 //! Draft acceptance through production executables, real SQLite, and TLS IMAP.
 //! MAILCTL_PACKAGED_BIN_DIR selects installer-verified candidate bytes. The cli_
 //! and mcp_ filters need only that installed component; cross_ needs both.
-#![cfg(all(target_os = "macos", any(feature = "cli", feature = "mcp")))]
+#![cfg(all(
+    any(target_os = "macos", target_os = "linux"),
+    any(feature = "cli", feature = "mcp")
+))]
 
 #[path = "packaged_drafts/bounds.rs"]
 mod bounds;
@@ -35,9 +38,7 @@ impl Fixture {
         let server = server::ImapServer::new(directory);
         let empty_path = directory.join("empty-path");
         fs::create_dir(&empty_path).unwrap();
-        let secret = directory.join("synthetic-credential");
-        fs::write(&secret, "disposable-password").unwrap();
-        fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+        let credential = support::packaged_credential(directory, "disposable-password");
         fs::write(
             installation.config(),
             format!(
@@ -58,11 +59,7 @@ from_identities = ["work@example.test"]
 drafts_mailbox = "Drafts"
 retain_history = true
 [accounts.credential]
-source = "command"
-executable = {helper}
-args = [{secret}]
-working_dir = {directory}
-protected_paths = [{secret}]
+{credential}
 
 [[grants]]
 name = "default"
@@ -90,9 +87,7 @@ initialization_seconds = 1
 "#,
                 state = support::toml_string(&directory.join("state")),
                 port = server.port,
-                helper = support::toml_string(&fs::canonicalize("/bin/cat").unwrap()),
-                secret = support::toml_string(&secret),
-                directory = support::toml_string(directory),
+                credential = toml::to_string(&credential).unwrap(),
             ),
         )
         .unwrap();
@@ -136,10 +131,7 @@ initialization_seconds = 1
         let mut command = self.installation.command(executable);
         // Only production-supported credential/CA sources are supplied. No
         // fixture hook, broker, sibling binary, or operator environment exists.
-        command
-            .env_clear()
-            .env("PATH", &self.empty_path)
-            .env("SSL_CERT_FILE", &self.server.certificate);
+        support::packaged_environment(&mut command, &self.server.certificate, &self.empty_path);
         command
     }
 
