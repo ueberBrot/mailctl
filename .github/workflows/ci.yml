@@ -263,6 +263,9 @@ jobs:
       - name: Build reusable Windows acceptance harnesses
         shell: pwsh
         run: ./scripts/ci/windows-packaged-acceptance.ps1 -Phase prepare
+      - name: Qualify Windows executables through WSL2 and restart
+        shell: pwsh
+        run: ./scripts/ci/windows-packaged-acceptance.ps1 -Phase wsl
       - name: Qualify installed setup, shared account state, backup and restore
         shell: pwsh
         run: ./scripts/ci/windows-packaged-acceptance.ps1 -Phase state
