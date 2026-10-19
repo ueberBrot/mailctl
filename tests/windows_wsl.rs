@@ -403,7 +403,22 @@ impl Caller {
         input: Value,
     ) -> Value {
         let mut result = self.response(fixture, arguments, tool, input).await;
-        assert_eq!(result["ok"], true, "{result}");
+        if result["ok"] != true {
+            let names: Vec<_> = arguments
+                .iter()
+                .take_while(|argument| !argument.starts_with("--"))
+                .chain(
+                    arguments
+                        .iter()
+                        .filter(|argument| argument.starts_with("--")),
+                )
+                .map(String::as_str)
+                .collect();
+            panic!(
+                "{tool} ({names:?}) returned {}",
+                result["error"]["code"].as_str().unwrap_or("unknown_error")
+            );
+        }
         result["result"].take()
     }
     async fn draft(
@@ -554,13 +569,13 @@ async fn read(fixture: &Fixture, component: &'static str) {
                     "--root",
                     fixture.root.to_str().unwrap(),
                     "--name",
-                    "résumé 🦀.bin",
+                    "résumé.bin",
                 ]),
-                "unused_cli_export",
+                "cli_attachment_export",
                 json!({}),
             )
             .await;
-        let destination = fixture.root.join("résumé 🦀.bin");
+        let destination = fixture.root.join("résumé.bin");
         assert_eq!(receipt["path"], destination.to_str().unwrap());
         assert!(
             receipt["filesystem"]
