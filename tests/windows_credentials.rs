@@ -9,7 +9,7 @@ use mailctl::{
     config::CredentialSource,
     credentials::{self, Availability, Secret, SourceError},
 };
-use std::{fs, process::Command};
+use std::{collections::HashMap, fs, process::Command};
 use support::{Installation, assert_success, envelope, run_bounded};
 use uuid::Uuid;
 
@@ -56,14 +56,24 @@ fn command(installation: &Installation, executable: &str, arguments: &[&str]) ->
     envelope(&output)["result"].clone()
 }
 
-fn native_entry_count() -> usize {
+fn assert_native_entry_count(expected: usize, context: &str) {
     let mut command = Command::new("cmdkey.exe");
     command.arg("/list");
     let output = run_bounded(command);
     assert_success(&output);
-    String::from_utf8_lossy(&output.stdout)
-        .matches(".mailctl")
-        .count()
+    let metadata = String::from_utf8_lossy(&output.stdout);
+    let targets: Vec<_> = metadata
+        .lines()
+        .filter_map(|line| {
+            let (prefix, _) = line.split_once(".mailctl")?;
+            Uuid::parse_str(prefix.get(prefix.len().checked_sub(36)?..)?).ok()
+        })
+        .collect();
+    assert_eq!(
+        metadata.matches(".mailctl").count(),
+        expected,
+        "{context}; mailctl target UUIDs: {targets:?}"
+    );
 }
 
 #[test]
@@ -73,11 +83,7 @@ fn native_windows_credentials_cross_processes_and_rotate() {
         std::env::var("MAILCTL_DISPOSABLE_WINDOWS").as_deref(),
         Ok("1")
     );
-    assert_eq!(
-        native_entry_count(),
-        0,
-        "native acceptance requires an empty mailctl store"
-    );
+    assert_native_entry_count(0, "native acceptance requires an empty mailctl store");
     let installation = Installation::empty();
     let binaries = executables();
     let first_binary = binaries[0];
@@ -139,7 +145,11 @@ fn native_windows_credentials_cross_processes_and_rotate() {
     use keyring_core::api::CredentialStoreApi;
     let entry = windows_native_keyring_store::Store::new()
         .unwrap()
-        .build(credentials::SERVICE_NAME, &first.to_string(), None)
+        .build(
+            credentials::SERVICE_NAME,
+            &first.to_string(),
+            Some(&HashMap::from([("persistence", "Local")])),
+        )
         .unwrap();
     assert_eq!(
         entry.get_secret().unwrap(),
@@ -147,6 +157,7 @@ fn native_windows_credentials_cross_processes_and_rotate() {
     );
     assert_eq!(entry.get_attributes().unwrap()["persistence"], "Local");
     entry.set_secret(&[0xff]).unwrap();
+    assert_eq!(entry.get_attributes().unwrap()["persistence"], "Local");
     assert_eq!(source.availability(first), Availability::Available);
     assert_eq!(
         source.resolve(first).unwrap_err(),
@@ -155,6 +166,10 @@ fn native_windows_credentials_cross_processes_and_rotate() {
     terminal::provision(&installation, first_binary, "work", FIRST);
     terminal::provision(&installation, second_binary, "personal", SECOND);
     terminal::cancel(&installation, first_binary, "work");
+    assert_native_entry_count(
+        2,
+        &format!("initial provisioning must create only target UUIDs {first} and {second}"),
+    );
     for binary in binaries {
         for alias in ["work", "personal"] {
             assert_eq!(
@@ -183,12 +198,6 @@ fn native_windows_credentials_cross_processes_and_rotate() {
         first_binary,
         &["--account", "work", "setup", "--alias", "renamed"],
     );
-    terminal::provision(&installation, second_binary, "renamed", ROTATED);
-    assert_eq!(
-        native_entry_count(),
-        2,
-        "rename and rotation must not duplicate entries"
-    );
     assert_eq!(
         command(
             &installation,
@@ -196,6 +205,11 @@ fn native_windows_credentials_cross_processes_and_rotate() {
             &["--account", "renamed", "credential", "status"]
         )["account_id"],
         first.to_string()
+    );
+    terminal::provision(&installation, second_binary, "renamed", ROTATED);
+    assert_native_entry_count(
+        2,
+        &format!("rename and rotation must retain only target UUIDs {first} and {second}"),
     );
     assert_eq!(source.resolve(second).unwrap().len(), SECOND.len());
     for binary in binaries {
@@ -262,7 +276,7 @@ fn native_windows_credentials_cross_processes_and_rotate() {
     );
     assert_eq!(source.availability(first), Availability::Missing);
     assert_eq!(source.availability(second), Availability::Missing);
-    assert_eq!(native_entry_count(), 0, "native fixture cleanup");
+    assert_native_entry_count(0, "native fixture cleanup");
     server.finish();
 }
 
@@ -274,7 +288,8 @@ fn mcp_discovery(installation: &Installation, server: &server::ImapServer) {
         .build()
         .unwrap()
         .block_on(async {
-            let mut command = tokio::process::Command::new(support::MAILCTL_MCP);
+            let mut command =
+                tokio::process::Command::new(support::selected_executable(support::MAILCTL_MCP));
             command
                 .arg("--config")
                 .arg(installation.config())

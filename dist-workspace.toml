@@ -7,8 +7,9 @@ cargo-dist-version = "0.33.0"
 # separate operator action; do not generate a tag-triggered publishing workflow.
 ci = []
 installers = []
-targets = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"]
+targets = ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
 unix-archive = ".tar.gz"
+windows-archive = ".zip"
 checksum = "sha256"
 precise-builds = true
 default-features = false
@@ -19,3 +20,4 @@ dist = false
 [dist.binaries]
 aarch64-apple-darwin = ["mailctl", "mailctl-mcp"]
 x86_64-unknown-linux-gnu = ["mailctl", "mailctl-mcp"]
+x86_64-pc-windows-msvc = ["mailctl", "mailctl-mcp"]

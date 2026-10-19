@@ -2,7 +2,7 @@
 //! MAILCTL_PACKAGED_BIN_DIR selects installer-verified candidate bytes. The cli_
 //! and mcp_ filters need only that installed component; cross_ needs both.
 #![cfg(all(
-    any(target_os = "macos", target_os = "linux"),
+    any(target_os = "macos", target_os = "linux", windows),
     any(feature = "cli", feature = "mcp")
 ))]
 
@@ -13,6 +13,9 @@ mod composition;
 #[path = "packaged_drafts/history.rs"]
 mod history;
 mod imap_support;
+#[cfg(windows)]
+#[path = "native_support/windows_export.rs"]
+mod native_support;
 #[path = "packaged_drafts/ownership.rs"]
 mod ownership;
 #[path = "imap_support/process.rs"]
@@ -20,7 +23,7 @@ mod server;
 mod support;
 
 use serde_json::{Value, json};
-use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, process::Command, time::Duration};
+use std::{fs, path::PathBuf, process::Command, time::Duration};
 use support::{Installation, envelope, run_bounded};
 
 struct Fixture {
@@ -91,7 +94,7 @@ initialization_seconds = 1
             ),
         )
         .unwrap();
-        fs::set_permissions(installation.config(), fs::Permissions::from_mode(0o600)).unwrap();
+        support::protect(installation.config(), false);
         let mut fixture = Self {
             installation,
             server,
@@ -101,7 +104,7 @@ initialization_seconds = 1
         };
         let setup = fixture.admin(executable, &["setup"]);
         assert!(setup.get("error").is_none(), "{setup}");
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows))]
         fixture
             .installation
             .provision_packaged_native("disposable-password");
@@ -515,11 +518,19 @@ macro_rules! component_tests {
     ($scenario:ident, $cli:ident, $mcp:ident) => {
         #[cfg(feature = "cli")]
         #[tokio::test]
+        #[cfg_attr(
+            windows,
+            ignore = "requires an explicitly disposable Windows identity and native credentials"
+        )]
         async fn $cli() {
             $scenario(support::MAILCTL).await;
         }
         #[cfg(feature = "mcp")]
         #[tokio::test]
+        #[cfg_attr(
+            windows,
+            ignore = "requires an explicitly disposable Windows identity and native credentials"
+        )]
         async fn $mcp() {
             $scenario(support::MAILCTL_MCP).await;
         }

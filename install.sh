@@ -16,7 +16,7 @@ Usage: sh install.sh [options]
   --version VERSION       Select a release (default: latest stable).
   --components SELECTION  cli, mcp, or cli,mcp (default: installed selection,
                           or cli,mcp for a new installation).
-  --install-dir DIRECTORY Override CARGO_HOME/bin or ~/.cargo/bin.
+  --install-dir DIRECTORY Override ~/.local/bin.
   --base-url URL          Candidate download directory; HTTPS or loopback HTTP.
   --config FILE           Verify this existing installation before replacement.
   --uninstall             Remove selected installer-owned components.
@@ -106,12 +106,8 @@ if [ "$mode" = install ]; then
 	printf '%s\n' "$base_url" | awk '/^[[:graph:]]+$/ && !/@/ {ok=1} END {exit !(NR == 1 && ok)}' || fail 'Invalid download URL.'
 fi
 if [ -z "$install_dir" ]; then
-	if [ -n "${CARGO_HOME:-}" ]; then
-		install_dir=$CARGO_HOME/bin
-	else
-		[ -n "${HOME:-}" ] || fail 'Set HOME or --install-dir.'
-		install_dir=$HOME/.cargo/bin
-	fi
+	[ -n "${HOME:-}" ] || fail 'Set HOME or --install-dir.'
+	install_dir=$HOME/.local/bin
 fi
 case "$install_dir" in /*) ;; *) fail 'The installation directory must be absolute.' ;; esac
 case "$install_dir" in *'

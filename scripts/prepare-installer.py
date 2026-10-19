@@ -17,10 +17,11 @@ import struct
 import subprocess
 import tarfile
 import tempfile
+import zipfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
-TARGETS = ("aarch64-apple-darwin", "x86_64-unknown-linux-gnu")
+TARGETS = ("aarch64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc")
 COMPONENTS = {"cli": "mailctl", "mcp": "mailctl-mcp"}
 # Bump with the installer's supported epoch when component/state compatibility changes.
 COMPATIBILITY = "1"
@@ -40,7 +41,9 @@ def native_target():
         return TARGETS[0]
     if host == ("Linux", "x86_64") and (os.confstr("CS_GNU_LIBC_VERSION") or "").startswith("glibc "):
         return TARGETS[1]
-    raise ValueError("candidate evidence requires native macOS Apple Silicon or GNU/Linux x86_64")
+    if host[0] == "Windows" and host[1].lower() in ("amd64", "x86_64"):
+        return TARGETS[2]
+    raise ValueError("candidate evidence requires native macOS Apple Silicon, GNU/Linux x86_64, or Windows x86_64")
 
 
 def linux_binary(path):
@@ -72,6 +75,48 @@ def linux_binary(path):
     return dict(elf_class="ELF64", elf_machine="x86_64", elf_interpreter=loader[:-1].decode())
 
 
+def windows_binary(path):
+    with path.open("rb") as binary:
+        header = binary.read(64)
+        if len(header) != 64 or header[:2] != b"MZ":
+            raise ValueError("expected a Windows executable: " + path.name)
+        offset = struct.unpack_from("<I", header, 60)[0]
+        size = path.stat().st_size
+        if not 64 <= offset <= size - 24:
+            raise ValueError("invalid PE header offset: " + path.name)
+        binary.seek(offset)
+        header = binary.read(24)
+        signature, machine, sections, _, _, _, optional_size, characteristics = struct.unpack(
+            "<4sHHIIIHH", header)
+        if (signature != b"PE\0\0" or machine != 0x8664 or not 1 <= sections <= 96
+                or optional_size < 112 or not characteristics & 2 or characteristics & 0x2000
+                or offset + 24 + optional_size + sections * 40 > size):
+            raise ValueError("expected an x86_64 PE executable: " + path.name)
+        if binary.read(2) != b"\x0b\x02":
+            raise ValueError("expected a PE32+ executable: " + path.name)
+    return dict(pe_machine="x86_64", pe_format="PE32+")
+
+
+def copy_binary(archive, binary, output, windows):
+    # Read exact regular members, never extract archive paths to disk.
+    if windows:
+        members = [member for member in archive.infolist()
+                   if Path(member.filename).name == binary + ".exe"]
+        if (len(members) != 1 or members[0].is_dir()
+                or ((members[0].external_attr >> 16) & 0o170000) not in (0, 0o100000)
+                or members[0].external_attr & 0x10):
+            raise ValueError("missing or ambiguous binary in dist archive: " + binary)
+        reader = archive.open(members[0])
+    else:
+        members = [member for member in archive.getmembers() if Path(member.name).name == binary]
+        if len(members) != 1 or not members[0].isfile():
+            raise ValueError("missing or ambiguous binary in dist archive: " + binary)
+        reader = archive.extractfile(members[0])
+    with reader, output.open("wb") as writer:
+        shutil.copyfileobj(reader, writer)
+    output.chmod(0o755)
+
+
 def prepare(manifest_path, destination, allow_dirty, target=None):
     native = native_target()
     target = target or native
@@ -84,13 +129,16 @@ def prepare(manifest_path, destination, allow_dirty, target=None):
         raise ValueError("source is dirty; use --allow-dirty only for local testing")
     commit = run("git", "rev-parse", "HEAD")
     manifest = json.loads(manifest_path.read_text())
+    if manifest["dist_version"] != "0.33.0":
+        raise ValueError("candidate requires pinned cargo-dist 0.33.0")
     releases = manifest["releases"]
     if len(releases) != 1 or releases[0]["app_name"] != "mailctl":
         raise ValueError("dist must distribute only the mailctl package")
     version = releases[0]["app_version"]
     if not re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", version):
         raise ValueError("installer requires a stable release version")
-    archive_name = "mailctl-" + target + ".tar.gz"
+    windows = target == "x86_64-pc-windows-msvc"
+    archive_name = "mailctl-" + target + (".zip" if windows else ".tar.gz")
     artifact = manifest["artifacts"][archive_name]
     if artifact["target_triples"] != [target]:
         raise ValueError("unexpected dist target")
@@ -110,24 +158,23 @@ def prepare(manifest_path, destination, allow_dirty, target=None):
         shutil.copy2(archive_path, staging / archive_name)
         shutil.copy2(checksum_path, staging / checksum_path.name)
         shutil.copy2(manifest_path, staging / "dist-manifest.json")
-        shutil.copy2(ROOT / "install.sh", staging / "install.sh")
+        installer = "install.ps1" if windows else "install.sh"
+        shutil.copy2(ROOT / installer, staging / installer)
         values = {"format": "1", "version": version, "target": target,
                   "commit": commit, "compatibility": compatibility}
         elf = None
-        # Read exact regular members, never extract archive paths to disk.
-        with tarfile.open(staging / archive_name, "r:gz") as archive:
+        windows_evidence = None
+        archive_reader = zipfile.ZipFile if windows else tarfile.open
+        with archive_reader(staging / archive_name, "r" if windows else "r:gz") as archive:
             for component, binary in COMPONENTS.items():
-                members = [m for m in archive.getmembers() if Path(m.name).name == binary]
-                if len(members) != 1 or not members[0].isfile():
-                    raise ValueError("missing or ambiguous binary in dist archive: " + binary)
-                filename = binary + "-v" + version + "-" + target
+                filename = binary + "-v" + version + "-" + target + (".exe" if windows else "")
                 output = staging / filename
-                with archive.extractfile(members[0]) as reader, output.open("wb") as writer:
-                    shutil.copyfileobj(reader, writer)
-                output.chmod(0o755)
+                copy_binary(archive, binary, output, windows)
                 if target == "aarch64-apple-darwin":
                     if run("/usr/bin/lipo", "-archs", str(output)) != "arm64":
                         raise ValueError("unexpected architecture: " + binary)
+                elif windows:
+                    windows_binary(output)
                 else:
                     binary_elf = linux_binary(output)
                     if elf is not None and elf != binary_elf:
@@ -145,6 +192,16 @@ def prepare(manifest_path, destination, allow_dirty, target=None):
                         signing = "unsigned"
                     else:
                         raise ValueError("unqualified signing status: " + signature.stderr)
+                elif windows:
+                    inspected = json.loads(run("pwsh", "-NoProfile", "-File",
+                                               str(ROOT / "scripts/ci/windows-candidate.ps1"),
+                                               "-Phase", "inspect", "-Binary", str(output)))
+                    if inspected["authenticode_status"] != "NotSigned":
+                        raise ValueError("unqualified Authenticode status: " + inspected["authenticode_status"])
+                    if windows_evidence is not None and windows_evidence != inspected:
+                        raise ValueError("component Windows host or signing evidence differs")
+                    windows_evidence = inspected
+                    signing = "unsigned"
                 else:
                     signing = "unsigned"
                 values.update({component + "_file": filename,
@@ -158,6 +215,10 @@ def prepare(manifest_path, destination, allow_dirty, target=None):
                         dist_version=manifest["dist_version"], rustc=run("rustc", "--version"))
         if target == "aarch64-apple-darwin":
             evidence["macos"] = run("sw_vers", "-productVersion")
+        elif windows:
+            evidence.update(os_release="Windows", os_version=platform.win32_ver()[1],
+                            windows_release=platform.release(), **windows_binary(output),
+                            **windows_evidence)
         else:
             distribution = platform.freedesktop_os_release()
             evidence.update(os_release=distribution["ID"], os_version=distribution["VERSION_ID"],
@@ -186,5 +247,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
     try:
         prepare(args.manifest.resolve(strict=True), args.output.resolve(), args.allow_dirty, args.target)
-    except (ValueError, KeyError, OSError, subprocess.CalledProcessError) as error:
+    except (ValueError, KeyError, OSError, subprocess.CalledProcessError,
+            tarfile.TarError, zipfile.BadZipFile) as error:
         parser.exit(1, "prepare-installer: " + str(error) + "\n")

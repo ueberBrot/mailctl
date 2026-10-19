@@ -32,8 +32,9 @@ curl --fail --location --proto '=https' --proto-redir '=https' \
   https://github.com/ueberBrot/mailctl/releases/latest/download/install.sh | sh -s -- --components mcp
 ```
 
-Executables go into `~/.cargo/bin`, or `$CARGO_HOME/bin` when `CARGO_HOME` is nonempty.
-Add that directory to your `PATH`. Use `--install-dir /absolute/path/to/bin` for a different destination.
+Executables go into `~/.local/bin`. Use `--install-dir /absolute/path/to/bin` for a different destination.
+Add `export PATH="$HOME/.local/bin:$PATH"` to your shell profile so future terminals can find them.
+For agents launched from a GUI, use the executable's full path if needed.
 
 To install an exact release, set `VERSION` and use its installer:
 

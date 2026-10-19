@@ -105,6 +105,10 @@ async fn reject_without_provider(fixture: &Fixture, reader: &Reader, input: Valu
 
 #[cfg(feature = "mcp")]
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an explicitly disposable Windows identity and native credentials"
+)]
 async fn mcp_attachment_quota_preserves_live_tokens_and_expiry_releases_capacity() {
     tokio::time::timeout(Duration::from_secs(30), async {
         let mut fixture = Fixture::with_limits(
@@ -206,18 +210,30 @@ async fn interrupt_attachment_at_its_deadline(executable: &str) {
 
 #[cfg(feature = "cli")]
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an explicitly disposable Windows identity and native credentials"
+)]
 async fn cli_attachment_deadlines_dispose_authentication_and_incomplete_fetches() {
     interrupt_attachment_at_its_deadline(support::MAILCTL).await;
 }
 
 #[cfg(feature = "mcp")]
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an explicitly disposable Windows identity and native credentials"
+)]
 async fn mcp_attachment_deadlines_dispose_authentication_and_incomplete_fetches() {
     interrupt_attachment_at_its_deadline(support::MAILCTL_MCP).await;
 }
 
 #[cfg(feature = "mcp")]
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an explicitly disposable Windows identity and native credentials"
+)]
 async fn mcp_attachment_cancellation_disposes_transport_and_releases_capacity() {
     use rmcp::{
         model::{CallToolRequest, CallToolRequestParams, ClientRequest},
