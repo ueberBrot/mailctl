@@ -262,22 +262,22 @@ jobs:
         run: ./scripts/ci/windows-candidate.ps1 installer
       - name: Build reusable Windows acceptance harnesses
         shell: pwsh
-        run: ./scripts/ci/windows-packaged-acceptance.ps1 prepare
+        run: ./scripts/ci/windows-packaged-acceptance.ps1 -Phase prepare
       - name: Qualify installed setup, shared account state, backup and restore
         shell: pwsh
-        run: ./scripts/ci/windows-packaged-acceptance.ps1 state
+        run: ./scripts/ci/windows-packaged-acceptance.ps1 -Phase state
       - name: Qualify installed interfaces, export and process recovery
         shell: pwsh
-        run: ./scripts/ci/windows-packaged-acceptance.ps1 process
+        run: ./scripts/ci/windows-packaged-acceptance.ps1 -Phase process
       - name: Qualify installed Credential Manager lifecycle under a disposable identity
         shell: pwsh
-        run: ./scripts/ci/windows-packaged-acceptance.ps1 native
+        run: ./scripts/ci/windows-packaged-acceptance.ps1 -Phase native
       - name: Qualify installed reading through native Windows credentials
         shell: pwsh
-        run: ./scripts/ci/windows-packaged-acceptance.ps1 reading
+        run: ./scripts/ci/windows-packaged-acceptance.ps1 -Phase reading
       - name: Qualify installed draft faults and recovery
         shell: pwsh
-        run: ./scripts/ci/windows-packaged-acceptance.ps1 drafts
+        run: ./scripts/ci/windows-packaged-acceptance.ps1 -Phase drafts
       - name: Record passing Windows candidate acceptance
         shell: pwsh
         run: ./scripts/ci/windows-candidate.ps1 record
