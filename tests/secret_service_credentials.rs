@@ -210,7 +210,7 @@ fn native_secret_service_credentials_cross_components_rotate_and_clean_up() {
     provision(&installation, binaries[0], "work", FIRST, 0);
     provision(
         &installation,
-        *binaries.last().unwrap(),
+        binaries.last().unwrap(),
         "personal",
         SECOND,
         0,
@@ -278,7 +278,7 @@ fn native_secret_service_credentials_cross_components_rotate_and_clean_up() {
     );
     provision(
         &installation,
-        *binaries.last().unwrap(),
+        binaries.last().unwrap(),
         "renamed",
         ROTATED,
         0,
@@ -362,7 +362,7 @@ fn native_secret_service_credentials_cross_components_rotate_and_clean_up() {
     }
     admin(
         &installation,
-        *binaries.last().unwrap(),
+        binaries.last().unwrap(),
         &["--account", "personal", "credential", "delete"],
     );
     assert_eq!(entry_count(first), 0);

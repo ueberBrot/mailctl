@@ -101,6 +101,7 @@ initialization_seconds = 1
         };
         let setup = fixture.admin(executable, &["setup"]);
         assert!(setup.get("error").is_none(), "{setup}");
+        #[cfg(target_os = "linux")]
         fixture
             .installation
             .provision_packaged_native("disposable-password");

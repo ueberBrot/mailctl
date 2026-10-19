@@ -145,43 +145,34 @@ impl Installation {
         &self.config
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     pub(crate) fn provision_packaged_native(&self, password: &str) {
         if std::env::var("MAILCTL_PACKAGED_CREDENTIAL_SOURCE").as_deref() != Ok("native") {
             return;
         }
-        #[cfg(target_os = "linux")]
-        {
-            use mailctl::{
-                config::CredentialSource,
-                credentials::{self, Secret},
-            };
-            secret_service::assert_disposable();
-            let registry: Value = serde_json::from_slice(
-                &fs::read(self.directory.join("state/accounts.json")).unwrap(),
-            )
-            .unwrap();
-            let source = credentials::source_for(&CredentialSource::Native {});
-            let store = source
-                .mutable_store()
-                .expect("mutable native Linux credential source");
-            let secret = Secret::new(password.as_bytes().to_vec()).unwrap();
-            for account in registry["accounts"].as_object().unwrap().values() {
-                let id = Uuid::parse_str(account["account_id"].as_str().unwrap()).unwrap();
-                store
-                    .set(id, &secret)
-                    .expect("provision a disposable native credential");
-                let mut owned = self.native_credentials.lock().unwrap();
-                if !owned.contains(&id) {
-                    owned.push(id);
-                }
+        use mailctl::{
+            config::CredentialSource,
+            credentials::{self, Secret},
+        };
+        secret_service::assert_disposable();
+        let registry: Value =
+            serde_json::from_slice(&fs::read(self.directory.join("state/accounts.json")).unwrap())
+                .unwrap();
+        let source = credentials::source_for(&CredentialSource::Native {});
+        let store = source
+            .mutable_store()
+            .expect("mutable native Linux credential source");
+        let secret = Secret::new(password.as_bytes().to_vec()).unwrap();
+        for account in registry["accounts"].as_object().unwrap().values() {
+            let id = Uuid::parse_str(account["account_id"].as_str().unwrap()).unwrap();
+            store
+                .set(id, &secret)
+                .expect("provision a disposable native credential");
+            let mut owned = self.native_credentials.lock().unwrap();
+            if !owned.contains(&id) {
+                owned.push(id);
             }
         }
-        #[cfg(not(target_os = "linux"))]
-        panic!(
-            "packaged native credential acceptance requires disposable Linux; secret length {}",
-            password.len()
-        );
     }
 
     pub(crate) fn write_configuration(&self, default_grant: &str) {
