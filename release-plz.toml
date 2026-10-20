@@ -29,8 +29,10 @@ Email access from your terminal or AI agent.
 - Attachment retrieval and export to an approved directory.
 - Unsent draft creation, status, and recovery after interrupted saves.
 - Read-only defaults and access grants for selected accounts, mailboxes, and operations.
-- Password storage in macOS Keychain and TLS connections to email providers.
-- Standalone macOS Apple Silicon installer with CLI-only, MCP-only, and combined installations, updates, and removal.
+- TLS connections and password storage in macOS Keychain, Windows Credential Manager, or Linux Secret Service.
+- Prebuilt binaries and standalone installers for macOS Apple Silicon, GNU/Linux x86_64, and Windows x86_64.
+- CLI-only, MCP-only, and combined installations, updates, and removal.
+- Windows executables launched through WSL2 retain Windows credentials and paths.
 - Installable agent skill for setup and email workflows through CLI or MCP.
 
 mailctl does not send email or edit existing drafts.

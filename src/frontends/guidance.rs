@@ -91,7 +91,7 @@ transport refusal, which has no `structuredContent` envelope.
 
 ## Operator readiness
 
-On macOS or Windows, provision an account's native credential interactively:
+Provision an account's native credential in your own terminal:
 
 ```sh
 mailctl setup --alias work --server imap.example.com --username user@example.com
@@ -99,10 +99,16 @@ mailctl --account work credential set
 mailctl --account work doctor --check-account --json
 ```
 
+Native credentials use macOS Keychain, Windows Credential Manager, or an unlocked
+default Secret Service collection on the Linux execution identity's session
+D-Bus. Enter passwords at the credential prompt, outside agent chat and command
+arguments.
+
 Check `result.accounts[].authentication.outcome.status` for `authenticated`.
-Plain `doctor` inspects local readiness without authenticating. On Linux,
-credentials require an externally provisioned source; consult its `doctor`
-prerequisites. MCP-only installations use `mailctl-mcp` for these commands.
+Plain `doctor` inspects local readiness without authenticating. For headless Linux
+without Secret Service, the operator must explicitly select and provision a
+trusted command source or systemd credentials. Consult the selected source's
+`doctor` prerequisites. MCP-only installations use `mailctl-mcp` for these commands.
 
 New installations grant read-only access to every current and future folder;
 new account and grant scopes omit `mailboxes`, which means all folders.
@@ -282,7 +288,7 @@ one bounded base64 result:
 mailctl attachment get --attachment "$attachment_reference" --json
 ```
 
-For a file on macOS or Windows, use an operator-approved export root:
+For a file on macOS, Linux, or Windows, use an operator-approved export root:
 
 ```sh
 mailctl attachment export --attachment "$attachment_reference" \
