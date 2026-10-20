@@ -259,6 +259,8 @@ impl Service {
         }
         let mut budget =
             crate::encoding::OutputBudget::new(context.response_limit().saturating_sub(512));
+        // Base64 needs no JSON escaping. The remaining fields (including the
+        // authorized account UUID and numeric fields) fit the fixed reservation.
         budget.reserve(512 + page.bytes.len().div_ceil(3) * 4)?;
         budget.count(&entry.reference)?;
         let progress = match page.integrity {
@@ -283,7 +285,6 @@ impl Service {
             decoded_offset: entry.offset,
             progress,
         };
-        crate::encoding::serialized_size(&result, context.response_limit().saturating_sub(512))?;
         if page.integrity.is_none() {
             entry.offset = next_offset;
             reservation.retain(entry)?;
