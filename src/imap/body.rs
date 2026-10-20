@@ -146,7 +146,7 @@ async fn read_selected(
         let raw = headers(
             conn,
             request.uid,
-            Section::Mime(path.clone()),
+            Section::Mime(&path),
             limits,
             &mut header_bytes,
         )
@@ -185,7 +185,7 @@ async fn read_selected(
                 bytes(
                     conn,
                     request.uid,
-                    Some(Section::Part(selected.part.clone())),
+                    Some(Section::Part(&selected.part)),
                     Some(selected.wire_size),
                     limits.max_body_wire_bytes,
                     limits,
@@ -245,7 +245,7 @@ async fn read_selected(
 async fn headers(
     conn: &mut Connection<'_>,
     uid: u32,
-    section: Section,
+    section: Section<'_>,
     limits: &Limits,
     used: &mut usize,
 ) -> Result<Vec<u8>, Error> {
@@ -274,7 +274,7 @@ async fn headers(
 async fn bytes(
     conn: &mut Connection<'_>,
     uid: u32,
-    section: Option<Section>,
+    section: Option<Section<'_>>,
     expected: Option<usize>,
     budget: usize,
     limits: &Limits,
@@ -289,7 +289,7 @@ async fn bytes(
         let count = chunk.min(ceiling + 1 - result.len());
         let fetch = Fetch::Bytes {
             uid,
-            section: section.clone(),
+            section,
             offset: result.len() as u32,
             count: count as u32,
         };

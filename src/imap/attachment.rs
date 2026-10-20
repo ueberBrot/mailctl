@@ -94,7 +94,7 @@ impl TransferState {
             let count = limits.fetch_chunk_bytes()?.min(remaining.saturating_add(1));
             let fetch = Fetch::Bytes {
                 uid: self.uid,
-                section: Some(Section::Part(self.part.clone())),
+                section: Some(Section::Part(&self.part)),
                 offset: u32::try_from(self.wire_bytes).map_err(|_| Error::Limit)?,
                 count: count as u32,
             };

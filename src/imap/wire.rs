@@ -107,7 +107,7 @@ pub(super) enum Kind<'a> {
     Examine,
     Search,
     Projection,
-    Body(&'a Fetch),
+    Body(&'a Fetch<'a>),
     Logout,
 }
 impl Kind<'_> {
