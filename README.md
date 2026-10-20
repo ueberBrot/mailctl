@@ -10,7 +10,16 @@ Model Context Protocol (MCP). Install both or use either on its own.
 
 ## Install
 
-The standalone installer supports macOS on Apple Silicon. It does not require Rust.
+Standalone installers use prebuilt binaries. Rust is not required.
+
+| Platform | Installer | Default executable directory |
+| --- | --- | --- |
+| macOS on Apple Silicon | Shell | `~/.local/bin` |
+| GNU/Linux x86_64 with glibc | Shell | `~/.local/bin` |
+| Windows x86_64 | PowerShell | `%USERPROFILE%\.local\bin` |
+
+### macOS and Linux
+
 Install the latest stable release:
 
 ```sh
@@ -32,7 +41,7 @@ curl --fail --location --proto '=https' --proto-redir '=https' \
   https://github.com/ueberBrot/mailctl/releases/latest/download/install.sh | sh -s -- --components mcp
 ```
 
-Executables go into `~/.local/bin`. Use `--install-dir /absolute/path/to/bin` for a different destination.
+Use `--install-dir /absolute/path/to/bin` for a different destination.
 Add `export PATH="$HOME/.local/bin:$PATH"` to your shell profile so future terminals can find them.
 For agents launched from a GUI, use the executable's full path if needed.
 
@@ -43,9 +52,42 @@ VERSION=0.1.0
 curl --fail --location --proto '=https' --proto-redir '=https' "https://github.com/ueberBrot/mailctl/releases/download/v${VERSION}/install.sh" | sh -s -- --version "$VERSION"
 ```
 
+### Windows
+
+Run this command in Windows PowerShell 5.1 or PowerShell 7:
+
+```powershell
+$installer = (Invoke-WebRequest -UseBasicParsing 'https://github.com/ueberBrot/mailctl/releases/latest/download/install.ps1').Content
+& ([scriptblock]::Create($installer))
+```
+
+Both components install by default. Add `-Components cli` to the last line for CLI only, or `-Components mcp` for MCP only.
+Use `-InstallDir 'C:\absolute\path\to\bin'` for a different destination.
+Add the executable directory to your user `PATH`, then restart your terminal and agent.
+
+<details>
+<summary>Install an exact Windows version</summary>
+
+```powershell
+$Version = '0.1.0'
+$installer = (Invoke-WebRequest -UseBasicParsing "https://github.com/ueberBrot/mailctl/releases/download/v$Version/install.ps1").Content
+& ([scriptblock]::Create($installer)) -Version $Version
+```
+
+</details>
+
+Inside WSL2, choose the Linux installer or run the Windows installer in Windows PowerShell.
+Linux and Windows installations can coexist. They use separate configuration, credential stores, and draft history.
+
 ## Connect your account
 
-Run these commands in your own terminal. Replace the server and username with
+For MCP-only installations, use `mailctl-mcp` for the commands below.
+On Linux, native credentials need an unlocked Secret Service collection on your session D-Bus.
+For headless Linux without that service, configure a command or systemd credential source as described in `mailctl guide overview`.
+For Windows executables, enter credentials in a native Windows terminal under the same Windows account.
+Use that terminal for credentials when you launch Windows executables from WSL2 too.
+
+For native credentials, run these commands in your own terminal. Replace the server and username with
 your provider's values. `work` is the name that you give the account:
 
 ```sh
@@ -57,13 +99,14 @@ mailctl --account work doctor --check-account --json
 Enter your password or app password at the credential prompt.
 The doctor command tests authentication. New accounts use TLS on port 993.
 
-For MCP-only installations, use `mailctl-mcp` for account, credential, and guide commands.
 Use `--config /absolute/path/to/config.toml` to select a custom configuration.
 
 ## Use MCP with your agent
 
 Merge the example into your agent's global or project MCP configuration.
-Replace `/absolute/path/to/mailctl-mcp` with the path from `command -v mailctl-mcp`.
+Replace `/absolute/path/to/mailctl-mcp` with the installed path as seen by your agent.
+Find it with `command -v mailctl-mcp` on Unix or `(Get-Command mailctl-mcp).Source` in PowerShell.
+In Windows JSON and TOML strings, use forward slashes, such as `C:/Users/you/.local/bin/mailctl-mcp.exe`.
 Project paths are relative to your project folder.
 
 <details>
@@ -128,7 +171,7 @@ Replace `writer` with your grant's name. Use `mailctl-mcp guide drafts` for the 
 
 The [mailctl skill](skills/mailctl/SKILL.md) helps your agent install and update
 mailctl, set up accounts, read messages and attachments, and create approved unsent drafts.
-One skill covers CLI and MCP:
+One skill covers CLI and MCP for Codex, Claude Code, and other compatible agents:
 
 ```sh
 npx skills add ueberBrot/mailctl --skill mailctl
@@ -175,11 +218,12 @@ mailctl guide drafts
 
 ## Credentials and permissions
 
-The standard setup stores account passwords in macOS Keychain.
+The standard setup stores account passwords in macOS Keychain, Windows Credential Manager, or Linux Secret Service.
 Account configuration contains a reference to the saved credential.
 Keep passwords out of agent chat, command arguments, and account configuration.
 The MCP server never prompts for passwords or returns saved account passwords.
-For external command credential sources, their owner controls the storage and protection.
+For command credential sources, their owner controls storage and protection.
+For systemd sources on Linux, systemd supplies the credentials to the configured service.
 
 An access grant defines the permitted accounts, mailboxes, and operations.
 New installations allow read-only access to all folders in configured accounts.
@@ -194,11 +238,11 @@ Before updating, stop the CLI commands and MCP servers that use the installation
 Repeat the install command to update to the latest stable release.
 Without `--components`, the installer keeps your installed component selection.
 If both components are installed, it updates both together.
-Use `--components cli,mcp` to add a missing component.
-Use the original `--install-dir` for a custom destination.
-For a custom configuration, also pass `--config /absolute/path/to/config.toml`.
+Use `--components cli,mcp` on Unix or `-Components 'cli,mcp'` in PowerShell to add a missing component.
+Use the original `--install-dir` or `-InstallDir` for a custom destination.
+For a custom configuration, also pass `--config` or `-Config` with its absolute path.
 
-To remove the installed components:
+To remove the installed components on macOS or Linux:
 
 ```sh
 curl --fail --location --proto '=https' --proto-redir '=https' https://github.com/ueberBrot/mailctl/releases/latest/download/install.sh | sh -s -- --uninstall
@@ -206,6 +250,15 @@ curl --fail --location --proto '=https' --proto-redir '=https' https://github.co
 
 Add `--components cli` or `--components mcp` to remove only one.
 For a custom destination, add the original `--install-dir /absolute/path/to/bin`.
+
+On Windows:
+
+```powershell
+$installer = (Invoke-WebRequest -UseBasicParsing 'https://github.com/ueberBrot/mailctl/releases/latest/download/install.ps1').Content
+& ([scriptblock]::Create($installer)) -Uninstall
+```
+
+Add `-Components cli` or `-Components mcp` for partial removal, or the original `-InstallDir` for a custom destination.
 Updates and removal preserve account configuration, credentials, and draft history.
 
 ## Build from source
