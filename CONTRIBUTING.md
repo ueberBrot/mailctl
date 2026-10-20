@@ -125,7 +125,7 @@ Keep dependency declarations, `Cargo.lock`, and repository policy checks
 consistent when updating dependencies. The CI workflow defines the full platform
 matrix and acceptance checks.
 
-## Release preparation
+## Releases
 
 The [main-only workflow](.github/workflows/release-plz.yml) uses
 [release-plz](https://release-plz.dev/) and its embedded git-cliff to prepare a
@@ -139,12 +139,14 @@ release notes, including compatibility changes and migration instructions.
 The workflow uses the built-in GitHub token. A maintainer with write access
 must select "Approve workflows to run" on the generated PR. That approval
 starts the CI checks.
-Review the candidate and wait for those checks before merging. Publication is a
-separate operator action. Preparation and merging create no release tags or
-published packages.
+Review the version, changelog, and candidate checks before a maintainer manually
+merges the release PR. That merge approves publication. After the merged commit
+passes all Development checks, the [publication workflow](.github/workflows/release.yml)
+uses release-plz to create the version tag and draft release with its changelog.
+The workflow verifies that run's qualified artifacts, attaches the installers,
+binaries, and checksums, then publishes the release after verifying every asset.
+Ordinary pushes to `main` do not publish releases.
 
-Keep the first release PR open while `0.1.0` is still changing. Release-plz
-preserves a merged changelog entry until that version is tagged. When the
-candidate is ready, merge it and publish the qualified commit through the
-separate release process. Run preparation again after the first published tag
-if more changes need a release candidate.
+If publication fails, inspect the retained release plan, publication journal,
+and any existing tag or draft release before recovery. The manual commands in
+`scripts/release.py` remain available for reviewed recovery.

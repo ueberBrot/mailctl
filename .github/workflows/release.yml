@@ -1,0 +1,75 @@
+name: Release publication
+# The job accepts only successful main pushes from this repository.
+on:  # zizmor: ignore[dangerous-triggers]
+  workflow_run:
+    workflows: [Development checks]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-publication
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: >-
+      github.repository == 'ueberBrot/mailctl' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == 'ueberBrot/mailctl'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      contents: write
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f  # v2.0.0; reads rust-toolchain.toml
+        with:
+          cache: false
+      - name: Create the version tag and draft release
+        id: release
+        uses: release-plz/action@f393a7b38aca9d9b4c58447b291dbac963901df6  # v0.5.141
+        with:
+          command: release
+          version: 0.3.171
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: Reject unfinished publication when release-plz skips the version
+        if: steps.release.outputs.releases_created != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAILCTL_COMMIT: ${{ github.event.workflow_run.head_sha }}
+        run: python3 scripts/release.py check-state --commit "$MAILCTL_COMMIT"
+      - name: Verify the qualified release artifacts
+        if: steps.release.outputs.releases_created == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAILCTL_COMMIT: ${{ github.event.workflow_run.head_sha }}
+          MAILCTL_RUN_ID: ${{ github.event.workflow_run.id }}
+          MAILCTL_RELEASES: ${{ steps.release.outputs.releases }}
+          MAILCTL_RELEASE_DIR: ${{ runner.temp }}/mailctl-release
+        run: python3 scripts/release.py prepare-ci --commit "$MAILCTL_COMMIT" --run-id "$MAILCTL_RUN_ID" --output "$MAILCTL_RELEASE_DIR"
+      - name: Attach verified assets and publish the release
+        if: steps.release.outputs.releases_created == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAILCTL_RELEASE_DIR: ${{ runner.temp }}/mailctl-release
+        run: python3 scripts/release.py finalize "$MAILCTL_RELEASE_DIR"
+      - name: Keep the release plan and publication journal
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: mailctl-publication-${{ github.event.workflow_run.id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mailctl-release/
+          if-no-files-found: ignore
+          retention-days: 14
