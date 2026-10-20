@@ -1,9 +1,10 @@
 [workspace]
-# Prepare candidates from git history; publication is a separate operator action.
+# release.yml runs release-plz after the merged release PR passes CI.
 git_only = true
 publish = false
 git_tag_enable = false
 git_release_enable = false
+release_always = false
 dependencies_update = false
 semver_check = false
 release = false
@@ -14,29 +15,15 @@ name = "mailctl"
 release = true
 changelog_path = "CHANGELOG.md"
 git_tag_name = "v{{ version }}"
+git_tag_enable = true
+git_release_enable = true
+git_release_draft = true
+git_release_latest = false
+git_release_body = "{{ changelog | trim }}"
 
 [changelog]
 body = """
 ## [{{ version }}]{%- if release_link -%}({{ release_link }}){% endif %} - {{ timestamp | date(format="%Y-%m-%d") }}
-{%- if version == "0.1.0" %}
-
-### Initial release
-
-Email access from your terminal or AI agent.
-
-- Independent CLI (`mailctl`) and MCP server (`mailctl-mcp`) with shared account configuration.
-- Account and mailbox discovery, message search, and bounded text reads.
-- Attachment retrieval and export to an approved directory.
-- Unsent draft creation, status, and recovery after interrupted saves.
-- Read-only defaults and access grants for selected accounts, mailboxes, and operations.
-- TLS connections and password storage in macOS Keychain, Windows Credential Manager, or Linux Secret Service.
-- Prebuilt binaries and standalone installers for macOS Apple Silicon, GNU/Linux x86_64, and Windows x86_64.
-- CLI-only, MCP-only, and combined installations, updates, and removal.
-- Windows executables launched through WSL2 retain Windows credentials and paths.
-- Installable agent skill for setup and email workflows through CLI or MCP.
-
-mailctl does not send email or edit existing drafts.
-{%- else %}
 {% for group, commits in commits | group_by(attribute="group") %}
 ### {{ group | upper_first }}
 
@@ -48,7 +35,6 @@ mailctl does not send email or edit existing drafts.
 {% endif -%}
 {% endfor -%}
 {% endfor %}
-{%- endif %}
 """
 protect_breaking_commits = true
 commit_parsers = [

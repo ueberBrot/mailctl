@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Preserve, inspect, and explicitly approve one mailctl release candidate.
+"""Verify mailctl release candidates and upload them to a release-plz draft.
 
 Requires Python 3.11+ and gh. prepare and verify use only GitHub GET requests.
 Downloaded programs and installers are never executed.
@@ -18,6 +18,7 @@ import struct
 import subprocess
 import sys
 import tarfile
+import tempfile
 import zipfile
 
 try:
@@ -169,6 +170,31 @@ class GitHub:
             self.call(["api", "--hostname", "github.com", "--method", "GET",
                        BASE + f"actions/artifacts/{artifact_id}/zip"], output=output)
 
+    def job_log(self, job_id):
+        return self.call(["api", "--hostname", "github.com", "--method", "GET",
+                          BASE + f"actions/jobs/{job_id}/logs", "--allow-escape-sequences"])
+
+
+def upload_receipt(gh, job, upload, artifact):
+    # Runner step times and artifact-service creation times use different clocks.
+    # Bind the ID and digest to the successful upload in this attempt's job log.
+    expected = [
+        "SHA256 digest of uploaded artifact is " + artifact["digest"].removeprefix("sha256:"),
+        f"Artifact {artifact['name']} successfully finalized. Artifact ID {artifact['id']}",
+        f"Artifact download URL: https://github.com/{REPO}/actions/runs/{job['run_id']}/artifacts/{artifact['id']}",
+    ]
+    found = []
+    log = gh.job_log(job["id"])
+    require(len(log) <= MAX_FILE, "Job log exceeds size limit")
+    for line in log.decode(errors="replace").splitlines():
+        match = re.fullmatch(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.\d+)?Z (.*)", line)
+        if match and match[2] in expected:
+            # The jobs API reports whole seconds; log timestamps retain fractions.
+            require(timestamp(upload["started_at"]) <= timestamp(match[1] + "Z")
+                    <= timestamp(upload["completed_at"]), "Upload receipt is outside the successful step")
+            found.append(match[2])
+    require(found == expected, "Missing or ambiguous artifact upload receipt")
+
 
 def metadata(gh, commit, run_id, artifact_ids):
     require(re.fullmatch(r"[0-9a-f]{40}", commit), "Use a full lowercase commit SHA")
@@ -222,12 +248,13 @@ def metadata(gh, commit, run_id, artifact_ids):
                 "Artifact exceeds size limit")
         require(re.fullmatch(r"sha256:[0-9a-f]{64}", artifact["digest"]), "Missing artifact SHA256 digest")
         require(timestamp(artifact["expires_at"]) > datetime.now(timezone.utc), "Artifact expired")
-        # Artifacts lack run_attempt; bind each ID to its own successful upload window.
+        # Artifacts lack run_attempt; the job and its receipt identify the attempt.
         require(timestamp(job["started_at"]) <= timestamp(artifact["created_at"])
                 <= timestamp(job["completed_at"]), "Artifact belongs to another attempt")
         upload = steps[upload_name]
-        require(timestamp(upload["started_at"]) <= timestamp(artifact["created_at"])
-                <= timestamp(upload["completed_at"]), "Artifact is outside this attempt's upload step")
+        require(timestamp(upload["started_at"]) <= timestamp(artifact["created_at"]),
+                "Artifact predates this attempt's upload step")
+        upload_receipt(gh, job, upload, artifact)
         named = [entry for entry in artifacts if entry["name"] == artifact_name(target)]
         require(len(named) == 1 and named[0] == artifact, "Ambiguous or mismatched run artifact")
         selected[target] = dict(job=job, artifact=artifact)
@@ -598,11 +625,7 @@ def plan_for(directory, meta, source, bundles, zips):
     version, changelog = versions.pop()
     note_bytes = read(directory / "qualification-notes.json")
     qualification(note_bytes, commit, meta)
-    notes = (f"# mailctl {version}\n\n{changelog}\n\n"
-             "## Qualification supplied by the operator\n\n"
-             "These notes associate accepted source evidence with these artifacts. "
-             "The release helper does not run live qualification.\n\n```json\n" +
-             note_bytes.decode().rstrip() + "\n```\n").encode()
+    notes = changelog.encode()
     assets = release_assets(bundles, zips, version)
     plan = dict(format=2, repository=REPO, commit=commit, version=version, tag="v" + version,
                 run_id=meta["run"]["id"], run_attempt=meta["run"]["run_attempt"],
@@ -678,6 +701,45 @@ def prepare(gh, commit, run_id, artifact_ids, qualification_notes, directory):
     return sha(encoded)
 
 
+def source_version(gh, commit):
+    require(re.fullmatch(r"[0-9a-f]{40}", commit), "Use a full lowercase commit SHA")
+    source = gh.get(f"contents/Cargo.toml?ref={commit}", raw=True)
+    return tomllib.loads(source.decode())["workspace"]["package"]["version"]
+
+
+def check_state(gh, commit):
+    tag = "v" + source_version(gh, commit)
+    ref = gh.get("git/ref/tags/" + tag, absent_ok=True)
+    releases = [release for release in gh.pages("releases", None) if release["tag_name"] == tag]
+    require((ref is None and not releases) or
+            (ref is not None and len(releases) == 1 and releases[0]["draft"] is False),
+            "Unfinished publication for " + tag + "; inspect the tag, draft and retained plan for manual recovery")
+
+
+def prepare_ci(gh, commit, run_id, releases, directory):
+    version = source_version(gh, commit)
+    selected = parse_json(releases)
+    require(isinstance(selected, list) and len(selected) == 1, "Expected one release-plz product release")
+    matches(selected[0], dict(package_name="mailctl", version=version, tag="v" + version), "release-plz output")
+    artifacts = gh.pages(f"actions/runs/{run_id}/artifacts", "artifacts")
+    names = {artifact_name(target) for target in TARGETS}
+    ids = [artifact["id"] for artifact in artifacts if artifact["name"] in names]
+    meta = metadata(gh, commit, run_id, ids)
+    notes = dict(source_commit=commit, operator="Maintainer merge of the release-plz PR",
+                 accepted_source_evidence=[f"https://github.com/{REPO}/actions/runs/{run_id}"],
+                 association_notes="These exact artifacts passed the automated installed reading, draft, "
+                 "credential and platform checks in this CI attempt. Live provider and agent-client "
+                 "qualification are historical; this run does not refresh them or qualify isolation.",
+                 artifact_associations={target: dict(commit=commit, run_id=run_id,
+                     run_attempt=meta["run"]["run_attempt"], artifact_id=platform["artifact"]["id"],
+                     artifact_sha256=platform["artifact"]["digest"])
+                     for target, platform in meta["platforms"].items()})
+    with tempfile.TemporaryDirectory(prefix="mailctl-release-notes-", dir=directory.parent) as temporary:
+        path = Path(temporary) / "qualification.json"
+        path.write_bytes(canonical(notes))
+        return prepare(gh, commit, run_id, ids, path, directory)
+
+
 def verify(gh, directory):
     require(directory.is_dir() and not directory.is_symlink(), "Expected a plan directory")
     require(not (directory / "publication-started.json").exists(), "Publication already started; use manual recovery")
@@ -716,6 +778,56 @@ def approved_payload(directory, plan, digest):
                 "Approved asset changed during publication: " + name)
 
 
+def require_tag(gh, plan):
+    obj = gh.get("git/ref/tags/" + plan["tag"])["object"]
+    if obj["type"] == "tag":
+        annotated = gh.get("git/tags/" + obj["sha"])
+        matches(annotated, {"tag": plan["tag"]}, "annotated release tag")
+        obj = annotated["object"]
+    matches(obj, {"type": "commit", "sha": plan["commit"]}, "release tag")
+
+
+def draft_release(gh, plan):
+    releases = [release for release in gh.pages("releases", None) if release["tag_name"] == plan["tag"]]
+    require(len(releases) == 1, "Expected exactly one draft release")
+    release = releases[0]
+    matches(release, {"tag_name": plan["tag"], "draft": True}, "draft release")
+    require(sha(release["body"].encode()) == plan["release_notes_sha256"], "Draft release notes differ from the changelog")
+    return release
+
+
+def publish_draft(gh, directory, plan, digest, *, latest=False):
+    release = draft_release(gh, plan)
+    assets = gh.pages(f"releases/{release['id']}/assets", None)
+    require(len(assets) == len(plan["assets"]), "Remote asset count differs; draft remains unpublished")
+    seen = set()
+    for asset in assets:
+        name = asset["name"]
+        require(name in plan["assets"] and name not in seen, "Remote asset names differ; draft remains unpublished")
+        seen.add(name)
+        expected = plan["assets"][name]
+        matches(asset, {"size": expected["size"], "digest": "sha256:" + expected["sha256"],
+                       "state": "uploaded"}, "remote asset " + name)
+    require_tag(gh, plan)
+    approved_payload(directory, plan, digest)
+    gh.call(["release", "edit", plan["tag"], "--draft=false", "--repo", REPO,
+             *(["--latest"] if latest else [])])
+    matches(gh.get(f"releases/{release['id']}"), {"tag_name": plan["tag"], "draft": False}, "published release")
+
+
+def finalize(gh, directory):
+    plan, digest = verify(gh, directory)
+    require_tag(gh, plan)
+    release = draft_release(gh, plan)
+    require(not gh.pages(f"releases/{release['id']}/assets", None), "Draft already has assets; use manual recovery")
+    with (directory / "publication-started.json").open("xb") as journal:
+        journal.write(canonical(dict(plan_sha256=digest, tag=plan["tag"], commit=plan["commit"])))
+    approved_payload(directory, plan, digest)
+    gh.call(["release", "upload", plan["tag"], "--repo", REPO, *sorted(plan["assets"])],
+            cwd=directory / "assets")
+    publish_draft(gh, directory, plan, digest, latest=True)
+
+
 def publish(gh, directory, approved):
     require(re.fullmatch(r"[0-9a-f]{64}", approved), "Approval requires the exact plan SHA256")
     require(sha(read(directory / "plan.json")) == approved, "Approved digest differs from this plan")
@@ -737,25 +849,7 @@ def publish(gh, directory, approved):
     gh.call(["release", "create", tag, "--draft", "--verify-tag", "--repo", REPO,
              "--title", tag, "--notes-file", str(directory / "release-notes.md"),
              *sorted(plan["assets"])], cwd=directory / "assets")
-    releases = [release for release in gh.pages("releases", None) if release["tag_name"] == tag]
-    require(len(releases) == 1, "Expected exactly one draft release")
-    release = releases[0]
-    matches(release, {"tag_name": tag, "draft": True}, "draft release")
-    require(sha(release["body"].encode()) == plan["release_notes_sha256"], "Draft release notes differ from approval")
-    assets = gh.pages(f"releases/{release['id']}/assets", None)
-    require(len(assets) == len(plan["assets"]), "Remote asset count differs; draft remains unpublished")
-    seen = set()
-    for asset in assets:
-        name = asset["name"]
-        require(name in plan["assets"] and name not in seen, "Remote asset names differ; draft remains unpublished")
-        seen.add(name)
-        expected = plan["assets"][name]
-        matches(asset, {"size": expected["size"], "digest": "sha256:" + expected["sha256"],
-                       "state": "uploaded"}, "remote asset " + name)
-    matches(gh.get("git/ref/tags/" + tag)["object"], {"type": "commit", "sha": plan["commit"]}, "final tag")
-    approved_payload(directory, plan, digest)
-    gh.call(["release", "edit", tag, "--draft=false", "--repo", REPO])
-    matches(gh.get(f"releases/{release['id']}"), {"tag_name": tag, "draft": False}, "published release")
+    publish_draft(gh, directory, plan, digest)
 
 
 def main():
@@ -768,6 +862,12 @@ def main():
                       help="repeat once per qualified macOS, Linux and Windows target")
     prep.add_argument("--qualification-notes", required=True, type=Path)
     prep.add_argument("--output", required=True, type=Path)
+    ci = commands.add_parser("prepare-ci", help="Verify the artifacts selected by a native release-plz release")
+    ci.add_argument("--commit", required=True)
+    ci.add_argument("--run-id", required=True, type=int)
+    ci.add_argument("--output", required=True, type=Path)
+    commands.add_parser("finalize", help="Upload verified artifacts and publish the release-plz draft").add_argument("directory", type=Path)
+    commands.add_parser("check-state", help="Reject unfinished publication after release-plz skips a version").add_argument("--commit", required=True)
     commands.add_parser("verify", help="Revalidate local files and GitHub metadata using GET requests").add_argument("directory", type=Path)
     pub = commands.add_parser("publish", help="Create a tag and publish only the explicitly approved plan")
     pub.add_argument("directory", type=Path)
@@ -780,6 +880,14 @@ def main():
                              args.qualification_notes, args.output.absolute())
         elif args.command == "verify":
             _, result = verify(gh, args.directory.absolute())
+        elif args.command == "prepare-ci":
+            result = prepare_ci(gh, args.commit, args.run_id, os.environ.get("MAILCTL_RELEASES", ""), args.output.absolute())
+        elif args.command == "finalize":
+            finalize(gh, args.directory.absolute())
+            result = "Published the verified release-plz draft"
+        elif args.command == "check-state":
+            check_state(gh, args.commit)
+            result = "No unfinished publication"
         else:
             publish(gh, args.directory.absolute(), args.approve)
             result = "Published approved plan " + args.approve

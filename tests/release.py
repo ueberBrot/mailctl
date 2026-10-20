@@ -279,6 +279,7 @@ class FakeGitHub(release.GitHub):
         self.after_tag = None
         self.after_create = None
         self.created_tag_sha = COMMIT
+        self.annotated_tag = None
         self.workflow = dict(id=99, path=".github/workflows/ci.yml", state="active")
         repository = dict(id=42, full_name=release.REPO)
         self.run = dict(id=RUN_ID, head_sha=COMMIT, head_branch="main", event="push",
@@ -303,6 +304,12 @@ class FakeGitHub(release.GitHub):
                 workflow_run=dict(id=RUN_ID, head_sha=COMMIT, head_branch="main", repository_id=42, head_repository_id=42)))
         self.artifact = self.artifacts[0]
         self.main_sha = COMMIT
+        self.logs = {
+            job["id"]: ("\n".join("2026-10-15T10:29:59.4862900Z " + line for line in (
+                "SHA256 digest of uploaded artifact is " + artifact["digest"].removeprefix("sha256:"),
+                f"Artifact {artifact['name']} successfully finalized. Artifact ID {artifact['id']}",
+                f"Artifact download URL: https://github.com/{release.REPO}/actions/runs/{RUN_ID}/artifacts/{artifact['id']}")) + "\n").encode()
+            for job, artifact in zip(self.jobs, self.artifacts)}
 
 
     @property
@@ -333,6 +340,11 @@ class FakeGitHub(release.GitHub):
             raise AssertionError("Unexpected API mutation: " + repr(args))
         path = urlsplit(endpoint).path
         query = parse_qs(urlsplit(endpoint).query)
+        for job_id, log in self.logs.items():
+            if path == f"actions/jobs/{job_id}/logs":
+                if args[6:] != ["--allow-escape-sequences"]:
+                    raise AssertionError("Job logs require explicit escape-sequence handling")
+                return log
         for target, artifact_id in zip(TARGETS, ARTIFACT_IDS):
             if path == f"actions/artifacts/{artifact_id}/zip":
                 if output is None:
@@ -356,6 +368,7 @@ class FakeGitHub(release.GitHub):
             f"actions/runs/{RUN_ID}/attempts/{self.run['run_attempt']}": self.attempt,
             **{f"actions/artifacts/{artifact_id}": artifact for artifact_id, artifact in zip(ARTIFACT_IDS, self.artifacts)},
             f"git/ref/tags/v{VERSION}": self.tag,
+            "git/tags/" + "c" * 40: self.annotated_tag,
             f"releases/{RELEASE_ID}": self.draft,
         }
         collections = {f"actions/runs/{RUN_ID}/attempts/{self.run['run_attempt']}/jobs": ("jobs", self.jobs),
@@ -380,6 +393,25 @@ class FakeGitHub(release.GitHub):
         return release.canonical(value)
 
     def release_command(self, args, *, cwd=None):
+        if args[:2] == ["release", "upload"]:
+            if args[:5] != ["release", "upload", "v" + VERSION, "--repo", release.REPO]:
+                raise AssertionError("Unexpected draft upload argv: " + repr(args))
+            if not self.draft or not self.draft["draft"] or self.remote_assets:
+                raise AssertionError("Upload requires an empty native draft")
+            assets = [Path(cwd) / name for name in args[5:]]
+            if {path.name for path in assets} != EXPECTED_CANDIDATE:
+                raise AssertionError("Upload requires all qualified assets")
+            self.remote_assets = [dict(id=index, name=path.name, size=path.stat().st_size,
+                                      digest="sha256:" + release.sha(path.read_bytes()), state="uploaded")
+                                  for index, path in enumerate(assets, 1)]
+            if self.fail_upload:
+                self.remote_assets = self.remote_assets[:1]
+                raise ValueError("gh failed: simulated asset upload failure")
+            if self.asset_error:
+                self.asset_error(self.remote_assets)
+            if self.after_create:
+                self.after_create()
+            return b""
         if args[:2] == ["release", "create"]:
             prefix = ["release", "create", "v" + VERSION, "--draft", "--verify-tag", "--repo",
                       release.REPO, "--title", "v" + VERSION, "--notes-file"]
@@ -407,7 +439,8 @@ class FakeGitHub(release.GitHub):
             if self.after_create:
                 self.after_create()
             return b""
-        if args == ["release", "edit", "v" + VERSION, "--draft=false", "--repo", release.REPO]:
+        if args in (["release", "edit", "v" + VERSION, "--draft=false", "--repo", release.REPO],
+                    ["release", "edit", "v" + VERSION, "--draft=false", "--repo", release.REPO, "--latest"]):
             if not self.draft or not self.draft["draft"]:
                 raise AssertionError("Only the created draft can be published")
             self.draft["draft"] = False
@@ -465,6 +498,66 @@ class ReleaseTests(unittest.TestCase):
             self.assertEqual((directory / "source" / name).read_bytes(), data)
         self.assertEqual(gh.mutations, [])
         self.assertTrue(all(call["args"][:5] == ["api", "--hostname", "github.com", "--method", "GET"] for call in gh.calls))
+
+    def test_ci_preparation_uses_native_release_selection_and_only_current_artifacts(self):
+        gh, directory, _ = self.case()
+        selected = release.canonical([dict(package_name="mailctl", version=VERSION, tag="v" + VERSION)])
+        digest = release.prepare_ci(gh, COMMIT, RUN_ID, selected, directory)
+        plan, actual = release.verify(gh, directory)
+        self.assertEqual(actual, digest)
+        self.assertEqual(plan["commit"], COMMIT)
+        self.assertEqual((directory / "release-notes.md").read_text(), "Initial release.")
+        self.assertEqual(gh.mutations, [])
+
+    def test_ci_preparation_rejects_unexpected_release_plz_output(self):
+        for selected in ([], [dict(package_name="other", version=VERSION, tag="v" + VERSION)],
+                         [dict(package_name="mailctl", version="0.2.0", tag="v0.2.0")],
+                         [dict(package_name="mailctl", version=VERSION, tag="other")], [{}, {}]):
+            with self.subTest(selected=selected):
+                gh, directory, _ = self.case()
+                with self.assertRaises(ValueError):
+                    release.prepare_ci(gh, COMMIT, RUN_ID, release.canonical(selected), directory)
+                self.assertEqual(gh.mutations, [])
+
+    def test_skipped_native_release_distinguishes_completed_absent_and_unfinished_state(self):
+        gh = FakeGitHub()
+        release.check_state(gh, COMMIT)
+        gh.tag = {"object": {"type": "tag", "sha": "c" * 40}}
+        gh.draft = dict(tag_name="v" + VERSION, draft=False)
+        release.check_state(gh, COMMIT)
+        self.assertEqual(gh.mutations, [])
+        for tag, draft in ((True, None), (True, True), (False, True), (False, False)):
+            with self.subTest(tag=tag, draft=draft):
+                gh = FakeGitHub()
+                if tag:
+                    gh.tag = {"object": {"type": "commit", "sha": "b" * 40}}
+                if draft is not None:
+                    gh.draft = dict(tag_name="v" + VERSION, draft=draft)
+                with self.assertRaisesRegex(ValueError, "manual recovery"):
+                    release.check_state(gh, COMMIT)
+                self.assertEqual(gh.mutations, [])
+
+    def test_artifact_creation_can_follow_step_completion_when_the_receipt_matches(self):
+        gh = FakeGitHub()
+        gh.artifact.update(created_at="2026-10-15T10:30:00Z", updated_at="2026-10-15T10:30:00Z")
+        self.prepare(gh)
+        gh = FakeGitHub()
+        gh.artifact["created_at"] = "2026-10-15T10:30:01Z"
+        self.rejected(gh, "another attempt")
+
+    def test_upload_receipt_must_match_the_id_digest_run_and_successful_step(self):
+        original = FakeGitHub().logs[777]
+        changes = [b"", original + original,
+                   original.replace(str(ARTIFACT_ID).encode(), b"99999"),
+                   original.replace(str(RUN_ID).encode(), b"9999"),
+                   original.replace(b"SHA256 digest", b"Wrong digest"),
+                   original.replace(b"10:29:59.4862900Z", b"10:30:00.0000000Z"),
+                   b"\n".join(reversed(original.splitlines()))]
+        for log in changes:
+            with self.subTest(log=log[:80]):
+                gh = FakeGitHub()
+                gh.logs[777] = log
+                self.rejected(gh)
 
     def test_all_three_targets_are_preserved_and_only_unambiguous_assets_are_uploaded(self):
         gh, directory, digest = self.prepare()
@@ -557,9 +650,13 @@ class ReleaseTests(unittest.TestCase):
         for target in (release.LINUX, release.WINDOWS):
             gh = FakeGitHub()
             gh.zips[target] = gh.zips[release.MAC]
-            artifact = gh.artifacts[TARGETS.index(target)]
+            index = TARGETS.index(target)
+            artifact = gh.artifacts[index]
+            old_digest = artifact["digest"].removeprefix("sha256:")
             artifact["digest"] = "sha256:" + release.sha(gh.zips[target])
             artifact["size_in_bytes"] = len(gh.zips[target])
+            job_id = gh.jobs[index]["id"]
+            gh.logs[job_id] = gh.logs[job_id].replace(old_digest.encode(), artifact["digest"].removeprefix("sha256:").encode())
             self.rejected(gh, "exact expected files")
 
     def test_native_qualification_requires_each_component_log_and_source_record(self):
@@ -974,6 +1071,69 @@ class ReleaseTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     release.publish(gh, directory, digest)
                 self.assertEqual(gh.mutations, [])
+
+    def native_draft(self):
+        gh, directory, _ = self.prepare()
+        gh.tag = {"object": {"type": "tag", "sha": "c" * 40}}
+        gh.annotated_tag = dict(tag="v" + VERSION, object=dict(type="commit", sha=COMMIT))
+        gh.draft = dict(id=RELEASE_ID, tag_name="v" + VERSION, draft=True,
+                        body=(directory / "release-notes.md").read_text())
+        return gh, directory
+
+    def test_finalize_uses_native_tag_and_notes_and_publishes_only_verified_assets(self):
+        gh, directory = self.native_draft()
+        release.finalize(gh, directory)
+        self.assertEqual(len(gh.mutations), 2)
+        upload, publish = gh.mutations
+        self.assertEqual(upload["args"], ["release", "upload", "v" + VERSION, "--repo", release.REPO,
+                                          *sorted(EXPECTED_CANDIDATE)])
+        self.assertEqual(upload["cwd"], directory / "assets")
+        self.assertEqual(publish["args"][-1], "--latest")
+        self.assertEqual(gh.draft["body"], "Initial release.")
+        self.assertFalse(gh.draft["draft"])
+        self.assertTrue((directory / "publication-started.json").is_file())
+        self.assertEqual({asset["name"] for asset in gh.remote_assets}, EXPECTED_CANDIDATE)
+
+    def test_finalize_rejects_wrong_native_tag_draft_and_notes_before_upload(self):
+        changes = {
+            "wrong-commit": lambda gh: gh.annotated_tag["object"].update(sha="b" * 40),
+            "wrong-tag-name": lambda gh: gh.annotated_tag.update(tag="v0.2.0"),
+            "missing-tag": lambda gh: setattr(gh, "tag", None),
+            "published": lambda gh: gh.draft.update(draft=False),
+            "notes": lambda gh: gh.draft.update(body="Other release notes"),
+            "existing-assets": lambda gh: gh.remote_assets.append(dict(name="unexpected")),
+        }
+        for name, change in changes.items():
+            with self.subTest(name=name):
+                gh, directory = self.native_draft()
+                change(gh)
+                with self.assertRaises(ValueError):
+                    release.finalize(gh, directory)
+                self.assertEqual(gh.mutations, [])
+                self.assertFalse((directory / "publication-started.json").exists())
+
+    def test_finalize_leaves_partial_drafts_unpublished_and_refuses_automatic_retry(self):
+        gh, directory = self.native_draft()
+        gh.fail_upload = True
+        with self.assertRaisesRegex(ValueError, "upload failure"):
+            release.finalize(gh, directory)
+        self.assertTrue(gh.draft["draft"])
+        self.assertEqual(len(gh.mutations), 1)
+        self.assertEqual(len(gh.remote_assets), 1)
+        with self.assertRaises(ValueError):
+            release.finalize(gh, directory)
+        self.assertEqual(len(gh.mutations), 1)
+
+    def test_finalize_rechecks_remote_bytes_notes_and_tag_after_upload(self):
+        for change in (lambda gh: gh.remote_assets[0].update(digest="sha256:" + "0" * 64),
+                       lambda gh: gh.draft.update(body="Changed after upload"),
+                       lambda gh: gh.annotated_tag["object"].update(sha="b" * 40)):
+            gh, directory = self.native_draft()
+            gh.after_create = lambda: change(gh)
+            with self.assertRaises(ValueError):
+                release.finalize(gh, directory)
+            self.assertTrue(gh.draft["draft"])
+            self.assertEqual(len(gh.mutations), 1)
 
     def test_publish_creates_exact_tag_then_draft_with_all_assets_then_publishes(self):
         gh, directory, digest = self.prepare()
