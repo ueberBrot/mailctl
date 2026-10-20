@@ -372,10 +372,10 @@ impl AccountRegistry {
         generation: u64,
         mailbox: &str,
     ) -> Result<Cow<'a, AccountConfig>, Error> {
-        let route = self.registry.accounts[&current.key]
-            .generations
-            .iter()
-            .find(|route| route.generation == generation)
+        let route = generation
+            .checked_sub(1)
+            .and_then(|index| usize::try_from(index).ok())
+            .and_then(|index| self.registry.accounts[&current.key].generations.get(index))
             .ok_or_else(|| Error::new(ErrorCode::DraftMailboxUnavailable))?;
         if route
             .drafts_mailbox

@@ -2,10 +2,11 @@
 use super::{
     Error, Limits,
     admission::FrameContract,
-    mime::{Part, part_name},
+    mime::part_name,
     wire::{Connection, Kind},
 };
 use imap_proto::{AttributeValue, BodyStructure, MessageSection, Response, SectionPath};
+use std::num::NonZeroU32;
 
 pub(super) const MAX_CHUNK_BYTES: usize = 16 * 1024;
 
@@ -21,13 +22,13 @@ impl Limits {
     }
 }
 
-#[derive(Clone, Debug)]
-pub(super) enum Section {
+#[derive(Clone, Copy, Debug)]
+pub(super) enum Section<'a> {
     Header,
-    Mime(Part),
-    Part(Part),
+    Mime(&'a [NonZeroU32]),
+    Part(&'a [NonZeroU32]),
 }
-impl Section {
+impl Section<'_> {
     fn name(&self) -> String {
         match self {
             Self::Header => "HEADER".into(),
@@ -35,31 +36,32 @@ impl Section {
             Self::Part(part) => part_name(part),
         }
     }
-    fn path(&self) -> SectionPath {
-        match self {
-            Self::Header => SectionPath::Full(MessageSection::Header),
-            Self::Mime(part) => SectionPath::Part(
-                part.iter().map(|v| v.get()).collect(),
-                Some(MessageSection::Mime),
-            ),
-            Self::Part(part) => SectionPath::Part(part.iter().map(|v| v.get()).collect(), None),
+    fn matches(&self, returned: &SectionPath) -> bool {
+        match (self, returned) {
+            (Self::Header, SectionPath::Full(MessageSection::Header)) => true,
+            (Self::Mime(part), SectionPath::Part(path, Some(MessageSection::Mime)))
+            | (Self::Part(part), SectionPath::Part(path, None)) => part
+                .iter()
+                .map(|number| number.get())
+                .eq(path.iter().copied()),
+            _ => false,
         }
     }
 }
 
 #[derive(Debug)]
-pub(super) enum Fetch {
+pub(super) enum Fetch<'a> {
     Metadata {
         uid: u32,
     },
     Bytes {
         uid: u32,
-        section: Option<Section>,
+        section: Option<Section<'a>>,
         offset: u32,
         count: u32,
     },
 }
-impl Fetch {
+impl Fetch<'_> {
     pub(super) fn items<'a>(
         row: &'a Response<'static>,
     ) -> Result<&'a [AttributeValue<'static>], Error> {
@@ -155,7 +157,11 @@ impl Fetch {
                     index,
                     data: Some(value),
                 } if data.is_none()
-                    && *returned == section.as_ref().map(Section::path)
+                    && match (section, returned) {
+                        (None, None) => true,
+                        (Some(expected), Some(returned)) => expected.matches(returned),
+                        _ => false,
+                    }
                     && *index == Some(*offset)
                     && value.len() <= *count as usize =>
                 {
@@ -200,5 +206,64 @@ impl Fetch {
             return Err(Error::MessageNotFound);
         }
         Ok(rows.remove(0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::borrow::Cow;
+
+    #[test]
+    fn repeated_partial_fetch_validation_borrows_nested_section_paths() {
+        let part = vec![NonZeroU32::new(3).unwrap(); 40];
+        for (section, returned) in [
+            (None, None),
+            (
+                Some(Section::Header),
+                Some(SectionPath::Full(MessageSection::Header)),
+            ),
+            (
+                Some(Section::Mime(&part)),
+                Some(SectionPath::Part(vec![3; 40], Some(MessageSection::Mime))),
+            ),
+            (
+                Some(Section::Part(&part)),
+                Some(SectionPath::Part(vec![3; 40], None)),
+            ),
+        ] {
+            let request = Fetch::Bytes {
+                uid: 4,
+                section,
+                offset: 16_384,
+                count: 16_384,
+            };
+            let mut fields = [
+                AttributeValue::Uid(4),
+                AttributeValue::BodySection {
+                    section: returned,
+                    index: Some(16_384),
+                    data: Some(Cow::Borrowed(b"payload")),
+                },
+            ];
+            let measured = allocation_counter::measure(|| {
+                for _ in 0..64 {
+                    request.validate(&fields).unwrap();
+                    assert_eq!(request.data(&fields).unwrap(), b"payload");
+                }
+            });
+            assert_eq!(measured.count_total, 0, "{measured:?}");
+            let AttributeValue::BodySection { section, .. } = &mut fields[1] else {
+                unreachable!();
+            };
+            *section = Some(SectionPath::Part(vec![3; 39], None));
+            assert_eq!(request.validate(&fields), Err(Error::Protocol));
+            let AttributeValue::BodySection { section, index, .. } = &mut fields[1] else {
+                unreachable!();
+            };
+            *section = None;
+            *index = Some(0);
+            assert_eq!(request.validate(&fields), Err(Error::Protocol));
+        }
     }
 }

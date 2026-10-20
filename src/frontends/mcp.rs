@@ -30,73 +30,86 @@ fn request_cancellation(context: &RequestContext<RoleServer>) -> &CancellationTo
 }
 
 fn tool<I: schemars::JsonSchema + 'static, O: schemars::JsonSchema + 'static>(
+    operations: &[String],
     name: &'static str,
     description: &'static str,
-) -> Tool {
+) -> Option<Tool> {
+    if name != "email_list_accounts"
+        && !operations
+            .iter()
+            .any(|operation| name.strip_prefix("email_") == Some(operation.as_str()))
+    {
+        return None;
+    }
     let journal_mutation = matches!(name, "email_save_draft" | "email_draft_status");
-    Tool::new(name, description, serde_json::Map::new())
-        .with_input_schema::<I>()
-        .with_raw_output_schema(schema::output::<O>())
-        .with_annotations(
-            ToolAnnotations::new()
-                .read_only(!journal_mutation)
-                .destructive(false)
-                .idempotent(name == "email_save_draft")
-                .open_world(!matches!(
-                    name,
-                    "email_list_accounts" | "email_capabilities"
-                )),
-        )
+    Some(
+        Tool::new(name, description, serde_json::Map::new())
+            .with_input_schema::<I>()
+            .with_raw_output_schema(schema::output::<O>())
+            .with_annotations(
+                ToolAnnotations::new()
+                    .read_only(!journal_mutation)
+                    .destructive(false)
+                    .idempotent(name == "email_save_draft")
+                    .open_world(!matches!(
+                        name,
+                        "email_list_accounts" | "email_capabilities"
+                    )),
+            ),
+    )
 }
 
 fn definitions(operations: &[String]) -> Vec<Tool> {
     let empty = json!({"type":"object","properties":{},"additionalProperties":false});
     [
         tool::<crate::domain::SaveDraftInput, crate::domain::DraftReceipt>(
+            operations,
             "email_save_draft", "Create one unsent draft; retain identity and unchanged input before calling, then reuse them on retries. See mailctl://guide/drafts.",
         ),
         tool::<crate::domain::DraftStatusInput, crate::domain::DraftReceipt>(
+            operations,
             "email_draft_status", "Inspect an original draft operation. reconcile checks uncertain creation and updates its journal; never creates another draft. See mailctl://guide/drafts.",
         ),
         tool::<ListAccountsInput, AccountDiscovery>(
+            operations,
             "email_list_accounts",
             "List authorized email accounts with explicit completion.",
         ),
-        Tool::new(
+        Some(Tool::new(
             "email_capabilities",
             "Show callable MCP operations, effective permissions, health, and operation limits.",
             empty.as_object().unwrap().clone(),
         )
         .with_raw_output_schema(schema::output::<Capabilities>())
-        .with_annotations(ToolAnnotations::new().read_only(true).open_world(false)),
+        .with_annotations(ToolAnnotations::new().read_only(true).open_world(false))),
         tool::<ListMailboxesInput, MailboxDiscovery>(
+            operations,
             "email_list_mailboxes",
             "List approved mailboxes or resolve a reusable mailbox reference.",
         ),
         tool::<SearchMessagesInput, MessageSearch>(
+            operations,
             "email_search_messages",
             "Search one approved mailbox with AND predicates and bounded descending-UID pages.",
         ),
         tool::<GetMessageInput, MessageBody>(
+            operations,
             "email_get_message",
             "Read selected message text; max_bytes narrows the page and cursor continues it. Check truncation and continuation metadata. See mailctl://guide/reading.",
         ),
         tool::<crate::domain::ListAttachmentsInput, crate::domain::AttachmentList>(
+            operations,
             "email_list_attachments",
             "List attachment metadata and reusable references without retrieving payloads.",
         ),
         tool::<crate::domain::GetAttachmentInput, crate::domain::AttachmentChunk>(
+            operations,
             "email_get_attachment",
             "Retrieve a bounded base64 chunk, or resume a transfer in this session.",
         ),
     ]
     .into_iter()
-    .filter(|tool| {
-        matches!(tool.name.as_ref(), "email_list_accounts" | "email_capabilities")
-            || operations
-                .iter()
-                .any(|operation| tool.name.strip_prefix("email_") == Some(operation.as_str()))
-    })
+    .flatten()
     .collect()
 }
 
@@ -416,6 +429,52 @@ mod tests {
         service::{MemoryBodies, MemoryMailboxes, MemoryMessage, MemoryMessages, Service},
     };
     use std::sync::Arc;
+
+    #[test]
+    fn discovery_builds_only_exposed_tool_schemas() {
+        let operations = [
+            "save_draft",
+            "draft_status",
+            "list_accounts",
+            "list_mailboxes",
+            "search_messages",
+            "get_message",
+            "list_attachments",
+            "get_attachment",
+        ]
+        .map(String::from);
+        // Warm the SDK schema cache before comparing session-local construction.
+        let expected = definitions(&operations);
+        let mut restricted = Vec::new();
+        let restricted_allocation = allocation_counter::measure(|| {
+            restricted = definitions(&[]);
+        });
+        let complete_allocation = allocation_counter::measure(|| {
+            std::hint::black_box(definitions(&operations));
+        });
+        eprintln!(
+            "MCP discovery allocation: restricted={restricted_allocation:?}, complete={complete_allocation:?}",
+        );
+        assert_eq!(
+            serde_json::to_value(&restricted).unwrap(),
+            serde_json::to_value(
+                expected
+                    .into_iter()
+                    .filter(|tool| {
+                        matches!(
+                            tool.name.as_ref(),
+                            "email_list_accounts" | "email_capabilities"
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            )
+            .unwrap(),
+        );
+        assert!(
+            restricted_allocation.bytes_total * 2 < complete_allocation.bytes_total,
+            "restricted discovery must skip unavailable schemas: restricted={restricted_allocation:?}, complete={complete_allocation:?}",
+        );
+    }
 
     async fn message_handler(text: String) -> (EmailTools, CallToolRequestParams) {
         let size = text.len();

@@ -100,8 +100,37 @@ impl Decoder {
                 Ok(())
             }
             TransferEncoding::QuotedPrintable => {
-                for byte in wire.iter().copied() {
-                    self.raw_quoted_printable(byte, limits)?;
+                let mut offset = 0;
+                while offset < wire.len() {
+                    if self.quoted_printable.is_empty()
+                        && self.whitespace.is_empty()
+                        && !self.carriage_return
+                        && !matches!(wire[offset], b'=' | b' ' | b'\t' | b'\r' | b'\n')
+                    {
+                        let length = 1 + wire[offset + 1..]
+                            .iter()
+                            .take_while(|&&byte| {
+                                !matches!(byte, b'=' | b' ' | b'\t' | b'\r' | b'\n')
+                            })
+                            .count();
+                        let available = limits
+                            .max_attachment_decoded_bytes
+                            .saturating_sub(self.decoded_offset + self.pending_len())
+                            .min(Self::state_limit(limits).saturating_sub(self.retained_bytes()));
+                        let count = length.min(available);
+                        if count != 0 {
+                            self.append(&wire[offset..offset + count], limits)?;
+                            offset += count;
+                        }
+                        // Preserve the decoded prefix recorded by the scalar path
+                        // when the next ordinary byte exceeds either ceiling.
+                        if count != length {
+                            return Err(Error::Limit);
+                        }
+                        continue;
+                    }
+                    self.raw_quoted_printable(wire[offset], limits)?;
+                    offset += 1;
                     self.account_state();
                 }
                 Ok(())
@@ -440,6 +469,58 @@ mod narrow_page_tests {
                 decoder.push(format!("{prefix}!").as_bytes(), &limits),
                 Err(expected)
             );
+        }
+    }
+
+    #[test]
+    fn quoted_printable_runs_preserve_line_padding_carry_and_narrow_pages() {
+        let run = vec![b'x'; MAX_CHUNK_BYTES + 17];
+        let mut wire = run.clone();
+        wire.extend_from_slice(b" \t\r\n");
+        wire.extend_from_slice(&run);
+        wire.extend_from_slice(b"=\r\ntail=3D \tkept\rX\n \t");
+        let mut expected = run.clone();
+        expected.extend_from_slice(b"\r\n");
+        expected.extend_from_slice(&run);
+        expected.extend_from_slice(b"tail= \tkept\rX\n");
+        for wire_bytes in [1, 7, MAX_CHUNK_BYTES] {
+            for page in [1, 7, 1_024] {
+                assert_decodes_in_pages(
+                    TransferEncoding::QuotedPrintable,
+                    &wire,
+                    &expected,
+                    wire_bytes,
+                    page,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn quoted_printable_runs_preserve_prefix_progress_and_error_precedence() {
+        let mut wire = vec![b'x'; 256];
+        wire.extend_from_slice(b"=QQ");
+        for ceiling in [1, 255, 256, 257, 512] {
+            for wire_bytes in [1, 7, MAX_CHUNK_BYTES] {
+                let limits = Limits {
+                    max_attachment_decoded_bytes: ceiling,
+                    ..Limits::default()
+                };
+                let mut decoder = Decoder::new(TransferEncoding::QuotedPrintable);
+                let result = wire
+                    .chunks(wire_bytes)
+                    .try_for_each(|chunk| decoder.push(chunk, &limits));
+                assert_eq!(
+                    result,
+                    Err(if ceiling < 256 {
+                        Error::Limit
+                    } else {
+                        Error::Protocol
+                    })
+                );
+                assert_eq!(decoder.snapshot().decoded_bytes, ceiling.min(256));
+                assert_eq!(decoder.pending.as_slice(), &wire[..ceiling.min(256)]);
+            }
         }
     }
 

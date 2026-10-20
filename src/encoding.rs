@@ -2,7 +2,6 @@
 use crate::domain::{Error, ErrorCode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::fmt::Write as _;
 use std::io::{self, Write};
 
 /// Validate decoded UTF-8 byte length before allocating an owned input string.
@@ -76,9 +75,11 @@ impl<'de, T: Deserialize<'de>, const MAX: usize> Deserialize<'de> for BoundedVec
 }
 
 pub(crate) fn hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut encoded = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        let _ = write!(encoded, "{byte:02x}");
+    for &byte in bytes {
+        encoded.push(HEX[usize::from(byte >> 4)] as char);
+        encoded.push(HEX[usize::from(byte & 0x0f)] as char);
     }
     encoded
 }
