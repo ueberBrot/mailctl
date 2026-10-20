@@ -43,6 +43,7 @@ pub(crate) trait SelectedMailbox {
         last: u32,
         criteria: &SearchCriteria,
     ) -> impl Future<Output = Result<Vec<u32>, Error>> + Send;
+    /// The page planner supplies distinct, nonzero UIDs in descending order.
     fn fetch(
         &mut self,
         uids: &[u32],

@@ -71,11 +71,8 @@ impl SelectedMailbox for Selection<'_, '_> {
         if uids.is_empty() || uids.contains(&0) {
             return Err(Error::new(ErrorCode::InvalidRequest));
         }
-        let mut uids = uids.to_vec();
-        uids.sort_unstable();
-        uids.dedup();
         let mut set = String::with_capacity(uids.len() * 11);
-        for uid in &uids {
+        for uid in uids.iter().rev() {
             if !set.is_empty() {
                 set.push(',');
             }
@@ -93,7 +90,7 @@ impl SelectedMailbox for Selection<'_, '_> {
                 let projection = Projection::parse(Fetch::items(row)?)?;
                 projection.check_header_bytes(self.header_bytes)?;
                 let message = projection.message();
-                if uids.binary_search(&message.uid).is_err() {
+                if uids.binary_search_by(|uid| message.uid.cmp(uid)).is_err() {
                     return Err(Error::new(ErrorCode::ProviderUnavailable));
                 }
                 Ok(message)
