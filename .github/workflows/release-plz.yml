@@ -27,10 +27,17 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f  # v2.0.0; reads rust-toolchain.toml
         with:
           cache: false
+      - name: Check original release history
+        id: preparation
+        env:
+          MAILCTL_RELEASE_POLICY_DIR: ${{ runner.temp }}/mailctl-release-policy
+        run: python3 scripts/prepare-release.py plan --output "$MAILCTL_RELEASE_POLICY_DIR"
       - name: Prepare the release PR
+        if: steps.preparation.outputs.release == 'true'
         uses: release-plz/action@f393a7b38aca9d9b4c58447b291dbac963901df6  # v0.5.141
         with:
           command: release-pr
           version: 0.3.171
+          config: ${{ steps.preparation.outputs.config }}
         env:
           GITHUB_TOKEN: ${{ github.token }}

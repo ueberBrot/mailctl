@@ -38,6 +38,11 @@ jobs:
         run: python3 scripts/acceptance/test_codex_mcp.py
       - name: Check offline release preparation and publication fixtures
         run: python3 tests/release.py
+      - uses: taiki-e/install-action@d438492cf8a250514fa2d34b30bc3c0dc37c65ff  # v2.87.8
+        with:
+          tool: release-plz@0.3.171
+      - name: Check release policy against release-plz
+        run: python3 tests/release_preparation.py --integration
 
   components:
     strategy:
