@@ -1,9 +1,15 @@
-# mailctl
+<h1 align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/brand/mailctl-readme-dark.svg">
+    <img src="docs/assets/brand/mailctl-readme.svg" alt="mailctl" width="280">
+  </picture>
+</h1>
 
 Search and read email, retrieve attachments, and save unsent drafts from your
-terminal or AI agent. mailctl connects to IMAP accounts over TLS. It does not
-send email or edit existing drafts.
-Choose which accounts, mailboxes, and operations your agent can use.
+terminal or AI agent.
+
+mailctl connects to IMAP accounts over TLS. Choose which accounts, mailboxes,
+and operations your agent can use. It does not send email or edit existing drafts.
 
 Use `mailctl` for the command-line interface (CLI) or `mailctl-mcp` for the
 Model Context Protocol (MCP). Install both or use either on its own.
