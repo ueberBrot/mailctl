@@ -14,6 +14,26 @@ and operations your agent can use. It does not send email or edit existing draft
 Use `mailctl` for the command-line interface (CLI) or `mailctl-mcp` for the
 Model Context Protocol (MCP). Install both or use either on its own.
 
+## Set up with your AI agent
+
+Copy this prompt into an agent with terminal access:
+
+```text
+Set up mailctl for my email account and this agent.
+
+Read https://github.com/ueberBrot/mailctl/blob/main/README.md.
+Install the mailctl agent skill linked there, then follow its Installation
+and setup reference to install and configure mailctl for this system.
+
+Ask me for missing account details and CLI or MCP preferences. Have me
+enter passwords or app passwords in my own terminal. Keep access read-only.
+
+Verify the installed components and fresh account authentication using
+the setup reference's success criteria. Check that this agent can list my
+mailboxes. Report the installed versions and paths, how this agent connects,
+and any remaining steps I must complete, including a restart if needed.
+```
+
 ## Install
 
 Standalone installers use prebuilt binaries. Rust is not required.
