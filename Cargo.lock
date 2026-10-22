@@ -1350,7 +1350,7 @@ dependencies = [
 
 [[package]]
 name = "greenmail-support"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "imap-proto",
  "jsonschema",
@@ -2034,7 +2034,7 @@ dependencies = [
 
 [[package]]
 name = "mailctl"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "allocation-counter",
  "anstream",
@@ -2085,7 +2085,7 @@ dependencies = [
 
 [[package]]
 name = "mailctl-process-tests"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64 0.23.1",
  "mailctl",
