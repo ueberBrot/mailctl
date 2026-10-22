@@ -9,6 +9,9 @@ dependencies_update = false
 semver_check = false
 release = false
 pr_name = "chore: prepare mailctl v{{ version }}"
+# scripts/prepare-release.py applies this to original messages before release-plz
+# filters crate history. Docs can accompany a release but cannot initiate one.
+release_commits = '(?im)\A(?:(?:feat|fix|perf|refactor|revert)(?:\([^()\r\n]+\))?!?|(?:build|chore)\(deps\)!?|[a-z]+(?:\([^()\r\n]+\))?!): |^BREAKING[ -]CHANGE: '
 
 [[package]]
 name = "mailctl"
@@ -24,24 +27,43 @@ git_release_body = "{{ changelog | trim }}"
 [changelog]
 body = """
 ## [{{ version }}]{%- if release_link -%}({{ release_link }}){% endif %} - {{ timestamp | date(format="%Y-%m-%d") }}
-{% for group, commits in commits | group_by(attribute="group") %}
+{% for group, group_commits in commits | group_by(attribute="group") %}
+{% set visible = group_commits -%}
+{% if group == "maintenance" -%}
+{% set visible = group_commits | filter(attribute="breaking", value=true) -%}
+{% endif -%}
+{% if visible | length > 0 %}
 ### {{ group | upper_first }}
 
-{% for commit in commits %}
+{% for commit in visible %}
 {%- if commit.scope -%}
-- *({{commit.scope}})* {% if commit.breaking %}[**breaking**] {% endif %}{{ commit.message }}{%- if commit.links %} ({% for link in commit.links %}[{{link.text}}]({{link.href}}) {% endfor -%}){% endif %}
+- {% if commit.id == "0000000" %}<!-- mailctl-synthetic -->{% endif %}*({{commit.scope}})* {% if commit.breaking %}[**breaking**] {% endif %}{{ commit.message }}{%- if commit.links %} ({% for link in commit.links %}[{{link.text}}]({{link.href}}) {% endfor -%}){% endif %}
 {% else -%}
-- {% if commit.breaking %}[**breaking**] {% endif %}{{ commit.message }}
+- {% if commit.id == "0000000" %}<!-- mailctl-synthetic -->{% endif %}{% if commit.breaking %}[**breaking**] {% endif %}{{ commit.message }}
 {% endif -%}
 {% endfor -%}
+{% endif -%}
 {% endfor %}
+<!-- mailctl-release-commits: {% for commit in commits %}{{ commit.id }} {% endfor %} -->
 """
 protect_breaking_commits = true
+postprocessors = [
+    { pattern = "mailctl-release-commits:", replace_command = "python3 scripts/prepare-release.py supplement" },
+]
 commit_parsers = [
+    { message = "^fix\\(security\\)", group = "security" },
     { message = "^feat", group = "added" },
     { message = "^fix", group = "fixed" },
     { message = "^perf", group = "performance" },
-    { message = "^security", group = "security" },
+    { message = "^(refactor|revert)", group = "changed" },
+    { message = "^(build|chore)\\(deps\\)", group = "dependencies" },
     { message = "^docs", group = "documentation" },
+    # Keep release-plz's fallback until the postprocessor replaces it with the
+    # original dependency commits; otherwise an all-skipped fragment is not rendered.
+    { message = "^chore: update Cargo\\.(lock|toml) dependencies$", group = "dependencies" },
+    # Retain these until rendering so dependency notes can still be restored when
+    # native history contains only maintenance. The template hides ordinary
+    # entries while keeping breaking changes visible.
+    { message = "^(test|style|ci|build|chore)", group = "maintenance" },
     { message = ".*", group = "other" },
 ]
