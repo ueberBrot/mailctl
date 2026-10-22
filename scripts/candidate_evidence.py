@@ -39,13 +39,13 @@ def phases(target):
 def acceptance_groups(target):
     require(target in TARGETS, "Unsupported candidate target")
     if target == WINDOWS:
-        return {"installer": ("installer",), "state-native": ("state", "native"),
-                **{phase: (phase,) for phase in ("process", "reading", "drafts", "wsl")}}
-    groups = {"core": ("installer", "state", "process", "native"),
-              "reading": ("reading",), "drafts": ("drafts",)}
+        return {"core": ("installer", "state", "process", "native"),
+                "content": ("reading", "drafts", "wsl")}
+    groups = {"core": ("installer", "state", "process", "native", "drafts"),
+              "reading": ("reading",)}
     if target == LINUX:
-        groups.update({"desktop-reading": ("desktop-reading",),
-                       "desktop-drafts": ("desktop-credentials", "desktop-drafts")})
+        groups["core"] += ("desktop-credentials", "desktop-drafts")
+        groups["reading"] += ("desktop-reading",)
     return groups
 
 

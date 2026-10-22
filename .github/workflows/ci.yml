@@ -85,6 +85,19 @@ jobs:
         shell: bash
         env:
           MAILCTL_FEATURES: ${{ matrix.features }}
+      - name: Qualify systemd credentials under a disposable service identity
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        env:
+          MAILCTL_FEATURES: ${{ matrix.features }}
+        run: bash scripts/ci/native-acceptance.sh systemd
+      - name: Qualify Credential Manager on the disposable hosted Windows identity
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        env:
+          MAILCTL_FEATURES: ${{ matrix.features }}
+          MAILCTL_DISPOSABLE_WINDOWS: '1'
+        run: ./scripts/ci/windows-acceptance.ps1 credentials
       - name: Qualify optimized decoding and executable stacks on Windows
         if: matrix.os == 'windows-latest'
         shell: pwsh
@@ -118,49 +131,6 @@ jobs:
         run: cargo clippy --locked --workspace --all-targets --features docker-tests -- -D warnings
       - name: Test GreenMail integration
         run: cargo test --locked --test greenmail --features docker-tests -- --nocapture
-
-  systemd-credentials:
-    strategy:
-      fail-fast: false
-      matrix:
-        features: [cli, mcp, 'cli,mcp']
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f  # v2.0.0
-        with:
-          cache-key: ${{ matrix.features }}
-          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Qualify systemd credentials under a disposable service identity
-        shell: bash
-        env:
-          MAILCTL_FEATURES: ${{ matrix.features }}
-        run: bash scripts/ci/native-acceptance.sh systemd
-
-  windows-native-credentials:
-    strategy:
-      fail-fast: false
-      matrix:
-        features: [cli, mcp, 'cli,mcp']
-    runs-on: windows-latest
-    timeout-minutes: 25
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f  # v2.0.0
-        with:
-          cache-key: ${{ matrix.features }}
-          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Qualify Credential Manager on the disposable hosted Windows identity
-        shell: pwsh
-        env:
-          MAILCTL_FEATURES: ${{ matrix.features }}
-          MAILCTL_DISPOSABLE_WINDOWS: '1'
-        run: ./scripts/ci/windows-acceptance.ps1 credentials
 
   macos-candidate-build:
     name: build-aarch64-apple-darwin
@@ -213,7 +183,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        group: [core, reading, drafts]
+        group: [core, reading]
     runs-on: macos-26
     timeout-minutes: 25
     env:
@@ -336,7 +306,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        group: [core, reading, drafts, desktop-reading, desktop-drafts]
+        group: [core, reading]
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     env:
@@ -358,7 +328,6 @@ jobs:
         shell: bash
         run: python3 scripts/ci/candidate-jobs.py restore
       - name: Install native Secret Service test prerequisites
-        if: startsWith(matrix.group, 'desktop-')
         run: bash scripts/ci/desktop-acceptance.sh prerequisites
       - name: Qualify installed candidate and record evidence
         shell: bash
@@ -462,7 +431,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        group: [installer, state-native, process, reading, drafts, wsl]
+        group: [core, content]
     runs-on: windows-2025
     timeout-minutes: 25
     env:

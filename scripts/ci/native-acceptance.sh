@@ -6,7 +6,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 case "${1:-}" in
 systemd)
 	: "${MAILCTL_FEATURES:?}"
-	test_binaries=$(cargo test --locked --no-default-features \
+	test_binaries=$(cargo test --locked --workspace --no-default-features \
 		--features "$MAILCTL_FEATURES" \
 		--test systemd_native --test systemd_credentials \
 		--no-run --message-format=json |

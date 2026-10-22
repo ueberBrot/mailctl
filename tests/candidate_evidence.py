@@ -279,17 +279,15 @@ class CandidateEvidenceTests(unittest.TestCase):
                         self.assertEqual(re.findall(rb"^suite=(.+)$", files[name], re.MULTILINE),
                                          [b"credentials", b"reading", b"drafts"])
 
-    def test_acceptance_groups_preserve_platform_phase_order_and_singletons(self):
+    def test_acceptance_groups_preserve_required_platform_phase_membership_and_order(self):
         expected = {
-            release.MAC: {"core": ("installer", "state", "process", "native"),
-                          "reading": ("reading",), "drafts": ("drafts",)},
-            release.LINUX: {"core": ("installer", "state", "process", "native"),
-                            "reading": ("reading",), "drafts": ("drafts",),
-                            "desktop-reading": ("desktop-reading",),
-                            "desktop-drafts": ("desktop-credentials", "desktop-drafts")},
-            release.WINDOWS: {"installer": ("installer",), "state-native": ("state", "native"),
-                              "process": ("process",), "reading": ("reading",),
-                              "drafts": ("drafts",), "wsl": ("wsl",)},
+            release.MAC: {"core": ("installer", "state", "process", "native", "drafts"),
+                          "reading": ("reading",)},
+            release.LINUX: {"core": ("installer", "state", "process", "native", "drafts",
+                                     "desktop-credentials", "desktop-drafts"),
+                            "reading": ("reading", "desktop-reading")},
+            release.WINDOWS: {"core": ("installer", "state", "process", "native"),
+                              "content": ("reading", "drafts", "wsl")},
         }
         for target, groups in expected.items():
             with self.subTest(target=target):
@@ -357,18 +355,30 @@ class CandidateEvidenceTests(unittest.TestCase):
                     self.assertEqual(files[name], expected, name)
 
     def test_group_failure_stops_before_later_phases_and_records_only_success(self):
-        candidate = self.prepared()
-        worker, environment = candidate.group_worker("core")
-        environment["MAILCTL_FIXTURE_FAIL_PHASE"] = "state"
-        candidate.qualify("core", environment, succeeds=False)
-        self.assertEqual([record["phase"] for record in candidate.executions()], ["installer", "state"])
-        self.assertEqual({path.name for path in (candidate.shards / "core").iterdir()}, {"installer"})
-        ledgers = [json.loads(path.read_bytes()) for path in worker.rglob("execution.json")]
-        self.assertEqual([ledger["phase"] for ledger in ledgers], ["installer"])
-        for phase in ("process", "native"):
-            self.assertFalse((worker / "phases" / phase).exists())
-        self.assertEqual(candidate.contents(), candidate.prepared)
-        self.assertEqual({path.name: path.read_bytes() for path in (worker / "candidate").iterdir()}, candidate.prepared)
+        cases = [
+            (release.MAC, "core", ("installer", "state", "process", "native", "drafts"), "state"),
+            (release.LINUX, "core", ("installer", "state", "process", "native", "drafts",
+                                     "desktop-credentials", "desktop-drafts"), "desktop-credentials"),
+        ]
+        for target, group, phases in ((release.LINUX, "reading", ("reading", "desktop-reading")),
+                                      (release.WINDOWS, "content", ("reading", "drafts", "wsl"))):
+            cases.extend((target, group, phases, phase) for phase in phases)
+        for target, group, phases, failed in cases:
+            with self.subTest(target=target, group=group, failed=failed):
+                candidate = self.prepared(target)
+                worker, environment = candidate.group_worker(group)
+                environment["MAILCTL_FIXTURE_FAIL_PHASE"] = failed
+                candidate.qualify(group, environment, succeeds=False)
+                index = phases.index(failed)
+                self.assertEqual([record["phase"] for record in candidate.executions()], list(phases[:index + 1]))
+                self.assertEqual({path.name for path in (candidate.shards / group).iterdir()}, set(phases[:index]))
+                ledgers = [json.loads(path.read_bytes()) for path in worker.rglob("execution.json")]
+                self.assertCountEqual([ledger["phase"] for ledger in ledgers], phases[:index])
+                for phase in phases[index + 1:]:
+                    self.assertFalse((worker / "phases" / phase).exists())
+                self.assertEqual(candidate.contents(), candidate.prepared)
+                self.assertEqual({path.name: path.read_bytes() for path in (worker / "candidate").iterdir()},
+                                 candidate.prepared)
 
     def test_group_rejects_modified_prepared_and_harness_bytes_before_execution(self):
         for directory, name in (("candidate", "install.sh"), ("harnesses", "fixture-driver")):
@@ -395,7 +405,9 @@ class CandidateEvidenceTests(unittest.TestCase):
 
     def test_group_rejects_unknown_platform_groups_without_running_commands(self):
         for target, group in ((release.MAC, "state-native"), (release.LINUX, "desktop-credentials"),
-                              (release.WINDOWS, "core"), (release.MAC, "unknown")):
+                              (release.WINDOWS, "state-native"), (release.WINDOWS, "reading"),
+                              (release.MAC, "drafts"), (release.LINUX, "desktop-reading"),
+                              (release.LINUX, "desktop-drafts"), (release.MAC, "unknown")):
             with self.subTest(target=target, group=group):
                 candidate = self.prepared(target)
                 _, environment = candidate.group_worker(group)
@@ -607,6 +619,31 @@ class CandidateEvidenceTests(unittest.TestCase):
                 candidate.collect(succeeds=False)
                 self.assertFalse((candidate.candidate / "parallel-acceptance.json").exists())
                 self.assertEqual(candidate.contents(), candidate.prepared)
+
+    def test_collect_rejects_missing_reading_and_content_groups_or_their_phase_receipts(self):
+        for target, group, phases in ((release.LINUX, "reading", ("reading", "desktop-reading")),
+                                      (release.WINDOWS, "content", ("reading", "drafts", "wsl"))):
+            candidate = self.prepared(target)
+            candidate.record_all()
+            flat = candidate.root / "flat-shards"
+            candidate.shards.rename(flat)
+            candidate.shards.mkdir()
+            for name, members in evidence.acceptance_groups(target).items():
+                folder = candidate.shards / name
+                folder.mkdir()
+                for phase in members:
+                    (flat / phase).rename(folder / phase)
+            for missing in (None, *phases):
+                with self.subTest(target=target, group=group, missing=missing):
+                    folder = candidate.shards / group
+                    path = folder if missing is None else folder / missing
+                    saved = candidate.root / "missing-evidence"
+                    path.rename(saved)
+                    message = ("Missing or duplicate acceptance shard" if missing is None
+                               else "Acceptance group has missing or unexpected phases")
+                    candidate.collect(succeeds=False, message=message)
+                    self.assertEqual(candidate.contents(), candidate.prepared)
+                    saved.rename(path)
 
     def test_collect_rejects_changed_or_added_shard_payloads(self):
         candidate = self.prepared(release.LINUX)

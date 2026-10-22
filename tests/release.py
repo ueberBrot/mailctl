@@ -39,9 +39,9 @@ RELEASE_ID = 9012
 TARGETS = (release.MAC, release.LINUX, release.WINDOWS)
 ARTIFACT_IDS = [ARTIFACT_ID + index for index in range(3)]
 ACCEPTANCE_GROUPS = {
-    release.MAC: ("core", "reading", "drafts"),
-    release.LINUX: ("core", "reading", "drafts", "desktop-reading", "desktop-drafts"),
-    release.WINDOWS: ("installer", "state-native", "process", "reading", "drafts", "wsl"),
+    release.MAC: ("core", "reading"),
+    release.LINUX: ("core", "reading"),
+    release.WINDOWS: ("core", "content"),
 }
 
 
