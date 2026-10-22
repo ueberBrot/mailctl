@@ -36,6 +36,19 @@ def phases(target):
     return common + (("wsl",) if target == WINDOWS else ())
 
 
+def acceptance_groups(target):
+    require(target in TARGETS, "Unsupported candidate target")
+    if target == WINDOWS:
+        return {"installer": ("installer",), "state-native": ("state", "native"),
+                **{phase: (phase,) for phase in ("process", "reading", "drafts", "wsl")}}
+    groups = {"core": ("installer", "state", "process", "native"),
+              "reading": ("reading",), "drafts": ("drafts",)}
+    if target == LINUX:
+        groups.update({"desktop-reading": ("desktop-reading",),
+                       "desktop-drafts": ("desktop-credentials", "desktop-drafts")})
+    return groups
+
+
 def phase_files(target, phase):
     require(phase in phases(target), "Unexpected acceptance phase")
     selections = ("cli", "mcp", "cli-mcp")

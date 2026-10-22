@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import platform
+import shutil
 import stat
 import subprocess
 import sys
@@ -43,9 +44,9 @@ def load_build(root):
     return build
 
 
-def verify_build(root, build, *, extra=False):
+def verify_build(root, build, *, extra=False, candidate=None):
     for name in ("candidate", "harnesses"):
-        contents = files(root / name)
+        contents = files(candidate if name == "candidate" and candidate is not None else root / name)
         expected = build[name]
         evidence.require((set(expected) <= set(contents) if extra and name == "candidate" else set(expected) == set(contents)),
                          "Prepared build file set differs: " + name)
@@ -71,10 +72,61 @@ def command_for_phase(target, phase):
     return ["bash", str(scripts / "candidate.sh"), phase]
 
 
+def execute_phase(root, build, phase, environment, ledger):
+    candidate = Path(environment["MAILCTL_CANDIDATE_DIR"])
+    verify_build(root, build, candidate=candidate)
+    execution = dict(argv=command_for_phase(build["target"], phase), env={
+        name: environment[name] for name in ("MAILCTL_CANDIDATE_DIR", "MAILCTL_HARNESS_DIR", "MAILCTL_PACKAGED_BIN_DIR")})
+    ledger.unlink(missing_ok=True)
+    subprocess.run(execution["argv"], env=environment, check=True)
+    ledger.write_bytes(evidence.canonical(dict(context=context(), phase=phase, execution=execution,
+                                             build_sha256=evidence.digest(evidence.canonical(build)), artifact=artifact())))
+
+
+def record_phase(root, build, phase, candidate, ledger, destination):
+    if candidate != root / "candidate":
+        verify_build(root, build)
+    verify_build(root, build, extra=True, candidate=candidate)
+    executed = json.loads(ledger.read_bytes())
+    evidence.require(executed["context"] == context() and executed["phase"] == phase
+                     and executed["build_sha256"] == evidence.digest(evidence.canonical(build))
+                     and executed["artifact"] == artifact(), "Missing current executing shard command")
+    contents = {name: data for name, data in files(candidate).items() if name not in build["candidate"]}
+    receipt = evidence.receipt(build, phase, contents, artifact(),
+                              dict(system=platform.system(), release=platform.release(), machine=platform.machine()),
+                              executed["execution"])
+    # Store shared text without an encoding marker so it can be checked after collection.
+    for name in receipt["shared"]:
+        contents[name] = contents[name].decode("utf-8-sig").encode()
+    receipt["files"] = evidence.hashes(contents)
+    write(destination, dict(contents, **{"receipt.json": evidence.canonical(receipt)}))
+
+
+def shard_directories(directory, target):
+    folders = sorted(directory.iterdir())
+    nested = None
+    for folder in folders:
+        evidence.require(folder.is_dir() and not folder.is_symlink(), "Unsafe shard directory")
+        grouped = not (folder / "receipt.json").exists()
+        evidence.require(nested is None or nested == grouped, "Mixed acceptance artifact layouts")
+        nested = grouped
+        if not grouped:
+            yield folder
+            continue
+        phases = sorted(folder.iterdir())
+        evidence.require({path.name for path in phases} in
+                         [set(group) for group in evidence.acceptance_groups(target).values()],
+                         "Acceptance group has missing or unexpected phases")
+        for phase in phases:
+            evidence.require(phase.is_dir() and not phase.is_symlink(), "Unsafe shard directory")
+            yield phase
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("init", "seal", "restore", "run", "record", "collect", "verify"))
+    parser.add_argument("command", choices=("init", "seal", "restore", "run", "record", "qualify", "collect", "verify"))
     parser.add_argument("--phase")
+    parser.add_argument("--group")
     parser.add_argument("--evidence", type=Path)
     args = parser.parse_args()
     if args.command == "init":
@@ -121,13 +173,25 @@ def main():
     verify_build(root, build, extra=args.command == "record")
     if args.command == "run":
         evidence.require(args.phase is not None, "Execution requires an acceptance phase")
-        execution = dict(argv=command_for_phase(target, args.phase), env={
-            name: os.environ[name] for name in ("MAILCTL_CANDIDATE_DIR", "MAILCTL_HARNESS_DIR", "MAILCTL_PACKAGED_BIN_DIR")})
-        ledger = root / "execution.json"
-        ledger.unlink(missing_ok=True)
-        subprocess.run(execution["argv"], check=True)
-        ledger.write_bytes(evidence.canonical(dict(context=context(), phase=args.phase, execution=execution,
-                                                 build_sha256=evidence.digest(evidence.canonical(build)), artifact=artifact())))
+        execute_phase(root, build, args.phase, dict(os.environ), root / "execution.json")
+    elif args.command == "qualify":
+        groups = evidence.acceptance_groups(target)
+        evidence.require(args.group in groups and args.evidence is not None,
+                         "Qualification requires an acceptance group and evidence directory")
+        args.evidence.mkdir()
+        working = root / "phases"
+        working.mkdir()
+        for phase in groups[args.group]:
+            print("Qualifying candidate phase: " + phase, flush=True)
+            phase_root = working / phase
+            phase_root.mkdir()
+            phase_candidate = phase_root / "candidate"
+            shutil.copytree(candidate, phase_candidate)
+            environment = dict(os.environ, MAILCTL_CANDIDATE_DIR=str(phase_candidate))
+            ledger = phase_root / "execution.json"
+            execute_phase(root, build, phase, environment, ledger)
+            record_phase(root, build, phase, phase_candidate, ledger, args.evidence / phase)
+        verify_build(root, build)
     elif args.command == "restore":
         # Actions artifacts preserve bytes but strip Unix executable permissions.
         for path in (root / "harnesses").iterdir():
@@ -138,28 +202,16 @@ def main():
                 (candidate / name).chmod(0o755)
     elif args.command == "record":
         evidence.require(args.phase and args.evidence, "Recording requires phase and evidence directory")
-        ledger = json.loads((root / "execution.json").read_bytes())
-        evidence.require(ledger["context"] == context() and ledger["phase"] == args.phase
-                         and ledger["build_sha256"] == evidence.digest(evidence.canonical(build))
-                         and ledger["artifact"] == artifact(),
-                         "Missing current executing shard command")
-        contents = {name: data for name, data in files(candidate).items() if name not in build["candidate"]}
-        receipt = evidence.receipt(build, args.phase, contents, artifact(),
-                                  dict(system=platform.system(), release=platform.release(), machine=platform.machine()),
-                                  ledger["execution"])
-        # Store shared text without an encoding marker so it can be checked after collection.
-        for name in receipt["shared"]:
-            contents[name] = contents[name].decode("utf-8-sig").encode()
-        receipt["files"] = evidence.hashes(contents)
-        write(args.evidence, dict(contents, **{"receipt.json": evidence.canonical(receipt)}))
+        record_phase(root, build, args.phase, candidate, root / "execution.json", args.evidence)
     elif args.command == "collect":
         evidence.require(args.evidence is not None, "Collection requires an evidence directory")
         shards = []
         payloads = []
-        for folder in sorted(args.evidence.iterdir()):
-            evidence.require(folder.is_dir() and not folder.is_symlink(), "Unsafe shard directory")
+        for folder in shard_directories(args.evidence, target):
             payload = files(folder)
             receipt = json.loads(payload.pop("receipt.json"))
+            evidence.require(folder.parent == args.evidence or folder.name == receipt["phase"],
+                             "Acceptance phase directory differs from receipt")
             evidence.require(evidence.hashes(payload) == receipt["files"], "Acceptance evidence bytes changed")
             shards.append(receipt)
             payloads.append(payload)

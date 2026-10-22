@@ -16,6 +16,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 
 
@@ -111,6 +112,80 @@ class PreparedCandidate:
                     payload[name] = b"\xef\xbb\xbf" + payload[name].replace(b"\n", b"\r\n")
             self.record(phase, payload)
 
+    def stub_commands(self):
+        commands = self.root / "commands"
+        if commands.exists():
+            return commands
+        commands.mkdir()
+        payloads = self.root / "payloads"
+        payloads.mkdir()
+        for phase in evidence.phases(self.target):
+            folder = payloads / phase
+            folder.mkdir()
+            self.put(folder, self.payload(phase))
+        script = f"#!{sys.executable}\n" + textwrap.dedent("""\
+            import hashlib
+            import json
+            import os
+            from pathlib import Path
+            import sys
+
+            def hashes(directory):
+                return {path.name: dict(sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+                                       size=path.stat().st_size) for path in directory.iterdir()}
+
+            root = Path(os.environ["MAILCTL_FIXTURE_ROOT"])
+            phase = sys.argv[-1]
+            if any(Path(arg).name == "desktop-acceptance.sh" for arg in sys.argv[1:]):
+                phase = "desktop-" + phase
+            paths = {name: os.environ[name] for name in
+                     ("MAILCTL_CANDIDATE_DIR", "MAILCTL_HARNESS_DIR", "MAILCTL_PACKAGED_BIN_DIR")}
+            candidate = Path(paths["MAILCTL_CANDIDATE_DIR"])
+            record = dict(phase=phase, before=hashes(candidate),
+                          harnesses=hashes(Path(paths["MAILCTL_HARNESS_DIR"])),
+                          execution=dict(argv=[Path(sys.argv[0]).name, *sys.argv[1:]], env=paths))
+            with (root / "commands.jsonl").open("a") as trace:
+                trace.write(json.dumps(record) + "\\n")
+            for path in (root / "payloads" / phase).iterdir():
+                (candidate / path.name).write_bytes(path.read_bytes())
+            if phase == os.environ.get("MAILCTL_FIXTURE_MUTATE_PHASE"):
+                build = Path(os.environ["MAILCTL_BUILD_DIR"])
+                changed = {"prepared": build / "candidate" / "install.sh",
+                           "harness": build / "harnesses" / "fixture-driver",
+                           "phase": candidate / "install.sh"}[os.environ["MAILCTL_FIXTURE_MUTATE"]]
+                changed.write_bytes(changed.read_bytes() + b"changed")
+            if phase == os.environ.get("MAILCTL_FIXTURE_FAIL_PHASE"):
+                sys.exit(37)
+            """)
+        for name in ("bash", "pwsh"):
+            command = commands / name
+            command.write_text(script)
+            command.chmod(0o755)
+        return commands
+
+    def group_worker(self, group):
+        commands = self.stub_commands()
+        worker = self.root / "group-workers" / group
+        shutil.copytree(self.build, worker)
+        for path in worker.rglob("*"):
+            if path.is_file():
+                path.chmod(0o644)
+        environment = dict(MAILCTL_BUILD_DIR=str(worker), MAILCTL_CANDIDATE_DIR=str(worker / "candidate"),
+                           MAILCTL_HARNESS_DIR=str(worker / "harnesses"),
+                           MAILCTL_PACKAGED_BIN_DIR=str(worker / "installed"),
+                           MAILCTL_FIXTURE_ROOT=str(self.root),
+                           PATH=str(commands) + os.pathsep + os.environ["PATH"])
+        self.command("restore", overrides=environment)
+        return worker, environment
+
+    def qualify(self, group, environment, **kwargs):
+        return self.command("qualify", "--group", group, "--evidence", self.shards / group,
+                            overrides=environment, **kwargs)
+
+    def executions(self):
+        trace = self.root / "commands.jsonl"
+        return [json.loads(line) for line in trace.read_text().splitlines()] if trace.exists() else []
+
     def collect(self, **kwargs):
         return self.command("collect", "--evidence", self.shards, **kwargs)
 
@@ -203,6 +278,150 @@ class CandidateEvidenceTests(unittest.TestCase):
                     for name in ("linux-source-evidence.txt", "desktop-source-evidence.txt"):
                         self.assertEqual(re.findall(rb"^suite=(.+)$", files[name], re.MULTILINE),
                                          [b"credentials", b"reading", b"drafts"])
+
+    def test_acceptance_groups_preserve_platform_phase_order_and_singletons(self):
+        expected = {
+            release.MAC: {"core": ("installer", "state", "process", "native"),
+                          "reading": ("reading",), "drafts": ("drafts",)},
+            release.LINUX: {"core": ("installer", "state", "process", "native"),
+                            "reading": ("reading",), "drafts": ("drafts",),
+                            "desktop-reading": ("desktop-reading",),
+                            "desktop-drafts": ("desktop-credentials", "desktop-drafts")},
+            release.WINDOWS: {"installer": ("installer",), "state-native": ("state", "native"),
+                              "process": ("process",), "reading": ("reading",),
+                              "drafts": ("drafts",), "wsl": ("wsl",)},
+        }
+        for target, groups in expected.items():
+            with self.subTest(target=target):
+                self.assertEqual(evidence.acceptance_groups(target), groups)
+        with self.assertRaises(ValueError):
+            evidence.acceptance_groups("unsupported-target")
+
+    def test_grouped_cli_roundtrip_isolates_phase_outputs_and_records_actual_commands(self):
+        for target in fixtures.TARGETS:
+            with self.subTest(target=target):
+                candidate = self.prepared(target)
+                build = json.loads((candidate.build / "build.json").read_bytes())
+                expected_order = []
+                for group, phases in reversed(list(evidence.acceptance_groups(target).items())):
+                    worker, environment = candidate.group_worker(group)
+                    candidate.qualify(group, environment)
+                    expected_order.extend(phases)
+                    self.assertEqual({path.name for path in (candidate.shards / group).iterdir()}, set(phases))
+                    self.assertEqual({path.name: path.read_bytes() for path in (worker / "candidate").iterdir()},
+                                     candidate.prepared)
+                    self.assertEqual({path.name: path.read_bytes() for path in (worker / "harnesses").iterdir()},
+                                     {"fixture-driver": b"driver"})
+                    for phase in phases:
+                        folder = candidate.shards / group / phase
+                        receipt = json.loads((folder / "receipt.json").read_bytes())
+                        payload = candidate.payload(phase)
+                        self.assertEqual({path.name: path.read_bytes() for path in folder.iterdir()
+                                          if path.name != "receipt.json"}, payload)
+                        phase_candidate = worker / "phases" / phase / "candidate"
+                        self.assertEqual({path.name: path.read_bytes() for path in phase_candidate.iterdir()},
+                                         dict(candidate.prepared, **payload))
+                        if target == release.WINDOWS:
+                            script = ("windows-candidate.ps1" if phase == "installer"
+                                      else "windows-packaged-acceptance.ps1")
+                            argv = ["pwsh", "-NoProfile", "-File", str(ROOT / "scripts/ci" / script),
+                                    "-Phase", phase]
+                        else:
+                            script = "desktop-acceptance.sh" if phase.startswith("desktop-") else "candidate.sh"
+                            argv = ["bash", str(ROOT / "scripts/ci" / script), phase.removeprefix("desktop-")]
+                        paths = {name: environment[name] for name in
+                                 ("MAILCTL_HARNESS_DIR", "MAILCTL_PACKAGED_BIN_DIR")}
+                        paths["MAILCTL_CANDIDATE_DIR"] = str(phase_candidate)
+                        self.assertEqual(receipt["execution"], dict(argv=argv, env=paths))
+                        self.assertEqual(receipt["phase"], phase)
+                        self.assertEqual(receipt["context"], CONTEXT)
+                        self.assertEqual(receipt["artifact"], candidate.artifact)
+                        self.assertEqual(receipt["build_sha256"], evidence.digest(evidence.canonical(build)))
+                        actual = next(record for record in candidate.executions() if record["phase"] == phase)
+                        self.assertEqual(receipt["execution"], actual["execution"])
+                        self.assertEqual(actual["before"], build["candidate"])
+                        self.assertEqual(actual["harnesses"], build["harnesses"])
+                self.assertEqual([record["phase"] for record in candidate.executions()], expected_order)
+                self.assertEqual(candidate.contents(), candidate.prepared)
+                candidate.collect()
+                candidate.finish()
+                candidate.command("verify")
+                files = candidate.contents()
+                proof = json.loads(files["parallel-acceptance.json"])
+                self.assertEqual([receipt["phase"] for receipt in proof["shards"]], list(evidence.phases(target)))
+                release.validate_candidate(files, candidate.fixture.source, fixtures.COMMIT, target)
+                for name in set(files) - {"parallel-acceptance.json", "SHA256SUMS"}:
+                    expected = candidate.fixture.files[name]
+                    if name == "windows-source-evidence.txt":
+                        expected = evidence.normalized(expected)
+                    self.assertEqual(files[name], expected, name)
+
+    def test_group_failure_stops_before_later_phases_and_records_only_success(self):
+        candidate = self.prepared()
+        worker, environment = candidate.group_worker("core")
+        environment["MAILCTL_FIXTURE_FAIL_PHASE"] = "state"
+        candidate.qualify("core", environment, succeeds=False)
+        self.assertEqual([record["phase"] for record in candidate.executions()], ["installer", "state"])
+        self.assertEqual({path.name for path in (candidate.shards / "core").iterdir()}, {"installer"})
+        ledgers = [json.loads(path.read_bytes()) for path in worker.rglob("execution.json")]
+        self.assertEqual([ledger["phase"] for ledger in ledgers], ["installer"])
+        for phase in ("process", "native"):
+            self.assertFalse((worker / "phases" / phase).exists())
+        self.assertEqual(candidate.contents(), candidate.prepared)
+        self.assertEqual({path.name: path.read_bytes() for path in (worker / "candidate").iterdir()}, candidate.prepared)
+
+    def test_group_rejects_modified_prepared_and_harness_bytes_before_execution(self):
+        for directory, name in (("candidate", "install.sh"), ("harnesses", "fixture-driver")):
+            with self.subTest(directory=directory):
+                candidate = self.prepared()
+                worker, environment = candidate.group_worker("core")
+                path = worker / directory / name
+                path.write_bytes(path.read_bytes() + b"changed")
+                candidate.qualify("core", environment, succeeds=False)
+                self.assertEqual(candidate.executions(), [])
+                self.assertFalse((candidate.shards / "core").exists())
+
+    def test_group_rejects_prepared_or_harness_mutation_during_a_successful_command(self):
+        for mutation in ("prepared", "harness", "phase"):
+            with self.subTest(mutation=mutation):
+                candidate = self.prepared()
+                worker, environment = candidate.group_worker("core")
+                environment.update(MAILCTL_FIXTURE_MUTATE_PHASE="installer", MAILCTL_FIXTURE_MUTATE=mutation)
+                candidate.qualify("core", environment, succeeds=False)
+                self.assertEqual([record["phase"] for record in candidate.executions()], ["installer"])
+                self.assertEqual(list((candidate.shards / "core").rglob("receipt.json")), [])
+                self.assertFalse((worker / "phases" / "state").exists())
+                self.assertEqual(candidate.contents(), candidate.prepared)
+
+    def test_group_rejects_unknown_platform_groups_without_running_commands(self):
+        for target, group in ((release.MAC, "state-native"), (release.LINUX, "desktop-credentials"),
+                              (release.WINDOWS, "core"), (release.MAC, "unknown")):
+            with self.subTest(target=target, group=group):
+                candidate = self.prepared(target)
+                _, environment = candidate.group_worker(group)
+                candidate.qualify(group, environment, succeeds=False)
+                self.assertEqual(candidate.executions(), [])
+                self.assertFalse((candidate.shards / group).exists())
+
+    def test_group_rejects_stale_output_and_repeated_qualification(self):
+        for problem in ("evidence", "working", "repeat"):
+            with self.subTest(problem=problem):
+                candidate = self.prepared()
+                worker, environment = candidate.group_worker("core")
+                if problem == "repeat":
+                    candidate.qualify("core", environment)
+                else:
+                    stale = (candidate.shards / "core" if problem == "evidence"
+                             else worker / "phases" / "state" / "candidate")
+                    stale.mkdir(parents=True)
+                    (stale / "stale.log").write_bytes(b"previous attempt")
+                before = candidate.executions()
+                retained = {path: path.read_bytes() for path in candidate.shards.rglob("*") if path.is_file()}
+                candidate.qualify("core", environment, succeeds=False)
+                self.assertEqual(candidate.executions(), before)
+                self.assertEqual({path: path.read_bytes() for path in candidate.shards.rglob("*") if path.is_file()},
+                                 retained)
+                self.assertEqual(candidate.contents(), candidate.prepared)
 
     def test_seal_rejects_bad_checksums_untracked_files_and_missing_harnesses(self):
         for problem in ("modified", "missing", "untracked", "duplicate-checksum", "no-harness"):
@@ -338,6 +557,56 @@ class CandidateEvidenceTests(unittest.TestCase):
                     shutil.rmtree(candidate.shards / "duplicate")
                 else:
                     receipt_path.write_bytes(original)
+
+    def test_collect_rejects_mixed_or_unexpected_grouped_artifact_nesting(self):
+        candidate = self.prepared()
+        candidate.record_all()
+        flat = candidate.root / "flat-shards"
+        candidate.shards.rename(flat)
+        candidate.shards.mkdir()
+        for group, phases in evidence.acceptance_groups(candidate.target).items():
+            folder = candidate.shards / group
+            folder.mkdir()
+            for phase in phases:
+                (flat / phase).rename(folder / phase)
+        valid = candidate.root / "valid-grouped-shards"
+        shutil.copytree(candidate.shards, valid)
+        for problem in ("mixed", "missing", "unexpected", "deep", "symlink", "phase-name", "payload"):
+            with self.subTest(problem=problem):
+                shutil.rmtree(candidate.shards)
+                shutil.copytree(valid, candidate.shards)
+                shutil.rmtree(candidate.candidate)
+                candidate.candidate.mkdir()
+                candidate.put(candidate.candidate, candidate.prepared)
+                core = candidate.shards / "core"
+                state = core / "state"
+                if problem == "mixed":
+                    (candidate.shards / "reading" / "reading").rename(candidate.shards / "legacy-reading")
+                    (candidate.shards / "reading").rmdir()
+                elif problem == "missing":
+                    shutil.rmtree(state)
+                elif problem == "unexpected":
+                    (core / "stale.log").write_bytes(b"previous attempt")
+                elif problem == "deep":
+                    nested = candidate.root / "nested-state"
+                    state.rename(nested)
+                    state.mkdir()
+                    nested.rename(state / "extra")
+                elif problem == "symlink":
+                    outside = candidate.root / "outside-state"
+                    state.rename(outside)
+                    state.symlink_to(outside, target_is_directory=True)
+                elif problem == "phase-name":
+                    saved = candidate.root / "swapped-state"
+                    state.rename(saved)
+                    (core / "process").rename(state)
+                    saved.rename(core / "process")
+                else:
+                    log = state / "installed-state-acceptance.log"
+                    log.write_bytes(log.read_bytes() + b"changed")
+                candidate.collect(succeeds=False)
+                self.assertFalse((candidate.candidate / "parallel-acceptance.json").exists())
+                self.assertEqual(candidate.contents(), candidate.prepared)
 
     def test_collect_rejects_changed_or_added_shard_payloads(self):
         candidate = self.prepared(release.LINUX)

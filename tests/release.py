@@ -38,6 +38,11 @@ ARTIFACT_ID = 5678
 RELEASE_ID = 9012
 TARGETS = (release.MAC, release.LINUX, release.WINDOWS)
 ARTIFACT_IDS = [ARTIFACT_ID + index for index in range(3)]
+ACCEPTANCE_GROUPS = {
+    release.MAC: ("core", "reading", "drafts"),
+    release.LINUX: ("core", "reading", "drafts", "desktop-reading", "desktop-drafts"),
+    release.WINDOWS: ("installer", "state-native", "process", "reading", "drafts", "wsl"),
+}
 
 
 def prepared_zip(build, files):
@@ -362,8 +367,9 @@ class FakeGitHub(release.GitHub):
                             size_in_bytes=len(self.prepared_zips[target]), created_at="2026-10-15T10:09:30Z")
             self.artifacts.append(artifact)
             names = {"build-" + target: ("Seal candidate build", "Keep candidate build")}
-            names.update({f"acceptance-{target}-{phase}": ("Record acceptance shard", "Keep acceptance evidence")
-                          for phase in release.candidate_evidence.phases(target)})
+            names.update({f"acceptance-{target}-{group}": ("Qualify installed candidate and record evidence",
+                                                        "Keep acceptance evidence")
+                          for group in ACCEPTANCE_GROUPS[target]})
             for offset, (name, steps) in enumerate(names.items()):
                 job_id = 1000 + index * 100 + offset
                 job = dict(id=job_id, name=name, run_id=RUN_ID, run_attempt=ATTEMPT, head_sha=COMMIT,
@@ -922,21 +928,48 @@ class ReleaseTests(unittest.TestCase):
             self.rejected(gh)
 
     def test_parallel_workers_and_prepared_artifacts_must_match_this_attempt(self):
-        for name in ("build-" + release.LINUX, "acceptance-" + release.WINDOWS + "-wsl"):
+        names = ["build-" + target for target in TARGETS] + [
+            f"acceptance-{target}-{group}" for target in TARGETS for group in ACCEPTANCE_GROUPS[target]]
+        for name in names:
             for field, value in (("conclusion", "failure"), ("run_attempt", ATTEMPT - 1),
-                                 ("head_sha", "b" * 40)):
+                                 ("head_sha", "b" * 40), ("run_id", RUN_ID + 1), ("status", "in_progress")):
                 with self.subTest(job=name, field=field):
                     gh = FakeGitHub()
                     next(job for job in gh.jobs if job["name"] == name)[field] = value
-                    self.rejected(gh)
-            gh = FakeGitHub()
-            gh.jobs = [job for job in gh.jobs if job["name"] != name]
-            self.rejected(gh)
+                    self.rejected(gh, re.escape(name))
+            for count in (0, 2):
+                with self.subTest(job=name, count=count):
+                    gh = FakeGitHub()
+                    worker = next(job for job in gh.jobs if job["name"] == name)
+                    gh.jobs = [job for job in gh.jobs if job["name"] != name] + [deepcopy(worker) for _ in range(count)]
+                    self.rejected(gh, re.escape(name))
         for field, value in (("expired", True), ("digest", "missing"),
                              ("created_at", "2026-10-15T09:59:59Z")):
             gh = FakeGitHub()
             gh.artifacts[3][field] = value
             self.rejected(gh)
+
+    def test_each_acceptance_group_requires_unique_successful_qualification_and_upload_steps(self):
+        for target in TARGETS:
+            for group in ACCEPTANCE_GROUPS[target]:
+                name = f"acceptance-{target}-{group}"
+                for step_name in ("Qualify installed candidate and record evidence", "Keep acceptance evidence"):
+                    for field, value in (("conclusion", "failure"), ("conclusion", "skipped"),
+                                         ("status", "in_progress")):
+                        with self.subTest(job=name, step=step_name, field=field, value=value):
+                            gh = FakeGitHub()
+                            worker = next(job for job in gh.jobs if job["name"] == name)
+                            step = next(step for step in worker["steps"] if step["name"] == step_name)
+                            step[field] = value
+                            self.rejected(gh, re.escape(step_name))
+                    for count in (0, 2):
+                        with self.subTest(job=name, step=step_name, count=count):
+                            gh = FakeGitHub()
+                            worker = next(job for job in gh.jobs if job["name"] == name)
+                            step = next(step for step in worker["steps"] if step["name"] == step_name)
+                            worker["steps"] = [step for step in worker["steps"] if step["name"] != step_name] + [
+                                deepcopy(step) for _ in range(count)]
+                            self.rejected(gh, re.escape(step_name))
 
     def test_previous_attempt_artifacts_do_not_shadow_current_candidates(self):
         gh, directory, _ = self.case()
@@ -951,14 +984,38 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual({entry["id"] for entry in plan["artifacts"].values()}, set(ARTIFACT_IDS))
 
     def test_parallel_receipts_cannot_relabel_a_different_build_or_attempt(self):
-        for field, value in (("run_id", RUN_ID + 1), ("run_attempt", ATTEMPT - 1),
-                             ("commit", "b" * 40)):
-            candidate = Candidate()
-            proof = json.loads(candidate.files["parallel-acceptance.json"])
-            proof["build"]["context"][field] = value
-            candidate.files["parallel-acceptance.json"] = release.canonical(proof)
-            candidate.sums()
-            self.rejected(FakeGitHub(candidate))
+        for target in TARGETS:
+            for field, value in (("run_id", RUN_ID + 1), ("run_attempt", ATTEMPT - 1),
+                                 ("commit", "b" * 40)):
+                with self.subTest(target=target, field=field):
+                    candidate = Candidate(target)
+                    proof = json.loads(candidate.files["parallel-acceptance.json"])
+                    proof["build"]["context"][field] = value
+                    candidate.files["parallel-acceptance.json"] = release.canonical(proof)
+                    candidate.sums()
+                    self.rejected(FakeGitHub(candidate))
+
+    def test_successful_acceptance_groups_still_require_every_phase_receipt(self):
+        for target in TARGETS:
+            for phase in release.candidate_evidence.phases(target):
+                for change in ("missing", "stale", "log-digest"):
+                    with self.subTest(target=target, phase=phase, change=change):
+                        candidate = Candidate(target)
+                        proof = json.loads(candidate.files["parallel-acceptance.json"])
+                        shard = next(shard for shard in proof["shards"] if shard["phase"] == phase)
+                        if change == "missing":
+                            proof["shards"].remove(shard)
+                            message = "Missing or duplicate acceptance shard"
+                        elif change == "stale":
+                            shard["context"]["run_attempt"] = ATTEMPT - 1
+                            message = "Acceptance shard belongs to another build or attempt"
+                        else:
+                            log = next(name for name in shard["files"] if name in LOGS_BY_TARGET[target])
+                            shard["files"][log]["sha256"] = "0" * 64
+                            message = "Acceptance log changed"
+                        candidate.files["parallel-acceptance.json"] = release.canonical(proof)
+                        candidate.sums()
+                        self.rejected(FakeGitHub(candidate), message)
 
     def test_collector_cannot_replace_the_authenticated_prepared_manifest(self):
         candidate = Candidate()

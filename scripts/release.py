@@ -273,8 +273,9 @@ def metadata(gh, commit, run_id, artifact_ids):
         require(type(build_artifact.get("size_in_bytes")) is int and 0 < build_artifact["size_in_bytes"] <= MAX_FILE,
                 "Prepared artifact exceeds size limit")
         required = {"build-" + target: ("Seal candidate build", "Keep candidate build")}
-        required.update({f"acceptance-{target}-{phase}": ("Record acceptance shard", "Keep acceptance evidence")
-                         for phase in candidate_evidence.phases(target)})
+        required.update({f"acceptance-{target}-{group}": ("Qualify installed candidate and record evidence",
+                                                       "Keep acceptance evidence")
+                         for group in candidate_evidence.acceptance_groups(target)})
         for name, required_steps in required.items():
             found = [value for value in jobs if value["name"] == name]
             require(len(found) == 1, "Missing or duplicate parallel candidate job: " + name)

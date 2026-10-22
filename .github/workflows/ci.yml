@@ -208,19 +208,19 @@ jobs:
           retention-days: 14
 
   macos-candidate-acceptance:
-    name: acceptance-aarch64-apple-darwin-${{ matrix.phase }}
+    name: acceptance-aarch64-apple-darwin-${{ matrix.group }}
     needs: macos-candidate-build
     strategy:
       fail-fast: false
       matrix:
-        phase: [installer, state, process, native, reading, drafts]
+        group: [core, reading, drafts]
     runs-on: macos-26
     timeout-minutes: 25
     env:
       MAILCTL_TARGET: aarch64-apple-darwin
       MAILCTL_BUILD_ARTIFACT_ID: ${{ needs.macos-candidate-build.outputs.artifact-id }}
       MAILCTL_BUILD_ARTIFACT_DIGEST: ${{ needs.macos-candidate-build.outputs.artifact-digest }}
-      MAILCTL_PHASE: ${{ matrix.phase }}
+      MAILCTL_GROUP: ${{ matrix.group }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -234,19 +234,13 @@ jobs:
       - name: Verify prepared bytes and restore executable permissions
         shell: bash
         run: python3 scripts/ci/candidate-jobs.py restore
-      - name: Install combined candidate components for lifecycle checks
-        if: matrix.phase == 'state' || matrix.phase == 'process' || matrix.phase == 'native'
-        run: bash scripts/ci/candidate.sh bootstrap
-      - name: Qualify installed candidate
+      - name: Qualify installed candidate and record evidence
         shell: bash
-        run: python3 scripts/ci/candidate-jobs.py run --phase "$MAILCTL_PHASE"
-      - name: Record acceptance shard
-        shell: bash
-        run: python3 scripts/ci/candidate-jobs.py record --phase "$MAILCTL_PHASE" --evidence "$RUNNER_TEMP/shard"
+        run: python3 scripts/ci/candidate-jobs.py qualify --group "$MAILCTL_GROUP" --evidence "$RUNNER_TEMP/shard"
       - name: Keep acceptance evidence
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
-          name: mailctl-acceptance-aarch64-apple-darwin-${{ matrix.phase }}-attempt-${{ github.run_attempt }}
+          name: mailctl-acceptance-aarch64-apple-darwin-${{ matrix.group }}-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/shard/
           if-no-files-found: error
           retention-days: 14
@@ -337,19 +331,19 @@ jobs:
           retention-days: 14
 
   linux-candidate-acceptance:
-    name: acceptance-x86_64-unknown-linux-gnu-${{ matrix.phase }}
+    name: acceptance-x86_64-unknown-linux-gnu-${{ matrix.group }}
     needs: linux-candidate-build
     strategy:
       fail-fast: false
       matrix:
-        phase: [installer, state, process, native, reading, drafts, desktop-credentials, desktop-reading, desktop-drafts]
+        group: [core, reading, drafts, desktop-reading, desktop-drafts]
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     env:
       MAILCTL_TARGET: x86_64-unknown-linux-gnu
       MAILCTL_BUILD_ARTIFACT_ID: ${{ needs.linux-candidate-build.outputs.artifact-id }}
       MAILCTL_BUILD_ARTIFACT_DIGEST: ${{ needs.linux-candidate-build.outputs.artifact-digest }}
-      MAILCTL_PHASE: ${{ matrix.phase }}
+      MAILCTL_GROUP: ${{ matrix.group }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -363,22 +357,16 @@ jobs:
       - name: Verify prepared bytes and restore executable permissions
         shell: bash
         run: python3 scripts/ci/candidate-jobs.py restore
-      - name: Install combined candidate components for lifecycle checks
-        if: matrix.phase == 'state' || matrix.phase == 'process' || matrix.phase == 'native'
-        run: bash scripts/ci/candidate.sh bootstrap
       - name: Install native Secret Service test prerequisites
-        if: startsWith(matrix.phase, 'desktop-')
+        if: startsWith(matrix.group, 'desktop-')
         run: bash scripts/ci/desktop-acceptance.sh prerequisites
-      - name: Qualify installed candidate
+      - name: Qualify installed candidate and record evidence
         shell: bash
-        run: python3 scripts/ci/candidate-jobs.py run --phase "$MAILCTL_PHASE"
-      - name: Record acceptance shard
-        shell: bash
-        run: python3 scripts/ci/candidate-jobs.py record --phase "$MAILCTL_PHASE" --evidence "$RUNNER_TEMP/shard"
+        run: python3 scripts/ci/candidate-jobs.py qualify --group "$MAILCTL_GROUP" --evidence "$RUNNER_TEMP/shard"
       - name: Keep acceptance evidence
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
-          name: mailctl-acceptance-x86_64-unknown-linux-gnu-${{ matrix.phase }}-attempt-${{ github.run_attempt }}
+          name: mailctl-acceptance-x86_64-unknown-linux-gnu-${{ matrix.group }}-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/shard/
           if-no-files-found: error
           retention-days: 14
@@ -469,19 +457,19 @@ jobs:
           retention-days: 14
 
   windows-candidate-acceptance:
-    name: acceptance-x86_64-pc-windows-msvc-${{ matrix.phase }}
+    name: acceptance-x86_64-pc-windows-msvc-${{ matrix.group }}
     needs: windows-candidate-build
     strategy:
       fail-fast: false
       matrix:
-        phase: [installer, state, process, native, reading, drafts, wsl]
+        group: [installer, state-native, process, reading, drafts, wsl]
     runs-on: windows-2025
     timeout-minutes: 25
     env:
       MAILCTL_TARGET: x86_64-pc-windows-msvc
       MAILCTL_BUILD_ARTIFACT_ID: ${{ needs.windows-candidate-build.outputs.artifact-id }}
       MAILCTL_BUILD_ARTIFACT_DIGEST: ${{ needs.windows-candidate-build.outputs.artifact-digest }}
-      MAILCTL_PHASE: ${{ matrix.phase }}
+      MAILCTL_GROUP: ${{ matrix.group }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -495,16 +483,13 @@ jobs:
       - name: Verify prepared bytes and restore executable permissions
         shell: pwsh
         run: python scripts/ci/candidate-jobs.py restore
-      - name: Qualify installed candidate
+      - name: Qualify installed candidate and record evidence
         shell: pwsh
-        run: python scripts/ci/candidate-jobs.py run --phase "$env:MAILCTL_PHASE"
-      - name: Record acceptance shard
-        shell: pwsh
-        run: python scripts/ci/candidate-jobs.py record --phase "$env:MAILCTL_PHASE" --evidence "$env:RUNNER_TEMP/shard"
+        run: python scripts/ci/candidate-jobs.py qualify --group "$env:MAILCTL_GROUP" --evidence "$env:RUNNER_TEMP/shard"
       - name: Keep acceptance evidence
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
-          name: mailctl-acceptance-x86_64-pc-windows-msvc-${{ matrix.phase }}-attempt-${{ github.run_attempt }}
+          name: mailctl-acceptance-x86_64-pc-windows-msvc-${{ matrix.group }}-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/shard/
           if-no-files-found: error
           retention-days: 14
