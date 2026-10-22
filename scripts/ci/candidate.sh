@@ -35,11 +35,14 @@ prepare)
 	python3 scripts/prepare-installer.py --target "$target" --output "$MAILCTL_CANDIDATE_DIR"
 	printf 'MAILCTL_CANDIDATE_DIR=%s\nMAILCTL_PACKAGED_BIN_DIR=%s\n' \
 		"$MAILCTL_CANDIDATE_DIR" "$MAILCTL_PACKAGED_BIN_DIR" >>"$GITHUB_ENV"
+	if [[ -n ${MAILCTL_HARNESS_DIR:-} ]]; then
+		printf 'MAILCTL_HARNESS_DIR=%s\n' "$MAILCTL_HARNESS_DIR" >>"$GITHUB_ENV"
+	fi
 	exit
 	;;
-installer | state | process | native | reading | drafts | record) ;;
+bootstrap | installer | state | process | native | reading | drafts | record) ;;
 *)
-	printf 'Usage: %s {build|prepare|installer|state|process|native|reading|drafts|record}\n' "$0" >&2
+	printf 'Usage: %s {build|prepare|bootstrap|installer|state|process|native|reading|drafts|record}\n' "$0" >&2
 	exit 2
 	;;
 esac
@@ -49,12 +52,16 @@ hash_command=(shasum -a 256)
 if command -v sha256sum >/dev/null; then hash_command=(sha256sum); fi
 installer_command=(python3 tests/installer.py --suite packaged
 	--artifacts "$MAILCTL_CANDIDATE_DIR" --install-to "$MAILCTL_PACKAGED_BIN_DIR")
-state_command=(cargo test --locked --test administration_process --test state_maintenance)
-process_command=(cargo test --locked
+test_command=(cargo test --locked)
+if [[ -n ${MAILCTL_HARNESS_DIR:-} ]]; then
+	test_command=(python3 scripts/ci/candidate-harness.py run)
+fi
+state_command=("${test_command[@]}" --test administration_process --test state_maintenance)
+process_command=("${test_command[@]}"
 	--test mcp_process --test message_process --test attachment_process
 	--test search_process --test discovery_process
 	--test read_contention_process --test draft_process)
-native_command=(cargo test --locked --test native_credentials -- --ignored --test-threads=1)
+native_command=("${test_command[@]}" --test native_credentials -- --ignored --test-threads=1)
 if [[ $target == x86_64-unknown-linux-gnu ]]; then
 	native_command=(bash scripts/ci/linux-acceptance.sh credentials)
 fi
@@ -62,7 +69,7 @@ component_command=(python3 tests/installer.py --artifacts "$MAILCTL_CANDIDATE_DI
 
 select_packaged_components() {
 	local suite=$1 components=$2
-	packaged_command=(cargo test --locked --test "packaged_$suite")
+	packaged_command=("${test_command[@]}" --test "packaged_$suite")
 	case "$components" in
 	cli,mcp)
 		label=cli-mcp
@@ -121,6 +128,9 @@ record_packaged_acceptance() {
 }
 
 case "$1" in
+bootstrap)
+	"${component_command[@]}" --components cli,mcp --install-to "$MAILCTL_PACKAGED_BIN_DIR"
+	;;
 installer)
 	run_acceptance installer-acceptance.log "${installer_command[@]}"
 	;;
@@ -152,6 +162,9 @@ record)
 	(cd "$MAILCTL_CANDIDATE_DIR" && "${hash_command[@]}" -c SHA256SUMS)
 	{
 		printf 'status=passed\ntopology=cooperative-embedded\n'
+		if [[ -f $MAILCTL_CANDIDATE_DIR/parallel-acceptance.json ]]; then
+			printf 'host_context=collector\ncommand_context=collector\nexecution_evidence=parallel-acceptance.json\n'
+		fi
 		if [[ $target == x86_64-unknown-linux-gnu ]]; then
 			printf 'credential_source=command,systemd,interactive-session\n'
 			cat /etc/os-release
@@ -174,14 +187,11 @@ record)
 		fi
 		printf 'real_provider=not-qualified\nisolation=not-qualified\npublication=not-performed\n'
 	} >"$MAILCTL_CANDIDATE_DIR/acceptance-evidence.txt"
-	if [[ $target == x86_64-unknown-linux-gnu ]]; then
-		(cd "$MAILCTL_CANDIDATE_DIR" && "${hash_command[@]}" \
-			acceptance-evidence.txt linux-source-evidence.txt desktop-source-evidence.txt ./*.log >>SHA256SUMS)
-	else
-		(cd "$MAILCTL_CANDIDATE_DIR" && "${hash_command[@]}" acceptance-evidence.txt installer-acceptance.log \
-			installed-state-acceptance.log installed-process-acceptance.log \
-			installed-native-acceptance.log installed-reading-*-acceptance.log \
-			installed-drafts-*-acceptance.log >>SHA256SUMS)
-	fi
+	(
+		cd "$MAILCTL_CANDIDATE_DIR"
+		for file in *; do
+			if [[ $file != SHA256SUMS ]]; then "${hash_command[@]}" "$file"; fi
+		done
+	) >"$MAILCTL_CANDIDATE_DIR/SHA256SUMS"
 	;;
 esac

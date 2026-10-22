@@ -9,6 +9,7 @@ from copy import deepcopy
 import importlib.util
 import io
 import json
+import re
 from pathlib import Path
 import stat
 import struct
@@ -24,6 +25,7 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.dont_write_bytecode = True
+sys.path.insert(0, str(ROOT / "scripts"))
 SPEC = importlib.util.spec_from_file_location("mailctl_release", ROOT / "scripts/release.py")
 release = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(release)
@@ -36,6 +38,45 @@ ARTIFACT_ID = 5678
 RELEASE_ID = 9012
 TARGETS = (release.MAC, release.LINUX, release.WINDOWS)
 ARTIFACT_IDS = [ARTIFACT_ID + index for index in range(3)]
+
+
+def prepared_zip(build, files):
+    original = {name: files[name] for name in build["candidate"] if name != "SHA256SUMS"}
+    original["SHA256SUMS"] = b"".join(f"{release.sha(data)}  {name}\n".encode() for name, data in sorted(original.items()))
+    return make_zip([(name, data, stat.S_IFREG | 0o644) for name, data in [
+        ("build.json", release.canonical(build)), ("harnesses/fixture-driver", b"driver"),
+        *(("candidate/" + name, data) for name, data in original.items())]])
+
+
+def parallel_proof(target, files):
+    parallel = release.candidate_evidence
+    phase_names = parallel.phases(target)
+    outputs = set().union(*(parallel.phase_files(target, phase) for phase in phase_names))
+    original = {name: data for name, data in files.items()
+                if name not in outputs | {"acceptance-evidence.txt", "SHA256SUMS", "parallel-acceptance.json"}}
+    original["SHA256SUMS"] = b"".join(f"{release.sha(data)}  {name}\n".encode() for name, data in sorted(original.items()))
+    build = dict(format=1, target=target,
+                 context=dict(repository=release.REPO, commit=COMMIT, run_id=RUN_ID, run_attempt=ATTEMPT),
+                 candidate=parallel.hashes(original), harnesses=parallel.hashes({"fixture-driver": b"driver"}))
+    artifact = dict(id=9000 + TARGETS.index(target), digest=release.sha(prepared_zip(build, files)))
+    receipts = []
+    for phase in phase_names:
+        contents = {name: files[name] for name in parallel.phase_files(target, phase)}
+        for name in set(contents) & parallel.SHARED:
+            data = parallel.normalized(contents[name])
+            if target == release.WINDOWS:
+                contents[name] = b"".join(line + b"\n" for line in data.splitlines()
+                                         if line.startswith(f"phase={phase} ".encode()))
+            else:
+                suite = "credentials" if phase in ("native", "desktop-credentials") else phase.removeprefix("desktop-")
+                blocks = re.split(rb"(?m)^suite=", data)[1:]
+                contents[name] = next(b"suite=" + block for block in blocks if block.splitlines()[0] == suite.encode())
+        receipts.append(parallel.receipt(build, phase, contents, artifact,
+                                        dict(system="fixture", release="fixture", machine="fixture"),
+                                        dict(argv=["fixture-runner", phase], env={
+                                            name: "/fixture/" + name for name in
+                                            ("MAILCTL_CANDIDATE_DIR", "MAILCTL_HARNESS_DIR", "MAILCTL_PACKAGED_BIN_DIR")})))
+    return parallel.canonical(parallel.combine(build, receipts, artifact))
 
 
 MAC_LOGS = {
@@ -214,6 +255,9 @@ class Candidate:
             self.files[name] = (b"Ran 12 tests in 0.123s\n\nOK\n" if name.startswith("installer-acceptance") else
                 b"test fixture ... ok\ntest result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n")
         self.archive()
+        self.files["parallel-acceptance.json"] = parallel_proof(target, self.files)
+        self.prepared_zip = prepared_zip(json.loads(self.files["parallel-acceptance.json"])["build"], self.files)
+        self.sums()
 
     def archive(self, binaries=None, special_member=None, zip_entries=None):
         output = io.BytesIO()
@@ -267,6 +311,7 @@ class FakeGitHub(release.GitHub):
             self.candidates[candidate.target] = candidate
         self.candidate = self.candidates[release.MAC]
         self.zips = {target: value.zip() for target, value in self.candidates.items()}
+        self.prepared_zips = {target: value.prepared_zip for target, value in self.candidates.items()}
         if zip_bytes is not None:
             self.zips[release.MAC] = zip_bytes
         self.zip_bytes = self.zips[release.MAC]
@@ -298,7 +343,7 @@ class FakeGitHub(release.GitHub):
                          started_at="2026-10-15T10:28:00Z", completed_at="2026-10-15T10:28:59Z"),
                     dict(name=upload_name, status="completed", conclusion="success", number=12,
                          started_at="2026-10-15T10:29:00Z", completed_at="2026-10-15T10:29:59Z")]))
-            self.artifacts.append(dict(id=ARTIFACT_IDS[index], name=release.artifact_name(target), expired=False,
+            self.artifacts.append(dict(id=ARTIFACT_IDS[index], name=release.ci_artifact_name(target, ATTEMPT), expired=False,
                 size_in_bytes=len(self.zips[target]), digest="sha256:" + release.sha(self.zips[target]),
                 created_at="2026-10-15T10:29:30Z", updated_at="2026-10-15T10:29:30Z", expires_at="2099-10-29T10:29:30Z",
                 workflow_run=dict(id=RUN_ID, head_sha=COMMIT, head_branch="main", repository_id=42, head_repository_id=42)))
@@ -310,6 +355,28 @@ class FakeGitHub(release.GitHub):
                 f"Artifact {artifact['name']} successfully finalized. Artifact ID {artifact['id']}",
                 f"Artifact download URL: https://github.com/{release.REPO}/actions/runs/{RUN_ID}/artifacts/{artifact['id']}")) + "\n").encode()
             for job, artifact in zip(self.jobs, self.artifacts)}
+        for index, target in enumerate(TARGETS):
+            artifact = deepcopy(self.artifact)
+            artifact.update(id=9000 + index, name=f"mailctl-build-{target}-attempt-{ATTEMPT}",
+                            digest="sha256:" + release.sha(self.prepared_zips[target]),
+                            size_in_bytes=len(self.prepared_zips[target]), created_at="2026-10-15T10:09:30Z")
+            self.artifacts.append(artifact)
+            names = {"build-" + target: ("Seal candidate build", "Keep candidate build")}
+            names.update({f"acceptance-{target}-{phase}": ("Record acceptance shard", "Keep acceptance evidence")
+                          for phase in release.candidate_evidence.phases(target)})
+            for offset, (name, steps) in enumerate(names.items()):
+                job_id = 1000 + index * 100 + offset
+                job = dict(id=job_id, name=name, run_id=RUN_ID, run_attempt=ATTEMPT, head_sha=COMMIT,
+                           status="completed", conclusion="success", started_at="2026-10-15T10:00:00Z",
+                           completed_at="2026-10-15T10:25:00Z", steps=[
+                               dict(name=step, status="completed", conclusion="success",
+                                    started_at="2026-10-15T10:09:00Z", completed_at="2026-10-15T10:09:59Z") for step in steps])
+                self.jobs.append(job)
+                if offset == 0:
+                    self.logs[job_id] = ("\n".join("2026-10-15T10:09:59.123Z " + line for line in (
+                        "SHA256 digest of uploaded artifact is " + artifact["digest"].removeprefix("sha256:"),
+                        f"Artifact {artifact['name']} successfully finalized. Artifact ID {artifact['id']}",
+                        f"Artifact download URL: https://github.com/{release.REPO}/actions/runs/{RUN_ID}/artifacts/{artifact['id']}")) + "\n").encode()
 
 
     @property
@@ -351,6 +418,12 @@ class FakeGitHub(release.GitHub):
                     raise AssertionError("Download requires a destination")
                 output.write(self.zips[target])
                 return None
+        for index, target in enumerate(TARGETS):
+            if path == f"actions/artifacts/{9000 + index}/zip":
+                if output is None:
+                    raise AssertionError("Prepared download requires a destination")
+                output.write(self.prepared_zips[target])
+                return None
         raw = args[6:] == ["-H", "Accept: application/vnd.github.raw+json"]
         if not raw and args[6:] != ["-H", "Accept: application/vnd.github+json"]:
             raise AssertionError("Unexpected API headers: " + repr(args))
@@ -367,6 +440,7 @@ class FakeGitHub(release.GitHub):
             f"actions/runs/{RUN_ID}": self.run,
             f"actions/runs/{RUN_ID}/attempts/{self.run['run_attempt']}": self.attempt,
             **{f"actions/artifacts/{artifact_id}": artifact for artifact_id, artifact in zip(ARTIFACT_IDS, self.artifacts)},
+            **{f"actions/artifacts/{artifact['id']}": artifact for artifact in self.artifacts[3:]},
             f"git/ref/tags/v{VERSION}": self.tag,
             "git/tags/" + "c" * 40: self.annotated_tag,
             f"releases/{RELEASE_ID}": self.draft,
@@ -566,7 +640,7 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(plan["format"], 2)
         self.assertEqual(set(plan["artifacts"]), set(TARGETS))
         self.assertEqual(len(plan["assets"]), 21)
-        for target, expected_count in ((release.MAC, 20), (release.LINUX, 46), (release.WINDOWS, 46)):
+        for target, expected_count in ((release.MAC, 21), (release.LINUX, 47), (release.WINDOWS, 47)):
             self.assertEqual(len(gh.candidates[target].files), expected_count)
         for target in TARGETS:
             candidate = gh.candidates[target]
@@ -657,7 +731,7 @@ class ReleaseTests(unittest.TestCase):
             artifact["size_in_bytes"] = len(gh.zips[target])
             job_id = gh.jobs[index]["id"]
             gh.logs[job_id] = gh.logs[job_id].replace(old_digest.encode(), artifact["digest"].removeprefix("sha256:").encode())
-            self.rejected(gh, "exact expected files")
+            self.rejected(gh, "authenticated prepared artifact")
 
     def test_native_qualification_requires_each_component_log_and_source_record(self):
         for target in (release.LINUX, release.WINDOWS):
@@ -847,6 +921,64 @@ class ReleaseTests(unittest.TestCase):
             gh.jobs *= count
             self.rejected(gh)
 
+    def test_parallel_workers_and_prepared_artifacts_must_match_this_attempt(self):
+        for name in ("build-" + release.LINUX, "acceptance-" + release.WINDOWS + "-wsl"):
+            for field, value in (("conclusion", "failure"), ("run_attempt", ATTEMPT - 1),
+                                 ("head_sha", "b" * 40)):
+                with self.subTest(job=name, field=field):
+                    gh = FakeGitHub()
+                    next(job for job in gh.jobs if job["name"] == name)[field] = value
+                    self.rejected(gh)
+            gh = FakeGitHub()
+            gh.jobs = [job for job in gh.jobs if job["name"] != name]
+            self.rejected(gh)
+        for field, value in (("expired", True), ("digest", "missing"),
+                             ("created_at", "2026-10-15T09:59:59Z")):
+            gh = FakeGitHub()
+            gh.artifacts[3][field] = value
+            self.rejected(gh)
+
+    def test_previous_attempt_artifacts_do_not_shadow_current_candidates(self):
+        gh, directory, _ = self.case()
+        for artifact in list(gh.artifacts):
+            previous = deepcopy(artifact)
+            previous.update(id=previous["id"] + 10000,
+                            name=previous["name"].removesuffix(str(ATTEMPT)) + str(ATTEMPT - 1))
+            gh.artifacts.append(previous)
+        releases = release.canonical([dict(package_name="mailctl", version=VERSION, tag="v" + VERSION)])
+        release.prepare_ci(gh, COMMIT, RUN_ID, releases, directory)
+        plan = json.loads((directory / "plan.json").read_bytes())
+        self.assertEqual({entry["id"] for entry in plan["artifacts"].values()}, set(ARTIFACT_IDS))
+
+    def test_parallel_receipts_cannot_relabel_a_different_build_or_attempt(self):
+        for field, value in (("run_id", RUN_ID + 1), ("run_attempt", ATTEMPT - 1),
+                             ("commit", "b" * 40)):
+            candidate = Candidate()
+            proof = json.loads(candidate.files["parallel-acceptance.json"])
+            proof["build"]["context"][field] = value
+            candidate.files["parallel-acceptance.json"] = release.canonical(proof)
+            candidate.sums()
+            self.rejected(FakeGitHub(candidate))
+
+    def test_collector_cannot_replace_the_authenticated_prepared_manifest(self):
+        candidate = Candidate()
+        original = json.loads(candidate.files["parallel-acceptance.json"])["artifact"]
+        replacement = candidate.binaries["mailctl"] + b"replacement bytes"
+        candidate.binaries["mailctl"] = replacement
+        candidate.files[release.binary_name("mailctl", VERSION, candidate.target)] = replacement
+        manifest_name = "manifest-" + candidate.target + ".txt"
+        manifest = release.fields(candidate.files[manifest_name])
+        manifest.update(cli_sha256=release.sha(replacement), cli_size=str(len(replacement)))
+        candidate.files[manifest_name] = evidence(manifest)
+        candidate.archive()
+        proof = json.loads(parallel_proof(candidate.target, candidate.files))
+        proof["artifact"] = original
+        for shard in proof["shards"]:
+            shard["artifact"] = original
+        candidate.files["parallel-acceptance.json"] = release.canonical(proof)
+        candidate.sums()
+        self.rejected(FakeGitHub(candidate), "authenticated prepared artifact")
+
     def test_artifact_identity_digest_retention_and_attempt_window(self):
         changes = (("id", ARTIFACT_ID + 1), ("name", "other-candidate"), ("expired", True),
                    ("digest", "sha256:" + "0" * 64), ("digest", "missing"),
@@ -1012,7 +1144,8 @@ class ReleaseTests(unittest.TestCase):
             self.assertEqual(gh.mutations, [])
 
     def test_verify_rejects_local_tampering_and_remote_changes(self):
-        for relative in ("candidates/" + release.MAC + "/artifact.zip", "qualification-notes.json", "release-notes.md", "metadata.json",
+        for relative in ("candidates/" + release.MAC + "/artifact.zip", "candidates/" + release.MAC + "/prepared.zip",
+                         "qualification-notes.json", "release-notes.md", "metadata.json",
                          "source/install.sh", "candidates/" + release.MAC + "/files/installed-state-acceptance.log", "plan.json", "PLAN_SHA256"):
             with self.subTest(relative=relative):
                 gh, directory, _ = self.prepare()

@@ -50,6 +50,9 @@ if ($Phase -eq 'prepare') {
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     [IO.File]::AppendAllText($env:GITHUB_ENV,
         "MAILCTL_CANDIDATE_DIR=$candidate`nMAILCTL_PACKAGED_BIN_DIR=$installed`n", $utf8)
+    if ($env:MAILCTL_HARNESS_DIR) {
+        [IO.File]::AppendAllText($env:GITHUB_ENV, "MAILCTL_HARNESS_DIR=$env:MAILCTL_HARNESS_DIR`n", $utf8)
+    }
     exit
 }
 
@@ -156,6 +159,9 @@ $evidence = @(
     'isolation=not-qualified',
     'publication=not-performed'
 ) + [IO.File]::ReadAllLines($sourceEvidence)
+if (Test-Path -LiteralPath (Join-Path $candidate 'parallel-acceptance.json')) {
+    $evidence += @('host_context=collector', 'command_context=collector', 'execution_evidence=parallel-acceptance.json')
+}
 foreach ($hostName in 'powershell.exe', 'pwsh') {
     $label = if ($hostName -eq 'pwsh') { 'pwsh' } else { 'powershell' }
     $command = @($hostName) + @(Get-InstallerArguments -HostName $hostName)
