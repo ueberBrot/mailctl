@@ -22,7 +22,7 @@ fn cli_executable_exposes_ordinary_commands_without_an_embedded_mcp_server() {
     assert!(version.stderr.is_empty());
     assert_eq!(
         String::from_utf8(version.stdout).unwrap(),
-        "mailctl 0.1.0\n"
+        format!("mailctl {}\n", env!("CARGO_PKG_VERSION"))
     );
 }
 
