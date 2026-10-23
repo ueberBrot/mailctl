@@ -3,7 +3,7 @@ members = [".", "tests/greenmail-support", "tests"]
 resolver = "3"
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.98.1"
 license = "ISC"
@@ -83,7 +83,7 @@ jsonschema = { version = "=0.58.6", default-features = false }
 rcgen = { version = "=0.14.10", default-features = false, features = ["ring", "pem"] }
 rmcp = { version = "=3.5.1", default-features = false, features = ["client", "transport-child-process"] }
 cargo_metadata = "0.23.1"
-greenmail-support = { version = "0.1.1", path = "tests/greenmail-support" }
+greenmail-support = { version = "0.1.2", path = "tests/greenmail-support" }
 serde_json = "1.0.151"
 toml = "1.1.8"
 
