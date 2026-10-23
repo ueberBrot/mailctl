@@ -64,6 +64,7 @@ pub(super) struct Session {
     limits: Limits,
     next_tag: u64,
     uid_validity: Option<u32>,
+    fuzzy_search: bool,
 }
 pub(super) struct Connection<'a> {
     session: Session,
@@ -192,6 +193,7 @@ impl<'a> Connection<'a> {
             limits,
             next_tag: 0,
             uid_validity: None,
+            fuzzy_search: false,
         }
         .resume(metrics))
     }
@@ -425,7 +427,11 @@ impl<'a> Connection<'a> {
         let Some(Response::Capabilities(values)) = rows.into_iter().next() else {
             return Err(Error::Protocol);
         };
+        self.session.fuzzy_search = super::has_capability(&values, "SEARCH=FUZZY");
         Ok(values)
+    }
+    pub(super) fn supports_fuzzy_search(&self) -> bool {
+        self.session.fuzzy_search
     }
     pub(super) async fn login(&mut self, user: &str, password: &str) -> Result<(), Error> {
         let password = Zeroizing::new(quote(password)?);

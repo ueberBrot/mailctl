@@ -225,6 +225,12 @@ mailctl message search --mailbox '<mailbox reference>' \
   --criteria '[{"field":"subject","value":"invoice"}]' --limit 10 --json
 ```
 
+Add `--fuzzy` to request approximate subject/text matching when the IMAP server
+supports `SEARCH=FUZZY`. Other servers use regular matching automatically.
+`result.fuzzy_applied` reports whether fuzzy matching was used. MCP callers use
+`"fuzzy": true` on `email_search_messages`. Matching is server-defined; results
+remain in descending UID order. Keep the same fuzzy option when continuing pages.
+
 Copy a message's `reference` from the search result and read its text:
 
 ```sh

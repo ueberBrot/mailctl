@@ -90,7 +90,7 @@ fn definitions(operations: &[String]) -> Vec<Tool> {
         tool::<SearchMessagesInput, MessageSearch>(
             operations,
             "email_search_messages",
-            "Search one approved mailbox with AND predicates and bounded descending-UID pages.",
+            "Search one approved mailbox with AND predicates and bounded descending-UID pages. Optional fuzzy subject/text matching falls back to regular matching when unsupported; fuzzy_applied reports its use.",
         ),
         tool::<GetMessageInput, MessageBody>(
             operations,

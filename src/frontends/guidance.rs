@@ -189,10 +189,20 @@ Date predicates use `received_after`, `received_before`, `sent_after`, or
 `flagged`, `recent`, or `seen`. Omit `criteria`, or pass `[]`, to search without
 predicates. Use `mailctl schema search_messages` for the exact contract.
 
+Set `fuzzy: true` (CLI `--fuzzy`) to request the server's approximate matching
+for `subject` and `text` predicates. It is used only when the authenticated server
+advertises `SEARCH=FUZZY`; otherwise the same criteria use regular matching.
+`result.fuzzy_applied` reports whether fuzzy matching was used. Sender, recipient,
+date, flag, and UID constraints keep their regular matching. Fuzzy matching is
+server-defined and can vary between requests; results still use descending UID
+order. Omitting `fuzzy` keeps regular matching.
+
 Search returns message metadata in descending UID order. Copy a message's
 `result.messages[].reference` for a body read. When `result.complete` is false,
-repeat the same mailbox and criteria with `cursor: result.next_cursor` (CLI
-`--cursor`). A page may contain no matches and still have more work to scan;
+repeat the same mailbox, criteria, and `fuzzy` option with
+`cursor: result.next_cursor` (CLI `--cursor`). If server capability changes would
+switch between fuzzy and regular matching, continuation returns `stale_cursor`;
+restart the search. A page may contain no matches and still have more work to scan;
 completion depends on `complete`, not the number of messages. To find every
 match, continue until `complete` is true. For a bounded selection, stop when the
 requested number of matches is collected and describe its scope accurately.

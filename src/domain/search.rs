@@ -11,14 +11,17 @@ pub struct SearchMessagesInput {
     #[serde(deserialize_with = "super::reference")]
     #[schemars(length(min = 1, max = 8192), extend("x-maxUtf8Bytes" = 8192))]
     pub mailbox: String,
-    /// AND predicates; an empty array selects all messages. Text values match case-insensitive substrings.
+    /// AND predicates; an empty array selects all messages. Text values normally match case-insensitive substrings.
     #[serde(default)]
     pub criteria: SearchCriteria,
+    /// Request server-defined fuzzy subject/text matching when supported; otherwise use regular matching.
+    #[serde(default)]
+    pub fuzzy: bool,
     /// Page size within capabilities.limits.search_page; omission uses that ceiling.
     #[serde(default, deserialize_with = "super::page_limit::<_, 200>")]
     #[schemars(range(min = 1, max = 200))]
     pub limit: Option<usize>,
-    /// Continue with next_cursor, the same mailbox reference, and the original criteria.
+    /// Continue with next_cursor, the same mailbox reference, original criteria, and fuzzy option.
     #[serde(
         default,
         deserialize_with = "super::bounded_optional_string::<_, 8192>"
@@ -333,6 +336,8 @@ pub struct MessageSearch {
     pub generation: u64,
     pub mailbox_reference: String,
     pub criteria: SearchCriteria,
+    /// Whether this page used server-defined fuzzy subject/text matching.
+    pub fuzzy_applied: bool,
     pub messages: Vec<MessageEnvelope>,
     pub complete: bool,
     pub next_cursor: Option<String>,

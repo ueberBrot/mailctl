@@ -444,6 +444,172 @@ async fn fetched(wire: &mut imap_support::Wire, uid: u32) {
     imap_support::write(wire, &format!("* {uid} FETCH (UID {uid} ENVELOPE (NIL \"message {uid}\" NIL NIL NIL NIL NIL NIL NIL NIL) FLAGS () INTERNALDATE \"01-Sep-2026 12:00:00 +0000\" RFC822.SIZE 100)\r\n")).await;
 }
 
+async fn authenticate_with_fuzzy(wire: &mut imap_support::Wire, before: bool, after: bool) {
+    use imap_support::*;
+    capability(
+        wire,
+        if before {
+            "IMAP4rev1 SEARCH=FUZZY"
+        } else {
+            "IMAP4rev1"
+        },
+    )
+    .await;
+    let tag = expect(wire, "LOGIN \"fixture\" \"disposable-password\"").await;
+    write(wire, &format!("{tag} OK authenticated\r\n")).await;
+    capability(
+        wire,
+        if after {
+            "IMAP4rev1 search=fuzzy"
+        } else {
+            "IMAP4rev1 UIDPLUS"
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn fuzzy_search_uses_post_login_capabilities_and_preserves_hard_filters() {
+    use imap_support::*;
+    for (before, after, requested, include_text, applied) in [
+        (false, true, true, true, true),
+        (true, false, true, true, false),
+        (true, true, false, true, false),
+        (false, true, true, false, false),
+    ] {
+        let fixture = fixture(
+            mailctl::imap::TlsMode::Implicit,
+            mailctl::imap::Limits::default(),
+            move |mut wire| {
+                Box::pin(async move {
+                    authenticate_with_fuzzy(&mut wire, before, after).await;
+                    examine(&mut wire).await;
+                    let tag = expect(&mut wire, "UID SEARCH UID *").await;
+                    write(&mut wire, &format!("* SEARCH 2\r\n{tag} OK boundary\r\n")).await;
+                    let mut command = "UID SEARCH".to_owned();
+                    if include_text {
+                        command.push_str(" CHARSET UTF-8");
+                    }
+                    command.push_str(" UID 1:2 SINCE 01-Oct-2026 FROM sender");
+                    if include_text {
+                        let prefix = if applied { "FUZZY " } else { "" };
+                        command.push_str(&format!(
+                            " {prefix}SUBJECT inovice {prefix}TEXT {{14}}\r\ncafé\r\nreceipt"
+                        ));
+                    }
+                    command.push_str(" FLAGGED");
+                    let tag = expect(&mut wire, &command).await;
+                    write(&mut wire, &format!("* SEARCH 2\r\n{tag} OK searched\r\n")).await;
+                    let tag = expect(
+                        &mut wire,
+                        "UID FETCH 2 (UID ENVELOPE FLAGS INTERNALDATE RFC822.SIZE)",
+                    )
+                    .await;
+                    fetched(&mut wire, 2).await;
+                    write(&mut wire, &format!("{tag} OK fetched\r\n")).await;
+                    logout(&mut wire).await;
+                })
+            },
+        )
+        .await;
+        let (service, reference) = imap_service(&fixture).await;
+        let mut criteria = vec![
+            json!({"field":"received_after","date":"2026-10-01"}),
+            json!({"field":"from","value":"sender"}),
+            json!({"field":"required_flag","flag":"flagged"}),
+        ];
+        if include_text {
+            criteria.extend([
+                json!({"field":"subject","value":"inovice"}),
+                json!({"field":"text","value":"café\r\nreceipt"}),
+            ]);
+        }
+        let result = search(
+            &service,
+            json!({
+                "mailbox":reference,"criteria":criteria,"fuzzy":requested
+            }),
+        )
+        .await;
+        assert_eq!(result["fuzzy_applied"], applied);
+        assert_eq!(result["messages"][0]["subject"]["value"], "message 2");
+        assert_eq!(result["complete"], true);
+        fixture.task.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn fuzzy_continuation_preserves_effective_matching_or_rejects_capability_changes() {
+    use imap_support::*;
+    for (initial, subsequent) in [(true, true), (true, false), (false, true), (false, false)] {
+        let mut page = 0;
+        let fixture = repeating_fixture(mailctl::imap::Limits::default(), 2, move |mut wire| {
+            page += 1;
+            let first = page == 1;
+            let supported = if first { initial } else { subsequent };
+            Box::pin(async move {
+                authenticate_with_fuzzy(&mut wire, false, supported).await;
+                examine(&mut wire).await;
+                if !first && initial != subsequent {
+                    dropped(&mut wire).await;
+                    return;
+                }
+                if first {
+                    let tag = expect(&mut wire, "UID SEARCH UID *").await;
+                    write(&mut wire, &format!("* SEARCH 2\r\n{tag} OK boundary\r\n")).await;
+                }
+                let upper = if first { 2 } else { 1 };
+                let prefix = if supported { "FUZZY " } else { "" };
+                let tag = expect(
+                    &mut wire,
+                    &format!("UID SEARCH UID 1:{upper} {prefix}SUBJECT inovice"),
+                )
+                .await;
+                let matches = if first { "1 2" } else { "1" };
+                write(
+                    &mut wire,
+                    &format!("* SEARCH {matches}\r\n{tag} OK searched\r\n"),
+                )
+                .await;
+                let tag = expect(
+                    &mut wire,
+                    &format!("UID FETCH {upper} (UID ENVELOPE FLAGS INTERNALDATE RFC822.SIZE)"),
+                )
+                .await;
+                fetched(&mut wire, upper).await;
+                write(&mut wire, &format!("{tag} OK fetched\r\n")).await;
+                logout(&mut wire).await;
+            })
+        })
+        .await;
+        let (service, reference) = imap_service(&fixture).await;
+        let mut input = json!({
+            "mailbox":reference,"criteria":[{"field":"subject","value":"inovice"}],
+            "fuzzy":true,"limit":1
+        });
+        let first = search(&service, input.clone()).await;
+        assert_eq!(first["fuzzy_applied"], initial);
+        assert_eq!(first["complete"], false);
+        input["cursor"] = first["next_cursor"].clone();
+        let context = service.context("reader", &Default::default()).unwrap();
+        let operation =
+            serde_json::from_value(json!({"operation":"search_messages","input":input})).unwrap();
+        let result = service.execute(&context, operation).await;
+        if initial == subsequent {
+            let result = serde_json::to_value(result.unwrap()).unwrap();
+            assert_eq!(result["fuzzy_applied"], subsequent);
+            assert_eq!(result["complete"], true);
+            assert_eq!(result["messages"][0]["subject"]["value"], "message 1");
+        } else {
+            assert_eq!(
+                result.unwrap_err().code,
+                mailctl::domain::ErrorCode::StaleCursor
+            );
+        }
+        fixture.task.await.unwrap();
+    }
+}
+
 #[tokio::test]
 async fn imap_pages_use_one_read_only_selection_and_fetch_only_the_requested_page() {
     use imap_support::*;
@@ -661,6 +827,7 @@ async fn cursors_bind_query_grant_selection_and_authenticate_token_kinds() {
     let context = service.context("reader", &Default::default()).unwrap();
     for input in [
         json!({"mailbox":reference,"cursor":first["next_cursor"],"criteria":[{"field":"subject","value":"changed"}]}),
+        json!({"mailbox":reference,"cursor":first["next_cursor"],"fuzzy":true}),
         json!({"mailbox":reference,"cursor":reference}),
         json!({"mailbox":reference,"cursor":format!("{}x",first["next_cursor"].as_str().unwrap())}),
     ] {
@@ -712,6 +879,7 @@ async fn cursors_bind_query_grant_selection_and_authenticate_token_kinds() {
                 .execute(
                     &context,
                     Operation::SearchMessages(mailctl::domain::SearchMessagesInput {
+                        fuzzy: false,
                         mailbox: reference.clone(),
                         criteria: Default::default(),
                         limit: Some(limit),

@@ -21,6 +21,15 @@ impl AuthenticatedConnection {
         super::mailbox(request.mailbox)?;
         limits.validate()?;
         connection.limit_search(limits);
+        let fuzzy = request.fuzzy
+            && connection.supports_fuzzy_search()
+            && request.criteria.predicates().iter().any(|predicate| {
+                matches!(
+                    predicate,
+                    crate::domain::SearchPredicate::Subject { .. }
+                        | crate::domain::SearchPredicate::Text { .. }
+                )
+            });
         let (validity, uid_next) = connection.examine_selection(request.mailbox).await?;
         let result = page(
             &mut Selection {
@@ -28,6 +37,7 @@ impl AuthenticatedConnection {
                 validity,
                 uid_next,
                 header_bytes: limits.header_bytes,
+                fuzzy,
             },
             &request,
             limits,
@@ -43,10 +53,14 @@ struct Selection<'a, 'b> {
     validity: u32,
     uid_next: Option<u32>,
     header_bytes: usize,
+    fuzzy: bool,
 }
 impl SelectedMailbox for Selection<'_, '_> {
     fn uid_validity(&self) -> u32 {
         self.validity
+    }
+    fn fuzzy(&self) -> bool {
+        self.fuzzy
     }
     async fn upper_uid(&mut self) -> Result<u32, Error> {
         self.connection
@@ -63,7 +77,7 @@ impl SelectedMailbox for Selection<'_, '_> {
         let mut keys = vec![SearchTerm::Atom(format!("UID {first}:{last}").into())];
         let mut utf8 = false;
         for predicate in criteria.predicates() {
-            keys.push(search_key(predicate, &mut utf8));
+            keys.push(search_key(predicate, &mut utf8, self.fuzzy));
         }
         Ok(self.connection.search(keys, utf8).await?)
     }
@@ -102,6 +116,7 @@ impl SelectedMailbox for Selection<'_, '_> {
 fn search_key<'a>(
     predicate: &'a crate::domain::SearchPredicate,
     utf8: &mut bool,
+    fuzzy: bool,
 ) -> SearchTerm<'a> {
     use crate::domain::{SearchPredicate::*, StandardFlag};
     let date = |keyword: &str, value: &crate::domain::SearchDate| {
@@ -120,8 +135,8 @@ fn search_key<'a>(
         To { value } => text("TO", value),
         Cc { value } => text("CC", value),
         Bcc { value } => text("BCC", value),
-        Subject { value } => text("SUBJECT", value),
-        Text { value } => text("TEXT", value),
+        Subject { value } => text(if fuzzy { "FUZZY SUBJECT" } else { "SUBJECT" }, value),
+        Text { value } => text(if fuzzy { "FUZZY TEXT" } else { "TEXT" }, value),
         RequiredFlag { flag } | ForbiddenFlag { flag } => {
             let flag = match (matches!(predicate, ForbiddenFlag { .. }), flag) {
                 (false, StandardFlag::Answered) => "ANSWERED",

@@ -115,6 +115,7 @@ fn maximum_fragmented_search_and_page_have_bounded_client_resources() {
                     "fixture",
                     "disposable-password",
                     SearchRequest {
+                        fuzzy: false,
                         mailbox: "INBOX",
                         criteria: &criteria,
                         position: None,
@@ -200,6 +201,7 @@ fn source_header_limits_precede_normalization_and_remain_separate_from_json() {
             "fixture",
             "disposable-password",
             SearchRequest {
+                fuzzy: false,
                 mailbox: "INBOX",
                 criteria: &criteria,
                 position: None,
@@ -274,6 +276,7 @@ fn narrow_wire_budget_and_oversized_literals_stop_reading_before_payload_allocat
                         "fixture",
                         "disposable-password",
                         SearchRequest {
+                            fuzzy: false,
                             mailbox: "INBOX",
                             criteria: &criteria,
                             position: None,
@@ -325,6 +328,7 @@ fn maximum_window_budget_retains_continuation_after_empty_live_queries() {
             "fixture",
             "disposable-password",
             SearchRequest {
+                fuzzy: false,
                 mailbox: "INBOX",
                 criteria: &criteria,
                 position: None,
@@ -372,6 +376,7 @@ fn valid_subject_text_can_contain_an_encoded_word_marker() {
             "fixture",
             "disposable-password",
             SearchRequest {
+                fuzzy: false,
                 mailbox: "INBOX",
                 criteria: &criteria,
                 position: None,
@@ -420,6 +425,7 @@ fn malformed_encoded_word_prefixes_have_linear_normalization_allocation() {
                     "fixture",
                     "disposable-password",
                     SearchRequest {
+                        fuzzy: false,
                         mailbox: "INBOX",
                         criteria: &criteria,
                         position: None,
