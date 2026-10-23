@@ -37,7 +37,7 @@ body = """
 
 {% for commit in visible %}
 {%- if commit.scope -%}
-- {% if commit.id == "0000000" %}<!-- mailctl-synthetic -->{% endif %}*({{commit.scope}})* {% if commit.breaking %}[**breaking**] {% endif %}{{ commit.message }}{%- if commit.links %} ({% for link in commit.links %}[{{link.text}}]({{link.href}}) {% endfor -%}){% endif %}
+- {% if commit.id == "0000000" %}<!-- mailctl-synthetic -->{% endif %}{% if commit.scope != group %}*({{commit.scope}})* {% endif %}{% if commit.breaking %}[**breaking**] {% endif %}{{ commit.message }}{%- if commit.links %} ({% for link in commit.links %}[{{link.text}}]({{link.href}}) {% endfor -%}){% endif %}
 {% else -%}
 - {% if commit.id == "0000000" %}<!-- mailctl-synthetic -->{% endif %}{% if commit.breaking %}[**breaking**] {% endif %}{{ commit.message }}
 {% endif -%}

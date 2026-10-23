@@ -387,6 +387,22 @@ def marker(*shas):
 
 
 class ChangelogSupplementTest(unittest.TestCase):
+    def test_redundant_scopes_are_omitted_but_other_scopes_and_markers_survive(self):
+        for scope, group, title, prefix in (
+                ("security", "security", "Security", ""),
+                ("drafts", "fixed", "Fixed", "*(drafts)* "),
+                ("deps", "dependencies", "Dependencies", "*(deps)* ")):
+            for breaking in (False, True):
+                with self.subTest(scope=scope, breaking=breaking):
+                    rendered = "## [0.1.1] - 2026-10-21\n\n"
+                    text = preparation.supplement(rendered + marker(), context(
+                        note(scope=scope, group=group, breaking=breaking)))
+                    expected = (rendered + "### " + title + "\n\n- " + prefix
+                                + ("[**breaking**] " if breaking else "")
+                                + "update certificate verification "
+                                "([#101](https://github.com/ueberBrot/mailctl/pull/101))\n")
+                    self.assertEqual(text, expected)
+
     def test_native_commit_ids_prevent_duplicate_notes(self):
         rendered = "## [0.1.1] - 2026-10-21\n\n### Security\n\n- Original native note (#101)\n"
         text = preparation.supplement(rendered + marker("a" * 40), context(note()))
@@ -486,6 +502,7 @@ class ReleasePlzIntegrationTest(RepositoryTest):
         self.assertIsNotNone(heading, changelog)
         notes = changelog[heading.start():].split("\n## [" + previous + "]", 1)[0]
         self.assertNotIn("mailctl-release-commits", notes)
+        self.assertNotIn("mailctl-synthetic", notes)
         self.assertNotIn("- update Cargo.lock dependencies", notes)
         return notes
 
@@ -515,6 +532,28 @@ class ReleasePlzIntegrationTest(RepositoryTest):
         self.assertEqual(repository.version(), "0.1.0")
         self.assertEqual(repository.tracked_files(), before)
 
+    def test_native_scopes_omit_section_names_and_preserve_links_and_breaking_markers(self):
+        for kind, scope, section, prefix in (
+                ("fix", "security", "Security", ""),
+                ("fix", "drafts", "Fixed", "*(drafts)* "),
+                ("chore", "deps", "Dependencies", "*(deps)* ")):
+            for breaking in (False, True):
+                with self.subTest(scope=scope, breaking=breaking):
+                    repository = self.repository(cargo=True)
+                    subject = f"{kind}({scope}){'!' if breaking else ''}: improve reading (#107)"
+                    repository.commit(subject, {"src/main.rs": 'fn main() { println!("fixed"); }\n'})
+                    context = self.update(repository)
+                    self.assertTrue(context["eligible"])
+                    self.assertEqual(context["notes"], [])
+                    version = "0.2.0" if breaking else "0.1.1"
+                    self.assertEqual(repository.version(), version)
+                    notes = self.release_notes(repository, version)
+                    expected = "- " + prefix + ("[**breaking**] " if breaking else "") + "improve reading"
+                    self.assert_section_contains(notes, section, expected)
+                    self.assertNotIn("*(security)*", notes)
+                    self.assertIn("[#107](https://github.com/ueberBrot/mailctl/pull/107)", notes)
+                    self.assertEqual(notes.count("#107"), 1)
+
     def test_lock_only_security_fix_keeps_authentic_security_note(self):
         repository = self.repository(cargo=True)
         repository.lock_version("0.1.1")
@@ -522,7 +561,8 @@ class ReleasePlzIntegrationTest(RepositoryTest):
         self.assertTrue(self.update(repository)["eligible"])
         self.assertEqual(repository.version(), "0.1.1")
         notes = self.release_notes(repository, "0.1.1")
-        self.assert_section_contains(notes, "Security", "update certificate verification")
+        self.assert_section_contains(notes, "Security", "- update certificate verification")
+        self.assertNotIn("*(security)*", notes)
         self.assertEqual(notes.count("#101"), 1)
         self.assertIn("https://github.com/ueberBrot/mailctl/pull/101", notes)
 
@@ -567,8 +607,9 @@ class ReleasePlzIntegrationTest(RepositoryTest):
         self.assertEqual(self.update(repository)["minimum_bump"], "minor")
         self.assertEqual(repository.version(), "0.2.0")
         notes = self.release_notes(repository, "0.2.0")
-        self.assert_section_contains(notes, "Security", "require verified certificates")
-        self.assertIn("[**breaking**]", notes)
+        self.assert_section_contains(notes, "Security", "- [**breaking**] require verified certificates")
+        self.assertNotIn("*(security)*", notes)
+        self.assertIn("[#102](https://github.com/ueberBrot/mailctl/pull/102)", notes)
 
     def test_lock_only_feature_bumps_post_one_minor(self):
         repository = self.repository(version="1.0.0", cargo=True)
@@ -576,7 +617,9 @@ class ReleasePlzIntegrationTest(RepositoryTest):
         repository.commit("feat(deps): expose new TLS support (#103)")
         self.assertEqual(self.update(repository)["minimum_bump"], "minor")
         self.assertEqual(repository.version(), "1.1.0")
-        self.assertIn("expose new TLS support", self.release_notes(repository, "1.1.0", "1.0.0"))
+        notes = self.release_notes(repository, "1.1.0", "1.0.0")
+        self.assert_section_contains(notes, "Added", "- *(deps)* expose new TLS support")
+        self.assertIn("[#103](https://github.com/ueberBrot/mailctl/pull/103)", notes)
 
     def test_lock_only_breaking_change_bumps_post_one_major(self):
         repository = self.repository(version="1.0.0", cargo=True)

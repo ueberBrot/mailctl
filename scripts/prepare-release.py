@@ -171,7 +171,7 @@ def prepare(root, output):
 
 def note_line(note):
     summary = re.sub(r"\(#(\d+)\)", r"([#\1](https://github.com/ueberBrot/mailctl/pull/\1))", note["summary"])
-    scope = f'*({note["scope"]})* ' if note.get("scope") else ""
+    scope = f'*({note["scope"]})* ' if note.get("scope") and note["scope"] != note["group"] else ""
     breaking = "[**breaking**] " if note["breaking"] else ""
     return "- " + scope + breaking + summary
 
