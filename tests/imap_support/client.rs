@@ -121,9 +121,11 @@ impl Client {
             username,
             password,
             SearchRequest {
+                fuzzy: false,
                 mailbox,
                 criteria: &domain::SearchCriteria::default(),
                 position: Some(mailctl::service::SearchPosition {
+                    fuzzy: false,
                     uid_validity: validity,
                     upper_uid: *window.end(),
                     next_uid: *window.end(),

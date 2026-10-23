@@ -508,10 +508,13 @@ enum Message {
         /// JSON predicates, combined with AND; use schema search_messages for their format.
         #[arg(long, default_value = "[]", value_parser = search_criteria)]
         criteria: SearchCriteria,
+        /// Use fuzzy subject/text matching when the server supports it; otherwise use regular matching.
+        #[arg(long)]
+        fuzzy: bool,
         /// Requested page size, up to the effective search_page ceiling.
         #[arg(long, value_parser = clap::value_parser!(u16).range(1..=200))]
         limit: Option<u16>,
-        /// next_cursor from the same mailbox, criteria, and access grant.
+        /// next_cursor from the same mailbox, criteria, fuzzy option, and access grant.
         #[arg(long)]
         cursor: Option<String>,
     },
@@ -685,11 +688,13 @@ impl Invocation {
                     Email::Message(Message::Search {
                         mailbox,
                         criteria,
+                        fuzzy,
                         limit,
                         cursor,
                     }) => Action::Email(Operation::SearchMessages(SearchMessagesInput {
                         mailbox,
                         criteria,
+                        fuzzy,
                         limit: limit.map(usize::from),
                         cursor,
                     })),

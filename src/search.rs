@@ -13,11 +13,14 @@ pub struct SearchPosition {
     pub uid_validity: u32,
     pub upper_uid: u32,
     pub next_uid: u32,
+    #[serde(default)]
+    pub fuzzy: bool,
 }
 
 pub struct SearchRequest<'a> {
     pub mailbox: &'a str,
     pub criteria: &'a SearchCriteria,
+    pub fuzzy: bool,
     pub position: Option<SearchPosition>,
     pub limit: usize,
     pub response_bytes: usize,
@@ -36,6 +39,9 @@ pub struct SearchBatch {
 
 pub(crate) trait SelectedMailbox {
     fn uid_validity(&self) -> u32;
+    fn fuzzy(&self) -> bool {
+        false
+    }
     fn upper_uid(&mut self) -> impl Future<Output = Result<u32, Error>> + Send;
     fn matches(
         &mut self,
@@ -65,7 +71,9 @@ pub(crate) async fn page(
         return Err(Error::new(ErrorCode::ProviderUnavailable));
     }
     let mut position = match request.position {
-        Some(position) if position.uid_validity != validity => {
+        Some(position)
+            if position.uid_validity != validity || position.fuzzy != selected.fuzzy() =>
+        {
             return Err(Error::new(ErrorCode::StaleCursor));
         }
         Some(position) => position,
@@ -75,6 +83,7 @@ pub(crate) async fn page(
                 uid_validity: validity,
                 upper_uid,
                 next_uid: upper_uid,
+                fuzzy: selected.fuzzy(),
             }
         }
     };

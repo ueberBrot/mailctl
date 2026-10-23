@@ -55,6 +55,9 @@ pub(super) fn human(result: &OperationResult) -> Result<String, serde_json::Erro
         }
         OperationResult::Messages(page) => {
             let _ = writeln!(output, "{} messages", page.messages.len());
+            if page.fuzzy_applied {
+                output.push_str("Server fuzzy matching applied to subject/text terms.\n");
+            }
             for message in &page.messages {
                 let subject = match &message.metadata.subject {
                     crate::domain::Metadata::Present(value) if value.is_empty() => {

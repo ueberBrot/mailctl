@@ -22,7 +22,14 @@ fn cli_search_rejects_invalid_criteria_and_stale_references_without_credentials(
     let installation = Installation::two_accounts();
     setup(&installation);
     let mut command = installation.cli();
-    command.args(["--json", "message", "search", "--mailbox", "invalid"]);
+    command.args([
+        "--json",
+        "message",
+        "search",
+        "--mailbox",
+        "invalid",
+        "--fuzzy",
+    ]);
     let output = run_bounded(command);
     assert_eq!(output.status.code(), Some(6));
     assert_eq!(envelope(&output)["error"]["code"], "stale_reference");
@@ -55,11 +62,19 @@ async fn mcp_search_publishes_schemas_and_matches_cli_errors_under_the_effective
         .find(|tool| tool.name == "email_search_messages")
         .expect("search tool");
     assert!(search.input_schema["properties"].get("criteria").is_some());
+    assert_eq!(
+        search.input_schema["properties"]["fuzzy"]["type"],
+        "boolean"
+    );
     assert!(search.output_schema.is_some());
     let response = client
         .call_tool(
-            CallToolRequestParams::new("email_search_messages")
-                .with_arguments(json!({"mailbox":"invalid"}).as_object().unwrap().clone()),
+            CallToolRequestParams::new("email_search_messages").with_arguments(
+                json!({"mailbox":"invalid","fuzzy":true})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
         )
         .await
         .unwrap();

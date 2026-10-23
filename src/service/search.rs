@@ -35,6 +35,8 @@ struct Cursor<S = String> {
     mailbox: S,
     scope: S,
     query: S,
+    #[serde(default)]
+    fuzzy: bool,
     position: SearchPosition,
 }
 
@@ -88,6 +90,7 @@ impl Service {
                 || cursor.mailbox != name
                 || cursor.scope != scope
                 || cursor.query != query
+                || cursor.fuzzy != input.fuzzy
                 || cursor.position.next_uid == 0
                 || cursor.position.next_uid > cursor.position.upper_uid
         }) {
@@ -110,6 +113,7 @@ impl Service {
                     SearchRequest {
                         mailbox: name,
                         criteria: &input.criteria,
+                        fuzzy: input.fuzzy,
                         position: cursor.map(|cursor| cursor.position),
                         limit,
                         response_bytes: context.response_limit().saturating_sub(2048),
@@ -130,6 +134,7 @@ impl Service {
                     mailbox: name,
                     scope: scope.as_str(),
                     query: query.as_str(),
+                    fuzzy: input.fuzzy,
                     position: batch.position,
                 },
                 limits.token_bytes,
@@ -164,6 +169,7 @@ impl Service {
             generation,
             mailbox_reference: input.mailbox,
             criteria: input.criteria,
+            fuzzy_applied: batch.position.fuzzy,
             messages,
             complete,
             next_cursor,

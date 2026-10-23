@@ -37,7 +37,8 @@ Before consuming a result, require `ok: true`. Read `error` when `ok` is false.
 Before claiming completeness, inspect the fields for the relevant operation:
 
 - For mailbox discovery and search, follow `result.next_cursor` until `result.complete` is true when all results are required.
-  Keep the account unchanged for mailbox continuation. Keep the mailbox reference and criteria unchanged for search continuation.
+  Keep the account unchanged for mailbox continuation. Keep the mailbox reference, criteria, and matching options unchanged for search continuation.
+  For fuzzy searches, use `result.fuzzy_applied` to distinguish fuzzy matching from regular matching.
   An empty search page can still be incomplete.
 - For body text, follow `body.next_cursor` while `body.continuation_available` is true.
   Keep the same message reference and `max_bytes` value or omission.

@@ -163,6 +163,7 @@ mailboxes = ["INBOX"]
                 .execute(
                     &context,
                     Operation::SearchMessages(SearchMessagesInput {
+                        fuzzy: false,
                         mailbox: mailbox.clone(),
                         criteria: Default::default(),
                         limit: Some(1),
@@ -297,6 +298,7 @@ mailboxes = ["INBOX"]
                 .execute(
                     &context,
                     Operation::SearchMessages(SearchMessagesInput {
+                        fuzzy: false,
                         mailbox: mailbox.clone(),
                         criteria,
                         limit: None,
@@ -747,6 +749,7 @@ accounts = ["fixture"]
                 .execute(
                     &context,
                     Operation::SearchMessages(SearchMessagesInput {
+                        fuzzy: false,
                         mailbox: reference.clone(),
                         criteria: Default::default(),
                         limit: None,
