@@ -22,11 +22,17 @@ esac
 for tool in dbus-daemon dbus-monitor gdbus gnome-keyring-daemon python3; do
 	test -x "/usr/bin/$tool"
 done
-compile=(cargo test --locked --workspace --no-default-features --features 'cli,mcp'
-	--test "$target" --no-run --message-format=json)
-binary=$("${compile[@]}" | jq -ser --arg target "$target" \
-	'map(select(.reason == "compiler-artifact" and .target.name == $target and .executable != null)) |
-  if length == 1 then .[0].executable else error("Missing or ambiguous native acceptance harness") end')
+if [[ -n ${MAILCTL_HARNESS_DIR:-} ]]; then
+	compile=(python3 scripts/ci/candidate-harness.py artifacts --test "$target")
+	binary=$("${compile[@]}" | jq -er --arg target "$target" '.[$target]')
+else
+	compile=(cargo test --locked --workspace --no-default-features --features 'cli,mcp'
+		--test "$target" --no-run --message-format=json)
+	binary=$("${compile[@]}" | jq -ser --arg target "$target" --arg source "$PWD/tests/$target.rs" \
+		'map(select(.reason == "compiler-artifact" and .target.name == $target and
+      .target.src_path == $source and .executable != null)) |
+      if length == 1 then .[0].executable else error("Missing or ambiguous native acceptance harness") end')
+fi
 
 workspace=$(mktemp -d /tmp/mailctl-desktop.XXXXXXXX)
 cleanup() { sudo rm -rf -- "$workspace"; }

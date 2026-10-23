@@ -21,6 +21,7 @@ import tarfile
 import tempfile
 import zipfile
 
+import candidate_evidence
 try:
     import tomllib
 except ModuleNotFoundError:
@@ -56,6 +57,10 @@ def binary_name(binary, version, target):
 
 def artifact_name(target):
     return "mailctl-candidate-" + target
+
+
+def ci_artifact_name(target, attempt):
+    return artifact_name(target) + "-attempt-" + str(attempt)
 
 
 def test_logs(target):
@@ -223,7 +228,7 @@ def metadata(gh, commit, run_id, artifact_ids):
     selected = {}
     for artifact_id in artifact_ids:
         artifact = gh.get(f"actions/artifacts/{artifact_id}")
-        targets = [target for target in TARGETS if artifact["name"] == artifact_name(target)]
+        targets = [target for target in TARGETS if artifact["name"] == ci_artifact_name(target, attempt_number)]
         require(len(targets) == 1 and targets[0] not in selected, "Missing, duplicate, or unsupported target artifact")
         target = targets[0]
         job_name, record_name, upload_name = TARGETS[target]
@@ -240,7 +245,7 @@ def metadata(gh, commit, run_id, artifact_ids):
             require(len(found) == 1, "Missing candidate step: " + name)
             matches(found[0], {"status": "completed", "conclusion": "success"}, name)
             steps[name] = found[0]
-        matches(artifact, {"id": artifact_id, "name": artifact_name(target), "expired": False}, "artifact")
+        matches(artifact, {"id": artifact_id, "name": ci_artifact_name(target, attempt_number), "expired": False}, "artifact")
         matches(artifact["workflow_run"], {"id": run_id, "head_sha": commit, "head_branch": "main",
                                           "repository_id": run["repository"]["id"],
                                           "head_repository_id": run["repository"]["id"]}, "artifact run")
@@ -255,9 +260,39 @@ def metadata(gh, commit, run_id, artifact_ids):
         require(timestamp(upload["started_at"]) <= timestamp(artifact["created_at"]),
                 "Artifact predates this attempt's upload step")
         upload_receipt(gh, job, upload, artifact)
-        named = [entry for entry in artifacts if entry["name"] == artifact_name(target)]
+        named = [entry for entry in artifacts if entry["name"] == ci_artifact_name(target, attempt_number)]
         require(len(named) == 1 and named[0] == artifact, "Ambiguous or mismatched run artifact")
-        selected[target] = dict(job=job, artifact=artifact)
+        build_name = f"mailctl-build-{target}-attempt-{attempt_number}"
+        builds = [entry for entry in artifacts if entry["name"] == build_name]
+        require(len(builds) == 1, "Missing or duplicate prepared build artifact")
+        build_artifact = builds[0]
+        matches(build_artifact, {"expired": False}, "prepared build artifact")
+        matches(build_artifact["workflow_run"], artifact["workflow_run"], "prepared build run")
+        require(re.fullmatch(r"sha256:[0-9a-f]{64}", build_artifact.get("digest", "")) and
+                timestamp(build_artifact["expires_at"]) > datetime.now(timezone.utc), "Prepared build digest or retention missing")
+        require(type(build_artifact.get("size_in_bytes")) is int and 0 < build_artifact["size_in_bytes"] <= MAX_FILE,
+                "Prepared artifact exceeds size limit")
+        required = {"build-" + target: ("Seal candidate build", "Keep candidate build")}
+        required.update({f"acceptance-{target}-{group}": ("Qualify installed candidate and record evidence",
+                                                       "Keep acceptance evidence")
+                         for group in candidate_evidence.acceptance_groups(target)})
+        for name, required_steps in required.items():
+            found = [value for value in jobs if value["name"] == name]
+            require(len(found) == 1, "Missing or duplicate parallel candidate job: " + name)
+            worker = found[0]
+            matches(worker, dict(run_id=run_id, head_sha=commit, status="completed", conclusion="success"), name)
+            if "run_attempt" in worker:
+                matches(worker, dict(run_attempt=attempt_number), name + " attempt")
+            for step_name in required_steps:
+                passing = [step for step in worker["steps"] if step["name"] == step_name]
+                require(len(passing) == 1, "Missing parallel candidate step: " + step_name)
+                matches(passing[0], dict(status="completed", conclusion="success"), step_name)
+            if name == "build-" + target:
+                upload = next(step for step in worker["steps"] if step["name"] == "Keep candidate build")
+                require(timestamp(worker["started_at"]) <= timestamp(build_artifact["created_at"])
+                        <= timestamp(worker["completed_at"]), "Prepared build belongs to another attempt")
+                upload_receipt(gh, worker, upload, build_artifact)
+        selected[target] = dict(job=job, artifact=artifact, build_artifact=build_artifact)
     require(set(selected) == set(TARGETS), "All three qualified targets are required")
     return dict(workflow=workflow, run=run, attempt=attempt, platforms=selected)
 
@@ -283,7 +318,7 @@ def zip_files(path):
 def candidate_files(version, target):
     archive = archive_name(target)
     files = test_logs(target) | {
-        "SHA256SUMS", "acceptance-evidence.txt", "build-evidence.txt", "dist-manifest.json",
+        "SHA256SUMS", "acceptance-evidence.txt", "build-evidence.txt", "dist-manifest.json", "parallel-acceptance.json",
         "install.ps1" if target == WINDOWS else "install.sh", archive, archive + ".sha256",
         f"manifest-{target}.txt"} | {
             binary_name(binary, version, target) for binary in COMPONENTS.values()}
@@ -621,6 +656,11 @@ def release_assets(bundles, zips, version):
 def plan_for(directory, meta, source, bundles, zips):
     commit = meta["run"]["head_sha"]
     versions = {validate_candidate(files, source, commit, target) for target, files in bundles.items()}
+    context = dict(repository=REPO, commit=commit, run_id=meta["run"]["id"], run_attempt=meta["run"]["run_attempt"])
+    for target, files in bundles.items():
+        build = meta["platforms"][target]["build_artifact"]
+        candidate_evidence.validate(parse_json(files["parallel-acceptance.json"]), files, target, commit, context,
+                                    dict(id=build["id"], digest=build["digest"].removeprefix("sha256:")))
     require(len(versions) == 1, "Candidate release versions differ")
     version, changelog = versions.pop()
     note_bytes = read(directory / "qualification-notes.json")
@@ -653,8 +693,30 @@ def load_bundles(directory, meta):
         require("sha256:" + sha(zipped) == platform["artifact"]["digest"], "ZIP digest mismatch: " + target)
         zips[target] = zipped
         bundles[target] = zip_files(folder / "artifact.zip")
+        prepared = read(folder / "prepared.zip")
+        require("sha256:" + sha(prepared) == platform["build_artifact"]["digest"], "Prepared ZIP digest mismatch")
+        with zipfile.ZipFile(io.BytesIO(prepared)) as archive:
+            entries = archive.infolist()
+            require(len({entry.filename for entry in entries}) == len(entries), "Duplicate prepared artifact path")
+            manifests = [entry for entry in entries if entry.filename == "build.json"]
+            require(len(manifests) == 1 and manifests[0].file_size <= 1024 * 1024, "Missing prepared build manifest")
+            build = parse_json(archive.read(manifests[0]))
+            expected = {f"{group}/{name}": value for group in ("candidate", "harnesses")
+                        for name, value in build[group].items()}
+            require(set(expected) | {"build.json"} == {entry.filename for entry in entries},
+                    "Prepared artifact file set differs")
+            require(sum(entry.file_size for entry in entries) <= MAX_TOTAL, "Prepared artifact exceeds size limit")
+            for entry in entries:
+                require(entry.filename == entry.orig_filename and not entry.is_dir()
+                        and stat.S_IFMT(entry.external_attr >> 16) in (0, stat.S_IFREG)
+                        and entry.file_size <= MAX_FILE, "Unsafe prepared artifact member")
+                if entry.filename != "build.json":
+                    require(candidate_evidence.hashes({entry.filename: archive.read(entry)})[entry.filename]
+                            == expected[entry.filename], "Prepared artifact manifest hash differs")
+            proof = parse_json(bundles[target]["parallel-acceptance.json"])
+            require(proof["build"] == build, "Collected manifest differs from authenticated prepared artifact")
         expanded_total += sum(len(data) for data in bundles[target].values())
-        compressed_total += len(zipped)
+        compressed_total += len(zipped) + len(prepared)
         require(expanded_total <= MAX_TOTAL and compressed_total <= MAX_TOTAL,
                 "Combined candidates exceed size limit")
     return bundles, zips
@@ -677,6 +739,7 @@ def prepare(gh, commit, run_id, artifact_ids, qualification_notes, directory):
         folder = directory / "candidates" / target
         folder.mkdir(mode=0o700)
         gh.download(platform["artifact"]["id"], folder / "artifact.zip")
+        gh.download(platform["build_artifact"]["id"], folder / "prepared.zip")
     bundles, zips = load_bundles(directory, meta)
     source = {}
     (directory / "source").mkdir(mode=0o700)
@@ -722,7 +785,8 @@ def prepare_ci(gh, commit, run_id, releases, directory):
     require(isinstance(selected, list) and len(selected) == 1, "Expected one release-plz product release")
     matches(selected[0], dict(package_name="mailctl", version=version, tag="v" + version), "release-plz output")
     artifacts = gh.pages(f"actions/runs/{run_id}/artifacts", "artifacts")
-    names = {artifact_name(target) for target in TARGETS}
+    run = gh.get(f"actions/runs/{run_id}")
+    names = {ci_artifact_name(target, run["run_attempt"]) for target in TARGETS}
     ids = [artifact["id"] for artifact in artifacts if artifact["name"] in names]
     meta = metadata(gh, commit, run_id, ids)
     notes = dict(source_commit=commit, operator="Maintainer merge of the release-plz PR",

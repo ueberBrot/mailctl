@@ -268,11 +268,28 @@ struct Fixture {
 }
 impl Fixture {
     async fn new(outcome: AppendOutcome, fail_outcome: bool, stall: bool) -> Self {
+        // Journal and replay tests need the normal operation budget. Only tests
+        // exercising deadlines should shorten it: verification can yield to a
+        // blocking worker before APPEND has started.
+        Self::with_deadline(
+            outcome,
+            fail_outcome,
+            stall,
+            Limits::default().operation_seconds,
+        )
+        .await
+    }
+    async fn with_deadline(
+        outcome: AppendOutcome,
+        fail_outcome: bool,
+        stall: bool,
+        operation_seconds: usize,
+    ) -> Self {
         let installation = support::Installation::two_accounts();
         let mut config =
             Config::parse(&std::fs::read_to_string(installation.config()).unwrap()).unwrap();
         config.accounts[0].from_identities = vec!["work@example.test".into()];
-        config.limits.operation_seconds = 2;
+        config.limits.operation_seconds = operation_seconds;
         config.limits.connection_seconds = 1;
         config.limits.initialization_seconds = 1;
         for grant in &mut config.grants {
@@ -408,7 +425,13 @@ async fn uncertain_acceptance_and_failed_outcome_commit_never_redispatch() {
             AppendOutcome::Unknown
         };
         let f = Fixture::new(outcome, fail_commit, false).await;
-        uncertain(f.save().await.unwrap_err(), &f.input);
+        let error = f.save().await.unwrap_err();
+        assert_eq!(
+            f.backend.appends.load(Ordering::SeqCst),
+            1,
+            "request did not reach APPEND: {error:?}"
+        );
+        uncertain(error, &f.input);
         if fail_commit {
             assert_eq!(f.state(), DraftOperationState::InFlight);
             uncertain(f.save().await.unwrap_err(), &f.input);
@@ -512,10 +535,50 @@ async fn live_owner_is_pending_and_cancellation_records_uncertainty_before_unloc
     uncertain(save(&other, f.input.clone()).await.unwrap_err(), &f.input);
     assert_eq!(f.backend.appends.load(Ordering::SeqCst), 1);
 }
+#[test]
+fn undispatched_deadline_remains_a_retryable_timeout() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let f = Fixture::with_deadline(AppendOutcome::Unknown, false, false, 1).await;
+        let entered = Arc::new(Notify::new());
+        let worker_entered = entered.clone();
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        // Hold the only blocking worker so journal verification cannot finish
+        // before the deadline. The handshake avoids a scheduler-dependent sleep.
+        let worker = tokio::task::spawn_blocking(move || {
+            worker_entered.notify_one();
+            let _ = wait.recv();
+        });
+        entered.notified().await;
+        let error = f.save().await.unwrap_err();
+        release.send(()).unwrap();
+        worker.await.unwrap();
+        // Drain the cancelled request's queued verification before inspecting
+        // the final APPEND count and disposing of the installation.
+        tokio::task::spawn_blocking(|| ()).await.unwrap();
+        assert_eq!(error.code, ErrorCode::Timeout);
+        assert!(error.retryable);
+        assert!(error.draft_operation.is_none());
+        assert_eq!(f.backend.appends.load(Ordering::SeqCst), 0);
+    });
+}
+
 #[tokio::test]
 async fn dispatched_deadline_returns_uncertainty_instead_of_retryable_timeout() {
-    let f = Fixture::new(AppendOutcome::Created { uid: None }, false, true).await;
-    let error = f.save().await.unwrap_err();
+    let f = Fixture::with_deadline(AppendOutcome::Created { uid: None }, false, true, 2).await;
+    let save = f.save();
+    tokio::pin!(save);
+    tokio::select! {
+        biased;
+        () = f.backend.entered.notified() => {}
+        result = &mut save => panic!("request finished before APPEND: {result:?}"),
+    }
+    assert_eq!(f.state(), DraftOperationState::InFlight);
+    let error = save.await.unwrap_err();
     assert!(error.message.contains("deadline exceeded"));
     uncertain(error, &f.input);
     assert_eq!(f.state(), DraftOperationState::OutcomeUnknown);

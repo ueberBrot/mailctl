@@ -120,6 +120,24 @@ if (!$env:MAILCTL_CANDIDATE_DIR -or !$env:MAILCTL_PACKAGED_BIN_DIR) {
 }
 $candidate = [System.IO.Path]::GetFullPath($env:MAILCTL_CANDIDATE_DIR)
 $manifestPath = Join-Path $candidate 'windows-harnesses.json'
+$harnessDirectory = $null
+if ($env:MAILCTL_HARNESS_DIR) {
+    if (![System.IO.Path]::IsPathFullyQualified($env:MAILCTL_HARNESS_DIR)) {
+        throw 'MAILCTL_HARNESS_DIR must be an absolute directory'
+    }
+    $harnessDirectory = [System.IO.Path]::GetFullPath($env:MAILCTL_HARNESS_DIR)
+    $cache = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $repository 'target' }
+    foreach ($other in @($candidate, (Join-Path $repository 'target'), $cache)) {
+        $other = [System.IO.Path]::GetFullPath($other)
+        $separator = [System.IO.Path]::DirectorySeparatorChar
+        $left = $harnessDirectory.TrimEnd($separator) + $separator
+        $right = $other.TrimEnd($separator) + $separator
+        if ($left.StartsWith($right, [StringComparison]::OrdinalIgnoreCase) -or
+            $right.StartsWith($left, [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'MAILCTL_HARNESS_DIR must be separate from candidate files and Cargo target caches'
+        }
+    }
+}
 $phaseTargets = @{
     state = @('administration_process', 'state_maintenance', 'windows_private_state')
     process = @('message_process', 'attachment_process', 'search_process')
@@ -130,6 +148,9 @@ $phaseTargets = @{
 }
 
 if ($Phase -eq 'prepare') {
+    if ($harnessDirectory) { New-Item -ItemType Directory -Path $harnessDirectory -Force | Out-Null }
+    # Do not retain a previous successful manifest when a rebuild fails.
+    if (Test-Path -LiteralPath $manifestPath) { Remove-Item -LiteralPath $manifestPath }
     $selections = @()
     foreach ($features in 'cli', 'mcp', 'cli,mcp') {
         $targets = @($phaseTargets.Values | ForEach-Object { $_ })
@@ -149,7 +170,13 @@ if ($Phase -eq 'prepare') {
                 $_.target.name -eq $target -and $_.target.src_path -eq $source
             })
             if ($artifact.Count -ne 1) { throw "Expected one workspace-built $features/$target harness" }
-            $harnesses += @{ Name = $target; Executable = $artifact[0].executable }
+            $executable = $artifact[0].executable
+            if ($harnessDirectory) {
+                $filename = "$($features.Replace(',', '-'))-$target.exe"
+                Copy-Item -LiteralPath $executable -Destination (Join-Path $harnessDirectory $filename) -Force
+                $executable = $filename
+            }
+            $harnesses += @{ Name = $target; Executable = $executable }
         }
         $selections += @{ Features = $features; Harnesses = $harnesses }
     }
@@ -205,8 +232,15 @@ try {
         $selected = @($selection.Harnesses | Where-Object { $_.Name -in $targets })
         if ($selected.Count -ne $targets.Count) { throw "Missing $Phase harnesses for $($selection.Features)" }
         foreach ($harness in $selected) {
+            $executable = $harness.Executable
+            if ($harnessDirectory) {
+                if ($executable -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*\.exe$') {
+                    throw "Expected a portable harness filename: $executable"
+                }
+                $executable = Join-Path $harnessDirectory $executable
+            }
             $destination = Join-Path $root "harnesses/$([System.IO.Path]::GetFileName($harness.Executable))"
-            Copy-Item -LiteralPath $harness.Executable -Destination $destination -Force
+            Copy-Item -LiteralPath $executable -Destination $destination -Force
             $harness.Executable = $destination
         }
         $selection.Harnesses = $selected

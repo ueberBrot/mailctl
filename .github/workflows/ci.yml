@@ -12,6 +12,8 @@ concurrency:
   group: development-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# Candidate inputs and evidence are bound to one CI attempt. If a candidate
+# partial rerun cannot restore its inputs, use GitHub's Re-run all jobs action.
 jobs:
   policy:
     runs-on: ubuntu-latest
@@ -21,6 +23,9 @@ jobs:
         with:
           persist-credentials: false
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f  # v2.0.0; reads rust-toolchain.toml
+        with:
+          # PRs restore main's caches without filling storage with merge-ref copies.
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@d438492cf8a250514fa2d34b30bc3c0dc37c65ff  # v2.87.8
         with:
           tool: cargo-deny@0.20.2
@@ -34,6 +39,10 @@ jobs:
         run: python3 tests/installer.py --suite fixtures
       - name: Check native candidate preparation fixtures
         run: python3 tests/prepare_installer.py
+      - name: Check parallel candidate transport and evidence fixtures
+        run: |
+          python3 tests/candidate_evidence.py
+          python3 tests/candidate_harness.py
       - name: Check offline Codex acceptance fixtures
         run: python3 scripts/acceptance/test_codex_mcp.py
       - name: Check offline release preparation and publication fixtures
@@ -57,6 +66,10 @@ jobs:
         with:
           persist-credentials: false
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f  # v2.0.0
+        with:
+          # Feature variants compile different dependency graphs and profiles.
+          cache-key: ${{ matrix.features }}
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build selected components
         run: cargo build --locked --workspace --all-targets --no-default-features --features "$MAILCTL_FEATURES"
         shell: bash
@@ -72,6 +85,19 @@ jobs:
         shell: bash
         env:
           MAILCTL_FEATURES: ${{ matrix.features }}
+      - name: Qualify systemd credentials under a disposable service identity
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        env:
+          MAILCTL_FEATURES: ${{ matrix.features }}
+        run: bash scripts/ci/native-acceptance.sh systemd
+      - name: Qualify Credential Manager on the disposable hosted Windows identity
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        env:
+          MAILCTL_FEATURES: ${{ matrix.features }}
+          MAILCTL_DISPOSABLE_WINDOWS: '1'
+        run: ./scripts/ci/windows-acceptance.ps1 credentials
       - name: Qualify optimized decoding and executable stacks on Windows
         if: matrix.os == 'windows-latest'
         shell: pwsh
@@ -91,6 +117,8 @@ jobs:
         with:
           persist-credentials: false
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f  # v2.0.0
+        with:
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       # Testcontainers starts GreenMail but needs a running Docker Engine.
       # Its pinned Rust client requires a newer API than the runner provides.
       - uses: docker/setup-docker-action@2bf61fb9464cc67f0cbdeabed6aa0380accd1c70  # v5.5.0
@@ -104,197 +132,376 @@ jobs:
       - name: Test GreenMail integration
         run: cargo test --locked --test greenmail --features docker-tests -- --nocapture
 
-  systemd-credentials:
-    strategy:
-      fail-fast: false
-      matrix:
-        features: [cli, mcp, 'cli,mcp']
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f  # v2.0.0
-      - name: Qualify systemd credentials under a disposable service identity
-        shell: bash
-        env:
-          MAILCTL_FEATURES: ${{ matrix.features }}
-        run: bash scripts/ci/native-acceptance.sh systemd
-
-  windows-native-credentials:
-    strategy:
-      fail-fast: false
-      matrix:
-        features: [cli, mcp, 'cli,mcp']
-    runs-on: windows-latest
-    timeout-minutes: 25
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f  # v2.0.0
-      - name: Qualify Credential Manager on the disposable hosted Windows identity
-        shell: pwsh
-        env:
-          MAILCTL_FEATURES: ${{ matrix.features }}
-          MAILCTL_DISPOSABLE_WINDOWS: '1'
-        run: ./scripts/ci/windows-acceptance.ps1 credentials
-
-  native-credentials:
-    # Qualify native credentials using the installed candidate bytes. Reuse this
-    # job rather than compiling a second macOS acceptance harness in another VM.
+  macos-candidate-build:
+    name: build-aarch64-apple-darwin
     runs-on: macos-26
     timeout-minutes: 30
+    outputs:
+      artifact-id: ${{ steps.bundle.outputs.artifact-id }}
+      artifact-digest: ${{ steps.bundle.outputs.artifact-digest }}
+    env:
+      MAILCTL_TARGET: aarch64-apple-darwin
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
+      - name: Set candidate paths
+        run: python3 scripts/ci/candidate-jobs.py init
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f  # v2.0.0
+        with:
+          cache-shared-key: native-credentials
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install dist 0.33.0 from its official release
         shell: bash
         env:
           DIST_BIN_DIR: ${{ runner.temp }}/dist-bin
         run: bash scripts/ci/install-dist.sh
-      - name: Build macOS Apple Silicon archives with dist
+      - name: Build native candidate archives with dist
+        shell: bash
         run: bash scripts/ci/candidate.sh build
-      - name: Prepare component manifest and signing evidence from the dist archive
-        env:
-          # Candidate evidence must not be restored with the Rust target cache.
-          MAILCTL_CANDIDATE_DIR: ${{ runner.temp }}/mailctl-release-candidate
-          MAILCTL_PACKAGED_BIN_DIR: ${{ runner.temp }}/mailctl-installed
+      - name: Prepare components and build evidence
+        shell: bash
         run: bash scripts/ci/candidate.sh prepare
-      - name: Qualify selected components through the standalone installer
-        run: bash scripts/ci/candidate.sh installer
-      - name: Qualify packaged setup, history, backup, and restore
-        run: bash scripts/ci/candidate.sh state
-      - name: Qualify packaged interfaces and process lifecycle
-        run: bash scripts/ci/candidate.sh process
-      - name: Qualify packaged native credentials on the disposable hosted identity
-        run: bash scripts/ci/candidate.sh native
-      - name: Qualify packaged reading for each standalone component selection
-        run: bash scripts/ci/candidate.sh reading
-      - name: Qualify packaged draft faults and history per component
-        run: bash scripts/ci/candidate.sh drafts
+      - name: Build reusable acceptance harnesses
+        shell: bash
+        run: python3 scripts/ci/candidate-harness.py prepare
+      - name: Seal candidate build
+        shell: bash
+        run: python3 scripts/ci/candidate-jobs.py seal
+      - name: Keep candidate build
+        id: bundle
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: mailctl-build-aarch64-apple-darwin-attempt-${{ github.run_attempt }}
+          path: ${{ env.MAILCTL_BUILD_DIR }}/
+          if-no-files-found: error
+          retention-days: 14
+
+  macos-candidate-acceptance:
+    name: acceptance-aarch64-apple-darwin-${{ matrix.group }}
+    needs: macos-candidate-build
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [core, reading]
+    runs-on: macos-26
+    timeout-minutes: 25
+    env:
+      MAILCTL_TARGET: aarch64-apple-darwin
+      MAILCTL_BUILD_ARTIFACT_ID: ${{ needs.macos-candidate-build.outputs.artifact-id }}
+      MAILCTL_BUILD_ARTIFACT_DIGEST: ${{ needs.macos-candidate-build.outputs.artifact-digest }}
+      MAILCTL_GROUP: ${{ matrix.group }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set candidate paths
+        run: python3 scripts/ci/candidate-jobs.py init
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          artifact-ids: ${{ needs.macos-candidate-build.outputs.artifact-id }}
+          path: ${{ env.MAILCTL_BUILD_DIR }}
+      - name: Verify prepared bytes and restore executable permissions
+        shell: bash
+        run: python3 scripts/ci/candidate-jobs.py restore
+      - name: Qualify installed candidate and record evidence
+        shell: bash
+        run: python3 scripts/ci/candidate-jobs.py qualify --group "$MAILCTL_GROUP" --evidence "$RUNNER_TEMP/shard"
+      - name: Keep acceptance evidence
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: mailctl-acceptance-aarch64-apple-darwin-${{ matrix.group }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/shard/
+          if-no-files-found: error
+          retention-days: 14
+
+  native-credentials:
+    # Passing publication evidence is collected only after every shard succeeds.
+    needs: [macos-candidate-build, macos-candidate-acceptance]
+    runs-on: macos-26
+    timeout-minutes: 10
+    env:
+      MAILCTL_TARGET: aarch64-apple-darwin
+      MAILCTL_BUILD_ARTIFACT_ID: ${{ needs.macos-candidate-build.outputs.artifact-id }}
+      MAILCTL_BUILD_ARTIFACT_DIGEST: ${{ needs.macos-candidate-build.outputs.artifact-digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set candidate paths
+        run: python3 scripts/ci/candidate-jobs.py init
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          artifact-ids: ${{ needs.macos-candidate-build.outputs.artifact-id }}
+          path: ${{ env.MAILCTL_BUILD_DIR }}
+      - name: Verify prepared bytes and restore executable permissions
+        shell: bash
+        run: python3 scripts/ci/candidate-jobs.py restore
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          pattern: mailctl-acceptance-aarch64-apple-darwin-*-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/acceptance-shards
       - name: Record passing candidate acceptance
-        run: bash scripts/ci/candidate.sh record
+        shell: bash
+        run: |
+          python3 scripts/ci/candidate-jobs.py collect --evidence "$RUNNER_TEMP/acceptance-shards"
+          bash scripts/ci/candidate.sh record
+          python3 scripts/ci/candidate-jobs.py verify
       - name: Keep candidate downloads and acceptance evidence
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
-          name: mailctl-candidate-aarch64-apple-darwin
+          name: mailctl-candidate-aarch64-apple-darwin-attempt-${{ github.run_attempt }}
           path: ${{ env.MAILCTL_CANDIDATE_DIR }}/
           if-no-files-found: error
           retention-days: 14
 
-  linux-candidate:
+  linux-candidate-build:
+    name: build-x86_64-unknown-linux-gnu
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 30
+    outputs:
+      artifact-id: ${{ steps.bundle.outputs.artifact-id }}
+      artifact-digest: ${{ steps.bundle.outputs.artifact-digest }}
     env:
       MAILCTL_TARGET: x86_64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
+      - name: Set candidate paths
+        run: python3 scripts/ci/candidate-jobs.py init
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f  # v2.0.0
+        with:
+          cache-shared-key: linux-candidate
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install dist 0.33.0 from its official release
         shell: bash
         env:
           DIST_BIN_DIR: ${{ runner.temp }}/dist-bin
         run: bash scripts/ci/install-dist.sh
-      - name: Build native Ubuntu x86_64 archives with dist
+      - name: Build native candidate archives with dist
+        shell: bash
         run: bash scripts/ci/candidate.sh build
-      - name: Prepare Linux components and build evidence
-        env:
-          MAILCTL_CANDIDATE_DIR: ${{ runner.temp }}/mailctl-linux-candidate
-          MAILCTL_PACKAGED_BIN_DIR: ${{ runner.temp }}/mailctl-linux-installed
+      - name: Prepare components and build evidence
+        shell: bash
         run: bash scripts/ci/candidate.sh prepare
-      - name: Qualify Linux installation, upgrades and removal
-        run: bash scripts/ci/candidate.sh installer
-      - name: Qualify packaged Linux setup, history, backup and restore
-        run: bash scripts/ci/candidate.sh state
-      - name: Qualify independent packaged Linux processes
-        run: bash scripts/ci/candidate.sh process
-      - name: Qualify headless credential sources and permissions
-        run: bash scripts/ci/candidate.sh native
-      - name: Qualify packaged Linux reading under command and systemd sources
-        run: bash scripts/ci/candidate.sh reading
-      - name: Qualify packaged Linux draft faults under command and systemd sources
-        run: bash scripts/ci/candidate.sh drafts
+      - name: Build reusable acceptance harnesses
+        shell: bash
+        run: python3 scripts/ci/candidate-harness.py prepare
+      - name: Seal candidate build
+        shell: bash
+        run: python3 scripts/ci/candidate-jobs.py seal
+      - name: Keep candidate build
+        id: bundle
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: mailctl-build-x86_64-unknown-linux-gnu-attempt-${{ github.run_attempt }}
+          path: ${{ env.MAILCTL_BUILD_DIR }}/
+          if-no-files-found: error
+          retention-days: 14
+
+  linux-candidate-acceptance:
+    name: acceptance-x86_64-unknown-linux-gnu-${{ matrix.group }}
+    needs: linux-candidate-build
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [core, reading]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      MAILCTL_TARGET: x86_64-unknown-linux-gnu
+      MAILCTL_BUILD_ARTIFACT_ID: ${{ needs.linux-candidate-build.outputs.artifact-id }}
+      MAILCTL_BUILD_ARTIFACT_DIGEST: ${{ needs.linux-candidate-build.outputs.artifact-digest }}
+      MAILCTL_GROUP: ${{ matrix.group }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set candidate paths
+        run: python3 scripts/ci/candidate-jobs.py init
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          artifact-ids: ${{ needs.linux-candidate-build.outputs.artifact-id }}
+          path: ${{ env.MAILCTL_BUILD_DIR }}
+      - name: Verify prepared bytes and restore executable permissions
+        shell: bash
+        run: python3 scripts/ci/candidate-jobs.py restore
       - name: Install native Secret Service test prerequisites
         run: bash scripts/ci/desktop-acceptance.sh prerequisites
-      - name: Qualify native Secret Service lifecycle and locked-store behavior
-        run: bash scripts/ci/desktop-acceptance.sh credentials
-      - name: Qualify packaged reading with native Secret Service credentials
-        run: bash scripts/ci/desktop-acceptance.sh reading
-      - name: Qualify packaged draft recovery with native Secret Service credentials
-        run: bash scripts/ci/desktop-acceptance.sh drafts
+      - name: Qualify installed candidate and record evidence
+        shell: bash
+        run: python3 scripts/ci/candidate-jobs.py qualify --group "$MAILCTL_GROUP" --evidence "$RUNNER_TEMP/shard"
+      - name: Keep acceptance evidence
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: mailctl-acceptance-x86_64-unknown-linux-gnu-${{ matrix.group }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/shard/
+          if-no-files-found: error
+          retention-days: 14
+
+  linux-candidate:
+    # Passing publication evidence is collected only after every shard succeeds.
+    needs: [linux-candidate-build, linux-candidate-acceptance]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      MAILCTL_TARGET: x86_64-unknown-linux-gnu
+      MAILCTL_BUILD_ARTIFACT_ID: ${{ needs.linux-candidate-build.outputs.artifact-id }}
+      MAILCTL_BUILD_ARTIFACT_DIGEST: ${{ needs.linux-candidate-build.outputs.artifact-digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set candidate paths
+        run: python3 scripts/ci/candidate-jobs.py init
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          artifact-ids: ${{ needs.linux-candidate-build.outputs.artifact-id }}
+          path: ${{ env.MAILCTL_BUILD_DIR }}
+      - name: Verify prepared bytes and restore executable permissions
+        shell: bash
+        run: python3 scripts/ci/candidate-jobs.py restore
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          pattern: mailctl-acceptance-x86_64-unknown-linux-gnu-*-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/acceptance-shards
       - name: Record passing Linux candidate acceptance
-        run: bash scripts/ci/candidate.sh record
+        shell: bash
+        run: |
+          python3 scripts/ci/candidate-jobs.py collect --evidence "$RUNNER_TEMP/acceptance-shards"
+          bash scripts/ci/candidate.sh record
+          python3 scripts/ci/candidate-jobs.py verify
       - name: Keep Linux candidate and acceptance evidence
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
-          name: mailctl-candidate-x86_64-unknown-linux-gnu
+          name: mailctl-candidate-x86_64-unknown-linux-gnu-attempt-${{ github.run_attempt }}
           path: ${{ env.MAILCTL_CANDIDATE_DIR }}/
           if-no-files-found: error
           retention-days: 14
 
-  windows-candidate:
+  windows-candidate-build:
+    name: build-x86_64-pc-windows-msvc
     runs-on: windows-2025
-    timeout-minutes: 90
+    timeout-minutes: 30
+    outputs:
+      artifact-id: ${{ steps.bundle.outputs.artifact-id }}
+      artifact-digest: ${{ steps.bundle.outputs.artifact-digest }}
     env:
       MAILCTL_TARGET: x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
+      - name: Set candidate paths
+        run: python scripts/ci/candidate-jobs.py init
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f  # v2.0.0
+        with:
+          cache-shared-key: windows-candidate
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install dist 0.33.0 from its official release
         shell: pwsh
         env:
           DIST_BIN_DIR: ${{ runner.temp }}/dist-bin
         run: ./scripts/ci/install-dist.ps1
-      - name: Build native Windows x86_64 archives with dist
+      - name: Build native candidate archives with dist
         shell: pwsh
         run: ./scripts/ci/windows-candidate.ps1 build
-      - name: Prepare Windows components and build evidence
+      - name: Prepare components and build evidence
         shell: pwsh
-        env:
-          MAILCTL_CANDIDATE_DIR: ${{ runner.temp }}/mailctl-windows-candidate
-          MAILCTL_PACKAGED_BIN_DIR: ${{ runner.temp }}/mailctl-windows-installed
         run: ./scripts/ci/windows-candidate.ps1 prepare
-      - name: Qualify installation, upgrades and removal with PowerShell 5.1 and 7
-        shell: pwsh
-        run: ./scripts/ci/windows-candidate.ps1 installer
-      - name: Build reusable Windows acceptance harnesses
+      - name: Build reusable acceptance harnesses
         shell: pwsh
         run: ./scripts/ci/windows-packaged-acceptance.ps1 -Phase prepare
-      - name: Qualify Windows executables through WSL2 and restart
+      - name: Seal candidate build
         shell: pwsh
-        run: ./scripts/ci/windows-packaged-acceptance.ps1 -Phase wsl
-      - name: Qualify installed setup, shared account state, backup and restore
-        shell: pwsh
-        run: ./scripts/ci/windows-packaged-acceptance.ps1 -Phase state
-      - name: Qualify installed interfaces, export and process recovery
-        shell: pwsh
-        run: ./scripts/ci/windows-packaged-acceptance.ps1 -Phase process
-      - name: Qualify installed Credential Manager lifecycle under a disposable identity
-        shell: pwsh
-        run: ./scripts/ci/windows-packaged-acceptance.ps1 -Phase native
-      - name: Qualify installed reading through native Windows credentials
-        shell: pwsh
-        run: ./scripts/ci/windows-packaged-acceptance.ps1 -Phase reading
-      - name: Qualify installed draft faults and recovery
-        shell: pwsh
-        run: ./scripts/ci/windows-packaged-acceptance.ps1 -Phase drafts
-      - name: Record passing Windows candidate acceptance
-        shell: pwsh
-        run: ./scripts/ci/windows-candidate.ps1 record
-      - name: Keep Windows candidate and acceptance evidence
-        if: always()
+        run: python scripts/ci/candidate-jobs.py seal
+      - name: Keep candidate build
+        id: bundle
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
-          name: mailctl-candidate-x86_64-pc-windows-msvc
-          path: ${{ runner.temp }}/mailctl-windows-candidate/
+          name: mailctl-build-x86_64-pc-windows-msvc-attempt-${{ github.run_attempt }}
+          path: ${{ env.MAILCTL_BUILD_DIR }}/
+          if-no-files-found: error
+          retention-days: 14
+
+  windows-candidate-acceptance:
+    name: acceptance-x86_64-pc-windows-msvc-${{ matrix.group }}
+    needs: windows-candidate-build
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [core, content]
+    runs-on: windows-2025
+    timeout-minutes: 25
+    env:
+      MAILCTL_TARGET: x86_64-pc-windows-msvc
+      MAILCTL_BUILD_ARTIFACT_ID: ${{ needs.windows-candidate-build.outputs.artifact-id }}
+      MAILCTL_BUILD_ARTIFACT_DIGEST: ${{ needs.windows-candidate-build.outputs.artifact-digest }}
+      MAILCTL_GROUP: ${{ matrix.group }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set candidate paths
+        run: python scripts/ci/candidate-jobs.py init
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          artifact-ids: ${{ needs.windows-candidate-build.outputs.artifact-id }}
+          path: ${{ env.MAILCTL_BUILD_DIR }}
+      - name: Verify prepared bytes and restore executable permissions
+        shell: pwsh
+        run: python scripts/ci/candidate-jobs.py restore
+      - name: Qualify installed candidate and record evidence
+        shell: pwsh
+        run: python scripts/ci/candidate-jobs.py qualify --group "$env:MAILCTL_GROUP" --evidence "$env:RUNNER_TEMP/shard"
+      - name: Keep acceptance evidence
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: mailctl-acceptance-x86_64-pc-windows-msvc-${{ matrix.group }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/shard/
+          if-no-files-found: error
+          retention-days: 14
+
+  windows-candidate:
+    # Passing publication evidence is collected only after every shard succeeds.
+    needs: [windows-candidate-build, windows-candidate-acceptance]
+    runs-on: windows-2025
+    timeout-minutes: 10
+    env:
+      MAILCTL_TARGET: x86_64-pc-windows-msvc
+      MAILCTL_BUILD_ARTIFACT_ID: ${{ needs.windows-candidate-build.outputs.artifact-id }}
+      MAILCTL_BUILD_ARTIFACT_DIGEST: ${{ needs.windows-candidate-build.outputs.artifact-digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set candidate paths
+        run: python scripts/ci/candidate-jobs.py init
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          artifact-ids: ${{ needs.windows-candidate-build.outputs.artifact-id }}
+          path: ${{ env.MAILCTL_BUILD_DIR }}
+      - name: Verify prepared bytes and restore executable permissions
+        shell: pwsh
+        run: python scripts/ci/candidate-jobs.py restore
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          pattern: mailctl-acceptance-x86_64-pc-windows-msvc-*-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/acceptance-shards
+      - name: Record passing Windows candidate acceptance
+        shell: pwsh
+        run: |
+          python scripts/ci/candidate-jobs.py collect --evidence "$env:RUNNER_TEMP/acceptance-shards"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./scripts/ci/windows-candidate.ps1 record
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/ci/candidate-jobs.py verify
+      - name: Keep Windows candidate and acceptance evidence
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: mailctl-candidate-x86_64-pc-windows-msvc-attempt-${{ github.run_attempt }}
+          path: ${{ env.MAILCTL_CANDIDATE_DIR }}/
           if-no-files-found: error
           retention-days: 14
 
@@ -306,6 +513,8 @@ jobs:
         with:
           persist-credentials: false
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f  # v2.0.0
+        with:
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Lint isolated access
         run: cargo clippy --locked --workspace --all-targets --features isolated -- -D warnings
       - name: Test isolated process access

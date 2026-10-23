@@ -22,11 +22,19 @@ test "$(cat /proc/1/comm)" = systemd
 test "$(id -u)" -ne 0
 test -x /usr/bin/python3
 
-compile=(cargo test --locked --workspace --no-default-features --features 'cli,mcp')
-for target in "${test_targets[@]}"; do compile+=(--test "$target"); done
-compile+=(--no-run --message-format=json)
-artifacts=$("${compile[@]}" | jq -s 'map(select(.reason == "compiler-artifact" and
-  .executable != null)) | map({key: .target.name, value: .executable}) | from_entries')
+if [[ -n ${MAILCTL_HARNESS_DIR:-} ]]; then
+	compile=(python3 scripts/ci/candidate-harness.py artifacts)
+	for target in "${test_targets[@]}"; do compile+=(--test "$target"); done
+	artifacts=$("${compile[@]}")
+else
+	compile=(cargo test --locked --workspace --no-default-features --features 'cli,mcp')
+	for target in "${test_targets[@]}"; do compile+=(--test "$target"); done
+	compile+=(--no-run --message-format=json)
+	artifacts=$("${compile[@]}" | jq -s --arg root "$PWD/tests/" \
+		'map(select(.reason == "compiler-artifact" and .executable != null and
+      .target.src_path == ($root + .target.name + ".rs"))) |
+      map({key: .target.name, value: .executable}) | from_entries')
+fi
 
 workspace=$(mktemp -d /tmp/mailctl-linux-acceptance.XXXXXXXX)
 cleanup() { sudo rm -rf -- "$workspace"; }

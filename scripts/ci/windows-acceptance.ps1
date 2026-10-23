@@ -84,7 +84,7 @@ switch ($Suite) {
         }
     }
     'credentials' {
-        cargo test --locked --no-default-features --features "$env:MAILCTL_FEATURES" `
+        cargo test --locked --workspace --no-default-features --features "$env:MAILCTL_FEATURES" `
             --test windows_credentials native_windows_credentials_cross_processes_and_rotate `
             -- --ignored --nocapture --test-threads=1
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
