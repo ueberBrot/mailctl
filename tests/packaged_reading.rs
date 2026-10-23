@@ -267,7 +267,7 @@ async fn read_and_continue_selected_bodies(executable: &str) {
     remote.set_nonblocking(true).unwrap();
     let url = format!("http://{}/private", remote.local_addr().unwrap());
     let html = format!(
-        r#"<!doctype html><html><head><script src="{url}">active-secret</script><style>@import url('{url}'); style-secret</style></head><body><p>a🦀éxyz</p><img src="{url}" alt=""></body></html>"#
+        r#"<!doctype html><html><head><script src="{url}">active-secret</script><style>@import url('{url}'); style-secret</style></head><body><div hidden>hidden-secret</div><p>a🦀éxyz</p><div style="d\69splay/**/:n\6f ne !important">inline-secret</div><object data="{url}">object-secret</object><img src="{url}" alt=""></body></html>"#
     );
     for (kind, source, pages, complete, selected_part, media_type, converted) in [
         (

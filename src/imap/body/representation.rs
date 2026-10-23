@@ -1,5 +1,7 @@
 //! Deterministic MIME body selection and bounded text rendering.
 
+mod html_policy;
+
 use super::super::{
     Error, Limits,
     mime::{Part, attachment, common, encoding_name, single, validate_structure},
@@ -734,6 +736,14 @@ fn render_html(text: &str, limits: &Limits, work: &mut usize) -> Result<String, 
         .parse_html(Cursor::new(text.as_bytes()))
         .map_err(|_| Error::Protocol)?;
     let nodes = preflight_html(&dom.document, limits, work)?;
+    // Preflight counts the complete original DOM, including discarded subtrees.
+    let policy_work = text
+        .len()
+        .checked_mul(16)
+        .and_then(|bytes| bytes.checked_add(nodes))
+        .ok_or(Error::Limit)?;
+    *work = add_work(*work, policy_work, limits)?;
+    html_policy::apply(&dom.document);
     let render_bound = text
         .len()
         .checked_mul(limits.max_nesting)
@@ -772,7 +782,16 @@ fn preflight_html(
             return Err(Error::Limit);
         }
         *work = add_work(*work, 1, limits)?;
-        if let html2text::Element { name, attrs, .. } = &node.data {
+        if let html2text::Element {
+            name,
+            attrs,
+            template_contents,
+            ..
+        } = &node.data
+        {
+            if let Some(contents) = template_contents.borrow().as_ref() {
+                stack.push((contents.clone(), depth + 1));
+            }
             let local = name.local.as_ref();
             let mut attrs = attrs.borrow_mut();
             attributes = attributes.checked_add(attrs.len()).ok_or(Error::Limit)?;

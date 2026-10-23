@@ -28,6 +28,7 @@ pub enum BodyRoute {
     MalformedUtf8,
     UnknownCharset,
     HtmlLinksAndQuotes,
+    HiddenHtml,
 }
 
 impl ImapServer {
@@ -157,7 +158,12 @@ pub async fn serve(wire: &mut imap_support::Wire, mailbox: &str, case: BodyRoute
         }
         DepthOver => format!("({plain} \"MIXED\" NIL NIL NIL NIL)"),
         HtmlLinksAndQuotes => {
-            payload = b"<html><head><script>active-secret</script><style>style-secret</style></head><body><p>Hello <a href=\"https://example.invalid/report\">report</a></p><blockquote>Quoted text</blockquote><img src=\"http://127.0.0.1:1/private\"></body></html>";
+            payload = br#"<html><head><script>active-secret</script><style>style-secret</style></head><body><p>Hello <a href="https://example.invalid/report">report</a></p><blockquote>Quoted text</blockquote><div hidden>hidden-secret</div><div style="display:none">inline-secret</div><object>object-secret</object><!-- comment-secret --><a href="javascript:alert(1)">Script label</a><a href="//example.invalid/relative">Relative label</a><img src="http://127.0.0.1:1/private"></body></html>"#;
+            let part = text("HTML", "UTF-8", "7BIT", payload.len(), "NIL");
+            format!("({part} \"ALTERNATIVE\" NIL NIL NIL NIL)")
+        }
+        HiddenHtml => {
+            payload = br#"<div hidden>hidden-secret</div>"#;
             let part = text("HTML", "UTF-8", "7BIT", payload.len(), "NIL");
             format!("({part} \"ALTERNATIVE\" NIL NIL NIL NIL)")
         }

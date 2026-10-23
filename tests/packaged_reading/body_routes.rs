@@ -83,6 +83,7 @@ async fn read_body_selection_and_representation_routes(executable: &str) {
         ),
         (UnknownCharset, "\u{fffd}text", Some("1"), false, true),
         (HtmlLinksAndQuotes, "Quoted text", Some("1"), true, false),
+        (HiddenHtml, "", Some("1"), true, false),
     ];
     for (case, expected, selected, converted, replacements) in cases {
         tokio::time::timeout(std::time::Duration::from_secs(30), async {
@@ -102,7 +103,8 @@ async fn read_body_selection_and_representation_routes(executable: &str) {
             assert_eq!(result["message_reference"], message, "{case:?}");
             let body = &result["body"];
             assert_eq!(
-                body["representation_version"], "mailctl-body/mail-parser-0.11.9/html2text-0.17.1",
+                body["representation_version"],
+                "mailctl-body/mail-parser-0.11.9/html2text-0.17.1/text-policy-1",
                 "{case:?}"
             );
             let text = body["text"].as_str().unwrap();
@@ -118,6 +120,12 @@ async fn read_body_selection_and_representation_routes(executable: &str) {
                 assert!(text.contains("Hello") && text.contains("report"));
                 assert!(text.contains("https://example.invalid/report"));
                 assert!(!text.contains("active-secret") && !text.contains("style-secret"));
+                assert!(text.contains("Script label") && text.contains("Relative label"));
+                assert!(
+                    !text.contains("javascript:") && !text.contains("//example.invalid/relative")
+                );
+                assert!(!text.contains("hidden-secret") && !text.contains("inline-secret"));
+                assert!(!text.contains("object-secret") && !text.contains("comment-secret"));
             }
             assert_eq!(body["selected_part"], json!(selected), "{case:?}");
             let media_type = selected.map(|_| if converted { "text/html" } else { "text/plain" });
