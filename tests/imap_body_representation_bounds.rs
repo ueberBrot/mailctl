@@ -540,6 +540,13 @@ fn hostile_html_admission_and_refusal_have_bounded_allocations() {
         (format!("<p>{}</p>", "x".repeat(64 * 1024)), None, None),
         (comment_nodes(4096), Some(1), Some(4096)),
         (comment_nodes(4097), None, Some(4097)),
+        // Template content has its own document fragment in the parsed DOM.
+        // It still consumes admission limits even though extraction omits it.
+        (
+            format!("safe<template>{}</template>", "<!---->".repeat(4096)),
+            None,
+            Some(4103),
+        ),
     ] {
         let source_len = body.len();
         let structure = format!(

@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 pub const DEFAULT_TEXT_PAGE_BYTES: usize = 8192;
 
 /// Identifier for the selected-body decoding and rendering behavior.
-pub const BODY_REPRESENTATION_VERSION: &str = "mailctl-body/mail-parser-0.11.9/html2text-0.17.1";
+pub const BODY_REPRESENTATION_VERSION: &str =
+    "mailctl-body/mail-parser-0.11.9/html2text-0.17.1/text-policy-1";
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]

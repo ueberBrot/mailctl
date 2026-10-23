@@ -467,7 +467,7 @@ async fn hostile_presentation(
     server: &server::ImapServer,
     message: &str,
 ) {
-    let mut bytes = "Private café\r\n\r\nNext\tcolumn\u{1b}]52;c;clipboard-secret\u{7}end\u{1b}[31mred\u{1b}[0m\u{202e}\u{0000}\u{007f}".as_bytes().to_vec();
+    let mut bytes = "Private café\r\n\r\nNext\tcolumn\u{1b}]52;c;clipboard-secret\u{7}end\u{1b}[31mred\u{1b}[0m\u{202e}\u{0000}\u{007f}\u{00ad}\u{200b}\u{2060}\u{2063}\u{feff}join\u{200c}\u{200d}".as_bytes().to_vec();
     bytes.extend_from_slice(&[0xff]);
     bytes.extend_from_slice("界".repeat(300).as_bytes());
     // The existing MIME representation prefixes a marker when decoding replaces bytes.
@@ -521,7 +521,7 @@ async fn hostile_presentation(
                 let text = String::from_utf8(output.stdout).unwrap();
                 assert!(
                     text.contains(
-                        "Private café\n\nNext    columnendred\\u{202e}\\u{0000}\\u{007f}�"
+                        "Private café\n\nNext    columnendred\\u{202e}\\u{0000}\\u{007f}\\u{00ad}\\u{200b}\\u{2060}\\u{2063}\\u{feff}join\u{200c}\u{200d}�"
                     )
                 );
                 assert!(!text.contains('\u{1b}') && !text.contains('\u{202e}'));

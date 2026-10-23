@@ -272,8 +272,9 @@ fn escape_characters(text: &str, unsafe_character: impl Fn(char) -> bool) -> Cow
 fn unsafe_character(character: char) -> bool {
     character.is_control()
         || matches!(character,
-        '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{2028}' | '\u{2029}' |
-        '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        '\u{00ad}' | '\u{061c}' | '\u{200b}' | '\u{200e}' | '\u{200f}' |
+        '\u{2028}' | '\u{2029}' | '\u{202a}'..='\u{202e}' |
+        '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{2069}' | '\u{feff}')
 }
 
 fn metadata_text(text: String) -> String {
