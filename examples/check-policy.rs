@@ -147,7 +147,7 @@ fn check_dependencies(
             for (dependency_name, version) in [
                 ("async-imap", "=0.12.0"),
                 ("imap-proto", "=0.17.0"),
-                ("tokio", "=1.53.2"),
+                ("tokio", "=1.53.3"),
                 ("tokio-rustls", "=0.26.6"),
                 ("mail-builder", "=1.0.0"),
                 ("rusqlite", "=0.40.2"),

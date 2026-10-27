@@ -24,7 +24,7 @@ uuid = "1.27.0"
 [dev-dependencies]
 base64 = { version = "=0.23.1", default-features = false, features = ["std"] }
 toml = "1.1.8"
-tokio = { version = "=1.53.2", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "process"] }
+tokio = { version = "=1.53.3", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "process"] }
 rmcp = { version = "=3.5.1", default-features = false, features = ["client", "transport-child-process"] }
 serde_json = "1.0.151"
 rcgen = { version = "=0.14.10", default-features = false, features = ["ring", "pem"] }
