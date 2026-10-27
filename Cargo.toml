@@ -34,7 +34,7 @@ chrono = { version = "=0.4.45", default-features = false, features = ["std"] }
 toml = "1.1.8"
 uuid = { version = "1.27.0", features = ["v4", "serde"] }
 schemars = { version = "1.2.2", features = ["uuid1"] }
-tokio = { version = "=1.53.2", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "sync", "time", "signal"] }
+tokio = { version = "=1.53.3", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "sync", "time", "signal"] }
 async-imap = { version = "=0.12.0", default-features = false, features = ["runtime-tokio"] }
 imap-proto = "=0.17.0"
 tokio-rustls = { version = "=0.26.6", default-features = false, features = ["ring", "tls12"] }

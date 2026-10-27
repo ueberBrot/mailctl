@@ -99,7 +99,14 @@ pub(super) async fn prompt(maximum: usize) -> Result<Secret, SourceError> {
     quiet.special_codes[SpecialCodeIndex::VTIME] = 0;
     let flags = fcntl_getfl(&input).map_err(|_| SourceError::InteractionRequired)?;
     fcntl_setfl(&input, flags | OFlags::NONBLOCK).map_err(|_| SourceError::InteractionRequired)?;
-    let input = match AsyncFd::try_with_interest(input, Interest::READABLE) {
+    #[expect(
+        unsafe_code,
+        reason = "the owned File keeps its descriptor open and unchanged until AsyncFd deregisters it"
+    )]
+    // SAFETY: input owns a cloned stdin descriptor. AsyncFd takes ownership of the
+    // File, which is never closed or replaced while registered with the reactor.
+    let registration = unsafe { AsyncFd::register_with_interest(input, Interest::READABLE) };
+    let input = match registration {
         Ok(file) => Input::Async(file),
         Err(error) => Input::Poll(error.into_parts().0),
     };
