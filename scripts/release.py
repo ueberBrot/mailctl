@@ -410,8 +410,12 @@ def validate_windows_sources(files):
         require(phase in PHASES and (phase, label) not in selections and
                 log == f"installed-{phase}-{label}-acceptance.log", "Unexpected Windows source selection")
         selections.add((phase, label))
-    require(set(identities) == set(PHASES) and len(set(identities.values())) == len(PHASES),
-            "Missing or reused disposable Windows identities")
+    require(set(identities) == set(PHASES), "Missing disposable Windows identities")
+    # Runner images can share hostnames and machine SIDs. Each acceptance job
+    # creates disposable users in its own local account namespace.
+    for group, phases in candidate_evidence.acceptance_groups(WINDOWS).items():
+        sids = [identities[phase] for phase in phases if phase in identities]
+        require(len(set(sids)) == len(sids), "Reused disposable Windows identities in " + group + " acceptance job")
     require(selections == {(phase, label) for phase in PHASES for label in SELECTIONS},
             "Missing Windows source component selection")
     wsl = fields(files["windows-wsl-evidence.txt"])

@@ -239,7 +239,9 @@ class Candidate:
         if target == release.WINDOWS:
             records = b""
             for index, phase in enumerate(release.PHASES):
-                records += f"phase={phase} identity=HOST\\mailctl_{index:010x} sid=S-1-5-21-1-2-3-{1000 + index} credential_source=windows-credential-manager\n".encode()
+                # Separate runner jobs can share the image's hostname and SID prefix.
+                rid = 1000 + index % 3
+                records += f"phase={phase} identity=HOST\\mailctl_{index:010x} sid=S-1-5-21-1-2-3-{rid} credential_source=windows-credential-manager\n".encode()
                 for selection in ("cli", "mcp", "cli,mcp"):
                     label = selection.replace(",", "-")
                     records += f"phase={phase} components={selection} installed=C:\\private bin log=installed-{phase}-{label}-acceptance.log\n".encode()
@@ -250,7 +252,7 @@ class Candidate:
             self.files["windows-wsl-evidence.txt"] = evidence(dict(status="passed", distro="mailctl-wsl-" + "a" * 32,
                 rootfs_sha256="27694aaa55fd7a9e3ef596e0ad4eb66802308bb20172b17030cd5f4d8ae9bac2",
                 kernel="6.18.40.1-microsoft-standard-WSL2", wsl_version="3.0.1.0", linux_release="3.22.6",
-                windows_identity_sid="S-1-5-21-1-2-3-1005"))
+                windows_identity_sid="S-1-5-21-1-2-3-1002"))
             self.files["windows-wsl.log"] = b'wsl_arguments=["--version"]\nexit=0\nWSL version: 3.0.1.0\n'
             self.files["windows-harnesses.json"] = release.canonical([
                 dict(Features=selection, Harnesses=[dict(Name="windows_wsl", Executable="C:\\harness.exe")])
@@ -769,6 +771,34 @@ class ReleaseTests(unittest.TestCase):
             broken.files["windows-wsl-evidence.txt"] = evidence(values)
             broken.sums()
             self.rejected(FakeGitHub(broken))
+
+    def test_windows_identity_sids_can_repeat_across_parallel_jobs(self):
+        candidate = Candidate(release.WINDOWS)
+        gh, directory, digest = self.prepare(FakeGitHub(candidate))
+        plan, actual = release.verify(gh, directory)
+        self.assertEqual(actual, digest)
+        self.assertEqual(len(plan["assets"]), 21)
+        self.assertEqual((directory / "candidates" / release.WINDOWS / "files" /
+                          "windows-source-evidence.txt").read_bytes(), candidate.files["windows-source-evidence.txt"])
+        self.assertEqual(gh.mutations, [])
+
+    def test_windows_identity_sids_must_be_distinct_within_each_job(self):
+        for phase, group in (("native", "core"), ("wsl", "content")):
+            with self.subTest(group=group):
+                candidate = Candidate(release.WINDOWS)
+                records = candidate.files["windows-source-evidence.txt"]
+                candidate.files["windows-source-evidence.txt"] = re.sub(
+                    rb"(phase=" + phase.encode() + rb" identity=[^\r\n]+ sid=)S-1-5-21-1-2-3-1002",
+                    rb"\g<1>S-1-5-21-1-2-3-1000", records)
+                candidate.sums()
+                self.rejected(FakeGitHub(candidate), "Reused disposable Windows identities in " + group)
+
+    def test_windows_acceptance_requires_every_disposable_identity(self):
+        candidate = Candidate(release.WINDOWS)
+        candidate.files["windows-source-evidence.txt"] = re.sub(
+            rb"(?m)^phase=reading identity=[^\r\n]+\r?\n", b"", candidate.files["windows-source-evidence.txt"])
+        candidate.sums()
+        self.rejected(FakeGitHub(candidate), "Missing disposable Windows identities")
 
     def test_windows_source_embedding_normalizes_line_endings_but_preserves_records(self):
         candidate = Candidate(release.WINDOWS)
