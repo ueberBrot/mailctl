@@ -138,7 +138,9 @@ release notes, including compatibility changes and migration instructions.
 
 The workflow uses the built-in GitHub token. A maintainer with write access
 must select "Approve workflows to run" on the generated PR. That approval
-starts the CI checks.
+starts the Development checks and PR title workflows. Both use `pull_request`
+so GitHub can queue them for approval on PRs created with the built-in token.
+Release PRs must pass the same title convention as other PRs.
 Review the version, changelog, and candidate checks before a maintainer manually
 merges the release PR. That merge approves publication. After the merged commit
 passes all Development checks, the [publication workflow](.github/workflows/release.yml)

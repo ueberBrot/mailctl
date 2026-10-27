@@ -1,7 +1,8 @@
 name: PR title convention
-# The trigger reads PR metadata only, with a read-only token and no code checkout.
-on:  # zizmor: ignore[dangerous-triggers]
-  pull_request_target:
+# Use pull_request so bot-created release PRs can run after approval.
+# This workflow reads PR metadata with a read-only token and no checkout.
+on:
+  pull_request:
     types: [opened, edited, synchronize, reopened, ready_for_review]
 
 permissions:
