@@ -400,6 +400,7 @@ fn malformed_encoded_word_prefixes_have_linear_normalization_allocation() {
         .unwrap();
     for repeats in [512, 1024] {
         let subject = "=?AB?q?x".repeat(repeats);
+        let expected_subject = subject.clone();
         let source_bytes = subject.len();
         let (mut probe, server) =
             dedicated_fixture(TlsMode::Implicit, Limits::default(), move |mut wire| {
@@ -436,10 +437,16 @@ fn malformed_encoded_word_prefixes_have_linear_normalization_allocation() {
                 ))
                 .unwrap();
             assert_eq!(batch.messages.len(), 1);
-            assert!(matches!(
-                batch.messages[0].metadata.subject,
-                mailctl::domain::Metadata::Malformed
-            ));
+            // The new decoder preserves malformed words as literal text
+            // without the old parser's repeated suffix allocations.
+            assert_eq!(
+                batch.messages[0]
+                    .metadata
+                    .subject
+                    .value()
+                    .map(String::as_str),
+                Some(expected_subject.as_str())
+            );
         });
         server.join().unwrap();
         eprintln!(

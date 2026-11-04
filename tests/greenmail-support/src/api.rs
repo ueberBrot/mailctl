@@ -42,7 +42,7 @@ struct Success {
 impl Api {
     pub fn new(port: u16) -> Result<Self> {
         let mut schema: Value =
-            serde_saphyr::from_str(include_str!("../../specs/greenmail-2.1.13.yml"))?;
+            serde_saphyr::from_str(include_str!("../../specs/greenmail-2.1.15.yml"))?;
         // Keep the upstream schema byte-for-byte; apply the documented wire correction.
         schema["components"]["schemas"]["Message"]["properties"]["uid"] =
             serde_json::from_str(include_str!("../../specs/message-uid-schema.json"))?;

@@ -512,7 +512,7 @@ def validate_candidate(files, source, commit, target):
         "Unexpected component manifest fields")
     matches(receipt, dict(common, format="1"), "component manifest")
     build = fields(files["build-evidence.txt"])
-    matches(build, dict(common, status="prepared", source="clean", dist_version="0.33.0",
+    matches(build, dict(common, status="prepared", source="clean", dist_version="0.34.0",
                         archive_sha256=sha(files[archive]), publication="not-performed", notarization="not-performed",
                         build_command=f"dist build --artifacts=local --target {target} --output-format=json"), "build evidence")
     require(build.get("rustc", "").startswith("rustc "), "Missing build compiler evidence")
@@ -586,7 +586,7 @@ def validate_candidate(files, source, commit, target):
     compatibility = b"$Fields.compatibility -cne '1'" if target == WINDOWS else b"compatibility=1"
     require(compatibility in source[installer], "Source installer compatibility changed")
     manifest = parse_json(files["dist-manifest.json"].decode("utf-8-sig"))
-    matches(manifest, {"dist_version": "0.33.0"}, "dist manifest")
+    matches(manifest, {"dist_version": "0.34.0"}, "dist manifest")
     require(len(manifest["releases"]) == 1, "Expected one dist release")
     release = manifest["releases"][0]
     matches(release, {"app_name": "mailctl", "app_version": version}, "dist release")

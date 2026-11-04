@@ -55,7 +55,7 @@ async fn public_composition_boundaries(executable: &str) {
         .parse(&baseline)
         .unwrap();
     for (field, addresses) in [("to", message.to()), ("cc", message.cc())] {
-        let actual = addresses.unwrap().as_list().unwrap();
+        let actual: Vec<_> = addresses.unwrap().mailboxes().collect();
         assert_eq!(actual.len(), 50);
         for (index, address) in actual.iter().enumerate() {
             assert_eq!(

@@ -104,7 +104,7 @@ async fn read_body_selection_and_representation_routes(executable: &str) {
             let body = &result["body"];
             assert_eq!(
                 body["representation_version"],
-                "mailctl-body/mail-parser-0.11.9/html2text-0.17.1/text-policy-1",
+                "mailctl-body/mail-parser-1.0.1/html2text-0.17.4/text-policy-1",
                 "{case:?}"
             );
             let text = body["text"].as_str().unwrap();

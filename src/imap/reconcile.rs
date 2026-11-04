@@ -106,18 +106,14 @@ impl AuthenticatedConnection {
                 }
                 // Reconciliation verifies the exact Message-ID and full MIME
                 // hash. Unrelated header normalization contributes no evidence.
-                let parsed = mail_parser::MessageParser::new()
-                    .default_header_ignore()
-                    .header_id(mail_parser::HeaderName::MessageId)
-                    .parse_headers(&headers)
-                    .ok_or(Error::Protocol)?;
-                let ids = parsed
-                    .headers()
-                    .iter()
-                    .filter(|header| header.name == mail_parser::HeaderName::MessageId)
-                    .count();
-                if ids != 1
-                    || parsed.message_id() != Some(expected.message_id.as_str())
+                let mut ids = super::header::fields(&headers)
+                    .filter(|(name, _)| *name == mail_parser::HeaderName::MessageId);
+                let parsed = ids
+                    .next()
+                    .map(|(_, raw)| mail_parser::HeaderForm::MessageIds.parse(raw));
+                let message_id = parsed.as_ref().and_then(|value| value.value().as_text());
+                if ids.next().is_some()
+                    || message_id != Some(expected.message_id.as_str())
                     || <[u8; 32]>::from(hash.finalize()) != expected.content_sha256
                 {
                     return Ok(DraftEvidence::ContentMismatch);

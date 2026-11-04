@@ -424,7 +424,10 @@ fn frozen_composition_preserves_folded_headers_and_body_with_exact_size_limit() 
         message.body_text(0).unwrap().replace("\r\n", "\n"),
         "First line\nSecond line\n"
     );
-    assert_eq!(message.in_reply_to().as_text(), Some("parent@example.test"));
+    assert_eq!(
+        message.in_reply_to().and_then(|ids| ids.last()),
+        Some("parent@example.test")
+    );
     let text = std::str::from_utf8(draft.bytes()).unwrap();
     assert!(text.contains("References: <ancestor@example.test> <parent@example.test>\r\n"));
     assert!(text.contains("Content-Type: text/plain"));
@@ -665,21 +668,16 @@ fn structured_recipients_and_reply_metadata_have_deterministic_mime() {
     let parsed = mail_parser::MessageParser::default()
         .parse(first.bytes())
         .unwrap();
-    let recipients = parsed.to().unwrap().as_list().unwrap();
-    assert_eq!(recipients[0].address.as_deref(), Some("first@example.test"));
-    assert_eq!(recipients[0].name.as_deref(), Some("First recipient"));
+    let recipients: Vec<_> = parsed.to().unwrap().mailboxes().collect();
+    assert_eq!(recipients[0].address(), Some("first@example.test"));
+    assert_eq!(recipients[0].name(), Some("First recipient"));
+    assert_eq!(recipients[1].address(), Some("second@example.test"));
     assert_eq!(
-        recipients[1].address.as_deref(),
-        Some("second@example.test")
-    );
-    assert_eq!(
-        parsed.bcc().unwrap().as_list().unwrap()[0]
-            .address
-            .as_deref(),
+        parsed.bcc().unwrap().first().unwrap().address(),
         Some("hidden@example.test")
     );
     assert_eq!(
-        parsed.in_reply_to().as_text(),
+        parsed.in_reply_to().and_then(|ids| ids.last()),
         Some("original@example.test")
     );
 }

@@ -2,7 +2,7 @@
 members = ["cargo:."]
 
 [dist]
-cargo-dist-version = "0.33.0"
+cargo-dist-version = "0.34.0"
 # Development checks build candidates; release.yml attaches their verified
 # artifacts to the release-plz release. Do not generate a second publisher.
 ci = []

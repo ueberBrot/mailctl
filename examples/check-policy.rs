@@ -128,12 +128,12 @@ fn check_dependencies(
             return Err("Use pinned tokio-rustls 0.26.6 with only ring and tls12".into());
         }
         if name == "mail-builder"
-            && (package.version.to_string() != "1.0.0" || !node.features.is_empty())
+            && (package.version.to_string() != "2.0.1" || !node.features.is_empty())
         {
-            return Err("Use pinned mail-builder 1.0.0 without hostname discovery".into());
+            return Err("Use pinned mail-builder 2.0.1 without hostname discovery".into());
         }
         if name == "rusqlite"
-            && (package.version.to_string() != "0.40.2"
+            && (package.version.to_string() != "0.41.1"
                 || node
                     .features
                     .iter()
@@ -141,16 +141,16 @@ fn check_dependencies(
                     .collect::<HashSet<_>>()
                     != HashSet::from(["bundled", "modern_sqlite"]))
         {
-            return Err("Use pinned rusqlite 0.40.2 with bundled SQLite".into());
+            return Err("Use pinned rusqlite 0.41.1 with bundled SQLite".into());
         }
         if name == "mailctl" {
             for (dependency_name, version) in [
                 ("async-imap", "=0.12.0"),
                 ("imap-proto", "=0.17.0"),
-                ("tokio", "=1.53.3"),
+                ("tokio", "=1.54.1"),
                 ("tokio-rustls", "=0.26.6"),
-                ("mail-builder", "=1.0.0"),
-                ("rusqlite", "=0.40.2"),
+                ("mail-builder", "=2.0.1"),
+                ("rusqlite", "=0.41.1"),
             ] {
                 if !dependencies.iter().any(|dependency| {
                     dependency.name == dependency_name && dependency.req.to_string() == version

@@ -7,8 +7,7 @@ pub(super) fn apply(root: &html2text::Handle) {
     while let Some(node) = stack.pop() {
         if let html2text::Element { attrs, .. } = &node.data {
             attrs.borrow_mut().retain(|attribute| {
-                attribute.name.local.as_ref() != "href"
-                    || allowed_link_destination(&attribute.value)
+                &*attribute.name.local != "href" || allowed_link_destination(&attribute.value)
             });
         }
         let mut children = node.children.borrow_mut();
@@ -16,7 +15,7 @@ pub(super) fn apply(root: &html2text::Handle) {
             html2text::Comment { .. } => false,
             html2text::Element { name, attrs, .. } => {
                 !matches!(
-                    name.local.as_ref(),
+                    &*name.local,
                     "head"
                         | "script"
                         | "style"
@@ -31,9 +30,8 @@ pub(super) fn apply(root: &html2text::Handle) {
                         | "audio"
                         | "video"
                 ) && !attrs.borrow().iter().any(|attribute| {
-                    attribute.name.local.as_ref() == "hidden"
-                        || attribute.name.local.as_ref() == "style"
-                            && inline_style_hides(&attribute.value)
+                    &*attribute.name.local == "hidden"
+                        || &*attribute.name.local == "style" && inline_style_hides(&attribute.value)
                 })
             }
             _ => true,

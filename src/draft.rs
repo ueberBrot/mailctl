@@ -4,7 +4,7 @@ use mail_builder::MessageBuilder;
 use sha2::{Digest, Sha256};
 use std::io::{self, Write};
 
-pub(crate) const ENCODER: &str = "mail-builder/1.0.0";
+pub(crate) const ENCODER: &str = "mail-builder/2.0.1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {

@@ -457,6 +457,11 @@ async fn malformed_transfer_tails_keep_the_decoded_prefix_and_mark_replacement()
         ("QUOTED-PRINTABLE", b"hello=QZ".as_slice(), "\u{fffd}hello"),
         (
             "QUOTED-PRINTABLE",
+            b"hello= \t\r\nworld".as_slice(),
+            "\u{fffd}helloworld",
+        ),
+        (
+            "QUOTED-PRINTABLE",
             b"hello\rworld".as_slice(),
             "\u{fffd}helloworld",
         ),
