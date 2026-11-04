@@ -121,10 +121,26 @@ jobs:
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       # Testcontainers starts GreenMail but needs a running Docker Engine.
       # Its pinned Rust client requires a newer API than the runner provides.
-      - uses: docker/setup-docker-action@7ec28a010822b4626af4874f9448a4b05ac6f3e5  # v5.6.0
-        with:
-          version: v29.9.3
-          set-host: true
+      - name: Install Docker 29.9.3 from its signed APT repository
+        shell: bash
+        run: |
+          # The archive action's release index can lag security releases.
+          # Hosted runners remove Docker's APT source after provisioning.
+          # shellcheck source=/dev/null
+          . /etc/os-release
+          docker_package_version="5:29.9.3-1~${ID}.${VERSION_ID}~${VERSION_CODENAME}"
+          sudo install -m 0755 -d /etc/apt/keyrings
+          sudo curl --fail --silent --show-error --location \
+            https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+          sudo chmod a+r /etc/apt/keyrings/docker.asc
+          printf 'deb [arch=%s signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu %s stable\n' \
+            "$(dpkg --print-architecture)" "$VERSION_CODENAME" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+          sudo apt-get update
+          sudo apt-get install --yes --allow-downgrades \
+            "docker-ce=$docker_package_version" "docker-ce-cli=$docker_package_version"
+          sudo systemctl restart docker
+          test "$(docker version --format '{{.Client.Version}}')" = '29.9.3'
+          test "$(docker version --format '{{.Server.Version}}')" = '29.9.3'
       - name: Record OpenSSL version
         run: openssl version
       - name: Lint GreenMail integration
