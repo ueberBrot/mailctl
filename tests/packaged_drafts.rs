@@ -424,18 +424,18 @@ fn assert_appended_content(fixture: &Fixture, response: &Value) {
         Some("hidden@example.test")
     );
     for addresses in [message.from(), message.to(), message.cc(), message.bcc()] {
-        assert_eq!(addresses.unwrap().as_list().unwrap().len(), 1);
+        assert_eq!(addresses.unwrap().mailboxes().count(), 1);
     }
     assert_eq!(
         message.to().unwrap().first().unwrap().name(),
         Some("Synthetic To")
     );
     assert_eq!(
-        message.in_reply_to().as_text(),
+        message.in_reply_to().and_then(|ids| ids.last()),
         Some("original@example.test")
     );
     assert_eq!(
-        message.references().as_text_list().unwrap(),
+        message.references().unwrap().iter().collect::<Vec<_>>(),
         ["ancestor@example.test", "original@example.test"]
     );
     assert_eq!(

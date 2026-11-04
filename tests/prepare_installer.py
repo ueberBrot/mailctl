@@ -71,7 +71,7 @@ class CandidatePreparationTest(unittest.TestCase):
         digest = prepare.digest(archive)
         checksum.write_text(f"{digest}  {archive.name}\n")
         manifest = {
-            "dist_version": "0.33.0",
+            "dist_version": "0.34.0",
             "releases": [{"app_name": "mailctl", "app_version": "0.1.0"}],
             "artifacts": {
                 archive.name: {"path": str(archive), "target_triples": [target],

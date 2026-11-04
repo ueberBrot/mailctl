@@ -129,8 +129,8 @@ def prepare(manifest_path, destination, allow_dirty, target=None):
         raise ValueError("source is dirty; use --allow-dirty only for local testing")
     commit = run("git", "rev-parse", "HEAD")
     manifest = json.loads(manifest_path.read_text())
-    if manifest["dist_version"] != "0.33.0":
-        raise ValueError("candidate requires pinned cargo-dist 0.33.0")
+    if manifest["dist_version"] != "0.34.0":
+        raise ValueError("candidate requires pinned cargo-dist 0.34.0")
     releases = manifest["releases"]
     if len(releases) != 1 or releases[0]["app_name"] != "mailctl":
         raise ValueError("dist must distribute only the mailctl package")

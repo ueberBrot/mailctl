@@ -8,7 +8,7 @@ use super::super::{
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use imap_proto::{BodyParams, BodyStructure};
-use mail_parser::{GetHeader, MessageParser, MimeHeaders};
+use mail_parser::{HeaderForm, HeaderName};
 use std::{borrow::Cow, collections::HashMap, io::Cursor, num::NonZeroU32};
 
 const HTML_TABLE_SPAN_LIMIT: usize = 8;
@@ -91,61 +91,46 @@ pub(super) fn validate_headers(
         }
         return Ok(None);
     }
-    // Body selection does not need Subject, addresses, or descriptive fields.
-    // Their encoded-word normalization can retry malformed suffixes; skip them
-    // rather than spending the body-read budget on unrelated metadata.
-    let parser = MessageParser::new()
-        .default_header_ignore()
-        .header_id(mail_parser::HeaderName::ContentId);
-    // MIME identity needs only the media type, charset and disposition type.
-    // Keep offsets for these fields so irrelevant canonical parameters can be
-    // omitted before the pinned parser joins continuation fragments.
-    let parser = if selected.is_some() {
-        parser
-            .ignore_header(mail_parser::HeaderName::ContentType)
-            .ignore_header(mail_parser::HeaderName::ContentDisposition)
-            .header_raw(mail_parser::HeaderName::ContentTransferEncoding)
-    } else {
-        parser
-    };
-    let message = parser.parse_headers(raw).ok_or(Error::Protocol)?;
-    let headers = message.parts.first().ok_or(Error::Protocol)?;
-    let content_id = headers
-        .headers
-        .header_value(&mail_parser::HeaderName::ContentId)
-        .and_then(|value| value.as_text())
+    // Parse only identity fields: the dependency's message parser always
+    // normalizes MIME fields, including parameters irrelevant to body selection.
+    let mut content_id = None;
+    let mut content_type = None;
+    let mut disposition = None;
+    let mut transfer_encoding = None;
+    for (name, value) in crate::imap::header::fields(raw) {
+        match name {
+            HeaderName::ContentId => content_id = Some(value),
+            HeaderName::ContentType => content_type = Some(value),
+            HeaderName::ContentDisposition => disposition = Some(value),
+            HeaderName::ContentTransferEncoding => transfer_encoding = Some(value),
+            _ => {}
+        }
+    }
+    let content_id = content_id.map(|value| HeaderForm::MessageIds.parse(value));
+    let content_id = content_id
+        .as_ref()
+        .and_then(|value| value.value().as_text())
         .map(normalize_content_id)
         .transpose()?
         .map(ToOwned::to_owned);
 
     if let Some(selected) = selected {
-        let content_type = identity_header_value(
-            raw,
-            headers.headers.header(mail_parser::HeaderName::ContentType),
-            Some("charset"),
-        )?;
-        let disposition = identity_header_value(
-            raw,
-            headers
-                .headers
-                .header(mail_parser::HeaderName::ContentDisposition),
-            None,
-        )?;
+        let content_type = projected_mime_value(content_type.unwrap_or_default(), Some("charset"));
+        let disposition = projected_mime_value(disposition.unwrap_or_default(), None);
         let work = add_work(0, mime_identity_parser_work(content_type.as_ref())?, limits)?;
         add_work(
             work,
             mime_identity_parser_work(disposition.as_ref())?,
             limits,
         )?;
-        let content_type =
-            mail_parser::parsers::MessageStream::new(content_type.as_ref()).parse_content_type();
-        let disposition =
-            mail_parser::parsers::MessageStream::new(disposition.as_ref()).parse_content_type();
-        let (media_type, charset) = content_type.as_content_type().map_or_else(
+        let content_type = HeaderForm::ContentType.parse(content_type.as_ref());
+        let disposition = HeaderForm::ContentType.parse(disposition.as_ref());
+        let transfer_encoding = transfer_encoding.map(|value| HeaderForm::Raw.parse(value));
+        let (media_type, charset) = content_type.value().as_content_type().map_or_else(
             || ("text/plain".to_owned(), "us-ascii"),
             |content_type| {
-                let subtype = content_type.c_subtype.as_deref().unwrap_or("plain");
-                let mut media_type = format!("{}/{subtype}", content_type.c_type);
+                let subtype = content_type.subtype().unwrap_or("plain");
+                let mut media_type = format!("{}/{subtype}", content_type.ctype());
                 media_type.make_ascii_lowercase();
                 (
                     media_type,
@@ -155,14 +140,17 @@ pub(super) fn validate_headers(
         );
         if media_type != selected.media_type
             || !charset.trim().eq_ignore_ascii_case(&selected.charset)
-            || !headers
-                .content_transfer_encoding()
+            || !transfer_encoding
+                .as_ref()
+                .and_then(|value| value.value().as_text())
+                .filter(|value| !value.is_empty())
                 .unwrap_or("7bit")
                 .trim()
                 .eq_ignore_ascii_case(&selected.transfer_encoding)
             || disposition
+                .value()
                 .as_content_type()
-                .is_some_and(|value| value.c_type.eq_ignore_ascii_case("attachment"))
+                .is_some_and(|value| value.ctype().eq_ignore_ascii_case("attachment"))
         {
             return Err(Error::Protocol);
         }
@@ -170,25 +158,11 @@ pub(super) fn validate_headers(
     Ok(content_id)
 }
 
-fn identity_header_value<'a>(
-    raw: &'a [u8],
-    header: Option<&mail_parser::Header<'_>>,
-    wanted: Option<&str>,
-) -> Result<Cow<'a, [u8]>, Error> {
-    let Some(header) = header else {
-        return Ok(Cow::Borrowed(&[]));
-    };
-    let value = raw
-        .get(header.offset_start as usize..header.offset_end as usize)
-        .ok_or(Error::Protocol)?;
-    Ok(projected_mime_value(value, wanted))
-}
-
 fn mime_identity_parser_work(value: &[u8]) -> Result<usize, Error> {
-    // Admit the pinned parser's repeated continuation joins, language-name
-    // searches and encoded-word suffix retries. Count triggers in every state;
-    // RFC2047 then RFC2231 decoding can each expand fourfold. This conservative
-    // estimate reserves their composed factor of 16 before dependency parsing.
+    // Keep conservative admission for composed RFC2047/RFC2231 normalization
+    // across dependency updates. Count every continuation, language-name and
+    // encoded-word trigger before parsing, including triggers in malformed
+    // syntax, and reserve a composed expansion factor of 16.
     let attempts = value
         .iter()
         .enumerate()
@@ -625,15 +599,16 @@ fn decode_transfer<'a>(wire: &'a [u8], transfer_encoding: &str) -> (Cow<'a, [u8]
 
 fn decode_base64(wire: &[u8]) -> (Vec<u8>, bool) {
     let (complete, well_formed) = scan_base64(wire);
-    if let Some(decoded) = mail_parser::decoders::base64::base64_decode(wire) {
-        return (decoded, !well_formed);
-    }
-
-    // The pinned decoder rejects an invalid byte wholesale. Keep the complete MIME quanta before
-    // that byte, which are independently decodable, and make the loss visible to the caller.
-    let recovered =
-        mail_parser::decoders::base64::base64_decode(&wire[..complete]).unwrap_or_default();
-    (recovered, true)
+    // Preserve independently decoded prefixes. The new dependency skips bad
+    // symbols, so admit its input before the first such symbol instead.
+    let input = wire.iter().position(|byte| {
+        !(base64_alphabet(*byte) || matches!(byte, b'=' | b' ' | b'\t' | b'\r' | b'\n'))
+    });
+    let input = input.map_or(wire, |_| &wire[..complete]);
+    (
+        mail_parser::Encoding::Base64.decode(input).into_owned(),
+        !well_formed,
+    )
 }
 
 /// Validate the whole input and retain the end of its independently decodable prefix.
@@ -671,16 +646,42 @@ fn base64_alphabet(byte: u8) -> bool {
 }
 
 fn decode_quoted_printable(wire: &[u8]) -> (Vec<u8>, bool) {
-    let prefix = quoted_printable_prefix_len(wire);
-    let malformed = prefix != wire.len();
-    if let Some(decoded) = mail_parser::decoders::quoted_printable::quoted_printable_decode(wire) {
-        return (decoded, malformed);
+    let malformed = quoted_printable_prefix_len(wire) != wire.len();
+    // Invalid escapes retain only the valid prefix. Bare CR is still dropped
+    // by the dependency's lenient body decoder, with replacement made visible.
+    let mut index = 0;
+    while let Some(&byte) = wire.get(index) {
+        if byte != b'=' {
+            index += 1;
+        } else if wire
+            .get(index + 1..index + 3)
+            .is_some_and(|bytes| bytes == b"\r\n" || bytes.iter().all(u8::is_ascii_hexdigit))
+        {
+            index += 3;
+        } else if wire.get(index + 1) == Some(&b'\n') {
+            index += 2;
+        } else {
+            let blanks = wire[index + 1..]
+                .iter()
+                .take_while(|byte| matches!(byte, b' ' | b'\t'))
+                .count();
+            let rest = &wire[index + 1 + blanks..];
+            let line_break = if rest.starts_with(b"\r\n") {
+                2
+            } else if rest.starts_with(b"\n") {
+                1
+            } else {
+                break;
+            };
+            index += 1 + blanks + line_break;
+        }
     }
-
-    let recovered =
-        mail_parser::decoders::quoted_printable::quoted_printable_decode(&wire[..prefix])
-            .unwrap_or_default();
-    (recovered, true)
+    (
+        mail_parser::Encoding::QuotedPrintable
+            .decode(&wire[..index])
+            .into_owned(),
+        malformed,
+    )
 }
 
 fn quoted_printable_prefix_len(wire: &[u8]) -> usize {
@@ -792,7 +793,7 @@ fn preflight_html(
             if let Some(contents) = template_contents.borrow().as_ref() {
                 stack.push((contents.clone(), depth + 1));
             }
-            let local = name.local.as_ref();
+            let local: &str = name.local.as_ref();
             let mut attrs = attrs.borrow_mut();
             attributes = attributes.checked_add(attrs.len()).ok_or(Error::Limit)?;
             if attributes > node_limit.saturating_mul(4) {
@@ -804,9 +805,7 @@ fn preflight_html(
                     return Err(Error::Limit);
                 }
                 for attribute in attrs.iter_mut() {
-                    if attribute.name.local.as_ref() == "colspan"
-                        || attribute.name.local.as_ref() == "rowspan"
-                    {
+                    if &*attribute.name.local == "colspan" || &*attribute.name.local == "rowspan" {
                         let parsed = attribute
                             .value
                             .parse::<usize>()
@@ -1384,6 +1383,14 @@ mod planner_performance_tests {
             validate_headers(valid, Some(&selected), &Limits::default()),
             Ok(None)
         );
+        assert_eq!(
+            validate_headers(
+                b"Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: \t\r\n\r\n",
+                Some(&selected),
+                &Limits::default(),
+            ),
+            Ok(None)
+        );
         for invalid in [
             "Content-Type: text/html; charset=utf-8\r\n\r\n",
             "Content-Type: text/plain; charset=iso-8859-1\r\n\r\n",
@@ -1504,55 +1511,44 @@ mod planner_performance_tests {
 
     fn compare_mime_identity(value: &[u8], require_header: bool) {
         for (header, wanted) in [
-            (mail_parser::HeaderName::ContentType, Some("charset")),
-            (mail_parser::HeaderName::ContentDisposition, None),
+            (HeaderName::ContentType, Some("charset")),
+            (HeaderName::ContentDisposition, None),
         ] {
             let mut raw = format!("{header}: ").into_bytes();
             raw.extend_from_slice(value);
             raw.extend_from_slice(b"\r\n\r\n");
-            let reference = MessageParser::new()
-                .default_header_ignore()
-                .header_content_type(header.clone())
+            let reference = mail_parser::MessageParser::new()
                 .parse_headers(&raw)
                 .unwrap();
-            let empty = mail_parser::HeaderValue::Empty;
-            let reference = reference.parts[0].headers.header_value(&header);
+            let reference = reference.headers().value(&header);
             if require_header {
                 assert!(reference.is_some(), "{raw:?}");
             }
-            let reference = reference.unwrap_or(&empty);
-            let parsed = MessageParser::new()
-                .default_header_ignore()
-                .ignore_header(header.clone())
-                .parse_headers(&raw)
-                .unwrap();
-            let projected = parsed.parts[0]
-                .headers
-                .header(header.clone())
-                .map(|value| &raw[value.offset_start as usize..value.offset_end as usize])
-                .map(|value| projected_mime_value(value, wanted));
+            let reference = reference.unwrap_or_default();
+            let projected = crate::imap::header::fields(&raw)
+                .find(|(name, _)| *name == header)
+                .map(|(_, value)| projected_mime_value(value, wanted));
             if require_header {
                 assert!(projected.is_some(), "{raw:?}");
             }
-            let projected = projected.as_ref().map_or_else(
-                || mail_parser::HeaderValue::Empty,
-                |projected| {
-                    mail_parser::parsers::MessageStream::new(projected.as_ref())
-                        .parse_content_type()
-                },
-            );
-            let identity = |value: &mail_parser::HeaderValue<'_>| {
+            let parsed = projected
+                .as_ref()
+                .map(|projected| HeaderForm::ContentType.parse(projected.as_ref()));
+            let projected = parsed
+                .as_ref()
+                .map_or(mail_parser::HeaderValue::Empty, |parsed| parsed.value());
+            let identity = |value: mail_parser::HeaderValue<'_>| {
                 value.as_content_type().map(|value| {
                     (
-                        value.c_type.to_string(),
-                        value.c_subtype.as_deref().map(str::to_owned),
+                        value.ctype().to_string(),
+                        value.subtype().map(str::to_owned),
                         wanted
                             .and_then(|wanted| value.attribute(wanted))
                             .map(str::to_owned),
                     )
                 })
             };
-            assert_eq!(identity(reference), identity(&projected), "{raw:?}");
+            assert_eq!(identity(reference), identity(projected), "{raw:?}");
         }
     }
 

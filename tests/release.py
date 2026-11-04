@@ -177,7 +177,7 @@ class Candidate:
         self.files[installer] = (self.source[installer].replace(b"\n", b"\r\n")
                                  if target == release.WINDOWS else self.source[installer])
         build = dict(status="prepared", source="clean", commit=COMMIT, version=VERSION,
-                     target=target, compatibility="1", dist_version="0.33.0", rustc="rustc 1.98.1 (fixture)",
+                     target=target, compatibility="1", dist_version="0.34.0", rustc="rustc 1.98.1 (fixture)",
                      archive_sha256="pending", build_command=f"dist build --artifacts=local --target {target} --output-format=json",
                      publication="not-performed", notarization="not-performed")
         if target == release.MAC:
@@ -292,7 +292,7 @@ class Candidate:
         build["archive_sha256"] = digest
         self.files["build-evidence.txt"] = evidence(build)
         self.files["dist-manifest.json"] = release.canonical({
-            "dist_version": "0.33.0", "releases": [{"app_name": "mailctl", "app_version": VERSION,
+            "dist_version": "0.34.0", "releases": [{"app_name": "mailctl", "app_version": VERSION,
                 "artifacts": [name, name + ".sha256"]}], "artifacts": {
                 name: {"name": name, "kind": "executable-zip", "path": "/historical/" + name,
                     "target_triples": [self.target], "checksum": name + ".sha256", "checksums": {"sha256": digest},

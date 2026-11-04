@@ -8,6 +8,7 @@ mod append;
 mod attachment;
 mod body;
 mod fetch;
+mod header;
 mod mime;
 mod projection;
 mod reconcile;

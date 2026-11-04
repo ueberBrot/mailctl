@@ -10,10 +10,10 @@ if (-not $IsWindows -or [Runtime.InteropServices.RuntimeInformation]::OSArchitec
 
 $temporary = Join-Path $env:RUNNER_TEMP ('mailctl-dist-' + [Guid]::NewGuid().ToString('N'))
 $archive = Join-Path $temporary 'dist.zip'
-$expected = '9a36d70795e14326a5ec4bf17aee085df00ab85a322739291ea5d4b1b5f693cd'
+$expected = '7bb53fbc998321f77a3bbb044084a52747c8ed041cf6d6a604802aa57b9c80c6'
 New-Item -ItemType Directory -Path $temporary | Out-Null
 try {
-    Invoke-WebRequest -Uri 'https://github.com/axodotdev/cargo-dist/releases/download/v0.33.0/cargo-dist-x86_64-pc-windows-msvc.zip' -OutFile $archive
+    Invoke-WebRequest -Uri 'https://github.com/axodotdev/cargo-dist/releases/download/v0.34.0/cargo-dist-x86_64-pc-windows-msvc.zip' -OutFile $archive
     if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) {
         throw 'The cargo-dist Windows release checksum differs from the pinned release'
     }
@@ -25,7 +25,7 @@ try {
     if (Test-Path -LiteralPath $destination) { throw 'Refusing to replace an existing dist executable' }
     Copy-Item -LiteralPath $executables[0].FullName -Destination $destination
     $version = & $destination --version
-    if ($LASTEXITCODE -ne 0 -or $version -ne 'cargo-dist 0.33.0') {
+    if ($LASTEXITCODE -ne 0 -or $version -ne 'cargo-dist 0.34.0') {
         throw 'The downloaded dist executable has an unexpected version'
     }
     [IO.File]::AppendAllText($env:GITHUB_PATH, $env:DIST_BIN_DIR + "`n", [Text.UTF8Encoding]::new($false))

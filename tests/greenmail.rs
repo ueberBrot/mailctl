@@ -616,7 +616,7 @@ fn imap_append_creates_exact_draft_in_existing_target_without_changing_inbox() {
             .parse(stored.mime_message.as_bytes())
             .unwrap();
         assert_eq!(
-            parsed.bcc().unwrap().first().unwrap().address.as_deref(),
+            parsed.bcc().unwrap().first().unwrap().address(),
             Some("private@example.test")
         );
         assert_eq!(fixture.snapshot().await?, inbox);

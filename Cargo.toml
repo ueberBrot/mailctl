@@ -29,63 +29,63 @@ lto = "thin"
 [dependencies]
 clap = { version = "4.6.7", default-features = false, features = ["std", "help", "usage", "error-context", "derive"] }
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
+serde_json = "1.0.154"
 chrono = { version = "=0.4.45", default-features = false, features = ["std"] }
-toml = "1.1.8"
-uuid = { version = "1.27.0", features = ["v4", "serde"] }
-schemars = { version = "1.2.2", features = ["uuid1"] }
-tokio = { version = "=1.53.3", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "sync", "time", "signal"] }
+toml = "1.2.0"
+uuid = { version = "1.29.0", features = ["v4", "serde"] }
+schemars = { version = "1.2.3", features = ["uuid1"] }
+tokio = { version = "=1.54.1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "sync", "time", "signal"] }
 async-imap = { version = "=0.12.0", default-features = false, features = ["runtime-tokio"] }
 imap-proto = "=0.17.0"
 tokio-rustls = { version = "=0.26.6", default-features = false, features = ["ring", "tls12"] }
 zeroize = "=1.9.1"
-rustls-native-certs = "=0.8.4"
-rmcp = { version = "=3.5.1", optional = true, default-features = false, features = ["server", "transport-io"] }
+rustls-native-certs = "=0.8.5"
+rmcp = { version = "=3.8.0", optional = true, default-features = false, features = ["server", "transport-io"] }
 tokio-util = { version = "0.7.20", optional = true, features = ["codec", "rt"] }
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["std", "registry", "fmt", "json", "ansi"] }
 anstream = "1.0.0"
 anstyle = "1.0.14"
-sha2 = "0.11.0"
+sha2 = "0.11.1"
 ring = "=0.17.14"
 base64 = { version = "=0.23.1", default-features = false, features = ["std"] }
 getrandom = "0.4.3"
 etcetera = "0.11.0"
-mail-parser = { version = "=0.11.9", default-features = false, features = ["full_encoding"] }
-html2text = { version = "=0.17.1", default-features = false }
-encoding_rs = "=0.8.42"
-rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled"] }
-mail-builder = { version = "=1.0.0", default-features = false }
+mail-parser = { version = "=1.0.1", default-features = false, features = ["full_encoding"] }
+html2text = { version = "=0.17.4", default-features = false }
+encoding_rs = "=0.8.44"
+rusqlite = { version = "=0.41.1", default-features = false, features = ["bundled"] }
+mail-builder = { version = "=2.0.1", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1.1.5", features = ["event", "fs", "process", "termios"] }
+rustix = { version = "1.1.6", features = ["event", "fs", "process", "termios"] }
 close_fds = "=0.3.2"
-libc = "=0.2.190"
+libc = "=0.2.191"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 oo7 = { version = "=0.6.0", default-features = false, features = ["tokio", "native_crypto"] }
 zbus = { version = "=5.19.0", default-features = false, features = ["tokio", "blocking-api"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-keyring-core = { version = "=1.0.0", default-features = false }
+keyring-core = { version = "=1.0.1", default-features = false }
 apple-native-keyring-store = { version = "=1.0.2", default-features = false, features = ["keychain"] }
 security-framework = "=3.7.0"
 
 [target.'cfg(windows)'.dependencies]
-keyring-core = { version = "=1.0.0", default-features = false }
+keyring-core = { version = "=1.0.1", default-features = false }
 windows-native-keyring-store = { version = "=1.1.0", default-features = false }
 windows-sys = { version = "=0.61.2", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_Threading", "Win32_System_Memory", "Win32_System_SystemServices"] }
 
 [dev-dependencies]
 allocation-counter = "=0.8.1"
-jsonschema = { version = "=0.58.6", default-features = false }
+jsonschema = { version = "=0.60.2", default-features = false }
 rcgen = { version = "=0.14.10", default-features = false, features = ["ring", "pem"] }
-rmcp = { version = "=3.5.1", default-features = false, features = ["client", "transport-child-process"] }
+rmcp = { version = "=3.8.0", default-features = false, features = ["client", "transport-child-process"] }
 cargo_metadata = "0.23.1"
 greenmail-support = { version = "0.1.2", path = "tests/greenmail-support" }
-serde_json = "1.0.151"
-toml = "1.1.8"
+serde_json = "1.0.154"
+toml = "1.2.0"
 
 [features]
 default = ["cli", "mcp"]

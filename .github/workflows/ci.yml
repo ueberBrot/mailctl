@@ -22,11 +22,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f  # v2.0.0; reads rust-toolchain.toml
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30  # v2.0.1; reads rust-toolchain.toml
         with:
           # PRs restore main's caches without filling storage with merge-ref copies.
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@d438492cf8a250514fa2d34b30bc3c0dc37c65ff  # v2.87.8
+      - uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2  # v2.90.0
         with:
           tool: cargo-deny@0.20.2
       - name: Check Rust formatting
@@ -47,9 +47,9 @@ jobs:
         run: python3 scripts/acceptance/test_codex_mcp.py
       - name: Check offline release preparation and publication fixtures
         run: python3 tests/release.py
-      - uses: taiki-e/install-action@d438492cf8a250514fa2d34b30bc3c0dc37c65ff  # v2.87.8
+      - uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2  # v2.90.0
         with:
-          tool: release-plz@0.3.171
+          tool: release-plz@0.4.3
       - name: Check release policy against release-plz
         run: python3 tests/release_preparation.py --integration
 
@@ -65,7 +65,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f  # v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30  # v2.0.1
         with:
           # Feature variants compile different dependency graphs and profiles.
           cache-key: ${{ matrix.features }}
@@ -116,15 +116,31 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f  # v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30  # v2.0.1
         with:
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       # Testcontainers starts GreenMail but needs a running Docker Engine.
       # Its pinned Rust client requires a newer API than the runner provides.
-      - uses: docker/setup-docker-action@2bf61fb9464cc67f0cbdeabed6aa0380accd1c70  # v5.5.0
-        with:
-          version: v29.9.0
-          set-host: true
+      - name: Install Docker 29.9.3 from its signed APT repository
+        shell: bash
+        run: |
+          # The archive action's release index can lag security releases.
+          # Hosted runners remove Docker's APT source after provisioning.
+          # shellcheck source=/dev/null
+          . /etc/os-release
+          docker_package_version="5:29.9.3-1~${ID}.${VERSION_ID}~${VERSION_CODENAME}"
+          sudo install -m 0755 -d /etc/apt/keyrings
+          sudo curl --fail --silent --show-error --location \
+            https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+          sudo chmod a+r /etc/apt/keyrings/docker.asc
+          printf 'deb [arch=%s signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu %s stable\n' \
+            "$(dpkg --print-architecture)" "$VERSION_CODENAME" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+          sudo apt-get update
+          sudo apt-get install --yes --allow-downgrades \
+            "docker-ce=$docker_package_version" "docker-ce-cli=$docker_package_version"
+          sudo systemctl restart docker
+          test "$(docker version --format '{{.Client.Version}}')" = '29.9.3'
+          test "$(docker version --format '{{.Server.Version}}')" = '29.9.3'
       - name: Record OpenSSL version
         run: openssl version
       - name: Lint GreenMail integration
@@ -147,11 +163,11 @@ jobs:
           persist-credentials: false
       - name: Set candidate paths
         run: python3 scripts/ci/candidate-jobs.py init
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f  # v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30  # v2.0.1
         with:
           cache-shared-key: native-credentials
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Install dist 0.33.0 from its official release
+      - name: Install dist 0.34.0 from its official release
         shell: bash
         env:
           DIST_BIN_DIR: ${{ runner.temp }}/dist-bin
@@ -270,11 +286,11 @@ jobs:
           persist-credentials: false
       - name: Set candidate paths
         run: python3 scripts/ci/candidate-jobs.py init
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f  # v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30  # v2.0.1
         with:
           cache-shared-key: linux-candidate
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Install dist 0.33.0 from its official release
+      - name: Install dist 0.34.0 from its official release
         shell: bash
         env:
           DIST_BIN_DIR: ${{ runner.temp }}/dist-bin
@@ -395,11 +411,11 @@ jobs:
           persist-credentials: false
       - name: Set candidate paths
         run: python scripts/ci/candidate-jobs.py init
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f  # v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30  # v2.0.1
         with:
           cache-shared-key: windows-candidate
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Install dist 0.33.0 from its official release
+      - name: Install dist 0.34.0 from its official release
         shell: pwsh
         env:
           DIST_BIN_DIR: ${{ runner.temp }}/dist-bin
@@ -512,7 +528,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f  # v2.0.0
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30  # v2.0.1
         with:
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Lint isolated access

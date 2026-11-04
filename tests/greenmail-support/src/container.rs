@@ -10,7 +10,7 @@ use testcontainers::{
 };
 
 const IMAGE_TAG: &str =
-    "2.1.13@sha256:3df66b7edd01c8a301343ca5e3601d8674760d4708655573560c24745e624fb2";
+    "2.1.15@sha256:309ba544ea482e5d4265d09921cdab07c8dad2cc4481d715c9b8ff5d3f0a149f";
 
 /// Owns a fresh server. Connections are scoped inside methods and closed before
 /// reset/purge. No API or transport handle escapes this exclusive owner.

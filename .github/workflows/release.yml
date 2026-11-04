@@ -33,15 +33,15 @@ jobs:
           ref: ${{ github.event.workflow_run.head_sha }}
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f  # v2.0.0; reads rust-toolchain.toml
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30  # v2.0.1; reads rust-toolchain.toml
         with:
           cache: false
       - name: Create the version tag and draft release
         id: release
-        uses: release-plz/action@f393a7b38aca9d9b4c58447b291dbac963901df6  # v0.5.141
+        uses: release-plz/action@66b324fd6c72d05d2a08568492ecdd62bfb8a62b  # v0.5.148
         with:
           command: release
-          version: 0.3.171
+          version: 0.4.3
         env:
           GITHUB_TOKEN: ${{ github.token }}
       - name: Reject unfinished publication when release-plz skips the version

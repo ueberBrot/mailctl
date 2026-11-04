@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Check release policy with disposable Git history and offline release-plz.
 
-Run with Python 3.11 or later. ``--integration`` requires release-plz 0.3.171
+Run with Python 3.11 or later. ``--integration`` requires release-plz 0.4.3
 on PATH or at MAILCTL_RELEASE_PLZ; without it, unavailable integration checks
 are skipped. Cargo resolves only the tiny vendored fixture dependency.
 """
@@ -25,7 +25,7 @@ sys.dont_write_bytecode = True
 SPEC = importlib.util.spec_from_file_location("prepare_release", ROOT / "scripts/prepare-release.py")
 preparation = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(preparation)
-RELEASE_PLZ_VERSION = "0.3.171"
+RELEASE_PLZ_VERSION = "0.4.3"
 RELEASE_PLZ = None
 RELEASE_DATE = "2026-10-21"
 
@@ -467,7 +467,7 @@ class ReleasePlzIntegrationTest(RepositoryTest):
     @classmethod
     def setUpClass(cls):
         if not RELEASE_PLZ:
-            raise unittest.SkipTest("release-plz 0.3.171 unavailable; use --integration to require it")
+            raise unittest.SkipTest("release-plz 0.4.3 unavailable; use --integration to require it")
         version = run(ROOT, RELEASE_PLZ, "--version").strip()
         if version != "release-plz " + RELEASE_PLZ_VERSION:
             raise AssertionError(f"Expected release-plz {RELEASE_PLZ_VERSION}, found {version!r}")
@@ -595,5 +595,5 @@ if __name__ == "__main__":
     arguments, unittest_arguments = parser.parse_known_args()
     RELEASE_PLZ = shutil.which(os.environ.get("MAILCTL_RELEASE_PLZ", "release-plz"))
     if arguments.integration and not RELEASE_PLZ:
-        parser.error("--integration requires release-plz 0.3.171 on PATH or at MAILCTL_RELEASE_PLZ")
+        parser.error("--integration requires release-plz 0.4.3 on PATH or at MAILCTL_RELEASE_PLZ")
     unittest.main(argv=[sys.argv[0], *unittest_arguments], verbosity=2)
